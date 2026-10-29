@@ -260,11 +260,13 @@ fn app(per_point: usize) -> App {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        discovery: None,
         derive_humidity: None,
     };
     let state = Arc::new(ArcSwap::from_pointee(EdrState {
         engines: HashMap::from([("obs".to_string(), engine)]),
         collections: HashMap::from([("obs".to_string(), config)]),
+        discovery: Default::default(),
         styles: HashMap::new(),
         feature_engines: HashMap::new(),
         base_url: "https://example.test".into(),

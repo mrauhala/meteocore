@@ -1466,6 +1466,32 @@ Both validated at config load: empty keyword entries, empty license title, a
 non-http(s) license URL, or a license `type` that is not a media type or has
 no `url` are rejected.
 
+### Collection themes & discovery records (#1356)
+
+An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
+`themes` concept, plus a link to the collection's WCMP2 discovery record.
+
+- `[collections.discovery]` (`[discovery]` in a collections.d file):
+  - `wis2_topic` becomes `themes`: one theme with scheme
+    `https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline` and
+    one concept per topic, at any level of the hierarchy.
+  - `wcmp2_record` (`urn:wmo:md:…`) becomes one `describedby`
+    `application/geo+json` link into the catalogue.
+  - Topics are validated at load against
+    `crates/core/assets/wis2-topic-hierarchy-<ver>/`, which is regenerated
+    only by `scripts/vendor-wis2-topic-hierarchy.py`.
+- WIS2-subscribed collections derive their topics from their subscriptions.
+  An engine that gains a WIS2 source adds its subscriptions to
+  `ds_core::discovery::topics`.
+- Build theme JSON only through `ds_core::discovery::themes`, and descriptions
+  only through `api_common::collection_metadata`, so the encoding stays in
+  one place.
+- The top-level `[discovery] catalogue` (GDC base URL, default
+  `https://wis2-gdc.weather.gc.ca`) is never part of `CollectionConfig`. It
+  reaches descriptions as the `Discovery` in each API state, a
+  `load_collections` argument taken from `AcceptedLoad`. A reload that
+  changes only the catalogue therefore rebuilds no engine.
+
 ## Admin & Operations
 
 - **Reload:** `POST /admin/collections/reload` — re-reads config, atomically

@@ -126,6 +126,7 @@ fn collection(dir: &Path, apis: &[&str]) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        discovery: None,
         derive_humidity: None,
     }
 }
@@ -169,6 +170,7 @@ fn maps(engine: Arc<SatelliteEngine>, dir: &Path) -> axum::Router {
     api_maps::router(Arc::new(ArcSwap::from_pointee(api_maps::MapsState {
         engines: HashMap::from([(ID.to_string(), engine as Arc<dyn MapEngine>)]),
         collections: HashMap::from([(ID.to_string(), collection(dir, &["maps"]))]),
+        discovery: Default::default(),
         styles: styles(),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),
@@ -182,6 +184,7 @@ fn tiles(engine: Arc<SatelliteEngine>, dir: &Path) -> axum::Router {
     api_tiles::router(Arc::new(ArcSwap::from_pointee(api_tiles::TilesState {
         map_engines: HashMap::from([(ID.to_string(), engine as Arc<dyn MapEngine>)]),
         collections: HashMap::from([(ID.to_string(), collection(dir, &["tiles"]))]),
+        discovery: Default::default(),
         styles: styles(),
         feature_engines: HashMap::new(),
         feature_collections: HashMap::new(),

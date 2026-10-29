@@ -1,0 +1,1312 @@
+# WIS2 Topic Hierarchy 1.3.0: every earth-system-discipline level, one path per row.
+# Flattened from https://github.com/wmo-im/wis2-topic-hierarchy/tree/1.3.0/topic-hierarchy/earth-system-discipline
+# by scripts/vendor-wis2-topic-hierarchy.py; do not edit. Apache-2.0, see LICENSE.
+path	status	description
+atmospheric-composition	Operational	Atmospheric Composition
+atmospheric-composition/advisories-warnings	Experimental	Advisories and warnings
+atmospheric-composition/advisories-warnings/air-pollution	Experimental	Air pollution
+atmospheric-composition/advisories-warnings/fires	Experimental	Fires
+atmospheric-composition/advisories-warnings/nuclear-fallout	Experimental	Nuclear fallout
+atmospheric-composition/advisories-warnings/ozone-and-ultraviolet-radiation	Experimental	Ozone and ultraviolet radiation
+atmospheric-composition/advisories-warnings/sand-and-dust	Experimental	Sand and dust
+atmospheric-composition/advisories-warnings/volcanic-activity	Experimental	Volcanic activity
+atmospheric-composition/experimental	Operational	Experimental topics
+atmospheric-composition/observations	Experimental	Observations
+atmospheric-composition/observations/aerosol-particles-and-clouds	Experimental	Aerosol particles and clouds
+atmospheric-composition/observations/atmospheric-processes-and-kinetics	Experimental	Atmospheric processes and kinetics
+atmospheric-composition/observations/emissions	Experimental	Emissions
+atmospheric-composition/observations/gases	Experimental	Gases
+atmospheric-composition/observations/gases/greenhouse-gases	Experimental	Greenhouse gases
+atmospheric-composition/observations/gases/ozone	Experimental	Ozone
+atmospheric-composition/observations/gases/reactive-gases	Experimental	Reactive gases (excluding stratospheric ozone)
+atmospheric-composition/observations/radiation-latent-heat	Experimental	Radiation latent heat
+atmospheric-composition/observations/radiation-latent-heat/ultraviolet-radiation	Experimental	Ultraviolet radiation
+atmospheric-composition/observations/surface-flux-densities	Experimental	Surface-flux-densities
+atmospheric-composition/observations/surface-flux-densities/dry-deposition	Experimental	Dry deposition
+atmospheric-composition/observations/surface-flux-densities/precipitation-chemistry	Experimental	Precipitation chemistry
+climate	Operational	Climate
+climate/experimental	Operational	Experimental topics
+climate/surface-based-observations	Operational	Surface based observations
+climate/surface-based-observations/daily	Operational	Daily values from land stations, e.g. DAYCLI
+climate/surface-based-observations/monthly	Operational	Monthly values from land stations, e.g. CLIMAT
+climate/surface-based-observations/sub-daily	Operational	Reprocessed hourly and other sub-daily observations from land stations
+cryosphere	Operational	Cryosphere
+cryosphere/experimental	Operational	Experimental topics
+cryosphere/space-based-observations	Operational	Space based observations
+cryosphere/space-based-observations/glacier-ice-sheet-ice-shelves	Operational	Glacier, ice-sheets, and ice-shelves including moving ice on land
+cryosphere/space-based-observations/lake-river-ice	Operational	Lake and river ice
+cryosphere/space-based-observations/sea-ice-icebergs	Operational	Sea ice and icebergs
+cryosphere/space-based-observations/snow	Operational	Snow
+cryosphere/space-based-observations/solid-precipitation	Operational	Solid precipitation, including snowfall, hail, sleet, etc.
+cryosphere/surface-based-observations	Operational	Surface based observations
+cryosphere/surface-based-observations/frozen-ground	Operational	Frozen ground, including permafrost and seasonal frozen ground
+cryosphere/surface-based-observations/snow	Operational	Snow
+cryosphere/surface-based-observations/solid-precipitation	Operational	Solid precipitation, including snowfall, hail, sleet, etc.
+hydrology	Operational	Hydrology
+hydrology/experimental	Operational	Experimental topics
+hydrology/space-based-observations	Experimental	Space based observations
+hydrology/space-based-observations/soil	Experimental	Soil
+hydrology/subsurface-based-observations	Experimental	Subsurface based observations
+hydrology/subsurface-based-observations/water-quantity	Experimental	Water quantity
+hydrology/subsurface-based-observations/water-quantity/groundwater	Experimental	Groundwater
+hydrology/subsurface-based-observations/water-quantity/soil	Experimental	Soil
+hydrology/surface-based-observations	Experimental	Surface based observations
+hydrology/surface-based-observations/atmospheric	Experimental	Atmospheric
+hydrology/surface-based-observations/atmospheric/precipitation	Experimental	Precipitation
+hydrology/surface-based-observations/water-quantity	Experimental	Water quantity
+hydrology/surface-based-observations/water-quantity/ice	Experimental	Ice
+hydrology/surface-based-observations/water-quantity/lake	Experimental	Lake
+hydrology/surface-based-observations/water-quantity/reservoir	Experimental	Reservoir
+hydrology/surface-based-observations/water-quantity/snow	Experimental	Snow
+hydrology/surface-based-observations/water-quantity/stream	Experimental	Stream
+ocean	Operational	Ocean
+ocean/experimental	Operational	Experimental topics
+ocean/surface-based-observations	Operational	Surface based observations
+ocean/surface-based-observations/animal-borne-sensors	Operational	Data from animal borne sensors
+ocean/surface-based-observations/autonomous-surface-vehicles	Operational	Data from autonomous surface vehicles
+ocean/surface-based-observations/autonomous-underwater-vehicles	Operational	Data from autonomous under water vehicles
+ocean/surface-based-observations/drifting-buoys	Operational	Data from drifting buoys
+ocean/surface-based-observations/drifting-ocean-profilers	Operational	Data from drifting ocean profilers, e.g. Argo
+ocean/surface-based-observations/fixed-coastal-stations	Operational	Data from fixed coastal stations, e.g. sea level monitoring station, HF radars etc
+ocean/surface-based-observations/fixed-marine-platforms	Operational	Data from fixed surface platforms
+ocean/surface-based-observations/moored-buoys-and-moorings	Operational	Data from moored buoys and moorings
+ocean/surface-based-observations/sea-ice	Operational	Sea ice observations
+ocean/surface-based-observations/ship-sub-surface	Operational	Profile data measured from ships, e.g. XBT, CTD, etc.
+ocean/surface-based-observations/ship-surface	Operational	Along track surface observations from ships
+ocean/surface-based-observations/tsunami-buoys	Operational	Data from tsunami buoys, e.g. DART buoys
+ocean/surface-based-observations/wave-buoys	Operational	Data from wave buoys
+space-weather	Operational	Space Weather
+space-weather/experimental	Operational	Experimental topics
+space-weather/space-based-observations	Operational	Space based observations
+space-weather/space-based-observations/ace	Operational	Advanced Composition Explorer (ACE)
+space-weather/space-based-observations/ace/cris	Operational	Cosmic Ray Isotope Spectrometer (CRiS)
+space-weather/space-based-observations/ace/epam	Operational	Electron, Proton, and Alpha-particle Monitor (EPAM)
+space-weather/space-based-observations/ace/mag	Operational	Magnetic Field Monitor (MAG)
+space-weather/space-based-observations/ace/sepica	Operational	Solar Energetic Particle Ionic Charge Analyzer (SEPICA)
+space-weather/space-based-observations/ace/sis	Operational	Solar Isotope Spectrometer (SIS)
+space-weather/space-based-observations/ace/swepam	Operational	Solar Wind Electron, Proton, and Alpha Monitor (SWEPAM)
+space-weather/space-based-observations/ace/swics	Operational	Solar Wind Ion Composition Spectrometer (SWICS)
+space-weather/space-based-observations/ace/swims	Operational	Solar Wind Ion Mass Spectrometer (SWIMS)
+space-weather/space-based-observations/ace/uleis	Operational	Ultra-Low Energy Isotope Spectrometer (ULEIS)
+space-weather/space-based-observations/aditya-1	Operational	Aditya-1
+space-weather/space-based-observations/aditya-1/aspex	Operational	Aditya Solar wind Particle Experiment (ASPEX)
+space-weather/space-based-observations/aditya-1/hel1os	Operational	High Energy L1 Orbiting X-ray Spectrometer (HEL1OS)
+space-weather/space-based-observations/aditya-1/magnetometer	Operational	Magnetometer
+space-weather/space-based-observations/aditya-1/papa	Operational	Plasma Analyzer Package for Aditya (PAPA)
+space-weather/space-based-observations/aditya-1/solexs	Operational	Solar Low Energy X-ray Spectrometer (SoLEXS)
+space-weather/space-based-observations/aditya-1/suit	Operational	Solar Ultraviolet Imaging Telescope (SUIT)
+space-weather/space-based-observations/aditya-1/velc	Operational	Visible Emission Line Coronagraph (VELC)
+space-weather/space-based-observations/arase-erg	Operational	Exploration of energization and Radiation in Geospace (Arase (ERG))
+space-weather/space-based-observations/arase-erg/hep-e	Operational	High-energy electron experiments (HEP-e)
+space-weather/space-based-observations/arase-erg/lep-e	Operational	Low-energy particle experiments - electron analyzer (LEP-e)
+space-weather/space-based-observations/arase-erg/lep-i	Operational	Low-energy particle experiments - ion mass analyzer (LEP-i)
+space-weather/space-based-observations/arase-erg/mep-e	Operational	Medium-energy particle experiments - electron analyzer (MEP-e)
+space-weather/space-based-observations/arase-erg/mep-i	Operational	Medium-energy particle experiments - ion mass analyzer (MEP-i)
+space-weather/space-based-observations/arase-erg/mgf	Operational	Magnetic field experiment (MGF)
+space-weather/space-based-observations/arase-erg/pwe	Operational	Plasma Wave Experiment (PWE)
+space-weather/space-based-observations/arase-erg/xep-e	Operational	Extremely high-energy electron experiments (XEP-e)
+space-weather/space-based-observations/arctica-m-n1	Operational	Arctica-M N1
+space-weather/space-based-observations/arctica-m-n1/ggak-e-fm-e	Operational	GGAK-E / Magnetometer instrument (GGAK-E/FM-E)
+space-weather/space-based-observations/arctica-m-n1/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/arctica-m-n1/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/arctica-m-n2	Operational	Arctica-M N2
+space-weather/space-based-observations/arctica-m-n2/ggak-e-fm-e	Operational	GGAK-E / Magnetometer instrument (GGAK-E/FM-E)
+space-weather/space-based-observations/arctica-m-n2/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/arctica-m-n2/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/artemis-p1	Operational	Acceleration, Reconnection, Turbulence, and Electrodynamics of the Moon's Interaction with the Sun - P1 (ARTEMIS-P1)
+space-weather/space-based-observations/artemis-p1/efi	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/artemis-p1/esa	Operational	Electrostatic Analyzer (ESA)
+space-weather/space-based-observations/artemis-p1/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/artemis-p1/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/artemis-p1/sst	Operational	Solid State Telescope (SST)
+space-weather/space-based-observations/artemis-p2	Operational	Acceleration, Reconnection, Turbulence, and Electrodynamics of the Moon's Interaction with the Sun - P2 (ARTEMIS-P2)
+space-weather/space-based-observations/artemis-p2/efi	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/artemis-p2/esa	Operational	Electrostatic Analyzer (ESA)
+space-weather/space-based-observations/artemis-p2/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/artemis-p2/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/artemis-p2/sst	Operational	Solid State Telescope (SST)
+space-weather/space-based-observations/aso-s	Operational	Advanced Space-based Solar Observatory (ASO-S (Kuafu-1))
+space-weather/space-based-observations/aso-s/fmg	Operational	Full-disk solar vector MagnetoGraph (FMG)
+space-weather/space-based-observations/aso-s/hxi	Operational	Hard X-ray Imager (HXI)
+space-weather/space-based-observations/aso-s/lst	Operational	Lyman-alpha Solar Telescope (LST)
+space-weather/space-based-observations/cluster-1	Operational	CLUSTER-1
+space-weather/space-based-observations/cluster-1/cis	Operational	Cluster Ion Spectrometry experiment (CIS)
+space-weather/space-based-observations/cluster-1/edi	Operational	Electron Drift Instrument (EDI)
+space-weather/space-based-observations/cluster-1/efw	Operational	Electric Fields and Waves (EFW)
+space-weather/space-based-observations/cluster-1/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/cluster-1/peace	Operational	Plasma Electron and Current Analyzer (PEACE)
+space-weather/space-based-observations/cluster-1/rapid	Operational	Research with Adaptive Particle Imaging Detectors (RAPID)
+space-weather/space-based-observations/cluster-1/staff	Operational	Spatio-Temporal Analysis of Field Fluctuations (STAFF)
+space-weather/space-based-observations/cluster-1/wbd	Operational	Wide Band Data (WBD)
+space-weather/space-based-observations/cluster-1/whisper	Operational	Waves of High Frequency and Sounder for Probing of Density by Relaxation (WHISPER)
+space-weather/space-based-observations/cluster-2	Operational	CLUSTER-2
+space-weather/space-based-observations/cluster-2/cis	Operational	Cluster Ion Spectrometry experiment (CIS)
+space-weather/space-based-observations/cluster-2/edi	Operational	Electron Drift Instrument (EDI)
+space-weather/space-based-observations/cluster-2/efw	Operational	Electric Fields and Waves (EFW)
+space-weather/space-based-observations/cluster-2/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/cluster-2/peace	Operational	Plasma Electron and Current Analyzer (PEACE)
+space-weather/space-based-observations/cluster-2/rapid	Operational	Research with Adaptive Particle Imaging Detectors (RAPID)
+space-weather/space-based-observations/cluster-2/staff	Operational	Spatio-Temporal Analysis of Field Fluctuations (STAFF)
+space-weather/space-based-observations/cluster-2/wbd	Operational	Wide Band Data (WBD)
+space-weather/space-based-observations/cluster-2/whisper	Operational	Waves of High Frequency and Sounder for Probing of Density by Relaxation (WHISPER)
+space-weather/space-based-observations/cluster-3	Operational	CLUSTER-3
+space-weather/space-based-observations/cluster-3/cis	Operational	Cluster Ion Spectrometry experiment (CIS)
+space-weather/space-based-observations/cluster-3/edi	Operational	Electron Drift Instrument (EDI)
+space-weather/space-based-observations/cluster-3/efw	Operational	Electric Fields and Waves (EFW)
+space-weather/space-based-observations/cluster-3/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/cluster-3/peace	Operational	Plasma Electron and Current Analyzer (PEACE)
+space-weather/space-based-observations/cluster-3/rapid	Operational	Research with Adaptive Particle Imaging Detectors (RAPID)
+space-weather/space-based-observations/cluster-3/staff	Operational	Spatio-Temporal Analysis of Field Fluctuations (STAFF)
+space-weather/space-based-observations/cluster-3/wbd	Operational	Wide Band Data (WBD)
+space-weather/space-based-observations/cluster-3/whisper	Operational	Waves of High Frequency and Sounder for Probing of Density by Relaxation (WHISPER)
+space-weather/space-based-observations/cluster-4	Operational	CLUSTER-4
+space-weather/space-based-observations/cluster-4/cis	Operational	Cluster Ion Spectrometry experiment (CIS)
+space-weather/space-based-observations/cluster-4/edi	Operational	Electron Drift Instrument (EDI)
+space-weather/space-based-observations/cluster-4/efw	Operational	Electric Fields and Waves (EFW)
+space-weather/space-based-observations/cluster-4/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/cluster-4/peace	Operational	Plasma Electron and Current Analyzer (PEACE)
+space-weather/space-based-observations/cluster-4/rapid	Operational	Research with Adaptive Particle Imaging Detectors (RAPID)
+space-weather/space-based-observations/cluster-4/staff	Operational	Spatio-Temporal Analysis of Field Fluctuations (STAFF)
+space-weather/space-based-observations/cluster-4/wbd	Operational	Wide Band Data (WBD)
+space-weather/space-based-observations/cluster-4/whisper	Operational	Waves of High Frequency and Sounder for Probing of Density by Relaxation (WHISPER)
+space-weather/space-based-observations/diademe-1	Operational	Diademe-1
+space-weather/space-based-observations/diademe-1/rra	Operational	Retro-Reflector Array (RRA)
+space-weather/space-based-observations/diademe-2	Operational	Diademe-2
+space-weather/space-based-observations/diademe-2/rra	Operational	Retro-Reflector Array (RRA)
+space-weather/space-based-observations/dmsp-17	Operational	Defense Meteorological Satellite Program - F17 (DMSP-F17)
+space-weather/space-based-observations/dmsp-17/sess-ssi-es-3	Operational	SESS / Special Sensor Ionospheric Plasma Drift/Scintillation Monitor - 3 (SESS/SSI/ES-3)
+space-weather/space-based-observations/dmsp-17/sess-ssj5	Operational	SESS / Special Sensor Precipitating Electron and Ion Spectrometer (SESS/SSJ5 )
+space-weather/space-based-observations/dmsp-17/sess-ssm-boom	Operational	SESS / Special Sensor Magnetometer - Boom (SESS/SSM-Boom)
+space-weather/space-based-observations/dmsp-17/sess-ssuli	Operational	SESS / Special Sensor Ultraviolet Limb Imager (SESS/SSULI)
+space-weather/space-based-observations/dmsp-17/sess-ssusi	Operational	SESS / Special Sensor Ultraviolet Spectrographic Imager (SESS/SSUSI)
+space-weather/space-based-observations/dmsp-18	Operational	Defense Meteorological Satellite Program - F18 (DMSP-F18)
+space-weather/space-based-observations/dmsp-18/sess-ssi-es-3	Operational	SESS / Special Sensor Ionospheric Plasma Drift/Scintillation Monitor - 3 (SESS/SSI/ES-3)
+space-weather/space-based-observations/dmsp-18/sess-ssj5	Operational	SESS / Special Sensor Precipitating Electron and Ion Spectrometer (SESS/SSJ5 )
+space-weather/space-based-observations/dmsp-18/sess-ssm-boom	Operational	SESS / Special Sensor Magnetometer - Boom (SESS/SSM-Boom)
+space-weather/space-based-observations/dmsp-18/sess-ssuli	Operational	SESS / Special Sensor Ultraviolet Limb Imager (SESS/SSULI)
+space-weather/space-based-observations/dmsp-18/sess-ssusi	Operational	SESS / Special Sensor Ultraviolet Spectrographic Imager (SESS/SSUSI)
+space-weather/space-based-observations/dscovr	Operational	Deep Space Climate Observatory (DSCOVR)
+space-weather/space-based-observations/dscovr/es	Operational	Electron Spectrometer (ES)
+space-weather/space-based-observations/dscovr/fc	Operational	Faraday Cup (FC)
+space-weather/space-based-observations/dscovr/mag	Operational	Magnetometer (MAG)
+space-weather/space-based-observations/electro-l-n2	Operational	Electro-L Number 2 (Electro-L N2)
+space-weather/space-based-observations/electro-l-n2/ggak-e-dir-e	Operational	Solar X-ray radiation flux sensor (GGAK-E/DIR-E)
+space-weather/space-based-observations/electro-l-n2/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/electro-l-n2/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/electro-l-n2/ggak-e-skl-e	Operational	GGAK-E / Solar cosmic rays spectrometer (GGAK-E/SKL-E)
+space-weather/space-based-observations/electro-l-n2/ggak-e-vuss-e	Operational	GGAK-E / Solar UV radiation sensor (GGAK-E/VUSS-E)
+space-weather/space-based-observations/electro-l-n3	Operational	Electro-L Number 3 (Electro-L N3)
+space-weather/space-based-observations/electro-l-n3/ggak-e-dir-e	Operational	Solar X-ray radiation flux sensor (GGAK-E/DIR-E)
+space-weather/space-based-observations/electro-l-n3/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/electro-l-n3/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/electro-l-n3/ggak-e-skl-e	Operational	GGAK-E / Solar cosmic rays spectrometer (GGAK-E/SKL-E)
+space-weather/space-based-observations/electro-l-n3/ggak-e-vuss-e	Operational	GGAK-E / Solar UV radiation sensor (GGAK-E/VUSS-E)
+space-weather/space-based-observations/electro-l-n4	Operational	Electro-L Number 4 (Electro-L N4)
+space-weather/space-based-observations/electro-l-n4/ggak-e-dir-e	Operational	Solar X-ray radiation flux sensor (GGAK-E/DIR-E)
+space-weather/space-based-observations/electro-l-n4/ggak-e-fm-e	Operational	GGAK-E / Magnetometer instrument (GGAK-E/FM-E)
+space-weather/space-based-observations/electro-l-n4/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/electro-l-n4/ggak-e-isp-2m	Operational	GGAK-L / Solar constant sensor (GGAK-E/ISP-2M)
+space-weather/space-based-observations/electro-l-n4/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/electro-l-n4/ggak-e-skl-e	Operational	GGAK-E / Solar cosmic rays spectrometer (GGAK-E/SKL-E)
+space-weather/space-based-observations/electro-l-n4/ggak-e-vuss-e	Operational	GGAK-E / Solar UV radiation sensor (GGAK-E/VUSS-E)
+space-weather/space-based-observations/formosat-5	Operational	FORMOSAT-5
+space-weather/space-based-observations/formosat-5/aip	Operational	Advanced Ionospheric Probe (AIP)
+space-weather/space-based-observations/fy-2g	Operational	Feng-Yun - 2G (FY-2G)
+space-weather/space-based-observations/fy-2g/sem	Operational	Space Environment Monitor (SEM)
+space-weather/space-based-observations/fy-2g/sxm	Operational	Solar X-ray monitor (SXM)
+space-weather/space-based-observations/fy-2h	Operational	Feng-Yun - 2H (FY-2H)
+space-weather/space-based-observations/fy-2h/sem	Operational	Space Environment Monitor (SEM)
+space-weather/space-based-observations/fy-2h/sxm	Operational	Solar X-ray monitor (SXM)
+space-weather/space-based-observations/fy-3c	Operational	Feng-Yun 3C (FY-3C)
+space-weather/space-based-observations/fy-3c/sem-hepd	Operational	Space Environment Monitor - High Energy Particle Detector (SEM/HEPD)
+space-weather/space-based-observations/fy-3c/sem-ims	Operational	Space Environment Monitor - Ionosphere Measurement Sensor (SEM/IMS)
+space-weather/space-based-observations/fy-3d	Operational	Feng-Yun 3D (FY-3D)
+space-weather/space-based-observations/fy-3d/sem-hepd	Operational	Space Environment Monitor - High Energy Particle Detector (SEM/HEPD)
+space-weather/space-based-observations/fy-3d/sws-sem-ims	Operational	Space Weather Suite / Space Environment Monitor / Ionosphere Measurement Sensor (SWS/SEM/IMS)
+space-weather/space-based-observations/fy-3d/sws-wai	Operational	Space Weather Suite / Wide-field Auroral Imager (SWS/WAI)
+space-weather/space-based-observations/fy-3e	Operational	Feng-Yun 3E (FY-3E)
+space-weather/space-based-observations/fy-3e/sws-sem-fgm	Operational	Space Weather Suite / Space Environment Monitor / Flux Gate Magnetometer (SWS/SEM/FGM)
+space-weather/space-based-observations/fy-3e/sws-sem-hepd	Operational	Space Weather Suite / Space Environment Monitor / High Energy Particle Detector (SWS/SEM/HEPD)
+space-weather/space-based-observations/fy-3e/sws-sem-ims	Operational	Space Weather Suite / Space Environment Monitor / Ionosphere Measurement Sensor (SWS/SEM/IMS)
+space-weather/space-based-observations/fy-3e/sws-tri-ipm	Operational	Space Weather Suite - Triple-angle Ionospheric PhotoMeter (SWS/Tri-IPM)
+space-weather/space-based-observations/fy-3e/xeuvi	Operational	Solar X-ray and Extreme Ultraviolet Imager (XEUVI)
+space-weather/space-based-observations/fy-4a	Operational	Feng-Yun - 4A (FY-4A)
+space-weather/space-based-observations/fy-4a/sep-fields	Operational	Space Environment Package - fields (SEP-fields)
+space-weather/space-based-observations/fy-4a/sep-heps	Operational	Space Environment Package / High Energy Particles Sensor (SEP/HEPS)
+space-weather/space-based-observations/fy-4b	Operational	Feng-Yun - 4B (FY-4B)
+space-weather/space-based-observations/fy-4b/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/fy-4b/sep-fields	Operational	Space Environment Package - fields (SEP-fields)
+space-weather/space-based-observations/fy-4b/sep-heps	Operational	Space Environment Package / High Energy Particles Sensor (SEP/HEPS)
+space-weather/space-based-observations/fy-4b/sep-leps	Operational	Space Environment Package / Low Energy Particles Sensor (SEP/LEPS)
+space-weather/space-based-observations/fy-4b/sep-meps	Operational	Space Environment Package / Medium Energy Particles Sensor (SEP/MEPS)
+space-weather/space-based-observations/fy-4c	Operational	Feng-Yun - 4C (FY-4C)
+space-weather/space-based-observations/fy-4c/sep-fields	Operational	Space Environment Package - fields (SEP-fields)
+space-weather/space-based-observations/fy-4c/sep-heps	Operational	Space Environment Package / High Energy Particles Sensor (SEP/HEPS)
+space-weather/space-based-observations/fy-4c/sep-leps	Operational	Space Environment Package / Low Energy Particles Sensor (SEP/LEPS)
+space-weather/space-based-observations/fy-4c/sep-meps	Operational	Space Environment Package / Medium Energy Particles Sensor (SEP/MEPS)
+space-weather/space-based-observations/fy-4c/suvi	Operational	Solar Extreme-UltraViolet Imager (SUVI)
+space-weather/space-based-observations/fy-4c/sxeuv	Operational	Solar X-EUV imaging telescope (SXEUV)
+space-weather/space-based-observations/fy-4c/sxus	Operational	Solar X-EUV Irradiance Sensor (SXUS)
+space-weather/space-based-observations/fy-4d	Operational	Feng-Yun - 4D (FY-4D)
+space-weather/space-based-observations/fy-4d/sep-fields	Operational	Space Environment Package - fields (SEP-fields)
+space-weather/space-based-observations/fy-4d/sep-heps	Operational	Space Environment Package / High Energy Particles Sensor (SEP/HEPS)
+space-weather/space-based-observations/fy-4d/sep-leps	Operational	Space Environment Package / Low Energy Particles Sensor (SEP/LEPS)
+space-weather/space-based-observations/fy-4d/sep-meps	Operational	Space Environment Package / Medium Energy Particles Sensor (SEP/MEPS)
+space-weather/space-based-observations/fy-4d/suvi	Operational	Solar Extreme-UltraViolet Imager (SUVI)
+space-weather/space-based-observations/fy-4d/sxeuv	Operational	Solar X-EUV imaging telescope (SXEUV)
+space-weather/space-based-observations/fy-4d/sxus	Operational	Solar X-EUV Irradiance Sensor (SXUS)
+space-weather/space-based-observations/fy-4e	Operational	Feng-Yun - 4E (FY-4E)
+space-weather/space-based-observations/fy-4e/sep-fields	Operational	Space Environment Package - fields (SEP-fields)
+space-weather/space-based-observations/fy-4e/sep-heps	Operational	Space Environment Package / High Energy Particles Sensor (SEP/HEPS)
+space-weather/space-based-observations/fy-4e/sep-leps	Operational	Space Environment Package / Low Energy Particles Sensor (SEP/LEPS)
+space-weather/space-based-observations/fy-4e/sep-meps	Operational	Space Environment Package / Medium Energy Particles Sensor (SEP/MEPS)
+space-weather/space-based-observations/fy-4e/suvi	Operational	Solar Extreme-UltraViolet Imager (SUVI)
+space-weather/space-based-observations/fy-4e/sxeuv	Operational	Solar X-EUV imaging telescope (SXEUV)
+space-weather/space-based-observations/fy-4e/sxus	Operational	Solar X-EUV Irradiance Sensor (SXUS)
+space-weather/space-based-observations/galileo	Operational	Galileo
+space-weather/space-based-observations/galileo/emu	Operational	Environmental Monitor Unit (EMU)
+space-weather/space-based-observations/geo-kompsat-2a	Operational	Geostationary Korea Multi-Purpose Satellite - 2A (GEO-KOMPSAT-2A)
+space-weather/space-based-observations/geo-kompsat-2a/ksem-cm	Operational	Korean Space wEather Monitor / Charging Monitor (KSEM/CM)
+space-weather/space-based-observations/geo-kompsat-2a/ksem-mag	Operational	Korean Space wEather Monitor / Magnetometer. ESA acronym is SOSMAG. (KSEM/MAG)
+space-weather/space-based-observations/geo-kompsat-2a/ksem-pd	Operational	Korea Space wEather Monitor / Particle Detector (KSEM/PD)
+space-weather/space-based-observations/goes-14	Operational	Geostationary Operational Environmental Satellite - 14 (GOES-14)
+space-weather/space-based-observations/goes-14/sem-eps	Operational	SEM / Energetic Particles Sensor (SEM/EPS)
+space-weather/space-based-observations/goes-14/sem-hepad	Operational	SEM / High Energy Proton and Alpha Particles Detector (SEM/HEPAD)
+space-weather/space-based-observations/goes-14/sem-mag	Operational	SEM / Magnetometer (SEM/MAG)
+space-weather/space-based-observations/goes-14/sem-xrs-euv	Operational	SEM / X-Ray Sensor - Extreme Ultra-Violet Sensor (SEM/XRS-EUV)
+space-weather/space-based-observations/goes-14/sxi	Operational	Solar X-ray Imager (SXI)
+space-weather/space-based-observations/goes-16	Operational	Geostationary Operational Environmental Satellite - 16 (GOES-16)
+space-weather/space-based-observations/goes-16/exis	Operational	Extreme Ultraviolet Sensor / X-Ray Sensor Irradiance Sensors (EXIS)
+space-weather/space-based-observations/goes-16/seiss-ehis	Operational	SEISS / Energetic Heavy Ion Sensor (SEISS/EHIS)
+space-weather/space-based-observations/goes-16/seiss-mps	Operational	SEISS / Magnetospheric Particle Sensor (SEISS/MPS)
+space-weather/space-based-observations/goes-16/seiss-sgps	Operational	SEISS / Solar and Galactic Proton Sensor (SEISS/SGPS)
+space-weather/space-based-observations/goes-16/sem-mag	Operational	SEM / Magnetometer (SEM/MAG)
+space-weather/space-based-observations/goes-16/suvi	Operational	Solar Ultraviolet Imager (SUVI)
+space-weather/space-based-observations/goes-17	Operational	Geostationary Operational Environmental Satellite - 17 (GOES-17)
+space-weather/space-based-observations/goes-17/exis	Operational	Extreme Ultraviolet Sensor / X-Ray Sensor Irradiance Sensors (EXIS)
+space-weather/space-based-observations/goes-17/seiss-ehis	Operational	SEISS / Energetic Heavy Ion Sensor (SEISS/EHIS)
+space-weather/space-based-observations/goes-17/seiss-mps	Operational	SEISS / Magnetospheric Particle Sensor (SEISS/MPS)
+space-weather/space-based-observations/goes-17/seiss-sgps	Operational	SEISS / Solar and Galactic Proton Sensor (SEISS/SGPS)
+space-weather/space-based-observations/goes-17/sem-mag	Operational	SEM / Magnetometer (SEM/MAG)
+space-weather/space-based-observations/goes-17/suvi	Operational	Solar Ultraviolet Imager (SUVI)
+space-weather/space-based-observations/goes-18	Operational	Geostationary Operational Environmental Satellite - 18 (GOES-18)
+space-weather/space-based-observations/goes-18/exis	Operational	Extreme Ultraviolet Sensor / X-Ray Sensor Irradiance Sensors (EXIS)
+space-weather/space-based-observations/goes-18/seiss-ehis	Operational	SEISS / Energetic Heavy Ion Sensor (SEISS/EHIS)
+space-weather/space-based-observations/goes-18/seiss-mps	Operational	SEISS / Magnetospheric Particle Sensor (SEISS/MPS)
+space-weather/space-based-observations/goes-18/seiss-sgps	Operational	SEISS / Solar and Galactic Proton Sensor (SEISS/SGPS)
+space-weather/space-based-observations/goes-18/sem-mag	Operational	SEM / Magnetometer (SEM/MAG)
+space-weather/space-based-observations/goes-18/suvi	Operational	Solar Ultraviolet Imager (SUVI)
+space-weather/space-based-observations/grace-fo	Operational	Gravity Recovery and Climate Experiment - Follow-on (GRACE-FO (2 sats))
+space-weather/space-based-observations/grace-fo/superstar	Operational	Super Space Three-axis Accelerometer for Research (SuperSTAR)
+space-weather/space-based-observations/icon	Operational	Ionospheric Connection Explorer (ICON)
+space-weather/space-based-observations/icon/euv	Operational	Extreme Ultra Violet Imaging Spectrograph (EUV)
+space-weather/space-based-observations/icon/fuv	Operational	Far Ultra Violet Imaging Spectrograph (FUV)
+space-weather/space-based-observations/icon/ivm	Operational	In-situ Ion Velocity Meter (IVM)
+space-weather/space-based-observations/iris	Operational	Interface Region Imaging Spectrograph (IRIS)
+space-weather/space-based-observations/iris/iris	Operational	Interface Region Imaging Spectrograph (IRIS)
+space-weather/space-based-observations/iss-gari	Operational	The GAGG Radiation Instruments (GARI) (ISS GARI)
+space-weather/space-based-observations/iss-gari/gari	Operational	The GAGG Radiation Instruments (GARI)
+space-weather/space-based-observations/jason-3	Operational	Joint Altimetry Satellite Oceanography Network - 3 (JASON-3)
+space-weather/space-based-observations/jason-3/carmen	Operational	Environment Characterization and Modelisation (CARMEN)
+space-weather/space-based-observations/jason-3/lpt	Operational	Light Particle Telescope (LPT)
+space-weather/space-based-observations/lemur-2	Operational	Low Earth Multi-Use Receiver - 2 (Lemur-2)
+space-weather/space-based-observations/lemur-2/stratos	Operational	STRATOS (STRATOS)
+space-weather/space-based-observations/mats	Operational	Mesospheric Airglow/Aerosol Tomography and Spectroscopy (MATS)
+space-weather/space-based-observations/mats/mats	Operational	Mesospheric Airglow/Aerosol Tomography and Spectroscopy (MATS)
+space-weather/space-based-observations/meteor-m-n2	Operational	Meteor-M Number 2 (Meteor-M N2)
+space-weather/space-based-observations/meteor-m-n2-2	Operational	Meteor-M Number 2-2 (Meteor-M N2-2)
+space-weather/space-based-observations/meteor-m-n2-2/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/meteor-m-n2-2/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/meteor-m-n2-2/ggak-m-rims-m	Operational	Radio-frequency mass spectrometer - M (GGAK-M/RIMS-M)
+space-weather/space-based-observations/meteor-m-n2-3	Operational	Meteor-M Number 2-3 (Meteor-M N2-3)
+space-weather/space-based-observations/meteor-m-n2-3/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/meteor-m-n2-3/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/meteor-m-n2-3/ggak-m-rims-m	Operational	Radio-frequency mass spectrometer - M (GGAK-M/RIMS-M)
+space-weather/space-based-observations/meteor-m-n2-4	Operational	Meteor-M Number 2-4 (Meteor-M N2-4)
+space-weather/space-based-observations/meteor-m-n2-4/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/meteor-m-n2-4/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/meteor-m-n2-4/ggak-m-rims-m	Operational	Radio-frequency mass spectrometer - M (GGAK-M/RIMS-M)
+space-weather/space-based-observations/meteor-m-n2/ggak-e-gals-e	Operational	GGAK-E / Detector of galactic cosmic rays (GGAK-E/GALS-E)
+space-weather/space-based-observations/meteor-m-n2/ggak-e-skif-6	Operational	GGAK-E / Corpuscular radiation spectrometer (GGAK-E/SKIF-6)
+space-weather/space-based-observations/meteor-m-n2/ggak-m-rims-m	Operational	Radio-frequency mass spectrometer - M (GGAK-M/RIMS-M)
+space-weather/space-based-observations/metop-b	Operational	Meteorological operational satellite - B (Metop-B)
+space-weather/space-based-observations/metop-b/sem-meped	Operational	SEM / Medium energy proton detector (SEM/MEPED)
+space-weather/space-based-observations/metop-b/sem-ted	Operational	SEM / Total Energy Detector (SEM/TED)
+space-weather/space-based-observations/metop-c	Operational	Meteorological operational satellite - C (Metop-C)
+space-weather/space-based-observations/metop-c/sem-meped	Operational	SEM / Medium energy proton detector (SEM/MEPED)
+space-weather/space-based-observations/metop-c/sem-ted	Operational	SEM / Total Energy Detector (SEM/TED)
+space-weather/space-based-observations/mms-a	Operational	Magnetospheric MultiScale mission - A (MMS-A)
+space-weather/space-based-observations/mms-a/afg	Operational	Analog Fluxgate Magnetometer (AFG)
+space-weather/space-based-observations/mms-a/dfg	Operational	Digital Fluxgate Magnetometer (DFG)
+space-weather/space-based-observations/mms-a/dp	Operational	Digital Fluxgate Magnetometer (DFG)
+space-weather/space-based-observations/mms-a/edi	Operational	Electron Drift Instrument (EDI)
+space-weather/space-based-observations/mms-a/eis	Operational	Energetic Ion Spectrometer (EIS)
+space-weather/space-based-observations/mms-a/feeps	Operational	Fly's Eye Energetic Particle Sensor (FEEPS)
+space-weather/space-based-observations/mms-a/fpi	Operational	Fast Plasma Instrument (FPI)
+space-weather/space-based-observations/mms-a/hpca	Operational	Hot Plasma Composition Analyzer (HPCA)
+space-weather/space-based-observations/mms-a/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/mms-b	Operational	Magnetospheric MultiScale mission - B (MMS-B)
+space-weather/space-based-observations/mms-b/afg	Operational	Analog Fluxgate Magnetometer (AFG)
+space-weather/space-based-observations/mms-b/dfg	Operational	Digital Fluxgate Magnetometer (DFG)
+space-weather/space-based-observations/mms-b/dp	Operational	Digital Fluxgate Magnetometer (DFG)
+space-weather/space-based-observations/mms-b/edi	Operational	Electron Drift Instrument (EDI)
+space-weather/space-based-observations/mms-b/eis	Operational	Energetic Ion Spectrometer (EIS)
+space-weather/space-based-observations/mms-b/feeps	Operational	Fly's Eye Energetic Particle Sensor (FEEPS)
+space-weather/space-based-observations/mms-b/fpi	Operational	Fast Plasma Instrument (FPI)
+space-weather/space-based-observations/mms-b/hpca	Operational	Hot Plasma Composition Analyzer (HPCA)
+space-weather/space-based-observations/mms-b/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/mms-c	Operational	Magnetospheric MultiScale mission - C (MMS-C)
+space-weather/space-based-observations/mms-c/afg	Operational	Analog Fluxgate Magnetometer (AFG)
+space-weather/space-based-observations/mms-c/dfg	Operational	Digital Fluxgate Magnetometer (DFG)
+space-weather/space-based-observations/mms-c/dp	Operational	Digital Fluxgate Magnetometer (DFG)
+space-weather/space-based-observations/mms-c/edi	Operational	Electron Drift Instrument (EDI)
+space-weather/space-based-observations/mms-c/eis	Operational	Energetic Ion Spectrometer (EIS)
+space-weather/space-based-observations/mms-c/feeps	Operational	Fly's Eye Energetic Particle Sensor (FEEPS)
+space-weather/space-based-observations/mms-c/fpi	Operational	Fast Plasma Instrument (FPI)
+space-weather/space-based-observations/mms-c/hpca	Operational	Hot Plasma Composition Analyzer (HPCA)
+space-weather/space-based-observations/mms-c/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/mms-d	Operational	Magnetospheric MultiScale mission - D (MMS-D)
+space-weather/space-based-observations/mms-d/afg	Operational	Analog Fluxgate Magnetometer (AFG)
+space-weather/space-based-observations/mms-d/dfg	Operational	Digital Fluxgate Magnetometer (DFG)
+space-weather/space-based-observations/mms-d/dp	Operational	Digital Fluxgate Magnetometer (DFG)
+space-weather/space-based-observations/mms-d/edi	Operational	Electron Drift Instrument (EDI)
+space-weather/space-based-observations/mms-d/eis	Operational	Energetic Ion Spectrometer (EIS)
+space-weather/space-based-observations/mms-d/feeps	Operational	Fly's Eye Energetic Particle Sensor (FEEPS)
+space-weather/space-based-observations/mms-d/fpi	Operational	Fast Plasma Instrument (FPI)
+space-weather/space-based-observations/mms-d/hpca	Operational	Hot Plasma Composition Analyzer (HPCA)
+space-weather/space-based-observations/mms-d/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/noaa-15	Operational	National Oceanic and Atmospheric Administration - 15 (NOAA-15)
+space-weather/space-based-observations/noaa-15/sem-meped	Operational	SEM / Medium energy proton detector (SEM/MEPED)
+space-weather/space-based-observations/noaa-15/sem-ted	Operational	SEM / Total Energy Detector (SEM/TED)
+space-weather/space-based-observations/noaa-18	Operational	National Oceanic and Atmospheric Administration - 18 (NOAA-18)
+space-weather/space-based-observations/noaa-18/sem-meped	Operational	SEM / Medium energy proton detector (SEM/MEPED)
+space-weather/space-based-observations/noaa-18/sem-ted	Operational	SEM / Total Energy Detector (SEM/TED)
+space-weather/space-based-observations/noaa-19	Operational	National Oceanic and Atmospheric Administration - 19 (NOAA-19)
+space-weather/space-based-observations/noaa-19/sem-meped	Operational	SEM / Medium energy proton detector (SEM/MEPED)
+space-weather/space-based-observations/noaa-19/sem-ted	Operational	SEM / Total Energy Detector (SEM/TED)
+space-weather/space-based-observations/parker-solar-probe	Operational	Parker Solar Probe
+space-weather/space-based-observations/parker-solar-probe/fields	Operational	Electromagnetic Fields Investigation (FIELDS)
+space-weather/space-based-observations/parker-solar-probe/isis-epi	Operational	Integrated Science Investigation of the Sun - Energetic Particle Instruments (ISIS-EPI)
+space-weather/space-based-observations/parker-solar-probe/sweapi	Operational	Solar Wind Electrons Alphas and Protons Investigation (SWEAPI)
+space-weather/space-based-observations/parker-solar-probe/wispr	Operational	Wide-field Imager for Solar Probe (WISPR)
+space-weather/space-based-observations/proba-2	Operational	Project for On-Board Autonomy - 2 (PROBA-2)
+space-weather/space-based-observations/proba-2/dslp	Operational	Dual Segmented Langmuir Probe (DSLP)
+space-weather/space-based-observations/proba-2/lyra	Operational	LYman-alpha RAdiometer (LYRA)
+space-weather/space-based-observations/proba-2/swap	Operational	Sun Watcher using Active Pixel System detector and Image Processing (SWAP)
+space-weather/space-based-observations/proba-2/tpmu	Operational	Thermal Plasma Measurement Unit (TPMU)
+space-weather/space-based-observations/sdo	Operational	Solar Dynamics Observatory (SDO)
+space-weather/space-based-observations/sdo/aia	Operational	Atmospheric Imaging Assembly (AIA)
+space-weather/space-based-observations/sdo/eve	Operational	EUV Variability Experiment (EVE)
+space-weather/space-based-observations/sdo/hmi	Operational	Helioseismic and Magnetic Imager (HMI)
+space-weather/space-based-observations/sich-2-30	Operational	SICH-2-30 (originally SICH-2-1)
+space-weather/space-based-observations/sich-2-30/potential	Operational	Potential
+space-weather/space-based-observations/soho	Operational	Solar and Heliospheric Observatory (SOHO)
+space-weather/space-based-observations/soho/cds	Operational	Coronal Diagnostic Spectrometer (CDS)
+space-weather/space-based-observations/soho/celias	Operational	Charge (CELIAS)
+space-weather/space-based-observations/soho/costep	Operational	Suprathermal & Energetic Particle Analyzer (COSTEP)
+space-weather/space-based-observations/soho/eit	Operational	Extreme UV Imaging Telescope (EIT)
+space-weather/space-based-observations/soho/erne	Operational	Energetic and Relativistic Nuclei and Electron experiment (ERNE)
+space-weather/space-based-observations/soho/golf	Operational	Global Oscillations at Low Frequencies (GOLF)
+space-weather/space-based-observations/soho/lasco	Operational	Large Angle and Spectrometric Coronagraph (LASCO)
+space-weather/space-based-observations/soho/mdi	Operational	Michelson Doppler Imager (MDI)
+space-weather/space-based-observations/soho/sem	Operational	Solar EUV monitor (SEM)
+space-weather/space-based-observations/soho/sumer	Operational	Solar UV Measurement of Emitted Radiation (SUMER)
+space-weather/space-based-observations/soho/swan	Operational	Solar Wind Anisotropies (SWAN)
+space-weather/space-based-observations/soho/uvcs	Operational	UV Coronagraph and Spectrometer (UVCS)
+space-weather/space-based-observations/soho/virgo	Operational	Variability of Solar Irradiance (VIRGO )
+space-weather/space-based-observations/solar-b	Operational	Solar-B (Hinode)
+space-weather/space-based-observations/solar-b/eis	Operational	EUV Imaging Spectrometer (EIS)
+space-weather/space-based-observations/solar-b/sot	Operational	Solar Optical Telescope (SOT)
+space-weather/space-based-observations/solar-b/xrt	Operational	X-Ray Telescope (XRT)
+space-weather/space-based-observations/solar-orbiter	Operational	Solar Orbiter
+space-weather/space-based-observations/solar-orbiter/epd	Operational	Energetic Particle Detector (EPD)
+space-weather/space-based-observations/solar-orbiter/eui	Operational	Extreme Ultraviolet Imager (EUI)
+space-weather/space-based-observations/solar-orbiter/mag	Operational	Magnetometer (Solar Orbiter) (MAG)
+space-weather/space-based-observations/solar-orbiter/metis	Operational	Multi Element Telescope for Imaging and Spectroscopy (METIS)
+space-weather/space-based-observations/solar-orbiter/phi	Operational	Polarimetric and Helioseismic Imager (PHI)
+space-weather/space-based-observations/solar-orbiter/rpw	Operational	Radio and Plasma Waves (RPW)
+space-weather/space-based-observations/solar-orbiter/solohi	Operational	Solar Orbiter Heliospheric Imager (SoloHI)
+space-weather/space-based-observations/solar-orbiter/spice	Operational	Spectral Imaging of the Coronal Environment (SPICE)
+space-weather/space-based-observations/solar-orbiter/stix	Operational	X-ray Spectrometer/Telescope (STIX)
+space-weather/space-based-observations/solar-orbiter/swa	Operational	Solar Wind Plasma Analyser (SWA)
+space-weather/space-based-observations/starlette	Operational	Satellite de Taille Adaptee avec Reflecteurs Laser pour les Etudes de la Terre (STARLETTE)
+space-weather/space-based-observations/starlette/lr	Operational	Laser Reflectors (LR)
+space-weather/space-based-observations/stella	Operational	STELLA
+space-weather/space-based-observations/stella/lr	Operational	Laser Reflectors (LR)
+space-weather/space-based-observations/stereo-a	Operational	Solar-TErrestrial RElations Observatory - A (STEREO-A)
+space-weather/space-based-observations/stereo-a/impact-mag	Operational	IMPACT / Magnetometer (IMPACT/MAG)
+space-weather/space-based-observations/stereo-a/impact-sep	Operational	IMPACT / Solar Energetic Particles (IMPACT/SEP)
+space-weather/space-based-observations/stereo-a/impact-ste	Operational	IMPACT / Suprathermal Electron Telescope (IMPACT/STE)
+space-weather/space-based-observations/stereo-a/impact-swea	Operational	IMPACT / Solar Wind Electron Analyzer (IMPACT/SWEA)
+space-weather/space-based-observations/stereo-a/plastic	Operational	PLAsma and SupraThermal Ion and Composition (PLASTIC)
+space-weather/space-based-observations/stereo-a/s-waves	Operational	STEREO/WAVES (S/WAVES)
+space-weather/space-based-observations/stereo-a/secchi-cor-1	Operational	SECCHI / Coronagraph imager 1 (SECCHI/COR-1)
+space-weather/space-based-observations/stereo-a/secchi-cor-2	Operational	SECCHI / Coronagraph imager 2 (SECCHI/COR-2)
+space-weather/space-based-observations/stereo-a/secchi-euvi	Operational	SECCHI / EUV Imager (SECCHI/EUVI)
+space-weather/space-based-observations/stereo-a/secchi-hi-1	Operational	SECCHI / Heliospheric Imager 1 (SECCHI/HI-1)
+space-weather/space-based-observations/stereo-a/secchi-hi-2	Operational	SECCHI / Heliospheric Imager 2 (SECCHI/HI-2)
+space-weather/space-based-observations/swarm-a	Operational	The Earth's Magnetic Field and Environment Explorers - A (SWARM-A)
+space-weather/space-based-observations/swarm-a/acc	Operational	Accelerometer (ACC)
+space-weather/space-based-observations/swarm-a/asm	Operational	Absolute Scalar Magnetometer (ASM)
+space-weather/space-based-observations/swarm-a/efi	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/swarm-a/vfm	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/swarm-b	Operational	The Earth's Magnetic Field and Environment Explorers - B (SWARM-B)
+space-weather/space-based-observations/swarm-b/acc	Operational	Accelerometer (ACC)
+space-weather/space-based-observations/swarm-b/asm	Operational	Absolute Scalar Magnetometer (ASM)
+space-weather/space-based-observations/swarm-b/efi	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/swarm-b/vfm	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/swarm-c	Operational	The Earth's Magnetic Field and Environment Explorers - C (SWARM-C)
+space-weather/space-based-observations/swarm-c/acc	Operational	Accelerometer (ACC)
+space-weather/space-based-observations/swarm-c/asm	Operational	Absolute Scalar Magnetometer (ASM)
+space-weather/space-based-observations/swarm-c/efi	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/swarm-c/vfm	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/tempo	Operational	Tropospheric Emissions: Monitoring of Pollution
+space-weather/space-based-observations/tempo/tempo	Operational	Tropospheric Emissions: Monitoring of Pollution
+space-weather/space-based-observations/themis-a	Operational	Time History of Events and Macroscale Interactions during Substorms - A (THEMIS-A)
+space-weather/space-based-observations/themis-a/efi	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/themis-a/esa	Operational	Electrostatic Analyzer (ESA)
+space-weather/space-based-observations/themis-a/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/themis-a/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/themis-a/sst	Operational	Solid State Telescope (SST)
+space-weather/space-based-observations/themis-d	Operational	Time History of Events and Macroscale Interactions during Substorms - D (THEMIS-D)
+space-weather/space-based-observations/themis-d/efi	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/themis-d/esa	Operational	Electrostatic Analyzer (ESA)
+space-weather/space-based-observations/themis-d/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/themis-d/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/themis-d/sst	Operational	Solid State Telescope (SST)
+space-weather/space-based-observations/themis-e	Operational	Time History of Events and Macroscale Interactions during Substorms - E (THEMIS-E)
+space-weather/space-based-observations/themis-e/efi	Operational	Electric Field Instrument (EFI)
+space-weather/space-based-observations/themis-e/esa	Operational	Electrostatic Analyzer (ESA)
+space-weather/space-based-observations/themis-e/fgm	Operational	Fluxgate Magnetometer (FGM)
+space-weather/space-based-observations/themis-e/scm	Operational	Search Coil Magnetometer (SCM)
+space-weather/space-based-observations/themis-e/sst	Operational	Solid State Telescope (SST)
+space-weather/space-based-observations/tianmu-1	Operational	Tianmu-1
+space-weather/space-based-observations/tianmu-1/tianmu-receiver	Operational	Tianmu-Receiver
+space-weather/space-based-observations/timed	Operational	Thermosphere, Ionosphere, Mesosphere Energetics and Dynamics mission (TIMED)
+space-weather/space-based-observations/timed/guvi	Operational	Global Ultra-Violet Imager (GUVI)
+space-weather/space-based-observations/timed/saber	Operational	Sounding of the Atmosphere using Broadband Emission Radiometry (SABER)
+space-weather/space-based-observations/timed/see	Operational	Solar Extreme Ultraviolet Experiment (SEE)
+space-weather/space-based-observations/timed/tidi	Operational	TIMED Doppler Interferometer (TIDI)
+space-weather/space-based-observations/triton	Operational	TRITON (also FORMOSAT-7R)
+space-weather/space-based-observations/triton/gpsr	Operational	GPS Reflection (GPSR)
+space-weather/space-based-observations/venus	Operational	Vegetation and Environment monitoring on a New Micro-Satellite (VENUS)
+space-weather/space-based-observations/venus/vssc	Operational	VENuS SuperSpectral Camera (VSSC)
+space-weather/space-based-observations/wind	Operational	WIND
+space-weather/space-based-observations/wind/epact	Operational	Energetic Particles Acceleration (EPACT)
+space-weather/space-based-observations/wind/mfi	Operational	Magnetic Field Investigation (MFI)
+space-weather/space-based-observations/wind/plasma	Operational	3-D Plasma and Energetic Particles Experiment (PLASMA)
+space-weather/space-based-observations/wind/sms	Operational	Solar wind ion composition (SMS)
+space-weather/space-based-observations/wind/swe	Operational	Solar Wind Experiment (SWE)
+space-weather/space-based-observations/wind/tgrs	Operational	Transient Gamma Ray Spectrometer (TGRS)
+space-weather/space-based-observations/wind/waves	Operational	Radio and Plasma Wave Experiment (WAVES)
+space-weather/space-based-observations/worldview-3	Operational	WorldView-3
+space-weather/space-based-observations/worldview-3/wv110	Operational	World View 110 camera (WV110)
+space-weather/space-based-observations/xmm-newton	Operational	X-ray Multi-Mirror Mission Observatory - Newton (XMM-Newton)
+space-weather/space-based-observations/xmm-newton/epic	Operational	European Photon Imaging Camera (EPIC)
+space-weather/space-based-observations/xmm-newton/om	Operational	Optical Monitor (OM)
+space-weather/space-based-observations/xmm-newton/rgs	Operational	Reflection Grating Spectrometer (RGS)
+weather	Operational	Weather
+weather/advisories-warnings	Operational	Advisories and warnings
+weather/aviation	Operational	Aviation
+weather/aviation/metar	Operational	Aerodrome observation
+weather/aviation/qvaci	Operational	Quantitative volcanic ash concentration information
+weather/aviation/taf	Operational	Aerodrome forecast
+weather/experimental	Operational	Experimental topics
+weather/maritime-safety-information	Experimental	Maritime safety information
+weather/maritime-safety-information/forecasts	Experimental	Forecasts
+weather/maritime-safety-information/sea-ice-information	Experimental	Sea-ice information
+weather/maritime-safety-information/warnings	Experimental	Warnings
+weather/prediction	Operational	Data sets produced by quantitative algorithms, such as numerical or statistical prediction models, describing the past, present and future meteorological states
+weather/prediction/analysis	Operational	Datasets of analyzed meteorological conditions for a specified time or period in the past
+weather/prediction/analysis/medium-range	Operational	A prediction system up to the order of 240 hours ahead
+weather/prediction/analysis/medium-range/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/analysis/medium-range/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/medium-range/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/medium-range/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/analysis/medium-range/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/medium-range/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/nowcasting	Operational	A prediction system up to the order of 120 minutes ahead
+weather/prediction/analysis/nowcasting/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/analysis/nowcasting/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/nowcasting/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/nowcasting/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/analysis/nowcasting/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/nowcasting/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/seasonal	Operational	A prediction system up to the order of 6 months ahead
+weather/prediction/analysis/seasonal/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/analysis/seasonal/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/seasonal/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/seasonal/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/analysis/seasonal/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/seasonal/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/short-range	Operational	A prediction system up to the order of 72 hours ahead
+weather/prediction/analysis/short-range/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/analysis/short-range/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/short-range/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/short-range/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/analysis/short-range/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/short-range/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/subseasonal	Operational	A prediction system up to the order of 30 days ahead
+weather/prediction/analysis/subseasonal/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/analysis/subseasonal/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/subseasonal/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/analysis/subseasonal/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/analysis/subseasonal/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/analysis/subseasonal/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast	Operational	Datasets of expected meteorological conditions for a specified time or period in the future, typically including the T+0 fields
+weather/prediction/forecast/medium-range	Operational	A prediction system up to the order of 240 hours ahead
+weather/prediction/forecast/medium-range/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/forecast/medium-range/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/medium-range/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/medium-range/deterministic/trajectory	Operational	Line in space representing the successive positions of (i) moving particles in the air, such as radioactive particles from a nuclear accident or (ii) the centre of a weather system, such as a tropical cyclone.
+weather/prediction/forecast/medium-range/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/forecast/medium-range/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/medium-range/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/medium-range/probabilistic/trajectory	Operational	Line in space representing the successive positions of (i) moving particles in the air, such as radioactive particles from a nuclear accident or (ii) the centre of a weather system, such as a tropical cyclone.
+weather/prediction/forecast/nowcasting	Operational	A prediction system up to the order of 120 minutes ahead
+weather/prediction/forecast/nowcasting/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/forecast/nowcasting/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/nowcasting/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/nowcasting/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/forecast/nowcasting/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/nowcasting/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/seasonal	Operational	A prediction system up to the order of 6 months ahead
+weather/prediction/forecast/seasonal/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/forecast/seasonal/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/seasonal/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/seasonal/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/forecast/seasonal/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/seasonal/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/short-range	Operational	A prediction system up to the order of 72 hours ahead
+weather/prediction/forecast/short-range/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/forecast/short-range/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/short-range/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/short-range/deterministic/trajectory	Operational	Line in space representing the successive positions of (i) moving particles in the air, such as radioactive particles from a nuclear accident or (ii) the centre of a weather system, such as a tropical cyclone.
+weather/prediction/forecast/short-range/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/forecast/short-range/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/short-range/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/short-range/probabilistic/trajectory	Operational	Line in space representing the successive positions of (i) moving particles in the air, such as radioactive particles from a nuclear accident or (ii) the centre of a weather system, such as a tropical cyclone.
+weather/prediction/forecast/subseasonal	Operational	A prediction system up to the order of 30 days ahead
+weather/prediction/forecast/subseasonal/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/forecast/subseasonal/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/subseasonal/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/forecast/subseasonal/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/forecast/subseasonal/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/forecast/subseasonal/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/hindcast	Operational	Datasets of retrospective forecast for a specified time or period in the past
+weather/prediction/hindcast/medium-range	Operational	A prediction system up to the order of 240 hours ahead
+weather/prediction/hindcast/medium-range/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/hindcast/medium-range/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/hindcast/medium-range/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/hindcast/medium-range/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/hindcast/medium-range/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/hindcast/medium-range/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/hindcast/seasonal	Operational	A prediction system up to the order of 6 months ahead
+weather/prediction/hindcast/seasonal/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/hindcast/seasonal/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/hindcast/seasonal/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/hindcast/seasonal/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/hindcast/seasonal/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/hindcast/seasonal/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/hindcast/short-range	Operational	A prediction system up to the order of 72 hours ahead
+weather/prediction/hindcast/short-range/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/hindcast/short-range/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/hindcast/short-range/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/hindcast/short-range/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/hindcast/short-range/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/hindcast/short-range/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/hindcast/subseasonal	Operational	A prediction system up to the order of 30 days ahead
+weather/prediction/hindcast/subseasonal/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/hindcast/subseasonal/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/hindcast/subseasonal/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/hindcast/subseasonal/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/hindcast/subseasonal/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/hindcast/subseasonal/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/reanalysis	Operational	Datasets constructing a record of past conditions
+weather/prediction/reanalysis/medium-range	Operational	A prediction system up to the order of 240 hours ahead
+weather/prediction/reanalysis/medium-range/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/reanalysis/medium-range/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/reanalysis/medium-range/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/reanalysis/medium-range/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/reanalysis/medium-range/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/reanalysis/medium-range/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/reanalysis/seasonal	Operational	A prediction system up to the order of 6 months ahead
+weather/prediction/reanalysis/seasonal/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/reanalysis/seasonal/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/reanalysis/seasonal/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/reanalysis/seasonal/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/reanalysis/seasonal/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/reanalysis/seasonal/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/reanalysis/short-range	Operational	A prediction system up to the order of 72 hours ahead
+weather/prediction/reanalysis/short-range/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/reanalysis/short-range/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/reanalysis/short-range/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/reanalysis/short-range/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/reanalysis/short-range/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/reanalysis/short-range/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/reanalysis/subseasonal	Operational	A prediction system up to the order of 30 days ahead
+weather/prediction/reanalysis/subseasonal/deterministic	Operational	Outputs from a prediction system which provides one single scenario
+weather/prediction/reanalysis/subseasonal/deterministic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/reanalysis/subseasonal/deterministic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/prediction/reanalysis/subseasonal/probabilistic	Operational	Outputs from a prediction system which provides multiple scenarios, including probability distribution and uncertainty information
+weather/prediction/reanalysis/subseasonal/probabilistic/global	Operational	A prediction system that covers the entire globe
+weather/prediction/reanalysis/subseasonal/probabilistic/limited-area	Operational	A prediction system that does not cover the entire globe
+weather/space-based-observations	Operational	Space based observations
+weather/space-based-observations/alos-2	Operational	Advanced Land Observing Satellite - 2 (ALOS-2)
+weather/space-based-observations/alos-2/palsar-2	Operational	Phased-Array L-band Synthetic Aperture Radar - 2 (PALSAR-2)
+weather/space-based-observations/alsat-2b	Operational	Algeria Satellite - 2B (AlSat-2B)
+weather/space-based-observations/alsat-2b/naomi	Operational	New AstroSat Optical Modular Instrument (NAOMI)
+weather/space-based-observations/altius	Operational	Atmospheric Limb Tracker for Investigation of the Upcoming Stratosphere
+weather/space-based-observations/altius/altius	Operational	Atmospheric Limb Tracker for Investigation of the Upcoming Stratosphere
+weather/space-based-observations/amazonia-1	Operational	Amazonia-1
+weather/space-based-observations/amazonia-1/awfi	Operational	Advanced Wide Field Imager (AWFI)
+weather/space-based-observations/aqua	Operational	Earth Observation System - Aqua
+weather/space-based-observations/aqua/airs	Operational	Atmospheric Infra-Red Sounder (AIRS)
+weather/space-based-observations/aqua/amsr-e	Operational	Advanced Microwave Scanning Radiometer for EOS (AMSR-E)
+weather/space-based-observations/aqua/amsu-a	Operational	Advanced Microwave Sounding Unit - A (AMSU-A)
+weather/space-based-observations/aqua/ceres	Operational	Clouds and the Earth's Radiant Energy System (CERES)
+weather/space-based-observations/aqua/hsb	Operational	Humidity Sounder for Brazil (HSB)
+weather/space-based-observations/aqua/modis	Operational	Moderate-resolution Imaging Spectro-radiometer (MODIS)
+weather/space-based-observations/arctica-m-n1	Operational	Arctica-M N1
+weather/space-based-observations/arctica-m-n1/msu-gs-a	Operational	Electro-L Imager for Arktika (MSU-GS/A)
+weather/space-based-observations/arctica-m-n2	Operational	Arctica-M N2
+weather/space-based-observations/arctica-m-n2/msu-gs-a	Operational	Electro-L Imager for Arktika (MSU-GS/A)
+weather/space-based-observations/asnaro-2	Operational	Advanced Satellite with new system ARchitecure for Observation - 2 (ASNARO-2)
+weather/space-based-observations/asnaro-2/xsar	Operational	X-band Synthetic Aperture Radar (XSAR)
+weather/space-based-observations/aura	Operational	Earth Observation System - Aura
+weather/space-based-observations/aura/hirdls	Operational	High-Resolution Dynamics Limb Sounder (HIRDLS)
+weather/space-based-observations/aura/mls	Operational	Microwave Limb Sounder (MLS )
+weather/space-based-observations/aura/omi	Operational	Ozone Monitoring Instrument (OMI )
+weather/space-based-observations/aura/tes-limb	Operational	Tropospheric Emission Spectrometer (TES-limb)
+weather/space-based-observations/aura/tes-nadir	Operational	Tropospheric Emission Spectrometer (TES-nadir)
+weather/space-based-observations/aws1	Operational	Arctic Weather Satellite Proto-Flight Model (AWS PFM)
+weather/space-based-observations/aws1/eps-sterna-radiometer	Operational	EPS Sterna Radiometer
+weather/space-based-observations/cartosat-2c	Operational	CartoSat-2C
+weather/space-based-observations/cartosat-2c/hrmx	Operational	High-Resolution Multi-Spectral (HRMX)
+weather/space-based-observations/cartosat-2d	Operational	CartoSat-2D
+weather/space-based-observations/cartosat-2d/hrmx	Operational	High-Resolution Multi-Spectral (HRMX)
+weather/space-based-observations/cartosat-2e	Operational	CartoSat-2E
+weather/space-based-observations/cartosat-2e/hrmx	Operational	High-Resolution Multi-Spectral (HRMX)
+weather/space-based-observations/cartosat-2f	Operational	CartoSat-2F
+weather/space-based-observations/cartosat-2f/hrmx	Operational	High-Resolution Multi-Spectral (HRMX)
+weather/space-based-observations/cartosat-3	Operational	CartoSat-3
+weather/space-based-observations/cartosat-3/mx	Operational	Multispectral VNIR (MX)
+weather/space-based-observations/cas-500-1	Operational	Compact Advanced Satellite 500-1 (CAS 500-1)
+weather/space-based-observations/cas-500-1/aeiss-hr	Operational	Advanced Electronic Image Scanning System - High Resolution (AEISS-HR)
+weather/space-based-observations/cbers-4	Operational	China-Brazil Earth Resources Satellite - 4 (ZY-1 FM4) (CBERS-4)
+weather/space-based-observations/cbers-4/irmss-2	Operational	Infrared Multispectral Scanner - 2 (IRMSS-2)
+weather/space-based-observations/cbers-4/muxcam	Operational	Multispectral Camera (MUXCAM)
+weather/space-based-observations/cbers-4/panmux	Operational	Panchromatic and Multispectral imager (PANMUX)
+weather/space-based-observations/cbers-4/wfi-2	Operational	Wide Field Imager - 2 (WFI-2)
+weather/space-based-observations/cbers-4b	Operational	China-Brazil Earth Resources Satellite - 4B (ZY-1 FM4B) (CBERS-4B)
+weather/space-based-observations/cbers-4b/irmss-2	Operational	Infrared Multispectral Scanner - 2 (IRMSS-2)
+weather/space-based-observations/cbers-4b/muxcam	Operational	Multispectral Camera (MUXCAM)
+weather/space-based-observations/cbers-4b/panmux	Operational	Panchromatic and Multispectral imager (PANMUX)
+weather/space-based-observations/cbers-4b/wfi-2	Operational	Wide Field Imager - 2 (WFI-2)
+weather/space-based-observations/cfosat	Operational	Chinese-French Oceanography Satellite (CFOSAT)
+weather/space-based-observations/cfosat/cscat	Operational	CFOSAT Scatterometer (CSCAT)
+weather/space-based-observations/cfosat/swim	Operational	Surface Waves Investigation and Monitoring (SWIM)
+weather/space-based-observations/cicero	Operational	Community Initiative for Continuing Earth Radio Occultation (CICERO)
+weather/space-based-observations/cicero-2	Operational	Community Initiative for Continuing Earth Radio Occultation (CICERO-2)
+weather/space-based-observations/cicero-2/cion-2	Operational	CICERO-2 Instrument for GNSS-RO (CION-2)
+weather/space-based-observations/cicero/cion	Operational	CICERO Instrument for GNSS-RO (CION)
+weather/space-based-observations/co2m-a	Planned	Carbon Dioxide Monitoring mission-A
+weather/space-based-observations/co2m-a/clim	Planned	Cloud Imager
+weather/space-based-observations/co2m-a/co2i-no2i	Planned	Combined Carbon Dioxide and Nitrogen Dioxide Imager
+weather/space-based-observations/co2m-a/map	Planned	Multi-Angle Polarimeter
+weather/space-based-observations/cosmic-2	Operational	Constellation Observing System for Meteorology, Ionosphere & Climate - 2a (COSMIC-2)
+weather/space-based-observations/cosmic-2/rfb	Operational	Radio Frequency Beacon (RFB)
+weather/space-based-observations/cosmic-2/tgrs	Operational	TriG (Tri-GNSS) GNSS Radio Occultation System (TGRS)
+weather/space-based-observations/cosmic-2/vidi	Operational	Velocity, Ion Density and Irregularities (VIDI)
+weather/space-based-observations/cryosat-2	Operational	CryoSat-2
+weather/space-based-observations/cryosat-2/siral	Operational	SAR Interferometer Radar Altimeter (SIRAL)
+weather/space-based-observations/csar-1	Operational	C-Band Synthetic Aperture Radar 1 (CSAR-1)
+weather/space-based-observations/csar-1/sar-c	Operational	Synthetic Aperture Radar (SAR-C)
+weather/space-based-observations/csar-2	Operational	C-Band Synthetic Aperture Radar 2 (CSAR-2)
+weather/space-based-observations/csar-2/sar-c	Operational	Synthetic Aperture Radar (SAR-C)
+weather/space-based-observations/csg-1	Operational	COSMO-SkyMed Second Generation - 1 (CSG-1)
+weather/space-based-observations/csg-1/csg-sar	Operational	COSMO-SkyMed Second Generation Synthetic Aperture Radar (CSG-SAR)
+weather/space-based-observations/csg-2	Operational	COSMO-SkyMed Second Generation - 2 (CSG-2)
+weather/space-based-observations/csg-2/csg-sar	Operational	COSMO-SkyMed Second Generation Synthetic Aperture Radar (CSG-SAR)
+weather/space-based-observations/csk-1	Operational	COSMO-SkyMed - 1 (CSK-1)
+weather/space-based-observations/csk-1/sar-2000	Operational	Synthetic Aperture Radar 2000 (X-band) (SAR-2000)
+weather/space-based-observations/csk-2	Operational	COSMO-SkyMed - 2 (CSK-2)
+weather/space-based-observations/csk-2/sar-2000	Operational	Synthetic Aperture Radar 2000 (X-band) (SAR-2000)
+weather/space-based-observations/csk-3	Operational	COSMO-SkyMed - 3 (CSK-3)
+weather/space-based-observations/csk-3/sar-2000	Operational	Synthetic Aperture Radar 2000 (X-band) (SAR-2000)
+weather/space-based-observations/csk-4	Operational	COSMO-SkyMed - 4 (CSK-4)
+weather/space-based-observations/csk-4/sar-2000	Operational	Synthetic Aperture Radar 2000 (X-band) (SAR-2000)
+weather/space-based-observations/ctim-fd	Operational	Compact Total Irradiance Monitor-Flight Demonstration (CTIM-FD)
+weather/space-based-observations/ctim-fd/ctim-fd	Operational	Compact Total Irradiance Monitor-Flight Demonstration (CTIM-FD)
+weather/space-based-observations/cygnss	Operational	Cyclone Global Navigation Satellite System (8 sats) (CYGNSS (8 sats))
+weather/space-based-observations/cygnss/ddmi	Operational	Delay Doppler Mapping Instrument (DDMI)
+weather/space-based-observations/deimos-2	Operational	Deimos-2
+weather/space-based-observations/deimos-2/hirais	Operational	High Resolution Advanced Imaging System (HiRAIS)
+weather/space-based-observations/dmsp-17	Operational	Defense Meteorological Satellite Program - F17 (DMSP-F17)
+weather/space-based-observations/dmsp-17/ols	Operational	Operational Linescan Systerm (OLS)
+weather/space-based-observations/dmsp-17/ssmis	Operational	Special Sensor Microwave - Imager/Sounder (SSMIS)
+weather/space-based-observations/dmsp-18	Operational	Defense Meteorological Satellite Program - F18 (DMSP-F18)
+weather/space-based-observations/dmsp-18/ols	Operational	Operational Linescan Systerm (OLS)
+weather/space-based-observations/dmsp-18/ssmis	Operational	Special Sensor Microwave - Imager/Sounder (SSMIS)
+weather/space-based-observations/dq-1	Operational	DQ-1 also AEMS (Atmospheric Environment Monitoring Satellite) or Daqi-1 (DQ-1)
+weather/space-based-observations/dq-1/acdl	Operational	Aerosol and Carbon Detection Lidar (ACDL)
+weather/space-based-observations/dq-1/dpc-2	Operational	Directional Polarization Camera - 2 (DPC-2)
+weather/space-based-observations/dq-1/emi-2	Operational	Environment Monitoring Instrument-2 (EMI-2)
+weather/space-based-observations/dq-1/posp	Operational	Particulate Observing Scanning Polarimeter (POSP)
+weather/space-based-observations/dscovr	Operational	Deep Space Climate Observatory (DSCOVR)
+weather/space-based-observations/dscovr/nistar	Operational	NIST Advanced Radiometer (NIST = National Institute of Standards and Technology Advanced Radiometer) (NISTAR)
+weather/space-based-observations/dubaisat-3	Operational	DubaiSat-3
+weather/space-based-observations/dubaisat-3/khcs	Operational	KhalifaSat Camera System (KHCS)
+weather/space-based-observations/egyptsat-a	Operational	EgyptSat-A
+weather/space-based-observations/egyptsat-a/msi	Operational	Multispectral imager (MSI)
+weather/space-based-observations/electro-l-n2	Operational	Electro-L Number 2 (Electro-L N2)
+weather/space-based-observations/electro-l-n2/msu-gs	Operational	Electro-L Imager (MSU-GS)
+weather/space-based-observations/electro-l-n3	Operational	Electro-L Number 3 (Electro-L N3)
+weather/space-based-observations/electro-l-n3/msu-gs	Operational	Electro-L Imager (MSU-GS)
+weather/space-based-observations/electro-l-n4	Operational	Electro-L Number 4 (Electro-L N4)
+weather/space-based-observations/electro-l-n4/msu-gs	Operational	Electro-L Imager (MSU-GS)
+weather/space-based-observations/enmap	Operational	Environmental Mapping and Analysis Programme (EnMAP)
+weather/space-based-observations/enmap/hsi	Operational	Hyper-Spectral Imager (HSI)
+weather/space-based-observations/eos-01	Operational	Earth Observation Satellite - 01 (EOS-01)
+weather/space-based-observations/eos-01/sar-x	Operational	Synthetic Aperture Radar (X-band) (SAR-X)
+weather/space-based-observations/eos-04	Operational	Earth Observation Satellite - 04 (also known as RISAT-1A) (EOS-04)
+weather/space-based-observations/eos-04/sar-c	Operational	Synthetic Aperture Radar (C-band) (SAR-C)
+weather/space-based-observations/eos-06	Operational	OceanSat-3 (EOS-06)
+weather/space-based-observations/eos-06/ocm	Operational	Ocean Color Monitor (OCM)
+weather/space-based-observations/eos-06/oscat-3	Operational	Scatterometer for Oceansat-3 (OSCAT-3)
+weather/space-based-observations/eos-07	Operational	EOS-07 (Microsat-2B) (EOS-07)
+weather/space-based-observations/eos-07/mhs	Operational	Microwave Humidity Sounder (MHS)
+weather/space-based-observations/formosat-5	Operational	FORMOSAT-5
+weather/space-based-observations/formosat-5/rsi	Operational	Remote Sensing Instrument (RSI)
+weather/space-based-observations/fy-2g	Operational	Feng-Yun - 2G (FY-2G)
+weather/space-based-observations/fy-2g/s-vissr	Operational	Stretched Visible and Infrared Spin Scan Radiometer (S-VISSR)
+weather/space-based-observations/fy-2h	Operational	Feng-Yun - 2H (FY-2H)
+weather/space-based-observations/fy-2h/s-vissr	Operational	Stretched Visible and Infrared Spin Scan Radiometer (S-VISSR)
+weather/space-based-observations/fy-3c	Operational	Feng-Yun 3C (FY-3C)
+weather/space-based-observations/fy-3c/erm-1	Operational	Earth Radiation Measurement - 1 (ERM-1)
+weather/space-based-observations/fy-3c/gnos	Operational	GNSS Radio Occultation Sounder (GNOS)
+weather/space-based-observations/fy-3c/mersi-1	Operational	Medium Resolution Spectral Imager -1 (MERSI-1)
+weather/space-based-observations/fy-3c/mwhs-2	Operational	Micro-Wave Humidity Sounder -2 (MWHS-2)
+weather/space-based-observations/fy-3c/mwri-1	Operational	Micro-Wave Radiation Imager 1 (MWRI-1)
+weather/space-based-observations/fy-3c/mwts-2	Operational	Micro-Wave Temperature Sounder - 2 (MWTS-2)
+weather/space-based-observations/fy-3c/sbus	Operational	Solar Backscatter Ultraviolet Sounder (SBUS)
+weather/space-based-observations/fy-3c/sim-1	Operational	Solar Irradiance Monitor - 1 (SIM-1)
+weather/space-based-observations/fy-3c/tou	Operational	Total Ozone Unit (TOU)
+weather/space-based-observations/fy-3c/virr	Operational	Visible and Infra-Red Radiometer (VIRR)
+weather/space-based-observations/fy-3d	Operational	Feng-Yun 3D (FY-3D)
+weather/space-based-observations/fy-3d/gas	Operational	Greenhouse-gases Absorption Spectrometer (GAS)
+weather/space-based-observations/fy-3d/gnos	Operational	GNSS Radio Occultation Sounder (GNOS)
+weather/space-based-observations/fy-3d/hiras	Operational	Hyperspectral Infrared Atmospheric Sounder (HIRAS)
+weather/space-based-observations/fy-3d/mersi-2	Operational	Medium Resolution Spectral Imager -2 (MERSI-2)
+weather/space-based-observations/fy-3d/mwhs-2	Operational	Micro-Wave Humidity Sounder -2 (MWHS-2)
+weather/space-based-observations/fy-3d/mwri-1	Operational	Micro-Wave Radiation Imager 1 (MWRI-1)
+weather/space-based-observations/fy-3d/mwts-2	Operational	Micro-Wave Temperature Sounder - 2 (MWTS-2)
+weather/space-based-observations/fy-3d/sws-ipm	Operational	Space Weather Suite / Ionospheric PhotoMeter (SWS/IPM)
+weather/space-based-observations/fy-3e	Operational	Feng-Yun 3E (FY-3E)
+weather/space-based-observations/fy-3e/gnos-2	Operational	GNSS Radio Occultation Sounder - 2 (GNOS-2)
+weather/space-based-observations/fy-3e/hiras-2	Operational	Hyperspectral Infrared Atmospheric Sounder - 2 (HIRAS-2)
+weather/space-based-observations/fy-3e/mersi-ll	Operational	Medium Resolution Spectral Imager - Low-Light (MERSI-LL)
+weather/space-based-observations/fy-3e/mwhs-2	Operational	Micro-Wave Humidity Sounder -2 (MWHS-2)
+weather/space-based-observations/fy-3e/mwts-3	Operational	Micro-Wave Temperature Sounder - 3 (MWTS-3)
+weather/space-based-observations/fy-3e/sim-2	Operational	Solar Irradiance Monitor - 2 (SIM-2)
+weather/space-based-observations/fy-3e/ssim	Operational	Solar Spectral Irradiance Monitor (SSIM)
+weather/space-based-observations/fy-3e/windrad	Operational	Wind Radar (WindRAD)
+weather/space-based-observations/fy-3f	Operational	Feng-Yun 3F (FY-3F)
+weather/space-based-observations/fy-3f/erm-2	Operational	Earth Radiation Measurement - 2 (ERM-2)
+weather/space-based-observations/fy-3f/gnos-2	Operational	GNSS Radio Occultation Sounder - 2 (GNOS-2)
+weather/space-based-observations/fy-3f/hiras-2	Operational	Hyperspectral Infrared Atmospheric Sounder - 2 (HIRAS-2)
+weather/space-based-observations/fy-3f/mersi-3	Operational	Medium Resolution Spectral Imager - 3 (MERSI-3)
+weather/space-based-observations/fy-3f/mwhs-2	Operational	Micro-Wave Humidity Sounder -2 (MWHS-2)
+weather/space-based-observations/fy-3f/mwri-2	Operational	Micro-Wave Radiation Imager 2 (MWRI-2)
+weather/space-based-observations/fy-3f/mwts-3	Operational	Micro-Wave Temperature Sounder - 3 (MWTS-3)
+weather/space-based-observations/fy-3f/oms-limb	Operational	Ozone Monitoring Suite - limb scanning unit (OMS-limb)
+weather/space-based-observations/fy-3f/oms-nadir	Operational	Ozone Monitoring Suite - nadir scanning unit (OMS-nadir)
+weather/space-based-observations/fy-3f/sim-2	Operational	Solar Irradiance Monitor - 2 (SIM-2)
+weather/space-based-observations/fy-3f/windrad	Operational	Wind Radar (WindRAD)
+weather/space-based-observations/fy-3g	Operational	Feng Yun 3G (FY-3G)
+weather/space-based-observations/fy-3g/gnos-2	Operational	GNSS Radio Occultation Sounder - 2 (GNOS-2)
+weather/space-based-observations/fy-3g/haoc	Operational	High Accuracy On-board Calibrator (HAOC)
+weather/space-based-observations/fy-3g/mwri-rm	Operational	Micro-Wave Radiation Imager for the Rainfall Mission (MWRI-RM)
+weather/space-based-observations/fy-3g/pmai	Operational	Short-wave Infrared Polarized Multi-Angle Imager (PMAI)
+weather/space-based-observations/fy-3g/pmr	Operational	Precipitation Measurement Radar (PMR)
+weather/space-based-observations/fy-4a	Operational	Feng-Yun - 4A (FY-4A)
+weather/space-based-observations/fy-4a/agri	Operational	Advanced Geostationary Radiation Imager (AGRI)
+weather/space-based-observations/fy-4a/giirs	Operational	Prototype Geostationary Interferometric Infrared Sounder (GIIRS)
+weather/space-based-observations/fy-4a/lmi	Operational	Lightning Mapping Imager (LMI)
+weather/space-based-observations/fy-4b	Operational	Feng-Yun - 4B (FY-4B)
+weather/space-based-observations/fy-4b/agri	Operational	Advanced Geostationary Radiation Imager (AGRI)
+weather/space-based-observations/fy-4b/ghi	Operational	Geostationary High-speed Imager (GHI)
+weather/space-based-observations/fy-4b/giirs-2	Operational	Geostationary Interferometric Infrared Sounder-2 (GIIRS-2)
+weather/space-based-observations/fy-4c	Operational	Feng-Yun - 4C (FY-4C)
+weather/space-based-observations/fy-4c/musi	Operational	Multiband Ionospheric Ultra-Violet Spectrum Imager (MUSI)
+weather/space-based-observations/fy-4d	Operational	Feng-Yun - 4D (FY-4D)
+weather/space-based-observations/fy-4d/musi	Operational	Multiband Ionospheric Ultra-Violet Spectrum Imager (MUSI)
+weather/space-based-observations/fy-4e	Operational	Feng-Yun - 4E (FY-4E)
+weather/space-based-observations/fy-4e/musi	Operational	Multiband Ionospheric Ultra-Violet Spectrum Imager (MUSI)
+weather/space-based-observations/gcom-c	Operational	Global Change Observation Mission for Climate (GCOM-C)
+weather/space-based-observations/gcom-c/sgli	Operational	Second-generation Global Imager (SGLI)
+weather/space-based-observations/gcom-w	Operational	Global Change Observation Mission for Water (GCOM-W)
+weather/space-based-observations/gcom-w/amsr2	Operational	Advanced Microwave Scanning Radiometer - 2 (AMSR2)
+weather/space-based-observations/geo-kompsat-2a	Operational	Geostationary Korea Multi-Purpose Satellite - 2A (GEO-KOMPSAT-2A)
+weather/space-based-observations/geo-kompsat-2a/ami	Operational	Advanced Meteorological Imager (AMI)
+weather/space-based-observations/geo-kompsat-2b	Operational	Geostationary Korea Multi-Purpose Satellite - 2B (GEO-KOMPSAT-2B)
+weather/space-based-observations/geo-kompsat-2b/gems	Operational	Geostationary Environmental Monitoring Spectrometer (GEMS)
+weather/space-based-observations/geo-kompsat-2b/goci-ii	Operational	Geostationary Ocean Color Imager: Follow-on (GOCI-II)
+weather/space-based-observations/gf-12	Operational	Gao Fen - 12 (GF-12)
+weather/space-based-observations/gf-12-02	Operational	Gao Fen - 12-02 (GF-12-02)
+weather/space-based-observations/gf-12-02/sar-c	Operational	Synthetic Aperture Radar (SAR-C)
+weather/space-based-observations/gf-12-03	Operational	Gao Fen - 12-03 (GF-12-03)
+weather/space-based-observations/gf-12-03/sar-c	Operational	Synthetic Aperture Radar (SAR-C)
+weather/space-based-observations/gf-12-04	Operational	Gao Fen - 12-04 (GF-12-04)
+weather/space-based-observations/gf-12-04/sar-c	Operational	Synthetic Aperture Radar (SAR-C)
+weather/space-based-observations/gf-12/sar-c	Operational	Synthetic Aperture Radar (SAR-C)
+weather/space-based-observations/gf-3	Operational	Gao Fen - 3 (GF-3)
+weather/space-based-observations/gf-3/sar-c	Operational	Synthetic Aperture Radar (SAR-C)
+weather/space-based-observations/gf-5-01a	Operational	Gao Fen - 5-01A (GF-5-01A)
+weather/space-based-observations/gf-5-01a/aius	Operational	Atmospheric Infrared Ultra-spectral spectrometer (AIUS)
+weather/space-based-observations/gf-5-01a/dpc	Operational	Directional Polarization Camera (DPC)
+weather/space-based-observations/gf-5-01a/emi	Operational	Environment Monitoring Instrument (EMI)
+weather/space-based-observations/gf-5-01a/gmi	Operational	Greenhouse-gases Monitoring Instrument (GMI)
+weather/space-based-observations/gf-5-02	Operational	Gao Fen - 5-02 (GF-5-02)
+weather/space-based-observations/gf-5-02/aius	Operational	Atmospheric Infrared Ultra-spectral spectrometer (AIUS)
+weather/space-based-observations/gf-5-02/dpc	Operational	Directional Polarization Camera (DPC)
+weather/space-based-observations/gf-5-02/emi	Operational	Environment Monitoring Instrument (EMI)
+weather/space-based-observations/gf-5-02/gmi	Operational	Greenhouse-gases Monitoring Instrument (GMI)
+weather/space-based-observations/ghgsat	Operational	Greenhouse Gas Satellite (GHGSat)
+weather/space-based-observations/ghgsat/ghgsat-spectrometer	Operational	GHGSat Imaging Spectrometer (GHGSat-Spectrometer)
+weather/space-based-observations/gnomes-2	Operational	GNSS Navigation and Occultation Measurement Satellites (GNOMES-2)
+weather/space-based-observations/gnomes-2/pyxis-ro	Operational	Pyxis-RO
+weather/space-based-observations/gnomes-3	Operational	GNSS Navigation and Occultation Measurement Satellites (GNOMES-3)
+weather/space-based-observations/gnomes-3/pyxis-ro	Operational	Pyxis-RO
+weather/space-based-observations/gnomes-4	Operational	GNSS Navigation and Occultation Measurement Satellites (GNOMES-4)
+weather/space-based-observations/gnomes-4/pyxis-ro	Operational	Pyxis-RO
+weather/space-based-observations/goes-14	Operational	Geostationary Operational Environmental Satellite - 14 (GOES-14)
+weather/space-based-observations/goes-14/imager	Operational	GOES Imager
+weather/space-based-observations/goes-16	Operational	Geostationary Operational Environmental Satellite - 16 (GOES-16)
+weather/space-based-observations/goes-16/abi	Operational	Advanced Baseline Imager (ABI)
+weather/space-based-observations/goes-16/glm	Operational	Geostationary Lightning Mapper (GLM)
+weather/space-based-observations/goes-17	Operational	Geostationary Operational Environmental Satellite - 17 (GOES-17)
+weather/space-based-observations/goes-17/abi	Operational	Advanced Baseline Imager (ABI)
+weather/space-based-observations/goes-17/glm	Operational	Geostationary Lightning Mapper (GLM)
+weather/space-based-observations/goes-18	Operational	Geostationary Operational Environmental Satellite - 18 (GOES-18)
+weather/space-based-observations/goes-18/abi	Operational	Advanced Baseline Imager (ABI)
+weather/space-based-observations/goes-18/glm	Operational	Geostationary Lightning Mapper (GLM)
+weather/space-based-observations/gosat	Operational	Green-house gas Observing Satellite (GOSAT)
+weather/space-based-observations/gosat-2	Operational	Green-house gas Observing Satellite - 2 (GOSAT-2)
+weather/space-based-observations/gosat-2/tanso-cai2	Operational	Thermal And Near infrared Sensor for carbon Observations - Cloud and Aerosol Imager / 2 (TANSO-CAI2)
+weather/space-based-observations/gosat-2/tanso-fts2	Operational	Thermal And Near infrared Sensor for carbon Observations - Fourier Transform Spectrometer / 2 (TANSO-FTS2)
+weather/space-based-observations/gosat/tanso-cai	Operational	Thermal And Near infrared Sensor for carbon Observations - Cloud and Aerosol Imager (TANSO-CAI)
+weather/space-based-observations/gosat/tanso-fts	Operational	Thermal And Near infrared Sensor for carbon Observations - Fourier Transform Spectrometer (TANSO-FTS)
+weather/space-based-observations/gpm-core	Operational	Global Precipitation Measurement - Core Observatory (GPM Core Observatory)
+weather/space-based-observations/gpm-core/dpr	Operational	Dual-frequency Precipitation Radar (DPR)
+weather/space-based-observations/gpm-core/gmi	Operational	GPM Microwave Imager (GMI)
+weather/space-based-observations/grace-fo	Operational	Gravity Recovery and Climate Experiment - Follow-on (GRACE-FO (2 sats))
+weather/space-based-observations/grace-fo/hairs	Operational	High Accuracy Inter-satellite Ranging System (HAIRS)
+weather/space-based-observations/grace-fo/tri-g	Operational	Triple G (GPS (Tri-G)
+weather/space-based-observations/hai-yang-1c	Operational	Hai Yang 1C (HY-1C)
+weather/space-based-observations/hai-yang-1c/cocts	Operational	China Ocean Colour & Temperature Scanner (COCTS)
+weather/space-based-observations/hai-yang-1c/czi	Operational	Coastal Zone Imager (CZI)
+weather/space-based-observations/hai-yang-1c/uvi	Operational	HY Ultraviolet Imaging and calibration sensor (UVI)
+weather/space-based-observations/hai-yang-1d	Operational	Hai Yang 1D (HY-1D)
+weather/space-based-observations/hai-yang-1d/cocts	Operational	China Ocean Colour & Temperature Scanner (COCTS)
+weather/space-based-observations/hai-yang-1d/czi	Operational	Coastal Zone Imager (CZI)
+weather/space-based-observations/hai-yang-1d/uvi	Operational	HY Ultraviolet Imaging and calibration sensor (UVI)
+weather/space-based-observations/hai-yang-1e	Operational	Hai Yang 1E (HY-1E)
+weather/space-based-observations/hai-yang-1e/cocts2	Operational	China Ocean Colour & Temperature Scanner 2 (COCTS2)
+weather/space-based-observations/hai-yang-1e/czi2	Operational	Coastal Zone Imager 2 (CZI2)
+weather/space-based-observations/hai-yang-1e/pmris	Operational	Programmable Medium Resolution Imaging Spectrometer (PMRIS)
+weather/space-based-observations/hai-yang-2b	Operational	Hai Yang 2B (HY-2B)
+weather/space-based-observations/hai-yang-2b/alt	Operational	Radar Altimeter (ALT)
+weather/space-based-observations/hai-yang-2b/hscat	Operational	HY Scatterometer (HSCAT)
+weather/space-based-observations/hai-yang-2b/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/hai-yang-2b/mwri	Operational	Microwave Radiometer Imager (MWRI)
+weather/space-based-observations/hai-yang-2c	Operational	Hai Yang 2C (HY-2C)
+weather/space-based-observations/hai-yang-2c/alt	Operational	Radar Altimeter (ALT)
+weather/space-based-observations/hai-yang-2c/hscat	Operational	HY Scatterometer (HSCAT)
+weather/space-based-observations/hai-yang-2c/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/hai-yang-2d	Operational	Hai Yang 2D (HY-2D)
+weather/space-based-observations/hai-yang-2d/alt	Operational	Radar Altimeter (ALT)
+weather/space-based-observations/hai-yang-2d/hscat	Operational	HY Scatterometer (HSCAT)
+weather/space-based-observations/hai-yang-2d/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/himawari-8	Operational	Himawari-8
+weather/space-based-observations/himawari-8/ahi	Operational	Advanced Himawari Imager (AHI)
+weather/space-based-observations/himawari-9	Operational	Himawari-9
+weather/space-based-observations/himawari-9/ahi	Operational	Advanced Himawari Imager (AHI)
+weather/space-based-observations/hj-2a	Operational	Huan Jing 2A (HJ-2A)
+weather/space-based-observations/hj-2a/hsi-2	Operational	Hyper-Spectral Imager (HSI-2)
+weather/space-based-observations/hj-2a/irmss-2	Operational	Infrared Multispectral Scanner - 2 (IRMSS-2)
+weather/space-based-observations/hj-2a/wvc-2	Operational	Wide View CCD camera - 2 (WVC-2)
+weather/space-based-observations/hj-2b	Operational	Huan Jing 2B (HJ-2B)
+weather/space-based-observations/hj-2b/hsi-2	Operational	Hyper-Spectral Imager (HSI-2)
+weather/space-based-observations/hj-2b/irmss-2	Operational	Infrared Multispectral Scanner - 2 (IRMSS-2)
+weather/space-based-observations/hj-2b/wvc-2	Operational	Wide View CCD camera - 2 (WVC-2)
+weather/space-based-observations/hj-2e	Operational	Huan Jing 2E (also known as S-SAR01) (HJ-2E)
+weather/space-based-observations/hj-2e/sar-s	Operational	Synthetic Aperture Radar (S-band) (SAR-S)
+weather/space-based-observations/hj-2f	Operational	Huan Jing 2F (also known as S-SAR02) (HJ-2F)
+weather/space-based-observations/hj-2f/sar-s	Operational	Synthetic Aperture Radar (S-band) (SAR-S)
+weather/space-based-observations/hrmis	Operational	High Resolution Multi-mode Imaging Satellite (HRMIS)
+weather/space-based-observations/hrmis/hrc	Operational	High Resolution Camera (HRC)
+weather/space-based-observations/hrmis/smac	Operational	Synchronous Monitoring Atmospheric Corrector (SMAC)
+weather/space-based-observations/hysis	Operational	Hyper Spectral Imaging Spectrometer (HySIS)
+weather/space-based-observations/hysis/hysis	Operational	Hyper Spectral Imaging Spectrometer (HySIS)
+weather/space-based-observations/icesat-2	Operational	Ice, Cloud and land Elevation Satellite (ICESat-2)
+weather/space-based-observations/icesat-2/atlas	Operational	Advanced Topographic Laser Altimeter System (ATLAS)
+weather/space-based-observations/icesat-2/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/icon	Operational	Ionospheric Connection Explorer (ICON)
+weather/space-based-observations/icon/mighti	Operational	Michelson Interferometer for Global High-resolution Thermospheric Imaging (MIGHTI)
+weather/space-based-observations/insat-3d	Operational	Indian National Satellite - 3D (INSAT-3D)
+weather/space-based-observations/insat-3d/imager	Operational	INSAT imager (IMAGER)
+weather/space-based-observations/insat-3dr	Operational	Indian National Satellite - 3D repeat (INSAT-3DR)
+weather/space-based-observations/insat-3dr/imager	Operational	INSAT imager (IMAGER)
+weather/space-based-observations/insat-3ds	Operational	Indian National Satellite - 3D second repeat (INSAT-3DS)
+weather/space-based-observations/insat-3ds/imager	Operational	INSAT imager (IMAGER)
+weather/space-based-observations/iss-asim	Operational	Atmosphere-Space Interactions Monitor on the ISS (ISS ASIM)
+weather/space-based-observations/iss-asim/mxgs	Operational	Modular X-ray and Gamma-ray Sensor (MXGS)
+weather/space-based-observations/iss-cowvr	Operational	Compact Ocean Wind Vector Radiometer on the ISS (ISS COWVR)
+weather/space-based-observations/iss-cowvr/cowvr	Operational	Compact Ocean Wind Vector Radiometer (COWVR)
+weather/space-based-observations/iss-desis	Operational	DLR Earth Sensing Imaging Spectrometer on the ISS (ISS DESIS)
+weather/space-based-observations/iss-desis/desis	Operational	DLR Earth Sensing Imaging Spectrometer (DESIS)
+weather/space-based-observations/iss-emit	Operational	Earth Surface Mineral Dust Source Investigation on the ISS (ISS EMIT)
+weather/space-based-observations/iss-emit/emit	Operational	Earth Surface Mineral Dust Source Investigation (EMIT)
+weather/space-based-observations/iss-hisui	Operational	Hyperspectral Imager Suite (ISS HISUI)
+weather/space-based-observations/iss-hisui/hisui	Operational	Hyperspectral Imager Suite (HISUI)
+weather/space-based-observations/iss-oco-3	Operational	Orbiting Carbon Observatory 3 on the ISS (ISS OCO-3)
+weather/space-based-observations/iss-oco-3/oco-iss-spectrometer	Operational	Orbiting Carbon Observatory ISS spectrometer (OCO (ISS) spectrometer)
+weather/space-based-observations/iss-sage-iii	Operational	Stratospheric Aerosol and Gas Experiment III on the ISS (ISS SAGE-III)
+weather/space-based-observations/iss-sage-iii/sage-iii	Operational	Stratospheric Aerosol and Gas Experiment - III (SAGE-III )
+weather/space-based-observations/iss-tempest-1	Operational	Temporal Experiment for Storms and Tropical Systems Technology - 1 on the ISS (ISS TEMPEST-1)
+weather/space-based-observations/iss-tempest-1/mm-radiometer	Operational	Millimetre-wave Radiometer (MM Radiometer)
+weather/space-based-observations/iss-tsis-1	Operational	Total and Spectral Solar Irradiance Sensor - 1 (ISS TSIS-1)
+weather/space-based-observations/iss-tsis-1/tsis	Operational	Total and Spectral Solar Irradiance Sensor (TSIS)
+weather/space-based-observations/jason-3	Operational	Joint Altimetry Satellite Oceanography Network - 3 (JASON-3)
+weather/space-based-observations/jason-3/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/jason-3/poseidon-3b	Operational	Poseidon 3B (Poseidon-3B)
+weather/space-based-observations/kanopus-v-ik-1	Operational	Kanopus-Vulkan-Infra-Krasny-1 (KANOPUS-V-IK-1)
+weather/space-based-observations/kanopus-v-ik-1/mss	Operational	Multispectral film-making system (MSS)
+weather/space-based-observations/kanopus-v3	Operational	KANOPUS-V3
+weather/space-based-observations/kanopus-v3/mss	Operational	Multispectral film-making system (MSS)
+weather/space-based-observations/kanopus-v4	Operational	KANOPUS-V4
+weather/space-based-observations/kanopus-v4/mss	Operational	Multispectral film-making system (MSS)
+weather/space-based-observations/kanopus-v5	Operational	KANOPUS-V5
+weather/space-based-observations/kanopus-v5/mss	Operational	Multispectral film-making system (MSS)
+weather/space-based-observations/kanopus-v6	Operational	KANOPUS-V6
+weather/space-based-observations/kanopus-v6/mss	Operational	Multispectral film-making system (MSS)
+weather/space-based-observations/kompsat-2	Operational	Korea Multi-Purpose Satellite - 2 (KOMPSAT-2)
+weather/space-based-observations/kompsat-2/msc	Operational	Multi-Spectral Camera (MSC)
+weather/space-based-observations/kompsat-3	Operational	Korea Multi-Purpose Satellite - 3 (KOMPSAT-3)
+weather/space-based-observations/kompsat-3/aeiss	Operational	Advanced Electronic Image Scanning System (AEISS)
+weather/space-based-observations/kompsat-3a	Operational	Korea Multi-Purpose Satellite - 3A (KOMPSAT-3A)
+weather/space-based-observations/kompsat-3a/aeiss	Operational	Advanced Electronic Image Scanning System (AEISS)
+weather/space-based-observations/kompsat-5	Operational	Korea Multi-Purpose Satellite - 5 (KOMPSAT-5)
+weather/space-based-observations/kompsat-5/aopod	Operational	Atmosphere Occultation and Precision Orbit Determination (AOPOD)
+weather/space-based-observations/kompsat-5/cosi	Operational	Corea SAR Instrument (COSI)
+weather/space-based-observations/lageos-1	Operational	Laser Geodynamics Satellite - 1 (LAGEOS-1)
+weather/space-based-observations/lageos-1/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/lageos-2	Operational	Laser Geodynamics Satellite - 2 (LAGEOS-2)
+weather/space-based-observations/lageos-2/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/landsat-8	Operational	Landsat-8
+weather/space-based-observations/landsat-8/oli	Operational	Operational Land Imager (OLI)
+weather/space-based-observations/landsat-8/tirs	Operational	Thermal Infra-Red Sensor (TIRS)
+weather/space-based-observations/landsat-9	Operational	Landsat-9
+weather/space-based-observations/landsat-9/oli	Operational	Operational Land Imager (OLI)
+weather/space-based-observations/landsat-9/tirs	Operational	Thermal Infra-Red Sensor (TIRS)
+weather/space-based-observations/lares-1	Operational	Laser RElativity Satellite - 1 (LARES-1)
+weather/space-based-observations/lares-1/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/lares-2	Operational	Laser RElativity Satellite - 2 (LARES-2)
+weather/space-based-observations/lares-2/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/lemur-2	Operational	Low Earth Multi-Use Receiver - 2 (Lemur-2)
+weather/space-based-observations/lemur-2/stratos	Operational	STRATOS
+weather/space-based-observations/ludi-tance-1-01a	Operational	L-band differential interferometric synthetic aperture radar satellite A (Ludi-Tance 1 01A)
+weather/space-based-observations/ludi-tance-1-01a/l-band-sar	Operational	L-band differential interferometric synthetic aperture radar (L band SAR)
+weather/space-based-observations/ludi-tance-1-01b	Operational	L-band differential interferometric synthetic aperture radar satellite A (Ludi-Tance 1 01B)
+weather/space-based-observations/ludi-tance-1-01b/l-band-sar	Operational	L-band differential interferometric synthetic aperture radar (L band SAR)
+weather/space-based-observations/ludi-tance-4-01a	Operational	L-band differential interferometric synthetic aperture radar satellite 4 01A (Ludi-Tance 4 01A)
+weather/space-based-observations/ludi-tance-4-01a/l-band-sar	Operational	L-band differential interferometric synthetic aperture radar (L band SAR)
+weather/space-based-observations/meteor-m-n2	Operational	Meteor-M Number 2 (Meteor-M N2)
+weather/space-based-observations/meteor-m-n2-2	Operational	Meteor-M Number 2-2 (Meteor-M N2-2)
+weather/space-based-observations/meteor-m-n2-2/ikfs-2	Operational	Infrared Fourier Spectrometer - 2 (IKFS-2)
+weather/space-based-observations/meteor-m-n2-2/ikor-m	Operational	Broadband SW radiometer (IKOR-M)
+weather/space-based-observations/meteor-m-n2-2/kmss	Operational	High-resolution VIS/IR Radiometer (KMSS)
+weather/space-based-observations/meteor-m-n2-2/msu-mr	Operational	VIS/IR Imaging Radiometer (MSU-MR)
+weather/space-based-observations/meteor-m-n2-2/mtvza-gy	Operational	Imaging/Sounding Microwave Radiometer - improved (MTVZA-GY)
+weather/space-based-observations/meteor-m-n2-2/severjanin-m	Operational	X-band Synthetic Aperture Radar (Severjanin-M)
+weather/space-based-observations/meteor-m-n2-3	Operational	Meteor-M Number 2-3 (Meteor-M N2-3)
+weather/space-based-observations/meteor-m-n2-3/ikfs-2	Operational	Infrared Fourier Spectrometer - 2 (IKFS-2)
+weather/space-based-observations/meteor-m-n2-3/kmss	Operational	High-resolution VIS/IR Radiometer (KMSS)
+weather/space-based-observations/meteor-m-n2-3/msu-mr	Operational	VIS/IR Imaging Radiometer (MSU-MR)
+weather/space-based-observations/meteor-m-n2-3/mtvza-gy	Operational	Imaging/Sounding Microwave Radiometer - improved (MTVZA-GY)
+weather/space-based-observations/meteor-m-n2-3/severjanin-m	Operational	X-band Synthetic Aperture Radar (Severjanin-M)
+weather/space-based-observations/meteor-m-n2-4	Operational	Meteor-M Number 2-4 (Meteor-M N2-4)
+weather/space-based-observations/meteor-m-n2-4/ikfs-2	Operational	Infrared Fourier Spectrometer - 2 (IKFS-2)
+weather/space-based-observations/meteor-m-n2-4/ikor-m	Operational	Broadband SW radiometer (IKOR-M)
+weather/space-based-observations/meteor-m-n2-4/kmss	Operational	High-resolution VIS/IR Radiometer (KMSS)
+weather/space-based-observations/meteor-m-n2-4/meteosar	Operational	Meteorological Synthetic Aperture Radar (MeteoSAR)
+weather/space-based-observations/meteor-m-n2-4/msu-mr	Operational	VIS/IR Imaging Radiometer (MSU-MR)
+weather/space-based-observations/meteor-m-n2-4/mtvza-gy	Operational	Imaging/Sounding Microwave Radiometer - improved (MTVZA-GY)
+weather/space-based-observations/meteor-m-n2/ikfs-2	Operational	Infrared Fourier Spectrometer - 2 (IKFS-2)
+weather/space-based-observations/meteor-m-n2/ikor-m	Operational	Broadband SW radiometer (IKOR-M)
+weather/space-based-observations/meteor-m-n2/kmss	Operational	High-resolution VIS/IR Radiometer (KMSS)
+weather/space-based-observations/meteor-m-n2/msu-mr	Operational	VIS/IR Imaging Radiometer (MSU-MR)
+weather/space-based-observations/meteor-m-n2/mtvza-gy	Operational	Imaging/Sounding Microwave Radiometer - improved (MTVZA-GY)
+weather/space-based-observations/meteor-m-n2/severjanin-m	Operational	X-band Synthetic Aperture Radar (Severjanin-M)
+weather/space-based-observations/meteosat-10	Operational	Meteosat-10
+weather/space-based-observations/meteosat-10/gerb	Operational	Geostationary Earth Radiation Budget (GERB)
+weather/space-based-observations/meteosat-10/seviri	Operational	Spinning Enhanced Visible Infra-Red Imager (SEVIRI)
+weather/space-based-observations/meteosat-11	Operational	Meteosat-11
+weather/space-based-observations/meteosat-11/gerb	Operational	Geostationary Earth Radiation Budget (GERB)
+weather/space-based-observations/meteosat-11/seviri	Operational	Spinning Enhanced Visible Infra-Red Imager (SEVIRI)
+weather/space-based-observations/meteosat-12	Operational	Meteosat-12
+weather/space-based-observations/meteosat-12/fci	Operational	Flexible Combined Imager (FCI)
+weather/space-based-observations/meteosat-12/li	Operational	Lightning Imager (LI)
+weather/space-based-observations/meteosat-13	Operational	Meteosat-13
+weather/space-based-observations/meteosat-13/irs	Operational	InfraRed Sounder (IRS)
+weather/space-based-observations/meteosat-13/uvn	Operational	Ultra-violet, Visible and Near-infrared sounder (UVN)
+weather/space-based-observations/meteosat-9	Operational	Meteosat-9 (IODC)
+weather/space-based-observations/meteosat-9/gerb	Operational	Geostationary Earth Radiation Budget (GERB)
+weather/space-based-observations/meteosat-9/seviri	Operational	Spinning Enhanced Visible Infra-Red Imager (SEVIRI)
+weather/space-based-observations/metop-b	Operational	Meteorological operational satellite - B (Metop-B)
+weather/space-based-observations/metop-b/amsu-a	Operational	Advanced Microwave Sounding Unit - A (AMSU-A)
+weather/space-based-observations/metop-b/ascat	Operational	Advanced Scatterometer (ASCAT)
+weather/space-based-observations/metop-b/avhrr-3	Operational	Advanced Very High Resolution Radiometer / 3 (AVHRR/3)
+weather/space-based-observations/metop-b/gome-2	Operational	Global Ozone Monitoring Experiment - 2 (GOME-2)
+weather/space-based-observations/metop-b/gras	Operational	GNSS Receiver for Atmospheric Sounding (GRAS)
+weather/space-based-observations/metop-b/hirs-4	Operational	High-resolution Infra Red Sounder / 4 (HIRS/4)
+weather/space-based-observations/metop-b/iasi	Operational	Infrared Atmospheric Sounding Interferometer (IASI)
+weather/space-based-observations/metop-b/mhs	Operational	Microwave Humidity Sounding (MHS)
+weather/space-based-observations/metop-c	Operational	Meteorological operational satellite - C (Metop-C)
+weather/space-based-observations/metop-c/amsu-a	Operational	Advanced Microwave Sounding Unit - A (AMSU-A)
+weather/space-based-observations/metop-c/ascat	Operational	Advanced Scatterometer (ASCAT)
+weather/space-based-observations/metop-c/avhrr-3	Operational	Advanced Very High Resolution Radiometer / 3 (AVHRR/3)
+weather/space-based-observations/metop-c/gome-2	Operational	Global Ozone Monitoring Experiment - 2 (GOME-2)
+weather/space-based-observations/metop-c/gras	Operational	GNSS Receiver for Atmospheric Sounding (GRAS)
+weather/space-based-observations/metop-c/iasi	Operational	Infrared Atmospheric Sounding Interferometer (IASI)
+weather/space-based-observations/metop-c/mhs	Operational	Microwave Humidity Sounding (MHS)
+weather/space-based-observations/metop-d	Operational	Meteorological operational satellite - D (Metop-D)
+weather/space-based-observations/metop-d/3mi	Operational	Multi-viewing Multi-channel Multi-polarisation Imager
+weather/space-based-observations/metop-d/iasi-ng	Operational	Infrared Atmospheric Sounder Interferometer - New Generation
+weather/space-based-observations/metop-d/metimage	Operational	Meteorological Imager (Previous name: VII - Visible and Infrared Imager )
+weather/space-based-observations/metop-d/ro	Operational	Radio Occultation sounder
+weather/space-based-observations/metop-d/s5-uvns	Operational	Sentinel-5 UVNS: Ultra-violet, Visible and Near-infrared Sounder
+weather/space-based-observations/metop-sga1	Operational	Meteorological operational satellite - Second Generation A1 (to be renamed Metop-D)
+weather/space-based-observations/metop-sga1/3mi	Operational	Multi-viewing Multi-channel Multi-polarisation Imager
+weather/space-based-observations/metop-sga1/iasi-ng	Operational	Infrared Atmospheric Sounder Interferometer - New Generation
+weather/space-based-observations/metop-sga1/metimage	Operational	Meteorological Imager (Previous name: VII - Visible and Infrared Imager)
+weather/space-based-observations/metop-sga1/ro	Operational	Radio Occultation sounder
+weather/space-based-observations/metop-sga1/s5-uvns	Operational	Sentinel-5 UVNS: Ultra-violet, Visible and Near-infrared Sounder
+weather/space-based-observations/microcarb	Experimental	MicroCarb
+weather/space-based-observations/microcarb/microcarb	Experimental	MicroCarb
+weather/space-based-observations/nachos-1	Operational	Nano-satellite Atmospheric Chemistry Hyperspectral Observation System-1 (NACHOS-1)
+weather/space-based-observations/nachos-1/nachos	Operational	NACHOS-Imager (NACHOS)
+weather/space-based-observations/nachos-2	Operational	Nano-satellite Atmospheric Chemistry Hyperspectral Observation System-1 (NACHOS-2)
+weather/space-based-observations/nachos-2/nachos	Operational	NACHOS-Imager (NACHOS)
+weather/space-based-observations/noaa-15	Operational	National Oceanic and Atmospheric Administration - 15 (NOAA-15)
+weather/space-based-observations/noaa-15/amsu-a	Operational	Advanced Microwave Sounding Unit - A (AMSU-A)
+weather/space-based-observations/noaa-15/amsu-b	Operational	Advanced Microwave Sounding Unit - B (AMSU-B)
+weather/space-based-observations/noaa-15/avhrr-3	Operational	Advanced Very High Resolution Radiometer / 3 (AVHRR/3)
+weather/space-based-observations/noaa-18	Operational	National Oceanic and Atmospheric Administration - 18 (NOAA-18)
+weather/space-based-observations/noaa-18/amsu-a	Operational	Advanced Microwave Sounding Unit - A (AMSU-A)
+weather/space-based-observations/noaa-18/avhrr-3	Operational	Advanced Very High Resolution Radiometer / 3 (AVHRR/3)
+weather/space-based-observations/noaa-18/hirs-4	Operational	High-resolution Infra Red Sounder / 4 (HIRS/4)
+weather/space-based-observations/noaa-18/mhs	Operational	Microwave Humidity Sounding (MHS)
+weather/space-based-observations/noaa-18/sbuv-2	Operational	Solar Backscatter Ultraviolet / 2 (SBUV/2)
+weather/space-based-observations/noaa-19	Operational	National Oceanic and Atmospheric Administration - 19 (NOAA-19)
+weather/space-based-observations/noaa-19/amsu-a	Operational	Advanced Microwave Sounding Unit - A (AMSU-A)
+weather/space-based-observations/noaa-19/avhrr-3	Operational	Advanced Very High Resolution Radiometer / 3 (AVHRR/3)
+weather/space-based-observations/noaa-19/hirs-4	Operational	High-resolution Infra Red Sounder / 4 (HIRS/4)
+weather/space-based-observations/noaa-19/mhs	Operational	Microwave Humidity Sounding (MHS)
+weather/space-based-observations/noaa-19/sbuv-2	Operational	Solar Backscatter Ultraviolet / 2 (SBUV/2)
+weather/space-based-observations/noaa-20	Operational	National Oceanic and Atmospheric Administration - 20 (NOAA-20)
+weather/space-based-observations/noaa-20/atms	Operational	Advanced Technology Microwave Sounder (ATMS)
+weather/space-based-observations/noaa-20/ceres	Operational	Clouds and the Earth's Radiant Energy System (CERES)
+weather/space-based-observations/noaa-20/cris	Operational	Cross-track Infrared Sounder (CrIS)
+weather/space-based-observations/noaa-20/omps-nadir	Operational	Ozone Mapping and Profiler Suite (OMPS-nadir)
+weather/space-based-observations/noaa-20/viirs	Operational	Visible/Infrared Imager Radiometer Suite (VIIRS)
+weather/space-based-observations/noaa-21	Operational	National Oceanic and Atmospheric Administration - 21 (NOAA-21)
+weather/space-based-observations/noaa-21/atms	Operational	Advanced Technology Microwave Sounder (ATMS)
+weather/space-based-observations/noaa-21/cris	Operational	Cross-track Infrared Sounder (CrIS)
+weather/space-based-observations/noaa-21/omps-limb	Operational	Ozone Mapping and Profiler Suite (OMPS-limb)
+weather/space-based-observations/noaa-21/omps-nadir	Operational	Ozone Mapping and Profiler Suite (OMPS-nadir)
+weather/space-based-observations/noaa-21/viirs	Operational	Visible/Infrared Imager Radiometer Suite (VIIRS)
+weather/space-based-observations/novasar-s	Operational	NovaSAR-S
+weather/space-based-observations/novasar-s/s-sar	Operational	S-band Synthetic Aperture Radar (S-SAR)
+weather/space-based-observations/oceansat-3	Operational	OceanSat-3 (EOS-06)
+weather/space-based-observations/oceansat-3/argos-4	Operational	Advanced Data Collection System (called "Argos-4")
+weather/space-based-observations/oceansat-3/ocm	Operational	Ocean Color Monitor
+weather/space-based-observations/oceansat-3/oscat-3	Operational	Scatterometer for Oceansat-3
+weather/space-based-observations/oco-2	Operational	Orbiting Carbon Observatory - 2 (OCO-2)
+weather/space-based-observations/oco-2/oco-spectrometer	Operational	Orbiting Carbon Observatory Spectrometer (OCO spectrometer)
+weather/space-based-observations/odin	Operational	Odin
+weather/space-based-observations/odin/osiris	Operational	Optical Spectrograph and Infra-Red Imaging System (OSIRIS)
+weather/space-based-observations/odin/smr	Operational	Sub-Millimetre Radiometer (SMR)
+weather/space-based-observations/pace	Operational	Plankton, Aerosol, Cloud, ocean Ecosystem (PACE)
+weather/space-based-observations/pace/harp2	Operational	Hyper Angular Research Polarimeter 2 (HARP2)
+weather/space-based-observations/pace/oci	Operational	Ocean Color Instrument (OCI)
+weather/space-based-observations/pace/spexone	Operational	SPEXone Polarimeter (SPEXone)
+weather/space-based-observations/paz	Operational	Satélite Español de Observación SAR (also Paz)
+weather/space-based-observations/paz/lrr	Operational	Laser Retro-Reflector
+weather/space-based-observations/paz/rohpp	Operational	Radio Occultations and Heavy Precipitation with PAZ
+weather/space-based-observations/paz/sar-x	Operational	Synthetic Aperture Radar (X-band)
+weather/space-based-observations/pleiades-neo-3	Operational	Pleiades-Neo 3
+weather/space-based-observations/pleiades-neo-3/pleiades-neo	Operational	Pleiades-Neo
+weather/space-based-observations/pleiades-neo-4	Operational	Pleiades-Neo 4
+weather/space-based-observations/pleiades-neo-4/pleiades-neo	Operational	Pleiades-Neo
+weather/space-based-observations/pretty	Operational	Passive Reflectometry and Dosimetry (PRETTY)
+weather/space-based-observations/pretty/gnss-r	Operational	GNSS Reflectometer (GNSS-R)
+weather/space-based-observations/prisma	Operational	PRecursore IperSpettrale della Missione Applicativa (PRISMA)
+weather/space-based-observations/prisma/hyc	Operational	HYperspectral Camera (HYC)
+weather/space-based-observations/proba-1	Operational	Project for On-Board Autonomy - 1 (PROBA-1)
+weather/space-based-observations/proba-1/chris	Operational	Compact High Resolution Imaging Spectrometer (CHRIS)
+weather/space-based-observations/proba-1/hrc	Operational	High Resolution Camera (HRC)
+weather/space-based-observations/proba-v-cc	Operational	Project for On-Board Autonomy - Vegetation Companion Cubesat (PROBA-V-CC)
+weather/space-based-observations/proba-v-cc/vegetation-p	Operational	Vegetation for PROBA (Vegetation-P)
+weather/space-based-observations/quicksounder	Planned	QuickSounder
+weather/space-based-observations/quicksounder/atms	Planned	Advanced Technology Microwave Sounder
+weather/space-based-observations/radarsat-2	Operational	RadarSat-2
+weather/space-based-observations/radarsat-2/sar	Operational	Synthetic Aperture Radar (C-band) (SAR)
+weather/space-based-observations/rcm-1	Operational	RadarSat Constellation Mission - 1 (RCM-1)
+weather/space-based-observations/rcm-1/sar-rcm	Operational	Synthetic Aperture Radar (C-band) for RadarSat constellation (SAR RCM)
+weather/space-based-observations/rcm-2	Operational	RadarSat Constellation Mission - 2 (RCM-2)
+weather/space-based-observations/rcm-2/sar-rcm	Operational	Synthetic Aperture Radar (C-band) for RadarSat constellation (SAR RCM)
+weather/space-based-observations/rcm-3	Operational	RadarSat Constellation Mission - 3 (RCM-3)
+weather/space-based-observations/rcm-3/sar-rcm	Operational	Synthetic Aperture Radar (C-band) for RadarSat constellation (SAR RCM)
+weather/space-based-observations/resourcesat-2	Operational	Satellite for Earth Resources - 2 (ResourceSat-2)
+weather/space-based-observations/resourcesat-2/awifs	Operational	Advanced Wide Field Sensor (AWiFS)
+weather/space-based-observations/resourcesat-2/liss-3	Operational	Linear Imaging Self-Scanning Sensor - 3 (LISS-3)
+weather/space-based-observations/resourcesat-2/liss-4	Operational	Linear Imaging Self-Scanning Sensor - 4 (LISS-4)
+weather/space-based-observations/resourcesat-2a	Operational	Satellite for Earth Resources - 2A (ResourceSat-2A)
+weather/space-based-observations/resourcesat-2a/awifs	Operational	Advanced Wide Field Sensor (AWiFS)
+weather/space-based-observations/resourcesat-2a/liss-3	Operational	Linear Imaging Self-Scanning Sensor - 3 (LISS-3)
+weather/space-based-observations/resourcesat-2a/liss-4	Operational	Linear Imaging Self-Scanning Sensor - 4 (LISS-4)
+weather/space-based-observations/risat-2b	Operational	Radar Imaging Satellite - 2B (RISAT-2B)
+weather/space-based-observations/risat-2b/sar-x	Operational	Synthetic Aperture Radar (X-band) (SAR-X)
+weather/space-based-observations/risat-2br1	Operational	Radar Imaging Satellite - 2BR-1 (RISAT-2BR1)
+weather/space-based-observations/risat-2br1/sar-x	Operational	Synthetic Aperture Radar (X-band) (SAR-X)
+weather/space-based-observations/saocom-1a	Operational	SAtelite Argentino de Observacion COn Microondas - 1A (SAOCOM-1A)
+weather/space-based-observations/saocom-1a/sar-l	Operational	Synthetic Aperture Radar (L-band) (SAR-L)
+weather/space-based-observations/saocom-1b	Operational	SAtelite Argentino de Observacion COn Microondas - 1B (SAOCOM-1B)
+weather/space-based-observations/saocom-1b/sar-l	Operational	Synthetic Aperture Radar (L-band) (SAR-L)
+weather/space-based-observations/saral	Operational	Satellite with ARGOS and AltiKa (SARAL)
+weather/space-based-observations/saral/altika	Operational	Ka-band Altimeter (AltiKa)
+weather/space-based-observations/saral/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/scisat-1	Operational	Scientific Satellite -1 (SCISAT-1)
+weather/space-based-observations/scisat-1/ace-fts	Operational	Atmospheric Chemistry Experiment - Fourier Transform Spectrometer (ACE-FTS)
+weather/space-based-observations/scisat-1/maestro	Operational	Measurements of Aerosol Extinction in the Stratosphere and Troposphere Retrieved by Occultation (MAESTRO)
+weather/space-based-observations/sdgsat-1	Operational	Sustainable Development Science Satellite 1 (SDGSAT-1)
+weather/space-based-observations/sdgsat-1/glimmer	Operational	GLIMMER Imager (GLIMMER)
+weather/space-based-observations/sdgsat-1/msi	Operational	Multispectral Imager on SDGSAT (MSI)
+weather/space-based-observations/sdgsat-1/tir	Operational	Thermal IR Spectrometer (TIR)
+weather/space-based-observations/sentinel-1a	Operational	Sentinel-1A
+weather/space-based-observations/sentinel-1a/sar-c	Operational	Synthetic Aperture Radar (C-band) (SAR-C)
+weather/space-based-observations/sentinel-1c	Operational	Sentinel-1C
+weather/space-based-observations/sentinel-1c/sar-c	Operational	Synthetic Aperture Radar (C-band) (SAR-C)
+weather/space-based-observations/sentinel-1d	Operational	Sentinel-1D
+weather/space-based-observations/sentinel-1d/sar-c	Operational	Synthetic Aperture Radar (C-band) (SAR-C)
+weather/space-based-observations/sentinel-2a	Operational	Sentinel-2A
+weather/space-based-observations/sentinel-2a/msi	Operational	Multi-Spectral Imager for Sentinel-2 (MSI)
+weather/space-based-observations/sentinel-2b	Operational	Sentinel-2B
+weather/space-based-observations/sentinel-2b/msi	Operational	Multi-Spectral Imager for Sentinel-2 (MSI)
+weather/space-based-observations/sentinel-3a	Operational	Sentinel-3A
+weather/space-based-observations/sentinel-3a/olci	Operational	Ocean and Land Colour Imager (OLCI )
+weather/space-based-observations/sentinel-3a/slstr	Operational	Sea and Land Surface Temperature Radiometer (SLSTR)
+weather/space-based-observations/sentinel-3a/sral	Operational	Synthetic aperture Radar Altimeter (SRAL)
+weather/space-based-observations/sentinel-3b	Operational	Sentinel-3B
+weather/space-based-observations/sentinel-3b/olci	Operational	Ocean and Land Colour Imager (OLCI )
+weather/space-based-observations/sentinel-3b/slstr	Operational	Sea and Land Surface Temperature Radiometer (SLSTR)
+weather/space-based-observations/sentinel-3b/sral	Operational	Synthetic aperture Radar Altimeter (SRAL)
+weather/space-based-observations/sentinel-5p	Operational	Sentinel-5 precursor (Sentinel-5P)
+weather/space-based-observations/sentinel-5p/tropomi	Operational	Tropospheric Monitoring Instrument (TROPOMI)
+weather/space-based-observations/sentinel-6a	Operational	Sentinel-6A
+weather/space-based-observations/sentinel-6a/gnss-ro	Operational	Global Navigation Satellite System - Radio Occultation (GNSS-RO)
+weather/space-based-observations/sentinel-6a/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/sentinel-6a/poseidon-4	Operational	Poseidon-4
+weather/space-based-observations/sentinel-6b	Operational	Sentinel-6B
+weather/space-based-observations/sentinel-6b/gnss-ro	Operational	Global Navigation Satellite System - Radio Occultation (GNSS-RO)
+weather/space-based-observations/sentinel-6b/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/sentinel-6b/poseidon-4	Operational	Poseidon-4
+weather/space-based-observations/seosar-paz	Operational	Satelite Espanol de Observacion SAR (also Paz) (SEOSAR/Paz)
+weather/space-based-observations/seosar-paz/rohpp	Operational	Radio Occultations and Heavy Precipitation with PAZ (ROHPP)
+weather/space-based-observations/seosar-paz/sar-x	Operational	Synthetic Aperture Radar (X-band) (SAR-X)
+weather/space-based-observations/sich-2-30	Operational	SICH-2-30 (originally SICH-2-1) (SICH-2-30)
+weather/space-based-observations/sich-2-30/mbei	Operational	Multi-Band Earth Imager (MBEI)
+weather/space-based-observations/smap	Operational	Soil Moisture Active-Passive (SMAP)
+weather/space-based-observations/smap/smap	Operational	Soil Moisture Active-Passive (intended as payload) (SMAP)
+weather/space-based-observations/smos	Operational	Soil Moisture and Ocean Salinity (SMOS)
+weather/space-based-observations/smos/miras	Operational	Microwave Imaging Radiometer using Aperture Synthesis (MIRAS)
+weather/space-based-observations/snpp	Operational	Suomi National Polar-orbiting Partnership (SNPP)
+weather/space-based-observations/snpp/atms	Operational	Advanced Technology Microwave Sounder (ATMS)
+weather/space-based-observations/snpp/ceres	Operational	Clouds and the Earth's Radiant Energy System (CERES)
+weather/space-based-observations/snpp/cris	Operational	Cross-track Infrared Sounder (CrIS)
+weather/space-based-observations/snpp/omps-limb	Operational	Ozone Mapping and Profiler Suite (OMPS-limb)
+weather/space-based-observations/snpp/omps-nadir	Operational	Ozone Mapping and Profiler Suite (OMPS-nadir)
+weather/space-based-observations/snpp/viirs	Operational	Visible/Infrared Imager Radiometer Suite (VIIRS)
+weather/space-based-observations/spot-6	Operational	Satellite Pour l'Observation de la Terre - 6 (SPOT-6)
+weather/space-based-observations/spot-6/naomi	Operational	New AstroSat Optical Modular Instrument (NAOMI)
+weather/space-based-observations/spot-7	Operational	Satellite Pour l'Observation de la Terre - 7 (SPOT-7)
+weather/space-based-observations/spot-7/naomi	Operational	New AstroSat Optical Modular Instrument (NAOMI)
+weather/space-based-observations/sstl-s1-1	Operational	Surrey Satellite Technology Ltd - S1 1 (SSTL-S1 1)
+weather/space-based-observations/sstl-s1-1/vhri-100	Operational	Very High Resolution Imager - 100 (VHRI-100)
+weather/space-based-observations/sstl-s1-2	Operational	Surrey Satellite Technology Ltd - S1 2 (SSTL-S1 2)
+weather/space-based-observations/sstl-s1-2/vhri-100	Operational	Very High Resolution Imager - 100 (VHRI-100)
+weather/space-based-observations/sstl-s1-3	Operational	Surrey Satellite Technology Ltd - S1 3 (SSTL-S1 3)
+weather/space-based-observations/sstl-s1-3/vhri-100	Operational	Very High Resolution Imager - 100 (VHRI-100)
+weather/space-based-observations/sstl-s1-4	Operational	Surrey Satellite Technology Ltd - S1 4 (SSTL-S1 4)
+weather/space-based-observations/sstl-s1-4/vhri-100	Operational	Very High Resolution Imager - 100 (VHRI-100)
+weather/space-based-observations/swot	Operational	Surface Water and Ocean Topography (SWOT)
+weather/space-based-observations/swot/gps	Operational	GPS Receiver (GPS)
+weather/space-based-observations/swot/karin	Operational	Ka-band Radar Interferometer (KaRIN)
+weather/space-based-observations/swot/lra	Operational	Laser Retroreflector Array (LRA)
+weather/space-based-observations/swot/poseidon-3c	Operational	Poseidon-3C Altimeter (Poseidon-3C)
+weather/space-based-observations/tandem-x	Operational	TerraSAR-X Add-oN for Digital Elevation Measurement (TanDEM-X)
+weather/space-based-observations/tandem-x/sar-x	Operational	Synthetic Aperture Radar (X-band) (SAR-X)
+weather/space-based-observations/tandem-x/tor	Operational	Tracking (TOR)
+weather/space-based-observations/terra	Operational	Earth Observation System - Terra
+weather/space-based-observations/terra/aster	Operational	Advanced Spaceborne Thermal Emission and Reflection radiometer (ASTER)
+weather/space-based-observations/terra/ceres	Operational	Clouds and the Earth's Radiant Energy System (CERES)
+weather/space-based-observations/terra/misr	Operational	Multi-angle Imaging Spectro-Radiometer (MISR)
+weather/space-based-observations/terra/modis	Operational	Moderate-resolution Imaging Spectro-radiometer (MODIS)
+weather/space-based-observations/terra/mopitt	Operational	Measurement Of Pollution In The Troposphere (MOPITT)
+weather/space-based-observations/terrasar-x	Operational	TerraSAR-X
+weather/space-based-observations/terrasar-x/sar-x	Operational	Synthetic Aperture Radar (X-band) (SAR-X)
+weather/space-based-observations/terrasar-x/tor	Operational	Tracking (TOR)
+weather/space-based-observations/th-1c	Operational	Tian Hui - 1C (TH-1C)
+weather/space-based-observations/th-1c/ms	Operational	Multispectral imager (MS)
+weather/space-based-observations/theos-1	Operational	Thailand Earth Observation System - 1 (THEOS-1)
+weather/space-based-observations/theos-1/ms	Operational	Multispectral imager (MS)
+weather/space-based-observations/theos-2-main	Operational	Thailand Earth Observation System - 2 Main VHR Satellite (THEOS-2 Main)
+weather/space-based-observations/theos-2-main/ms	Operational	New Astrosat Optical Modular Imager (MS)
+weather/space-based-observations/tianmu-1	Experimental	Tianmu-1
+weather/space-based-observations/tianmu-1/tgnos-m	Experimental	Tianmu Global Navigation Satellite System Occultation Sounder
+weather/space-based-observations/tomorrow	Operational	Tomorrow Microwave Sounder
+weather/space-based-observations/tomorrow/tms	Operational	Tomorrow Microwave Sounder
+weather/space-based-observations/tropics-01	Operational	Time-Resolved Observations of Precipitation structure and storm Intensity with a Constellation of Smallsats - 01 (TROPICS-01 (Pathfinder))
+weather/space-based-observations/tropics-01/tms	Operational	TROPICS Millimeter-wave Sounder (TMS)
+weather/space-based-observations/tropics-03	Operational	Time-Resolved Observations of Precipitation structure and storm Intensity with a Constellation of Smallsats - 03 (TROPICS-03)
+weather/space-based-observations/tropics-03/tms	Operational	TROPICS Millimeter-wave Sounder (TMS)
+weather/space-based-observations/tropics-05	Operational	Time-Resolved Observations of Precipitation structure and storm Intensity with a Constellation of Smallsats - 05 (TROPICS-05)
+weather/space-based-observations/tropics-05/tms	Operational	TROPICS Millimeter-wave Sounder (TMS)
+weather/space-based-observations/tropics-06	Operational	Time-Resolved Observations of Precipitation structure and storm Intensity with a Constellation of Smallsats - 06 (TROPICS-06)
+weather/space-based-observations/tropics-06/tms	Operational	TROPICS Millimeter-wave Sounder (TMS)
+weather/space-based-observations/tropics-07	Operational	Time-Resolved Observations of Precipitation structure and storm Intensity with a Constellation of Smallsats - 07 (TROPICS-07)
+weather/space-based-observations/tropics-07/tms	Operational	TROPICS Millimeter-wave Sounder (TMS)
+weather/space-based-observations/wsf-m1	Operational	Weather System Follow-on Microwave (WSF-M1)
+weather/space-based-observations/wsf-m1/ecp	Operational	Energetic Charged Particle sensor
+weather/space-based-observations/wsf-m1/mwi	Operational	MicroWave Imager
+weather/space-based-observations/zy-3-02	Operational	Zi Yuan - 3-02 (ZY-3-02)
+weather/space-based-observations/zy-3-02/msc	Operational	Multi-Spectral Camera (MSC)
+weather/space-based-observations/zy-3-03	Operational	Zi Yuan - 3-03 (ZY-3-03)
+weather/space-based-observations/zy-3-03/msc	Operational	Multi-Spectral Camera (MSC)
+weather/surface-based-observations	Operational	Surface based observations
+weather/surface-based-observations/amdar	Experimental	Aircraft meteorological data relay
+weather/surface-based-observations/fixed-marine-platforms	Operational	Weather observations from fixed marine platforms, e.g. rigs and offshore platforms
+weather/surface-based-observations/gnss-iwv	Experimental	Integrated water vapour observations derived from GNSS satellite delay
+weather/surface-based-observations/ship	Operational	Ship based weather observations
+weather/surface-based-observations/synop	Operational	Surface observations
+weather/surface-based-observations/temp	Operational	Upper air observations
+weather/surface-based-observations/temp-ship	Operational	Radiosonde measurements from ships
+weather/surface-based-observations/temperature-profile-radar	Operational	Radar based temperature profile measurements, e.g. RASS
+weather/surface-based-observations/uas	Experimental	Uncrewed aerial systems
+weather/surface-based-observations/vertical-profilers	Experimental	Vertical profilers, such as wind profilers, lidar, VAD radar, microwave radiometers, etc.
+weather/surface-based-observations/weather-radar	Experimental	Weather radar
+weather/surface-based-observations/wind-profile	Operational	Wind profile measurements using PILOT balloons
+weather/surface-based-observations/wind-profile-radar	Operational	Radar based wind profile measurements
+weather/surface-based-observations/wind-profile-ship	Operational	Wind profile measurements using PILOT balloons from ships

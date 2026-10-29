@@ -6,6 +6,7 @@ pub mod config;
 pub mod cube;
 pub mod datetime;
 pub mod derive;
+pub mod discovery;
 pub mod edr_engine;
 pub mod error;
 pub mod events;

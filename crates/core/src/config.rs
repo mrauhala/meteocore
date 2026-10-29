@@ -31,6 +31,38 @@ pub struct ServerConfig {
     /// config.toml only.
     #[serde(default)]
     pub parameter_defaults: Vec<ParameterDefault>,
+    /// Server-wide discovery settings (`[discovery]`, #1356). Top-level
+    /// config.toml only: in a collection, `[discovery]` is that
+    /// collection's [`DiscoveryConfig`].
+    #[serde(default)]
+    pub discovery: Option<DiscoverySettings>,
+}
+
+/// The top-level `[discovery]` table.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoverySettings {
+    /// Base URL of the WIS2 Global Discovery Catalogue the collections'
+    /// WCMP2 records resolve in (default
+    /// [`crate::discovery::DEFAULT_CATALOGUE`]). http(s) only.
+    #[serde(default)]
+    pub catalogue: Option<crate::discovery::Catalogue>,
+}
+
+/// A collection's `[discovery]` table (#1356): what classifies it for
+/// discovery. Both keys are optional and validated at load.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryConfig {
+    /// The collection's WIS2 topic from the earth-system-discipline level
+    /// down, at any depth (`weather/prediction`), served as its `themes`.
+    /// It replaces the topics a WIS2 subscription would give.
+    #[serde(default)]
+    pub wis2_topic: Option<crate::discovery::Wis2Topic>,
+    /// The WCMP2 record describing the collection (`urn:wmo:md:…`), linked
+    /// as `describedby` in the catalogue of the top-level `[discovery]`.
+    #[serde(default)]
+    pub wcmp2_record: Option<crate::discovery::RecordId>,
 }
 
 /// One `[[parameter_defaults]]` rule: match parameters by exact (normalized)
@@ -207,7 +239,19 @@ impl ServerConfig {
             style_bundles: Vec::new(),
             colormaps: Vec::new(),
             parameter_defaults: Vec::new(),
+            discovery: None,
         }
+    }
+
+    /// What collection descriptions read beyond their collections' configs
+    /// (#1356): the configured `[discovery] catalogue`, else the default.
+    pub fn discovery(&self) -> crate::discovery::Discovery {
+        crate::discovery::Discovery::new(
+            self.discovery
+                .as_ref()
+                .and_then(|d| d.catalogue.clone())
+                .unwrap_or_default(),
+        )
     }
 }
 
@@ -264,6 +308,10 @@ pub struct CollectionConfig {
     /// cards. Absent by default.
     #[serde(default)]
     pub license: Option<LicenseConfig>,
+    /// WIS2 topic and WCMP2 record (`[discovery]`, #1356), served as the
+    /// collection's `themes` and a `describedby` link. Absent by default.
+    #[serde(default)]
+    pub discovery: Option<DiscoveryConfig>,
     /// Path or URL to the data source. Required for csv/geojson engines.
     /// Optional for geotiff when endpoint+bucket are specified in [geotiff].
     #[serde(default)]
@@ -4497,6 +4545,18 @@ impl ServerConfig {
                      files — move the block to the top-level config.toml"
                 )));
             }
+            // A collection file's [discovery] is the collection's; the
+            // catalogue is server-wide.
+            if raw
+                .get("discovery")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|d| d.contains_key("catalogue"))
+            {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{filename}: [discovery] catalogue is not allowed in per-collection \
+                     files — set it in the top-level config.toml's [discovery]"
+                )));
+            }
             let collection: CollectionConfig = raw.try_into().map_err(|e| {
                 crate::error::DataServerError::Config(format!("Failed to parse {filename}: {e}"))
             })?;
@@ -7516,6 +7576,95 @@ colormap = "radar_dbz"
             err.contains("radar.toml: [[style_bundles]] is not allowed in per-collection files"),
             "got: {err}"
         );
+    }
+
+    /// `[discovery]` (#1356): a collection's topic and record parse
+    /// validated, the catalogue is server-wide, and each is a load error
+    /// when malformed or out of place.
+    #[test]
+    fn discovery_settings_load_and_validate() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+        let load = |top: &str, collection: &str| {
+            write_config(
+                tmp.path(),
+                "config.toml",
+                &format!(
+                    "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                     collections_dir = \"collections.d\"\n{top}"
+                ),
+            );
+            write_config(
+                &collections_dir,
+                "nwp.toml",
+                &format!("id = \"nwp\"\ntitle = \"NWP\"\ndescription = \"\"\n{collection}"),
+            );
+            let path = tmp.path().join("config.toml");
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+        let error = |top: &str, collection: &str| load(top, collection).unwrap_err().to_string();
+
+        let config = load(
+            "[discovery]\ncatalogue = \"https://gdc.example.org/\"\n",
+            "[discovery]\nwis2_topic = \"weather/prediction\"\n\
+             wcmp2_record = \"urn:wmo:md:int-ecmwf:aifs:oper:forecast\"\n",
+        )
+        .unwrap();
+        let discovery = config.collections[0].discovery.as_ref().unwrap();
+        assert_eq!(
+            discovery.wis2_topic.as_ref().map(|t| t.as_str()),
+            Some("weather/prediction")
+        );
+        assert_eq!(
+            discovery.wcmp2_record.as_ref().map(|r| r.as_str()),
+            Some("urn:wmo:md:int-ecmwf:aifs:oper:forecast")
+        );
+        assert_eq!(
+            config.discovery().catalogue().as_str(),
+            "https://gdc.example.org"
+        );
+        // Without the top-level table, records resolve in the default GDC.
+        let config = load("", "").unwrap();
+        assert!(config.collections[0].discovery.is_none());
+        assert_eq!(
+            config.discovery().catalogue().as_str(),
+            crate::discovery::DEFAULT_CATALOGUE
+        );
+
+        let unknown = error("", "[discovery]\nwis2_topic = \"weather/predictions\"\n");
+        assert!(
+            unknown.contains("nwp.toml")
+                && unknown.contains("unknown level 'predictions' below 'weather'"),
+            "{unknown}"
+        );
+        let urn = error("", "[discovery]\nwcmp2_record = \"aifs\"\n");
+        assert!(urn.contains("WCMP2 record id 'aifs'"), "{urn}");
+        let per_collection = error("", "[discovery]\ncatalogue = \"https://gdc.example.org\"\n");
+        assert!(
+            per_collection
+                .contains("nwp.toml: [discovery] catalogue is not allowed in per-collection files"),
+            "{per_collection}"
+        );
+        let scheme = error("[discovery]\ncatalogue = \"ftp://gdc.example.org\"\n", "");
+        assert!(
+            scheme.contains("catalogue 'ftp://gdc.example.org' must be an http(s) URL"),
+            "{scheme}"
+        );
+        // The tables hold only their own keys.
+        let misplaced = error("[discovery]\nwis2_topic = \"weather\"\n", "");
+        assert!(
+            misplaced.contains("unknown field `wis2_topic`"),
+            "{misplaced}"
+        );
+        let inline: Result<ServerConfig, _> = toml::from_str(
+            "[server]\nhost = \"h\"\nport = 1\n[[collections]]\nid = \"c\"\ntitle = \"\"\n\
+             description = \"\"\n[collections.discovery]\ncatalogue = \"https://x\"\n",
+        );
+        assert!(inline
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field `catalogue`"),);
     }
 
     #[test]

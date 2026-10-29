@@ -13,3 +13,7 @@ poll_interval_secs = 60
 # Temperature (°C) and Mean Sea Level Pressure (hPa) take the built-in
 # temperature and pressure defaults, and the collection layer draws its
 # default Temperature with that style.
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes.
+[discovery]
+wis2_topic = "weather/prediction/forecast/short-range/deterministic/limited-area"

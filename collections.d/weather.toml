@@ -21,3 +21,7 @@ name = "temperature"
 colormap = "temperature"
 min = -35.0
 max = 5.0
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes.
+[discovery]
+wis2_topic = "weather/surface-based-observations/synop"

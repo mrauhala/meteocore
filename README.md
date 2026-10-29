@@ -510,6 +510,9 @@ port = 8000
 # render_concurrency = 24              # optional, render CPU slots (default 2× CPUs, min 8); restart to change
 # state_dir = "/var/lib/meteocore"      # optional, writable dir for engine state snapshots (WIS2 CAP alert sets, WIS2 BUFR report stores)
 
+# [discovery]                                   # optional, top-level config.toml only
+# catalogue = "https://wis2-gdc.weather.gc.ca"  # WIS2 Global Discovery Catalogue of WCMP2 records (default)
+
 [[collections]]
 id = "weather"
 title = "Finnish Weather Observations"
@@ -551,6 +554,10 @@ max_files = 24
 colormap = "radar_dbz"          # built-in colormap (or use color_stops for custom)
 # webp_quality = 80             # optional, default WebP quality 1-100 (100 = lossless,
                                 # the default); lossy suits continuous-tone layers
+
+[collections.discovery]         # optional, see Discovery below
+wis2_topic = "weather/surface-based-observations/weather-radar"
+# wcmp2_record = "urn:wmo:md:<centre-id>:<local-id>"
 ```
 
 ### Server Config Fields
@@ -581,11 +588,52 @@ colormap = "radar_dbz"          # built-in colormap (or use color_stops for cust
 | `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"`, `"satellite"`, `"netcdf"`, `"station-grid"` (station observations gridded on the fly) |
 | `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
 | `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name), optional `url` and optional `type`, the media type `url` serves (default `text/html`; only with `url`). When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. The `rel="license"` link carries the `type`. |
+| `discovery` | no | — | `[collections.discovery]` table: `wis2_topic`, a WIS2 topic served as the collection's `themes`, and `wcmp2_record`, a WCMP2 record id linked as `describedby`. See [Discovery](#discovery-wis2-topics-and-wcmp2-records). |
 | `wms` | no | — | WMS rendering config. Required when `apis` contains `"wms"`. |
 | `csv` | no | — | `engine_type = "csv"` only: `[collections.csv.map]`, the [station symbol layers](#station-symbol-layers). Any other key is a load error. |
 | `derive_wind` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve wind speed and direction derived from u/v components (see [Derived wind](#derived-wind-speed-and-direction)). `false` opts out; the key on any other engine type is a load error. |
 | `derive_geopotential_height` | no | on | `grib`, `zarr` and `netcdf` only: serve geopotential height derived from geopotential where the collection has none at that level (see [Derived geopotential height](#derived-geopotential-height)). `false` opts out; the key on any other engine type is a load error. |
 | `derive_humidity` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve relative humidity and dew point derived from their ingredients where the collection has none at that level (see [Derived relative humidity and dew point](#derived-relative-humidity-and-dew-point)). `false` opts out; the key on any other engine type is a load error. |
+
+### Discovery: WIS2 topics and WCMP2 records
+
+A collection can say what it is in the WMO WIS2 vocabulary (#1356), an
+experiment for the OGC MetOcean Common profile:
+
+```toml
+[collections.discovery]
+wis2_topic = "weather/prediction/forecast/medium-range/deterministic/global"
+wcmp2_record = "urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+```
+
+- `wis2_topic` is a topic of the [WIS2 Topic Hierarchy](https://github.com/wmo-im/wis2-topic-hierarchy)
+  from its earth-system-discipline level down, at any depth (`weather`,
+  `weather/prediction`, …), without the channel, centre or data-policy
+  levels. It is validated against the vendored release 1.3.0: an unknown
+  level is a load error naming the levels allowed there. Levels below an
+  `experimental` level are free. Every collection description (shared root,
+  `/edr`, Maps, Tiles, Features, and each `/collections` entry) then carries
+  it as `themes`: one theme of the scheme
+  `https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline`, one
+  concept per topic, its `id` the topic path, its `url` the scheme plus `/`
+  plus the path, and its `title` the hierarchy's description of the last
+  level.
+- A collection fed by a WIS2 subscription (`[cap.wis2]`, `[bufr.wis2]`)
+  needs no `wis2_topic`: each subscribed topic, without its
+  `{cache|origin}/a/wis2/{centre-id}/data/{core|recommended}/` levels and cut
+  at its first wildcard, gives a concept, down to the deepest level the
+  hierarchy has. A configured `wis2_topic` replaces them.
+- `wcmp2_record` (`urn:wmo:md:<centre-id>:<local-id>`) adds a link with
+  `rel: describedby` and `type: application/geo+json` to the record in the
+  WIS2 Global Discovery Catalogue, `<catalogue>/collections/wis2-discovery-metadata/items/<record>`.
+  The catalogue is the top-level `[discovery] catalogue` of `config.toml`
+  (default `https://wis2-gdc.weather.gc.ca`, http(s) only); a collection's
+  own `[discovery]` cannot set it. A reload that changes only the catalogue
+  rebuilds no engine.
+- `/collections?q=` and `query=` also match the topic: `/` separates words,
+  so `q=weather/prediction` finds every collection classified below it. The
+  HTML collection page and catalog rows show the topic as a chip that runs
+  that search, and link the record.
 
 ### Per-File Collection Configs
 

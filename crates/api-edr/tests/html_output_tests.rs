@@ -704,6 +704,7 @@ fn config(id: &str, title: &str) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        discovery: None,
         derive_humidity: None,
     }
 }
@@ -749,6 +750,7 @@ fn router() -> axum::Router {
         feature_engines,
         base_url: "https://example.org".to_string(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     })))
 }
 

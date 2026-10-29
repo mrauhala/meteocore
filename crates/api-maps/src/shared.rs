@@ -61,6 +61,10 @@ impl BuildingBlock for MapsBlock {
         handlers::request_base_url(&self.state.load(), headers)
     }
 
+    fn discovery(&self) -> ds_core::discovery::Discovery {
+        self.state.load().discovery.clone()
+    }
+
     fn collections(&self, root: &str) -> Vec<Contribution> {
         let state = self.state.load();
         state

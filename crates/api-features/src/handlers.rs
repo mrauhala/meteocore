@@ -12,6 +12,7 @@ use serde_json::{json, Map, Value};
 use api_common::{JsonError, JsonQuery, Mount};
 
 use ds_core::config::CollectionConfig;
+use ds_core::discovery::Discovery;
 use ds_core::feature::FeatureQuery;
 use ds_core::feature_engine::FeatureEngine;
 
@@ -27,6 +28,9 @@ use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_que
 pub struct FeaturesState {
     pub engines: HashMap<String, Arc<dyn FeatureEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
+    /// What collection descriptions read beyond their configs: the WIS2
+    /// discovery catalogue (#1356).
+    pub discovery: Discovery,
     /// Static fallback base URL for absolute links (e.g. "https://api.example.com").
     /// Used as-is unless `trust_proxy_headers` resolves a per-request value.
     pub base_url: String,
@@ -824,6 +828,7 @@ pub async fn collections(
                 metadata: build_collection_metadata(
                     engine.as_ref(),
                     config,
+                    &state.discovery,
                     state.vector_tileset_ids.contains(&config.id),
                     base,
                     root,
@@ -861,6 +866,7 @@ pub async fn collection(
     let metadata = build_collection_metadata(
         engine.as_ref(),
         config,
+        &state.discovery,
         state.vector_tileset_ids.contains(&id),
         base,
         root,
@@ -1361,6 +1367,7 @@ pub(crate) fn collection_parts(
 fn build_collection_metadata(
     engine: &dyn FeatureEngine,
     config: &CollectionConfig,
+    discovery: &Discovery,
     vector_tilesets: bool,
     base_url: &str,
     root: &str,
@@ -1395,5 +1402,5 @@ fn build_collection_metadata(
         }));
     }
 
-    api_common::collection_metadata(config, Value::Object(fields), links)
+    api_common::collection_metadata(config, discovery, Value::Object(fields), links)
 }

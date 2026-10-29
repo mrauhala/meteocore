@@ -223,6 +223,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -233,6 +234,7 @@ fn make_edr_state(engine: Arc<dyn EdrEngine>) -> Arc<ArcSwap<EdrState>> {
         styles: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     }))
 }
 
@@ -279,6 +281,7 @@ mod proxy_headers {
             engines: cur.engines.clone(),
             feature_engines: cur.feature_engines.clone(),
             collections: cur.collections.clone(),
+            discovery: Default::default(),
             styles: cur.styles.clone(),
             base_url: base_url.to_string(),
             trust_proxy_headers,
@@ -2226,6 +2229,7 @@ mod metadata_extras {
                 preview: None,
                 derive_wind: None,
                 derive_geopotential_height: None,
+                discovery: None,
                 derive_humidity: None,
             },
         );
@@ -2236,6 +2240,7 @@ mod metadata_extras {
             styles: HashMap::new(),
             base_url: String::new(),
             trust_proxy_headers: false,
+            discovery: Default::default(),
         }))
     }
 
@@ -2295,11 +2300,73 @@ mod metadata_extras {
     async fn no_keywords_or_license_when_unset() {
         let json = collection_json(Vec::new(), None).await;
         assert!(json.get("keywords").is_none());
+        assert!(json.get("themes").is_none());
         assert!(json["links"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|l| l["rel"] != "license"));
+            .all(|l| l["rel"] != "license" && l["rel"] != "describedby"));
+    }
+
+    /// WIS2 discovery (#1356): the topic is the collection's `themes`, the
+    /// WCMP2 record a typed `describedby` link into the state's catalogue,
+    /// and `q` finds the collection by a broader topic. The document and the
+    /// listing still validate against both EDR bundles.
+    #[tokio::test]
+    async fn wis2_topic_and_record_are_described_searchable_and_valid() {
+        let mut state = (**state_with(Vec::new(), None).load()).clone();
+        state.discovery = ds_core::discovery::Discovery::new(
+            ds_core::discovery::Catalogue::parse("https://gdc.example.org").unwrap(),
+        );
+        state.collections.get_mut("weather").unwrap().discovery = Some(
+            serde_json::from_value(serde_json::json!({
+                "wis2_topic": "weather/surface-based-observations/synop",
+                "wcmp2_record": "urn:wmo:md:fi-fmi:synop"
+            }))
+            .unwrap(),
+        );
+        let app = api_edr::router(Arc::new(ArcSwap::from_pointee(state)));
+        let get = |uri: &'static str| {
+            let app = app.clone();
+            async move {
+                let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+                let body = app.oneshot(req).await.unwrap().into_body();
+                let body = body.collect().await.unwrap().to_bytes();
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+        let detail = get("/collections/weather").await;
+        let list = get("/collections").await;
+        for (what, doc) in [("detail", &detail), ("listing", &list["collections"][0])] {
+            assert_eq!(
+                doc["themes"][0]["concepts"][0]["id"], "weather/surface-based-observations/synop",
+                "{what}"
+            );
+            let records: Vec<&Value> = doc["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["rel"] == "describedby")
+                .collect();
+            assert_eq!(records.len(), 1, "{what}");
+            assert_eq!(
+                records[0]["href"],
+                "https://gdc.example.org/collections/wis2-discovery-metadata/items/urn:wmo:md:fi-fmi:synop",
+                "{what}"
+            );
+            assert_eq!(records[0]["type"], "application/geo+json", "{what}");
+        }
+        edr_schema::assert_valid("/collections", JSON, &list, "listing");
+        edr_schema::assert_valid("/collections/{collectionId}", JSON, &detail, "detail");
+        let matched = |list: Value| list["numberMatched"].as_u64().unwrap();
+        assert_eq!(
+            matched(get("/collections?q=weather/surface-based-observations").await),
+            1
+        );
+        assert_eq!(
+            matched(get("/collections?q=weather/surface-based-obs").await),
+            0
+        );
     }
 }
 

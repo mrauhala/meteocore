@@ -129,6 +129,7 @@ where
             engines: HashMap::from([(id.to_string(), edr_engine)]),
             feature_engines: HashMap::new(),
             collections: HashMap::from([(id.to_string(), collection(id, engine_type, "edr"))]),
+            discovery: Default::default(),
             styles: HashMap::new(),
             base_url: String::new(),
             trust_proxy_headers: false,
@@ -731,6 +732,7 @@ fn a_netcdf_pressure_level_map_draws_the_elevation_asked_for() {
     let maps = api_maps::router(Arc::new(ArcSwap::from_pointee(api_maps::MapsState {
         engines: HashMap::from([(id.to_string(), meps_pl_engine() as Arc<dyn MapEngine>)]),
         collections: HashMap::from([(id.to_string(), collection(id, "netcdf", "maps"))]),
+        discovery: Default::default(),
         styles: HashMap::from([(id.to_string(), style())]),
         render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
         rendered_cache: Arc::new(RenderedCache::new(16)),

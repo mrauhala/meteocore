@@ -220,6 +220,7 @@ fn config(id: &str) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        discovery: None,
         derive_humidity: None,
     }
 }
@@ -243,6 +244,7 @@ fn router(flat: &Arc<Recorder>, levels: &Arc<Recorder>) -> axum::Router {
         feature_engines: HashMap::new(),
         base_url: String::new(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     })))
 }
 

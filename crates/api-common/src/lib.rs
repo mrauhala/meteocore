@@ -21,6 +21,7 @@ use ds_core::collection_search::{
     SearchQueryParams, DEFAULT_LIMIT, MAX_LIMIT,
 };
 use ds_core::config::CollectionConfig;
+use ds_core::discovery::Discovery;
 use ds_core::html::{self, LinkView, Wanted};
 use ds_core::map_engine::{CompositeDef, RasterInfo};
 use serde_json::{json, Value};
@@ -328,6 +329,7 @@ pub fn collections_response(
             title: &entry.config.title,
             description: &entry.config.description,
             keywords: &entry.config.keywords,
+            themes: theme_ids(&entry.metadata),
             // Search the extent a description may advertise: CRS84-normalized,
             // none for a box that describes no area.
             bbox: entry.bbox.and_then(ds_core::geo::crs84_extent),
@@ -454,8 +456,12 @@ fn rejected_search(surface: workbench::Surface<'_>, rejected: RejectedSearch) ->
 /// API fields override defaults (EDR instances have their own id/title). The
 /// caller supplies the self link and API-specific access links, plus fields such
 /// as extent, crs, data_queries or styles. All callers pass a JSON object.
+///
+/// The collection's WIS2 topics become its `themes`, and each WCMP2 record
+/// describing it a `describedby` link into `discovery`'s catalogue (#1356).
 pub fn collection_metadata(
     config: &CollectionConfig,
+    discovery: &Discovery,
     fields: Value,
     mut links: Vec<Value>,
 ) -> Value {
@@ -478,6 +484,14 @@ pub fn collection_metadata(
             );
         }
     }
+    for record in discovery.records(config) {
+        links.push(json!({
+            "href": discovery.catalogue().record_url(record),
+            "rel": "describedby",
+            "type": "application/geo+json",
+            "title": format!("{RECORD_LINK_TITLE}{record}")
+        }));
+    }
     let mut metadata = json!({
         "id": config.id, "title": config.title, "description": config.description,
         "links": links
@@ -485,10 +499,30 @@ pub fn collection_metadata(
     if !config.keywords.is_empty() {
         metadata["keywords"] = json!(config.keywords);
     }
+    let themes = ds_core::discovery::themes(&ds_core::discovery::topics(config));
+    if !themes.is_empty() {
+        metadata["themes"] = serde_json::to_value(themes).expect("themes serialize to JSON");
+    }
     if let (Some(target), Value::Object(fields)) = (metadata.as_object_mut(), fields) {
         target.extend(fields);
     }
     metadata
+}
+
+/// The title of a `describedby` link to a WCMP2 record, before the record id.
+pub const RECORD_LINK_TITLE: &str = "WIS2 discovery metadata (WCMP2): ";
+
+/// The concept ids of a collection description's `themes`, which `q` and
+/// `query` search: what the description advertises, nothing else.
+pub fn theme_ids(metadata: &Value) -> Vec<&str> {
+    metadata["themes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|theme| theme["concepts"].as_array())
+        .flatten()
+        .filter_map(|concept| concept["id"].as_str())
+        .collect()
 }
 
 /// Collection member listing the parameters a multi-parameter raster renders:
@@ -762,7 +796,7 @@ pub fn collection_parameters() -> Value {
             CollectionParameter::Datetime => (json!({"type": "string"}),
                 "Filter by temporal extent overlap with an RFC 3339 instant or interval (start/end, ../end, start/..). Unknown extents remain eligible.".into()),
             CollectionParameter::Q => (json!({"type": "array", "minItems": 1, "items": {"type": "string"}}),
-                "Case-insensitive text search over title, description and keywords. Comma-separated terms are OR; phrases match whole words with normalized whitespace within one property.".into()),
+                "Case-insensitive text search over title, description, keywords and theme concept ids (WIS2 topics such as weather/prediction, where / separates words, so a topic also finds the collections classified below it). Comma-separated terms are OR; phrases match whole words with normalized whitespace within one property.".into()),
             CollectionParameter::Query => (json!({"type": "array", "minItems": 1, "items": {"type": "string"}}),
                 "Text search with comma-separated OR alternatives. Within each alternative, + requires and - excludes the following term or phrase; required terms may match different properties. Phrases match within one property with normalized whitespace. Operators only apply at the start or after whitespace; internal signs are literal. Encode + as %2B. Empty alternatives or operators without an attached term return 400. Combined with q and other filters using AND.".into()),
             // OGC API - Common - Part 4 `sortby`, schema verbatim from the
@@ -852,7 +886,8 @@ mod tests {
             .unwrap();
             let self_link =
                 json!({"href": "https://x/c", "rel": "self", "type": "application/json"});
-            collection_metadata(&config, json!({}), vec![self_link])["links"].clone()
+            collection_metadata(&config, &Discovery::default(), json!({}), vec![self_link])["links"]
+                .clone()
         };
         let license = |links: &Value| {
             let links = links.as_array().unwrap();
@@ -878,6 +913,48 @@ mod tests {
         ));
         assert_eq!(pdf["href"], "https://x/terms.pdf");
         assert_eq!(pdf["type"], "application/pdf");
+    }
+
+    /// A collection's WIS2 topic is one `themes` concept (#1356), and its
+    /// WCMP2 record a typed `describedby` link into the catalogue; a
+    /// collection with neither has no `themes` member.
+    #[test]
+    fn discovery_is_described_as_themes_and_a_record_link() {
+        let config: CollectionConfig = serde_json::from_value(json!({
+            "id": "nwp", "title": "NWP", "description": "",
+            "discovery": {
+                "wis2_topic": "weather/prediction/forecast/medium-range/deterministic/global",
+                "wcmp2_record": "urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+            }
+        }))
+        .unwrap();
+        let metadata = collection_metadata(&config, &Discovery::default(), json!({}), vec![]);
+        assert_eq!(
+            metadata["themes"],
+            json!([{
+                "scheme": "https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline",
+                "concepts": [{
+                    "id": "weather/prediction/forecast/medium-range/deterministic/global",
+                    "title": "A prediction system that covers the entire globe",
+                    "url": "https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline/weather/prediction/forecast/medium-range/deterministic/global"
+                }]
+            }])
+        );
+        assert_eq!(
+            metadata["links"],
+            json!([{
+                "rel": "describedby", "type": "application/geo+json",
+                "title": "WIS2 discovery metadata (WCMP2): urn:wmo:md:int-ecmwf:aifs:oper:forecast",
+                "href": "https://wis2-gdc.weather.gc.ca/collections/wis2-discovery-metadata/items/urn:wmo:md:int-ecmwf:aifs:oper:forecast"
+            }])
+        );
+        assert!(metadata.get("keywords").is_none());
+
+        let plain: CollectionConfig =
+            serde_json::from_value(json!({"id": "c", "title": "C", "description": ""})).unwrap();
+        let metadata = collection_metadata(&plain, &Discovery::default(), json!({}), vec![]);
+        assert!(metadata.get("themes").is_none());
+        assert_eq!(metadata["links"], json!([]));
     }
 
     #[test]

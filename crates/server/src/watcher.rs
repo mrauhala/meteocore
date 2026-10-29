@@ -399,6 +399,7 @@ pub(crate) mod tests {
             &config.style_bundles,
             &config.server.base_url(),
             config.server.trust_proxy_headers,
+            &config.discovery(),
             config.server.metatile_cache_mb,
             config.rendered_cache_mb().0,
             ReusableCaches::default(),

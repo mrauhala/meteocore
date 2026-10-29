@@ -85,6 +85,11 @@ pub struct CollectionMatch<'a> {
     /// The collection's configured keywords (may be empty). Matched by `q`
     /// and `query` alongside title and description.
     pub keywords: &'a [String],
+    /// The ids of the theme concepts its description advertises (#1356),
+    /// WIS2 topic paths such as `weather/prediction/forecast`. Matched like
+    /// keywords; `/` separates words, so a broader topic matches the
+    /// deeper ones below it.
+    pub themes: Vec<&'a str>,
     /// CRS84 bbox `[west, south, east, north]`, if the collection has one.
     pub bbox: Option<[f64; 4]>,
     /// Temporal interval `(start, end)`, if the collection has one.
@@ -510,6 +515,7 @@ fn matches(it: &CollectionMatch, p: &SearchParams) -> bool {
     let fields: Vec<_> = [it.title, it.description]
         .into_iter()
         .chain(it.keywords.iter().map(String::as_str))
+        .chain(it.themes.iter().copied())
         .map(normalize_text)
         .collect();
     let contains = |term: &String| fields.iter().any(|field| text_match(field, term));
@@ -895,6 +901,7 @@ mod tests {
             title,
             description,
             keywords: &[],
+            themes: Vec::new(),
             bbox,
             time,
         }
@@ -911,6 +918,7 @@ mod tests {
             title,
             description,
             keywords,
+            themes: Vec::new(),
             bbox: None,
             time: None,
         }
@@ -1390,6 +1398,32 @@ mod tests {
         assert_eq!(n("snow"), 0);
     }
 
+    /// Theme concept ids are searched like keywords (#1356): a broader WIS2
+    /// topic finds the collections classified below it, a cut level none.
+    #[test]
+    fn q_and_query_match_theme_ids() {
+        let mut nwp = cm("ECMWF", "Forecast", None, None);
+        nwp.themes = vec!["weather/prediction/forecast/medium-range/deterministic/global"];
+        let mut radar = cm("Radar", "Composite", None, None);
+        radar.themes = vec!["weather/surface-based-observations/weather-radar"];
+        let items = [nwp, radar];
+        let matched =
+            |q: Option<&str>, query: Option<&str>| search(&items, &text_params(q, query)).page;
+        assert_eq!(matched(Some("weather/prediction"), None), [0]);
+        assert_eq!(
+            matched(
+                Some("weather/prediction/forecast/medium-range/deterministic/global"),
+                None
+            ),
+            [0]
+        );
+        assert_eq!(matched(Some("weather"), None), [0, 1]);
+        assert_eq!(matched(Some("weather-radar"), None), [1]);
+        assert!(matched(Some("weather/predictio"), None).is_empty());
+        assert!(matched(Some("weather/prediction/forecasts"), None).is_empty());
+        assert_eq!(matched(None, Some("weather -weather/prediction")), [1]);
+    }
+
     #[test]
     fn pagination_cursors() {
         let items: Vec<CollectionMatch> = (0..5).map(|_| cm("a", "", None, None)).collect();
@@ -1496,6 +1530,7 @@ mod tests {
             title,
             description: "",
             keywords: &[],
+            themes: Vec::new(),
             bbox: None,
             time: None,
         };

@@ -14,6 +14,7 @@ use api_common::subset::{self, RequestedTime, TimeSelection};
 use api_common::workbench::Surface;
 use api_common::{rel, JsonQuery, Mount};
 use ds_core::config::CollectionConfig;
+use ds_core::discovery::Discovery;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, FeatureQuery};
 use ds_core::feature_engine::FeatureEngine;
@@ -55,6 +56,9 @@ pub struct TilesState {
     /// Collections that can produce map tiles (raster rendering).
     pub map_engines: HashMap<String, Arc<dyn MapEngine>>,
     pub collections: HashMap<String, CollectionConfig>,
+    /// What collection descriptions read beyond their configs: the WIS2
+    /// discovery catalogue (#1356).
+    pub discovery: Discovery,
     pub styles: HashMap<String, HashMap<String, StyleInfo>>,
     /// Collections that can produce vector tiles (MVT). Keyed independently of
     /// `map_engines` — a collection may serve raster, vector, or both.
@@ -421,6 +425,7 @@ pub(crate) fn collection_parts(
 
 fn build_collection_metadata(
     sources: &TileSources<'_>,
+    discovery: &Discovery,
     styles: Option<&HashMap<String, StyleInfo>>,
     root: &str,
 ) -> serde_json::Value {
@@ -433,7 +438,7 @@ fn build_collection_metadata(
         "title": config.title
     })];
     links.extend(access);
-    api_common::collection_metadata(config, serde_json::Value::Object(fields), links)
+    api_common::collection_metadata(config, discovery, serde_json::Value::Object(fields), links)
 }
 
 /// Temporal extent precedence shared by discovery and metadata.
@@ -1303,6 +1308,7 @@ pub async fn collections(
             config: sources.config,
             metadata: build_collection_metadata(
                 &sources,
+                &state.discovery,
                 state.styles.get(&sources.config.id),
                 root,
             ),
@@ -1335,7 +1341,8 @@ pub async fn collection(
     let sources = tile_sources(&state, &id)?;
     let base = &request_base_url(&state, &headers);
     let root = &mount.root(base);
-    let metadata = build_collection_metadata(&sources, state.styles.get(&id), root);
+    let metadata =
+        build_collection_metadata(&sources, &state.discovery, state.styles.get(&id), root);
     Ok(with_vary(match wanted {
         Wanted::Json => Json(metadata).into_response(),
         Wanted::Html => Html(api_common::workbench::collection_html(
