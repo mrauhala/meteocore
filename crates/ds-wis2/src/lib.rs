@@ -16,6 +16,8 @@
 //! - [`spawn_pipeline`] — the three stages wired together, yielding
 //!   [`Resolved`] payloads on a channel.
 //! - [`Status`] — atomics an engine reads for `/health` and `/metrics`.
+//! - [`RecordLearner`] — the WCMP2 records notifications name
+//!   (`metadata_id`), learned into the server's registry (#1356).
 //!
 //! **Runtime rule:** everything here is async and must be spawned on the
 //! server's background poll runtime (`poll_runtime()`), never on the
@@ -27,6 +29,7 @@ pub mod notification;
 pub mod payload;
 pub mod pipeline;
 pub mod policy;
+pub mod records;
 pub mod status;
 pub mod subscriber;
 
@@ -36,6 +39,7 @@ pub use notification::{parse_notification, Content, Geometry, Integrity, Link, N
 pub use payload::{Payload, PayloadSource};
 pub use pipeline::{spawn_pipeline, Resolved};
 pub use policy::DownloadPolicy;
+pub use records::{learn_record, RecordLearner};
 pub use status::{DropReason, Status, StatusSnapshot};
 pub use subscriber::Subscriber;
 

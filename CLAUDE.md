@@ -1491,6 +1491,19 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   reaches descriptions as the `Discovery` in each API state, a
   `load_collections` argument taken from `AcceptedLoad`. A reload that
   changes only the catalogue therefore rebuilds no engine.
+- WIS2-fed collections learn the records their notifications name in
+  `metadata_id`. They go into the server's one
+  `ds_core::discovery::LearnedRecords`, held as
+  `ServerState::learned_records` and in every load's `Discovery`.
+  - Each id must parse as a `RecordId`. A collection keeps at most 64, keyed
+    by its own id, and they are not persisted.
+  - A configured `wcmp2_record` replaces the learned ones.
+  - An accepted reload drops the records of collections it removed, or that
+    no longer subscribe to WIS2.
+  - A new WIS2 engine embeds `ds_wis2::RecordLearner` and calls `learn` on
+    each notification it applies. `load_collections` connects it through
+    `learn_records_into`, and its subscription goes in
+    `discovery::subscriptions`.
 
 ## Admin & Operations
 

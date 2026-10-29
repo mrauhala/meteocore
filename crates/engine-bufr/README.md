@@ -56,6 +56,14 @@ memory, and answers EDR and Features queries from that store.
   `m2 s-2` among them, are served as given.
 - **WIS2 deletions**: a `rel=deletion` notification removes the rows its
   `data_id` produced. The last 200 000 `data_id`s are remembered.
+- **WIS2 discovery records**: the WCMP2 record each notification names
+  (`properties.metadata_id`) is linked from the collection's descriptions as
+  `describedby` (#1356), sorted by id. Ids that are not
+  `urn:wmo:md:<centre-id>:<local-id>` are ignored, and a collection keeps at
+  most 64, with one WARN when it turns one away. A configured
+  `[discovery] wcmp2_record` replaces them. They live in memory: a reload
+  keeps them, removing the collection drops them, and a restart relearns
+  them from the next notifications.
 - **Persistence (WIS2 only)**: with `[server] state_dir` set, the store is
   saved as gzip-compressed JSON to `<state_dir>/<collection id>.bufr.state`
   at most every five minutes when it changed, and at shutdown. The

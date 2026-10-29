@@ -393,13 +393,14 @@ pub(crate) mod tests {
             crate::colormaps::build_palette_registry(&config, config_path.parent())
                 .expect("test config palette registry builds"),
         );
+        let learned_records = Arc::new(ds_core::discovery::LearnedRecords::default());
         let result = load_collections(
             &style_ctx,
             &config.collections,
             &config.style_bundles,
             &config.server.base_url(),
             config.server.trust_proxy_headers,
-            &config.discovery(),
+            &config.discovery(learned_records.clone()),
             config.server.metatile_cache_mb,
             config.rendered_cache_mb().0,
             ReusableCaches::default(),
@@ -418,6 +419,7 @@ pub(crate) mod tests {
                 &config,
                 style_ctx,
                 crate::colormaps::style_config_fingerprint(&config, config_path.parent()),
+                learned_records.clone(),
             )))),
             recovery_shutdown: ds_poll::Shutdown::new(),
             config_path: config_path.to_str().unwrap().to_string(),
@@ -437,6 +439,7 @@ pub(crate) mod tests {
             nowcast_engines: RwLock::new(result.nowcast_engines),
             station_grid_engines: RwLock::new(result.station_grid_engines),
             reload_lock: tokio::sync::Mutex::new(()),
+            learned_records,
             admin_token: None,
             style_fingerprint: std::sync::atomic::AtomicU64::new(
                 crate::colormaps::style_config_fingerprint(&config, config_path.parent()),

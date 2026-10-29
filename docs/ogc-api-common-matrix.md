@@ -172,7 +172,7 @@ collection.
 | Collection identifier, title and description | Yes | Yes | Yes | Yes |
 | Collection keywords | Yes — configuration | Yes — configuration | Yes — configuration | Yes — configuration |
 | Collection `themes`: WIS2 topic | Yes — configuration or WIS2 subscription [13] | Yes — same [13] | Yes — same [13] | Yes — same [13] |
-| `describedby` link to a WCMP2 discovery record | Yes — when configured [13] | Yes — same [13] | Yes — same [13] | Yes — same [13] |
+| `describedby` link to a WCMP2 discovery record | Yes — configured, or learned from WIS2 notifications [13] | Yes — same [13] | Yes — same [13] | Yes — same [13] |
 | License links | Yes — when configured with a resolvable URL; `type` `text/html` or the configured `type` | Yes — same | Yes — same | Yes — same |
 | `attribution` / `attributionMediaType` | No | No | No | No |
 | `itemType` for individually accessible items | Omitted; EDR locations require applicability review | N/A — map access | N/A — tile access | Yes — `feature` |
@@ -338,7 +338,9 @@ collection.
     Hierarchy 1.3.0, or else from a collection's WIS2 subscriptions. A
     `[discovery] wcmp2_record` adds a `describedby` link of type
     `application/geo+json` to the record in the server's WIS2 Global
-    Discovery Catalogue. The shared root, `/edr`, Maps, Tiles and Features
+    Discovery Catalogue; without one, a WIS2-fed collection links each
+    valid record its notifications name in `metadata_id`, sorted by id, at
+    most 64. The shared root, `/edr`, Maps, Tiles and Features
     describe them alike, in each collection document and `/collections`
     entry, and the HTML pages show the topic and link the record. `q` and
     `query` match concept ids, `/` separating words. Without CQL2 (§9) the

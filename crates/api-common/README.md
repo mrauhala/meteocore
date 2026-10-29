@@ -136,11 +136,14 @@ for you.
   - Its `type` is `text/html` unless `[collections.license] type` is set.
   - A free-text title with no `url` gets no link.
 - A `describedby` link of type `application/geo+json` per WCMP2 record
-  describing the collection (`Discovery::records`: `[discovery]
-  wcmp2_record`), into the catalogue of the `Discovery` the caller passes,
-  the server-wide `[discovery] catalogue`. Every API state holds that
-  `Discovery`, built per accepted load; the shared root reads its first
-  block's and adds the link once, since blocks contribute no record links.
+  describing the collection, sorted by id (`Discovery::records`: the
+  configured `[discovery] wcmp2_record`, else the records a WIS2-fed
+  collection learned from its notifications' `metadata_id`, at most 64),
+  into the catalogue of the `Discovery` the caller passes, the server-wide
+  `[discovery] catalogue`. Every API state holds that `Discovery`, built
+  per accepted load over the server's one `LearnedRecords`; the shared root
+  reads its first block's and adds the links once, since blocks contribute
+  no record links.
 
 The API's own fields, such as `extent`, `crs`, `styles` and `data_queries`,
 are merged on top; EDR instances replace `id` and `title` this way.
