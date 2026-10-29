@@ -2490,6 +2490,10 @@ pub struct ServerState {
     pub station_grid_engines: RwLock<Vec<Arc<engine_station_grid::StationGridEngine>>>,
     /// Serializes reload requests to prevent concurrent reloads from racing.
     pub reload_lock: tokio::sync::Mutex<()>,
+    /// The WCMP2 records WIS2-fed collections learned from their
+    /// notifications (#1356): one for the process, in every load's
+    /// `Discovery` and every CAP and BUFR engine, so reloads keep them.
+    pub learned_records: Arc<ds_core::discovery::LearnedRecords>,
     /// Bearer token for admin endpoint authentication.
     /// If None, admin endpoints are disabled (return 403).
     pub admin_token: Option<String>,
@@ -4750,6 +4754,8 @@ pub fn load_collections(
                         }
                     },
                 };
+                // Reused or new, it learns into the server's one registry.
+                engine.learn_records_into(discovery.learned().clone());
                 engines_by_id.insert(collection.id.clone(), EngineHandle::Cap(engine.clone()));
 
                 cap_engines.push(engine.clone());
@@ -4882,6 +4888,7 @@ pub fn load_collections(
                         }
                     },
                 };
+                engine.learn_records_into(discovery.learned().clone());
                 engines_by_id.insert(collection.id.clone(), EngineHandle::Bufr(engine.clone()));
                 bufr_engines.push(engine.clone());
 
@@ -6600,7 +6607,12 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     let fingerprint = crate::colormaps::style_config_fingerprint(&config, config_dir.as_deref());
     apply_load(
         state,
-        Arc::new(AcceptedLoad::new(&config, style_ctx, fingerprint)),
+        Arc::new(AcceptedLoad::new(
+            &config,
+            style_ctx,
+            fingerprint,
+            state.learned_records.clone(),
+        )),
         false,
     )
 }
@@ -6626,10 +6638,13 @@ pub struct AcceptedLoad {
 }
 
 impl AcceptedLoad {
+    /// `learned` is the server's one record registry
+    /// ([`ServerState::learned_records`]).
     pub fn new(
         config: &ds_core::config::ServerConfig,
         styles: ds_render::StyleContext,
         fingerprint: u64,
+        learned: Arc<ds_core::discovery::LearnedRecords>,
     ) -> Self {
         Self {
             collections: config.collections.clone(),
@@ -6637,7 +6652,7 @@ impl AcceptedLoad {
             styles,
             base_url: config.server.base_url(),
             trust_proxy_headers: config.server.trust_proxy_headers,
-            discovery: config.discovery(),
+            discovery: config.discovery(learned),
             metatile_cache_mb: config.server.metatile_cache_mb,
             rendered_cache_mb: config.rendered_cache_mb().0,
             render_cache_sources: crate::cache_plan::RenderCacheSources::of(config),
@@ -6963,6 +6978,18 @@ fn apply_load(
     state
         .style_fingerprint
         .store(new_style_fp, std::sync::atomic::Ordering::Relaxed);
+    // Learned records (#1356) go with their collection: removed, or no
+    // longer fed by WIS2.
+    let wis2_fed: std::collections::HashSet<&str> = config
+        .collections
+        .iter()
+        .filter(|c| ds_core::discovery::is_wis2_fed(c))
+        .map(|c| c.id.as_str())
+        .collect();
+    config
+        .discovery
+        .learned()
+        .retain(|id| wis2_fed.contains(id));
 
     // Surface a vanished per-site radar in `/health`. A site that was
     // `Ready` in the live registry but is absent from the new scan (its
@@ -10488,8 +10515,13 @@ prewarm_sweeps = 0
             toml::from_str(&text).unwrap()
         };
         let accepted = |config: &ds_core::config::ServerConfig| {
-            super::AcceptedLoad::new(config, ds_render::StyleContext::with_builtins(), 0)
-                .rendered_cache_mb
+            super::AcceptedLoad::new(
+                config,
+                ds_render::StyleContext::with_builtins(),
+                0,
+                Default::default(),
+            )
+            .rendered_cache_mb
         };
         assert_eq!(accepted(&config("rendered_cache_mb = 64", &[512])), 64);
         assert_eq!(accepted(&config("", &[128, 512])), 512);
@@ -13619,6 +13651,210 @@ colormap = "no_such_map"
 
         cap.shutdown();
         bufr.shutdown();
+    }
+
+    /// WCMP2 records learned from WIS2 notifications (#1356): each valid
+    /// `metadata_id` becomes one `describedby` link, sorted by id, on EDR,
+    /// Features and the shared root; an invalid or repeated one adds
+    /// nothing; a configured record replaces the learned ones. A reload
+    /// that rebuilds a collection keeps its records and one that removes
+    /// it drops them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wis2_notifications_link_the_records_they_name() {
+        use tower::ServiceExt;
+        let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let cap = |id: &str, extra: &str| {
+            format!(
+                "[[collections]]\nid = \"{id}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"cap\"\napis = [\"features\"]\n{extra}\
+                 [collections.cap]\n[collections.cap.wis2]\nbroker = \"mqtt://127.0.0.1:1\"\n\
+                 topics = [\"cache/a/wis2/test/data/core/weather/advisories-warnings\"]\n"
+            )
+        };
+        let write = |obs_title: &str, with_cap: bool| {
+            let ready = format!(
+                "[[collections]]\nid = \"cap-file\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"cap\"\napis = [\"features\"]\n\
+                 [collections.cap]\ndata_path = \"{testdata}/cap\"\n"
+            );
+            let obs = format!(
+                "[[collections]]\nid = \"obs-wis2\"\ntitle = \"{obs_title}\"\ndescription = \"d\"\n\
+                 engine_type = \"bufr\"\napis = [\"edr\", \"features\"]\n\
+                 [collections.bufr]\nretention = \"P36500D\"\n[collections.bufr.wis2]\n\
+                 broker = \"mqtt://127.0.0.1:1\"\n\
+                 topics = [\"cache/a/wis2/test/data/core/weather/surface-based-observations/synop\"]\n"
+            );
+            let configured = cap(
+                "cap-configured",
+                "[collections.discovery]\nwcmp2_record = \"urn:wmo:md:test:configured\"\n",
+            );
+            let learning = if with_cap {
+                cap("cap-wis2", "")
+            } else {
+                String::new()
+            };
+            std::fs::write(
+                &config_path,
+                format!(
+                    "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                     {ready}{obs}{configured}{learning}"
+                ),
+            )
+            .unwrap();
+        };
+        let notification = |data_id: &str, metadata_id: &str| ds_wis2::Notification {
+            topic: "cache/a/wis2/test/data/core/weather".into(),
+            centre_id: None,
+            id: format!("id-{data_id}"),
+            data_id: data_id.into(),
+            pubtime: chrono::Utc::now(),
+            datetime: None,
+            start_datetime: None,
+            end_datetime: None,
+            geometry: None,
+            integrity: None,
+            content: None,
+            links: Vec::new(),
+            metadata_id: Some(metadata_id.into()),
+            wigos_station_identifier: None,
+            global_cache: None,
+            extra: Default::default(),
+        };
+        let payload = |bytes: Vec<u8>| ds_wis2::Payload {
+            bytes: bytes.into(),
+            source: ds_wis2::PayloadSource::Inline,
+            media_type: None,
+            verified: None,
+        };
+        let synop = std::fs::read(format!(
+            "{testdata}/bufr-synop/synop_se-smhi_20260912T0800Z.bufr"
+        ))
+        .unwrap();
+        let observe = |state: &super::AdminState, metadata_id: &str| {
+            let bufr = state.bufr_engines.read().unwrap()[0].clone();
+            bufr.apply_notification(ds_wis2::Resolved {
+                notification: notification("synop", metadata_id),
+                payload: Some(payload(synop.clone())),
+            });
+        };
+        let alert = std::fs::read(format!("{testdata}/cap/helsinki-flood.xml")).unwrap();
+        let warn = |state: &super::AdminState, id: &str, metadata_id: &str| {
+            let engines = state.cap_engines.read().unwrap();
+            let cap = engines.iter().find(|e| e.collection_id() == id).unwrap();
+            cap.wis2_source().unwrap().apply_with_hint(
+                ds_wis2::Resolved {
+                    notification: notification("alert", metadata_id),
+                    payload: Some(payload(alert.clone())),
+                },
+                None,
+                id,
+                chrono::Utc::now(),
+            );
+        };
+        // The `describedby` hrefs of a collection document, in order.
+        let records = |app: axum::Router, path: String| async move {
+            let request = axum::http::Request::builder()
+                .uri(path.as_str())
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{path}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            doc["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|l| l["rel"] == "describedby")
+                .map(|l| {
+                    let href = l["href"].as_str().unwrap();
+                    href.rsplit('/').next().unwrap().to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let surfaces = |state: &super::AdminState| {
+            let shared = api_common::shared::router(api_common::shared::SharedApi::new(
+                "",
+                vec![
+                    Arc::new(api_maps::MapsBlock::new(state.maps.clone())),
+                    Arc::new(api_tiles::TilesBlock::new(state.tiles.clone())),
+                    Arc::new(api_features::FeaturesBlock::new(state.features.clone())),
+                ],
+                vec![],
+            ));
+            [
+                ("edr", api_edr::router(state.edr.clone())),
+                ("features", api_features::router(state.features.clone())),
+                ("shared", shared),
+            ]
+        };
+        let described = |state: &super::AdminState, id: &'static str| {
+            let apps = surfaces(state);
+            async move {
+                let mut seen = Vec::new();
+                for (surface, app) in apps {
+                    if surface == "edr" && id != "obs-wis2" {
+                        continue;
+                    }
+                    seen.push((surface, records(app, format!("/collections/{id}")).await));
+                }
+                seen
+            }
+        };
+
+        write("v1", true);
+        let state = crate::watcher::tests::build_state(&config_path);
+        observe(&state, "urn:wmo:md:se-smhi:synop");
+        observe(&state, "urn:wmo:md:se-smhi:synop");
+        observe(&state, "not a record id");
+        observe(&state, "urn:wmo:md:fi-fmi:synop");
+        warn(&state, "cap-wis2", "urn:wmo:md:eu-eumetnet:warnings");
+        warn(&state, "cap-configured", "urn:wmo:md:eu-eumetnet:warnings");
+        let synop_records = ["urn:wmo:md:fi-fmi:synop", "urn:wmo:md:se-smhi:synop"];
+        for (surface, hrefs) in described(&state, "obs-wis2").await {
+            assert_eq!(hrefs, synop_records, "{surface}");
+        }
+        for (surface, hrefs) in described(&state, "cap-wis2").await {
+            assert_eq!(hrefs, ["urn:wmo:md:eu-eumetnet:warnings"], "{surface}");
+        }
+        for (surface, hrefs) in described(&state, "cap-configured").await {
+            assert_eq!(hrefs, ["urn:wmo:md:test:configured"], "{surface}");
+        }
+
+        // A changed title rebuilds the BUFR collection: its records stay,
+        // and its new engine learns into the same registry.
+        let old_bufr = state.bufr_engines.read().unwrap()[0].clone();
+        write("v2", true);
+        super::do_reload(&state).unwrap();
+        assert!(!Arc::ptr_eq(
+            &old_bufr,
+            &state.bufr_engines.read().unwrap()[0]
+        ));
+        for (surface, hrefs) in described(&state, "obs-wis2").await {
+            assert_eq!(hrefs, synop_records, "{surface}");
+        }
+        observe(&state, "urn:wmo:md:dk-dmi:synop");
+        assert_eq!(
+            state.learned_records.get("obs-wis2").unwrap().len(),
+            3,
+            "the rebuilt engine learns"
+        );
+
+        // Removing a collection drops what it learned.
+        write("v2", false);
+        super::do_reload(&state).unwrap();
+        assert!(state.learned_records.get("cap-wis2").is_none());
+        assert!(state.learned_records.get("obs-wis2").is_some());
+
+        for engine in state.cap_engines.read().unwrap().iter() {
+            engine.shutdown();
+        }
+        state.bufr_engines.read().unwrap()[0].shutdown();
+        old_bufr.shutdown();
     }
 
     #[test]

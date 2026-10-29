@@ -116,6 +116,14 @@ and as a map layer that can be drawn for any time.
   begins empty, and `/health` reports "warming up after cold start: N
   alerts received" for `warmup` after the subscription comes up. A
   snapshot older than `warmup` restarts the warm-up.
+- The WCMP2 record each notification names
+  (`properties.metadata_id`) is linked from the collection's descriptions as
+  `describedby` (#1356), sorted by id. Ids that are not
+  `urn:wmo:md:<centre-id>:<local-id>` are ignored, and a collection keeps at
+  most 64, with one WARN when it turns one away. A configured
+  `[discovery] wcmp2_record` replaces them. They live in memory: a reload
+  keeps them, removing the collection drops them, and a restart relearns
+  them from the next notifications.
 
 ## Configuration
 

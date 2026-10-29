@@ -2420,7 +2420,7 @@ fn discovery_rows(doc: &Value, catalog: &str, class: &str) -> String {
         .into_iter()
         .map(|id| anchor(&query_edit(catalog, "q", Some(id)), id, "chip"))
         .collect();
-    let records: String = doc["links"]
+    let records: Vec<String> = doc["links"]
         .as_array()
         .into_iter()
         .flatten()
@@ -2449,7 +2449,13 @@ fn discovery_rows(doc: &Value, catalog: &str, class: &str) -> String {
     } else {
         format!("<span class=\"chip-row\">{topics}</span>")
     };
-    row("WIS2 topic", &topics) + &row("Discovery record", &records)
+    // A WIS2-fed collection can learn several records (#1356).
+    let records_label = if records.len() > 1 {
+        "Discovery records"
+    } else {
+        "Discovery record"
+    };
+    row("WIS2 topic", &topics) + &row(records_label, &records.concat())
 }
 
 fn license_html(license: Option<&LicenseConfig>) -> String {
@@ -4054,6 +4060,23 @@ mod tests {
         assert!(
             row.contains(&format!("<div class=\"row-line\">{record}")),
             "{row}"
+        );
+        // Several learned records share one row, each its own link.
+        let link = |id: &str| {
+            json!({"rel": "describedby", "type": "application/geo+json",
+            "title": format!("WIS2 discovery metadata (WCMP2): {id}"),
+            "href": format!("https://gdc.example.org/items/{id}")})
+        };
+        let several =
+            json!({"id": "obs", "links": [link("urn:wmo:md:a:x"), link("urn:wmo:md:b:y")]});
+        let page = collection("https://example.test", "edr", &several, None);
+        assert!(
+            page.contains(
+                "<span class=\"row-label\">Discovery records</span>\
+                 <a class=\"record-link\" href=\"https://gdc.example.org/items/urn:wmo:md:a:x\">urn:wmo:md:a:x</a>\
+                 <a class=\"record-link\" href=\"https://gdc.example.org/items/urn:wmo:md:b:y\">urn:wmo:md:b:y</a></div>"
+            ),
+            "{page}"
         );
         // A collection with neither has neither row.
         let bare = collection("https://example.test", "edr", &json!({"id": "c"}), None);

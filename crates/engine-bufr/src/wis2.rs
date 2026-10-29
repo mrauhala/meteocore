@@ -84,6 +84,8 @@ pub struct Wis2Source {
     /// state snapshot's revision, so a started clock is written even before
     /// the first report arrives.
     clock_changes: AtomicU64,
+    /// The WCMP2 records notifications name (#1356).
+    pub(crate) records: ds_wis2::RecordLearner,
 }
 
 /// Which `(station, time)` rows each `data_id` is responsible for, so a
@@ -202,6 +204,7 @@ impl Wis2Source {
             warmup,
             clock: Mutex::new(WarmupClock::default()),
             clock_changes: AtomicU64::new(0),
+            records: ds_wis2::RecordLearner::default(),
         }
     }
 
@@ -430,8 +433,9 @@ impl Wis2Source {
         // never leave a subscriber behind.
     }
 
-    fn apply(&self, engine: &BufrEngine, r: Resolved) {
+    pub(crate) fn apply(&self, engine: &BufrEngine, r: Resolved) {
         let n = r.notification;
+        self.records.learn(engine.collection_id(), &n);
         let Some(payload) = r.payload else {
             self.delete(engine, &n.data_id);
             return;

@@ -244,14 +244,20 @@ impl ServerConfig {
     }
 
     /// What collection descriptions read beyond their collections' configs
-    /// (#1356): the configured `[discovery] catalogue`, else the default.
-    pub fn discovery(&self) -> crate::discovery::Discovery {
+    /// (#1356): the configured `[discovery] catalogue`, else the default,
+    /// and the records WIS2-fed collections learned, `learned`: the
+    /// server's one registry, so every load reads the same.
+    pub fn discovery(
+        &self,
+        learned: std::sync::Arc<crate::discovery::LearnedRecords>,
+    ) -> crate::discovery::Discovery {
         crate::discovery::Discovery::new(
             self.discovery
                 .as_ref()
                 .and_then(|d| d.catalogue.clone())
                 .unwrap_or_default(),
         )
+        .with_learned(learned)
     }
 }
 
@@ -7621,14 +7627,14 @@ colormap = "radar_dbz"
             Some("urn:wmo:md:int-ecmwf:aifs:oper:forecast")
         );
         assert_eq!(
-            config.discovery().catalogue().as_str(),
+            config.discovery(Default::default()).catalogue().as_str(),
             "https://gdc.example.org"
         );
         // Without the top-level table, records resolve in the default GDC.
         let config = load("", "").unwrap();
         assert!(config.collections[0].discovery.is_none());
         assert_eq!(
-            config.discovery().catalogue().as_str(),
+            config.discovery(Default::default()).catalogue().as_str(),
             crate::discovery::DEFAULT_CATALOGUE
         );
 
