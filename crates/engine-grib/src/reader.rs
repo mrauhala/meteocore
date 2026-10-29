@@ -40,8 +40,8 @@ pub(crate) fn fetch_message_bytes(
         Some(l) => l,
         None => {
             let meta = store.head(path).map_err(|e| {
-                DataServerError::Storage(format!(
-                    "Failed to HEAD {path} for tail-length resolution of {}: {e}",
+                e.with_storage_context(format!(
+                    "Failed to HEAD {path} for tail-length resolution of {}",
                     entry.param
                 ))
             })?;
@@ -65,12 +65,13 @@ pub(crate) fn fetch_message_bytes(
         .ok_or_else(|| {
             DataServerError::Storage(format!("Invalid GRIB message range for {}", entry.param))
         })?;
+    // An upstream that kept refusing the read stays `Unavailable`, each
+    // API's 503 (#1355).
     let bytes = store.get_range(path, range).map_err(|e| {
-        DataServerError::Storage(format!(
-            "Failed to fetch GRIB message {}/{}: {}",
+        e.with_storage_context(format!(
+            "Failed to fetch GRIB message {}/{}",
             entry.param,
             entry.level.map_or("sfc".to_string(), |l| l.to_string()),
-            e
         ))
     })?;
 

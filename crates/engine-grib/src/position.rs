@@ -277,7 +277,8 @@ impl GribEngine {
             fields.into_iter(),
             move |(param, index, url, entry, keys)| {
                 // Missing/unreadable fields stay null in position series. Deadlines
-                // and worker failures are fatal and are handled by the scheduler.
+                // and worker failures are fatal and are handled by the scheduler,
+                // and so is a store that kept refusing the read (#1355).
                 // CCSDS fields read only the blocks the points need (#1300),
                 // and fetch only their bytes when not cached whole (#1301).
                 let field = PointField {
@@ -303,6 +304,10 @@ impl GribEngine {
                             point[index] = value;
                         }
                     }
+                    // A throttled store is no unreadable field: the query
+                    // fails with it, each API's 503 with `Retry-After`,
+                    // rather than answer nulls a client would take as data.
+                    Err(error @ DataServerError::Unavailable(_)) => return Err(error),
                     Err(error) => {
                         tracing::debug!(parameter = %params[param], error = %error, "GRIB position field unavailable")
                     }

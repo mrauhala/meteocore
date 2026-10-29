@@ -4216,6 +4216,61 @@ async fn decode_exhaustion_is_503_not_a_successful_error_image() {
     assert!(response.headers().get("etag").is_none());
 }
 
+/// A data source that kept refusing every read through all of its store's
+/// retries (#1355).
+struct ThrottledEngine;
+impl MapEngine for ThrottledEngine {
+    fn get_raster_tile(
+        &self,
+        _: [f64; 4],
+        _: u32,
+        _: u32,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+        _: &OutputCrs,
+        _: Option<&str>,
+        _: Option<f64>,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Err(DataServerError::Unavailable(
+            "GET https://secret-bucket.example/radar.tif: 503 Service Unavailable: SlowDown".into(),
+        ))
+    }
+    fn raster_info(&self) -> RasterInfo {
+        PopulatedMockMapEngine.raster_info()
+    }
+}
+
+/// A render whose data source keeps refusing the reads (#1355) is the 503
+/// exception with `Retry-After: 10`, never the red error tile, and it names
+/// no upstream: on the direct path and the meta-tiled one (EPSG:3857).
+#[tokio::test]
+async fn an_unavailable_source_is_503_not_a_red_error_tile() {
+    let app = build_populated_router_with_engine(Arc::new(ThrottledEngine));
+    for view in [
+        "CRS=CRS:84&BBOX=20,60,25,65",
+        "CRS=EPSG:3857&BBOX=2226389,8399737,2782987,9349764",
+    ] {
+        let uri = format!(
+            "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&{view}\
+             &WIDTH=32&HEIGHT=32&FORMAT=image/png"
+        );
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{view}");
+        assert_eq!(response.headers()["retry-after"], "10", "{view}");
+        assert_eq!(response.headers()["content-type"], "text/xml", "{view}");
+        assert!(response.headers().get("etag").is_none(), "{view}");
+        assert!(response.headers().get("x-cache").is_none(), "{view}");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let xml = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            xml.contains("Data source temporarily unavailable, try again later"),
+            "{view}: {xml}"
+        );
+        assert!(!xml.contains("secret"), "{view}: {xml}");
+    }
+}
+
 struct DeadlineMockEngine {
     stalled: std::sync::atomic::AtomicBool,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,

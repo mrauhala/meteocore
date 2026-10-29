@@ -399,6 +399,18 @@ impl ObjectStore for MetaStore {
     }
 }
 
+/// An S3 store's retries in tests (#1355): three, a millisecond or two
+/// apart, where [`crate::S3_RETRY`] waits seconds.
+pub(crate) const QUICK_S3_RETRY: object_store::RetryConfig = object_store::RetryConfig {
+    backoff: object_store::BackoffConfig {
+        init_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(2),
+        base: 2.0,
+    },
+    max_retries: 3,
+    retry_timeout: Duration::from_secs(10),
+};
+
 /// The object a [`RangeServer`] serves.
 #[derive(Debug)]
 pub(crate) struct RangeObject {

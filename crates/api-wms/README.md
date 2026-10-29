@@ -134,7 +134,9 @@ PNG is written 8-bit indexed when the image has at most 256 colours, else
 RGBA. A view with no data is the empty image (`x-cache: EMPTY`): `BGCOLOR`,
 or transparent with `TRANSPARENT=TRUE` in PNG or WebP. A render that fails
 in the engine is a red image with HTTP 200 (`x-cache: ERROR`), its cause
-only in the server log. Both come in the requested `FORMAT`.
+only in the server log. Both come in the requested `FORMAT`. A render whose
+object store kept answering 429, 502, 503 or 504 through all of its retries
+is no red image but the 503 exception, with `Retry-After: 10`.
 
 ### Several layers
 
@@ -356,7 +358,8 @@ features a table of its fields and one per feature.
   in GetMap's render queue and run on the query runtime EDR uses, one layer
   after another, under one deadline of their own,
   `MC_FEATURE_INFO_TIMEOUT_MS` (10 s), which also covers the wait for a
-  render slot. Overload or expiry is 503 with `Retry-After: 1`. An engine
+  render slot. Overload or expiry is 503 with `Retry-After: 1`, an object
+  store that keeps refusing the read 503 with `Retry-After: 10`. An engine
   failure is HTTP 500 with a generic message, its detail only in the server
   log, and the layers after it are not read.
 
@@ -401,8 +404,11 @@ A request error is a WMS 1.3.0 `ServiceExceptionReport` served as
 
 An internal error is HTTP 500 with code `Internal` and a generic message.
 An overloaded or timed-out request is HTTP 503 with code `Internal`,
-"Server busy, try again later" and `Retry-After: 1`. The detail of both is
-only in the server log.
+"Server busy, try again later" and `Retry-After: 1`. A request whose object
+store kept answering 429, 502, 503 or 504 through all of its retries is
+HTTP 503 with code `Internal`, "Data source temporarily unavailable, try
+again later" and `Retry-After: 10`. The detail of each is only in the
+server log, at WARN for the last.
 
 ## Deviations from WMS 1.3.0
 
@@ -412,7 +418,8 @@ only in the server log.
 - `EXCEPTIONS` is ignored: errors are always the XML report. `INIMAGE` and
   `BLANK` are not offered.
 - A GetMap whose render fails in the engine returns the red error image
-  with HTTP 200, not an exception.
+  with HTTP 200, not an exception. An overloaded, timed-out or upstream
+  throttled render is the 503 exception instead.
 - `TIME` and `ELEVATION` take one value: no lists, intervals or `current`.
 - Styles come from the server's configuration only: no `SLD` or `SLD_BODY`.
 - `EPSG:3067` covers only the hemisphere within 90° of longitude of 27°E,

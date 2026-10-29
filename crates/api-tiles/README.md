@@ -119,6 +119,9 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
   tile route. 404: unknown collection, style or tile matrix set, or a tile
   outside the matrix. 422: a vector tile over 50 000 features. 500: generic
   message. 503 + `Retry-After: 1`: render slots, deadline or memory exhausted.
+  503 `SourceUnavailable` + `Retry-After: 10`: the data's object store kept
+  answering 429, 502, 503 or 504 through all of its retries. Its
+  description names no upstream; the server logs the error at WARN.
 
 ## Conformance
 

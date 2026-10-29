@@ -49,11 +49,43 @@ pub enum DataServerError {
     #[error("Storage error: {0}")]
     Storage(String),
 
+    /// An upstream data source that kept refusing a read through all of the
+    /// store's retries: its last answer was a 429, 502, 503 or 504 (#1355).
+    /// Every API answers it with HTTP 503 and `Retry-After`
+    /// ([`Self::UNAVAILABLE_RETRY_AFTER_SECS`]) and the generic
+    /// [`Self::UNAVAILABLE_DESCRIPTION`]: the detail names the upstream, so
+    /// it goes to the log only, at WARN.
+    #[error("Data source unavailable: {0}")]
+    Unavailable(String),
+
     #[error("Render error: {0}")]
     Render(String),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl DataServerError {
+    /// The `Retry-After` of an [`Self::Unavailable`] answer, in seconds.
+    /// Longer than the busy answer's 1 s: an upstream that throttles keeps
+    /// at it for minutes.
+    pub const UNAVAILABLE_RETRY_AFTER_SECS: u64 = 10;
+
+    /// The client-facing description of an [`Self::Unavailable`] answer. It
+    /// names no upstream (root CLAUDE.md, Critical Rule 11).
+    pub const UNAVAILABLE_DESCRIPTION: &'static str =
+        "Data source temporarily unavailable, try again later";
+
+    /// A store read's error with `context` added, as an engine that wraps
+    /// one reports it: an [`Self::Unavailable`] stays one, so the APIs still
+    /// answer it with their 503 (#1355), and any other error becomes a
+    /// [`Self::Storage`] naming it.
+    pub fn with_storage_context(self, context: impl std::fmt::Display) -> Self {
+        match self {
+            Self::Unavailable(detail) => Self::Unavailable(format!("{context}: {detail}")),
+            other => Self::Storage(format!("{context}: {other}")),
+        }
+    }
 }
 
 /// Carries a human-readable error reason across the axum middleware stack via
@@ -66,3 +98,31 @@ pub enum DataServerError {
 /// framework dependency itself, which keeps ds-core framework-free.
 #[derive(Debug, Clone)]
 pub struct ErrorReason(pub String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An upstream's refusal keeps its variant through an engine's context;
+    /// any other error becomes the storage error it always was.
+    #[test]
+    fn storage_context_keeps_an_unavailable_source() {
+        let wrapped = DataServerError::Unavailable("503 Slow Down".into())
+            .with_storage_context("Failed to fetch GRIB message 10u/10");
+        match wrapped {
+            DataServerError::Unavailable(detail) => {
+                assert_eq!(detail, "Failed to fetch GRIB message 10u/10: 503 Slow Down")
+            }
+            other => panic!("{other:?}"),
+        }
+        let wrapped = DataServerError::Storage("connection reset".into())
+            .with_storage_context("Failed to fetch GRIB message 10u/10");
+        match wrapped {
+            DataServerError::Storage(detail) => assert_eq!(
+                detail,
+                "Failed to fetch GRIB message 10u/10: Storage error: connection reset"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+}

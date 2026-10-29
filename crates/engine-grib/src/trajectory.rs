@@ -105,7 +105,8 @@ impl GribEngine {
     /// [`FieldPlan`] (#1297): the field is fetched and decoded once,
     /// sampled at every point the path reads from it, and released. A
     /// missing or unreadable field stays null, as in a position series;
-    /// deadlines are fatal.
+    /// deadlines are fatal, and so is a store that kept refusing the read
+    /// (`Unavailable`, #1355).
     fn sample_trajectory(
         &self,
         plan: &TrajectoryPlan,
@@ -177,6 +178,9 @@ impl GribEngine {
             |(p, f, samples)| {
                 match samples {
                     Ok(samples) => values[p][f] = samples,
+                    // A throttled store is no unreadable field: the query
+                    // fails with it, each API's 503 with `Retry-After`.
+                    Err(error @ DataServerError::Unavailable(_)) => return Err(error),
                     Err(error) => tracing::debug!(
                         parameter = %params[p],
                         error = %error,

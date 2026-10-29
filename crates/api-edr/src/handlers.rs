@@ -516,9 +516,11 @@ fn render_coverage_response(
 }
 
 /// Map an engine error from a data query to its HTTP response: request
-/// errors → 400, absent resources → 404, everything else a generic 500
-/// (logged under `label`). One home for the four data-query handlers so a
-/// new `DataServerError` variant cannot map differently per query type.
+/// errors → 400, absent resources → 404, a data source that kept refusing
+/// the read → 503 `SourceUnavailable` with `Retry-After: 10` (logged at
+/// WARN under `label`, #1355), everything else a generic 500 (logged at
+/// ERROR). One home for the four data-query handlers so a new
+/// `DataServerError` variant cannot map differently per query type.
 pub(crate) fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
     match e {
         DataServerError::DeadlineExceeded => query_timeout(),
@@ -526,6 +528,10 @@ pub(crate) fn map_query_error(e: &DataServerError, label: &str) -> HandlerError 
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"code": "ServerBusy", "description": "Server busy, try again later"})),
         ),
+        DataServerError::Unavailable(_) => {
+            tracing::warn!("{label} query error: {e}");
+            api_common::source_unavailable()
+        }
         DataServerError::InvalidParameter(_)
         | DataServerError::InvalidBbox(_)
         | DataServerError::InvalidDatetime(_)
@@ -996,6 +1002,7 @@ const SHARED_RESPONSES: [(u16, &str, &str); 6] = [
         503,
         "ServiceUnavailable",
         "The query executor or the response memory budget is at capacity (ServerBusy, with \
+         Retry-After), a data source keeps refusing reads (SourceUnavailable, with a longer \
          Retry-After), or a response would exceed its configured budget (ResponseLimit); retry \
          later, or narrow the request.",
     ),
@@ -4285,4 +4292,64 @@ fn data_link(query_type: &str, link: &serde_json::Value) -> serde_json::Value {
         _ => link["variables"]["title"].as_str().unwrap_or(query_type),
     };
     json!({"href": link["href"], "rel": "data", "type": link["type"], "title": title})
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    /// A log sink a `fmt` subscriber writes its lines to.
+    #[derive(Clone, Default)]
+    struct Lines(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A data source that kept refusing the read (#1355) is logged at WARN,
+    /// not ERROR: the line holds the whole error, the upstream and its
+    /// status included, which the 503's body does not.
+    #[test]
+    fn an_unavailable_source_is_logged_at_warn_with_the_upstream_status() {
+        let lines = Lines::default();
+        let sink = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || sink.clone())
+            .finish();
+        let error = DataServerError::Unavailable(
+            "Failed to fetch GRIB message 10u/sfc: Error performing GET \
+             https://bucket.example/10u.grib2 - Server returned non-2xx status code: \
+             503 Service Unavailable: SlowDown"
+                .into(),
+        );
+        let response = tracing::subscriber::with_default(subscriber, || {
+            map_query_error(&error, "Area").into_response()
+        });
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "10");
+        let logged = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logged.lines().count(), 1, "{logged}");
+        assert!(logged.contains(" WARN "), "{logged}");
+        assert!(
+            logged.contains("Area query error: Data source unavailable: Failed to fetch GRIB"),
+            "{logged}"
+        );
+        assert!(
+            logged.contains("503 Service Unavailable: SlowDown"),
+            "{logged}"
+        );
+    }
 }

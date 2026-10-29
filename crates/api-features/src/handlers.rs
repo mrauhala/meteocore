@@ -148,10 +148,15 @@ type HandlerError = JsonError;
 /// analysis cap) is a 400 with its message, a missing feature a 404, an
 /// engine that is not ready or busy (`ResourceExhausted`, as a station grid
 /// whose residuals are still being computed answers, or `DeadlineExceeded`)
-/// a 503 with `Retry-After`, and anything else a 500 that names nothing
-/// internal.
+/// a 503 with `Retry-After`, a data source that kept refusing the read
+/// (`Unavailable`, #1355) the shared `SourceUnavailable` 503, and anything
+/// else a 500 that names nothing internal.
 fn engine_failure(e: &ds_core::error::DataServerError, route: &str) -> Response {
     use ds_core::error::DataServerError as E;
+    if let E::Unavailable(_) = e {
+        tracing::warn!("Features {route} error: {e}");
+        return api_common::source_unavailable().into_response();
+    }
     let (status, code, description) = match e {
         E::InvalidParameter(_)
         | E::InvalidBbox(_)

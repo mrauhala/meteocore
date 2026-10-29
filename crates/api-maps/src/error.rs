@@ -15,10 +15,20 @@ pub enum MapsError {
     Internal(String),
     /// Server too busy (render semaphore exhausted).
     ServiceUnavailable(String),
+    /// A data source that kept refusing the render's reads
+    /// (`DataServerError::Unavailable`, #1355): a 503 with `Retry-After: 10`.
+    SourceUnavailable,
 }
 
 impl IntoResponse for MapsError {
     fn into_response(self) -> axum::response::Response {
+        let retry_after = match &self {
+            MapsError::ServiceUnavailable(_) => Some(1),
+            MapsError::SourceUnavailable => {
+                Some(ds_core::error::DataServerError::UNAVAILABLE_RETRY_AFTER_SECS)
+            }
+            _ => None,
+        };
         let (status, code, description) = match &self {
             MapsError::NotFound(msg) => (StatusCode::NOT_FOUND, "NotFound", msg.as_str()),
             MapsError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BadRequest", msg.as_str()),
@@ -36,6 +46,12 @@ impl IntoResponse for MapsError {
                 "ServerBusy",
                 "Server busy, try again later",
             ),
+            // Names no upstream: the handler logs the detail at WARN.
+            MapsError::SourceUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                api_common::SOURCE_UNAVAILABLE,
+                ds_core::error::DataServerError::UNAVAILABLE_DESCRIPTION,
+            ),
         };
 
         let reason = ds_core::error::ErrorReason(format!("{code}: {description}"));
@@ -44,11 +60,10 @@ impl IntoResponse for MapsError {
             Json(json!({ "code": code, "description": description })),
         )
             .into_response();
-        if status == StatusCode::SERVICE_UNAVAILABLE {
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("1"),
-            );
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, axum::http::HeaderValue::from(seconds));
         }
         response.extensions_mut().insert(reason);
         response
@@ -112,6 +127,22 @@ mod tests {
             !reason.0.contains("secret"),
             "inner detail must not leak via ErrorReason, got {:?}",
             reason.0
+        );
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+    }
+
+    /// A data source that keeps refusing reads (#1355) is its own 503: a
+    /// longer `Retry-After` than the busy answer, and a description naming
+    /// no upstream.
+    #[test]
+    fn source_unavailable_is_a_503_with_a_longer_retry_after() {
+        let response = MapsError::SourceUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "10");
+        let reason = response.extensions().get::<ErrorReason>().unwrap();
+        assert_eq!(
+            reason.0,
+            "SourceUnavailable: Data source temporarily unavailable, try again later"
         );
     }
 }

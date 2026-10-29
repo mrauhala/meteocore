@@ -668,7 +668,8 @@ impl NetcdfEngine {
     /// positions asked of it. Fields are read through
     /// `ds_executor::field_jobs`, four reads at a time, each under the
     /// query's deadline; a failed read fails the query, never a null: a
-    /// replaced file or the decode budget is a 503, the deadline a 504, any
+    /// replaced file or the decode budget is a 503, so is a host that kept
+    /// refusing the read (`Unavailable`, #1355), the deadline a 504, any
     /// other failure a 500. A field with no position on the grid is not
     /// read ([`Sampling::is_read`]), nor is its step before: its values are
     /// null, as the read would sample them, and a point far off a remote

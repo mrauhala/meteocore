@@ -33,6 +33,10 @@ pub enum WmsError {
     Internal(String),
     /// Server too busy (render semaphore exhausted).
     ServiceUnavailable(String),
+    /// A data source that kept refusing the reads
+    /// (`DataServerError::Unavailable`, #1355): the busy answer's 503, with
+    /// `Retry-After: 10` and a message of its own that names no upstream.
+    SourceUnavailable,
 }
 
 impl WmsError {
@@ -85,7 +89,7 @@ impl WmsError {
             WmsError::LayerNotQueryable(_) => "LayerNotQueryable",
             WmsError::InvalidPoint(_) => "InvalidPoint",
             WmsError::Internal(_) => "Internal",
-            WmsError::ServiceUnavailable(_) => "Internal",
+            WmsError::ServiceUnavailable(_) | WmsError::SourceUnavailable => "Internal",
         }
     }
 
@@ -112,14 +116,29 @@ impl WmsError {
             | WmsError::InvalidPoint(m) => m,
             WmsError::Internal(_) => "Internal server error",
             WmsError::ServiceUnavailable(_) => "Server busy, try again later",
+            WmsError::SourceUnavailable => ds_core::error::DataServerError::UNAVAILABLE_DESCRIPTION,
         }
     }
 
     fn status_code(&self) -> StatusCode {
         match self {
             WmsError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            WmsError::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+            WmsError::ServiceUnavailable(_) | WmsError::SourceUnavailable => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             _ => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    /// The seconds a 503 asks the client to wait (`Retry-After`): the busy
+    /// answer's 1, a data source's 10 (#1355).
+    fn retry_after(&self) -> Option<u64> {
+        match self {
+            WmsError::ServiceUnavailable(_) => Some(1),
+            WmsError::SourceUnavailable => {
+                Some(ds_core::error::DataServerError::UNAVAILABLE_RETRY_AFTER_SECS)
+            }
+            _ => None,
         }
     }
 
@@ -149,6 +168,7 @@ impl WmsError {
 impl IntoResponse for WmsError {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
+        let retry_after = self.retry_after();
         let reason =
             ds_core::error::ErrorReason(format!("{}: {}", self.error_code(), self.message()));
         let xml = self.to_xml();
@@ -167,11 +187,10 @@ impl IntoResponse for WmsError {
             xml,
         )
             .into_response();
-        if status == StatusCode::SERVICE_UNAVAILABLE {
-            response.headers_mut().insert(
-                header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("1"),
-            );
+        if let Some(seconds) = retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, axum::http::HeaderValue::from(seconds));
         }
         response.extensions_mut().insert(reason);
         response
@@ -231,6 +250,24 @@ mod tests {
             "inner panic detail must not leak via ErrorReason, got {:?}",
             reason.0
         );
+    }
+
+    /// A data source that keeps refusing reads (#1355) is the busy
+    /// answer's 503 ServiceException with a longer `Retry-After` and a
+    /// message of its own.
+    #[test]
+    fn source_unavailable_is_a_503_with_a_longer_retry_after() {
+        let xml = String::from_utf8(WmsError::SourceUnavailable.to_xml()).unwrap();
+        assert!(
+            xml.contains("Data source temporarily unavailable, try again later"),
+            "{xml}"
+        );
+        let response = WmsError::SourceUnavailable.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "10");
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/xml");
+        let busy = WmsError::ServiceUnavailable("shed".into()).into_response();
+        assert_eq!(busy.headers()[header::RETRY_AFTER], "1");
     }
 
     #[test]

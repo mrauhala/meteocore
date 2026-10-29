@@ -14,6 +14,9 @@ pub struct Reads {
     pub attempts: BTreeMap<String, usize>,
     pub completed: Vec<String>,
     pub fail_once: HashSet<String>,
+    /// Paths whose every GET fails as a bucket that kept answering
+    /// `503 SlowDown` through object_store's retries does (#1355).
+    pub throttled: HashSet<String>,
     pub ranges: Vec<(String, Option<object_store::GetRange>)>,
     /// The thread each instrumented GET ran on, in `ranges` order.
     pub threads: Vec<String>,
@@ -89,6 +92,7 @@ impl ObjectStore for TestStore {
                 .push(thread.name().unwrap_or_default().to_owned());
             reads.fail_once.remove(path.as_ref())
         };
+        let throttled = self.reads.lock().unwrap().throttled.contains(path.as_ref());
         let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
         let _active = InFlight(&self.active);
         self.peak.fetch_max(active, Ordering::SeqCst);
@@ -109,6 +113,15 @@ impl ObjectStore for TestStore {
             Err(object_store::Error::Generic {
                 store: "scan test",
                 source: std::io::Error::other("transient index failure").into(),
+            })
+        } else if throttled {
+            // object_store's wording for the last answer, which ds-storage
+            // reads the status from.
+            Err(object_store::Error::Generic {
+                store: "S3",
+                source: "Server returned non-2xx status code: 503 Service Unavailable: \
+                         <Error><Code>SlowDown</Code></Error>"
+                    .into(),
             })
         } else {
             self.inner.get_opts(path, options).await

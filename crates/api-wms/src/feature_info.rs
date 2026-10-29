@@ -585,6 +585,11 @@ async fn read_layers(
             Err(e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded)) => {
                 return Err(WmsError::ServiceUnavailable(e.to_string()));
             }
+            // A data source that kept refusing the read (#1355).
+            Err(e @ DataServerError::Unavailable(_)) => {
+                tracing::warn!("WMS GetFeatureInfo error for layer '{}': {e}", query.layer);
+                return Err(WmsError::SourceUnavailable);
+            }
             Err(
                 e @ (DataServerError::InvalidParameter(_)
                 | DataServerError::InvalidDatetime(_)

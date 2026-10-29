@@ -108,6 +108,36 @@ impl MapEngine for InvalidParamEngine {
     }
 }
 
+/// A `MapEngine` whose data source kept refusing every read through all of
+/// its store's retries (#1355): `get_raster_tile` is `Unavailable`, its
+/// detail naming the upstream and its status.
+struct ThrottledEngine;
+
+/// What [`ThrottledEngine`] fails with, which no client may see.
+const UPSTREAM: &str = "Failed to fetch GRIB message 10u/sfc: Error performing GET \
+    https://bucket.example/10u.grib2 - Server returned non-2xx status code: \
+    503 Service Unavailable: SlowDown";
+
+impl MapEngine for ThrottledEngine {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        _width: u32,
+        _height: u32,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Err(DataServerError::Unavailable(UPSTREAM.into()))
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        MockMapEngine::make_info()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -696,6 +726,30 @@ mod get_tile {
                 .unwrap_or_default()
                 .contains("parameter"),
             "the helpful engine message must reach the client, got {json}"
+        );
+    }
+
+    /// A data source that keeps refusing the tile's reads (#1355) is a 503
+    /// `SourceUnavailable` with `Retry-After: 10`, never a 500, and its body
+    /// names no upstream.
+    #[tokio::test]
+    async fn render_from_an_unavailable_source_is_503_naming_no_upstream() {
+        let app = build_router_with_engine(Arc::new(ThrottledEngine));
+        let req = Request::builder()
+            .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers()["retry-after"], "10");
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "code": "SourceUnavailable",
+                "description": "Data source temporarily unavailable, try again later",
+            })
         );
     }
 

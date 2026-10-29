@@ -200,6 +200,7 @@ async fn html_error(
     let root = format!("{base}{mount}");
     let page = ErrorPage {
         status,
+        code: body["code"].as_str(),
         description: body["description"].as_str(),
         detail: &detail,
         uri: &uri,
@@ -263,6 +264,8 @@ fn vary_accept(headers: &mut HeaderMap) {
 /// One failed request, as its HTML page describes it.
 struct ErrorPage<'a> {
     status: StatusCode,
+    /// The JSON body's code.
+    code: Option<&'a str>,
     /// The JSON body's description: the client-visible message.
     description: Option<&'a str>,
     detail: &'a ErrorDetail,
@@ -280,10 +283,12 @@ impl ErrorPage<'_> {
         let none = ErrorDetail::default();
         let detail = if server_error { &none } else { self.detail };
         let message = if server_error {
-            if self.status == StatusCode::SERVICE_UNAVAILABLE {
-                "The server is busy. Try again in a moment."
-            } else {
+            if self.status != StatusCode::SERVICE_UNAVAILABLE {
                 "The server could not complete this request."
+            } else if self.code == Some(crate::SOURCE_UNAVAILABLE) {
+                "A data source is not answering for now. Try again in a few seconds."
+            } else {
+                "The server is busy. Try again in a moment."
             }
         } else {
             detail
@@ -564,6 +569,10 @@ mod tests {
                     )
                 }),
             )
+            .route(
+                "/collections/{id}/throttled",
+                get(|| async { crate::source_unavailable() }),
+            )
             .route("/ok", get(|| async { Json(json!({"ok": true})) }));
         // Nested as the server nests the EDR router.
         Router::new().nest("/edr", html_errors(router, "edr", "/edr", Arc::new(Pages)))
@@ -774,6 +783,21 @@ mod tests {
         assert!(!html.contains("/var/x"));
         assert!(html.contains("The server could not complete this request."));
         assert!(!html.contains("Back to other"));
+    }
+
+    /// A data source that keeps refusing reads (#1355) is a 503 page that
+    /// says so, keeping the JSON answer's `Retry-After`.
+    #[tokio::test]
+    async fn an_unavailable_source_is_a_page_of_its_own() {
+        let uri = "/edr/collections/radar/throttled?f=html";
+        let (response, html) = fetch(&app(), uri, None).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "10");
+        assert!(
+            html.contains("A data source is not answering for now."),
+            "{html}"
+        );
+        assert!(!html.contains("The server is busy"), "{html}");
     }
 
     #[test]

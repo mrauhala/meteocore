@@ -40,16 +40,31 @@ pub enum Tiles3dError {
     BadRequest(String),
     /// Server temporarily overloaded → 503.
     ServiceUnavailable(String),
+    /// A data source that kept refusing the reads
+    /// (`DataServerError::Unavailable`, #1355) → 503 with `Retry-After: 10`
+    /// and a message naming no upstream.
+    SourceUnavailable,
     /// Internal failure → 500 (details logged, not leaked to the client).
     Internal(String),
 }
 
 impl IntoResponse for Tiles3dError {
     fn into_response(self) -> Response {
+        let retry_after = match self {
+            Tiles3dError::ServiceUnavailable(_) => Some(1),
+            Tiles3dError::SourceUnavailable => {
+                Some(ds_core::error::DataServerError::UNAVAILABLE_RETRY_AFTER_SECS)
+            }
+            _ => None,
+        };
         let (status, message) = match self {
             Tiles3dError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             Tiles3dError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             Tiles3dError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+            Tiles3dError::SourceUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                ds_core::error::DataServerError::UNAVAILABLE_DESCRIPTION.to_string(),
+            ),
             // Don't leak internal detail to the client (CLAUDE.md code style).
             Tiles3dError::Internal(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -57,10 +72,10 @@ impl IntoResponse for Tiles3dError {
             ),
         };
         let mut response = (status, Json(json!({ "error": message }))).into_response();
-        if status == StatusCode::SERVICE_UNAVAILABLE {
+        if let Some(seconds) = retry_after {
             response.headers_mut().insert(
                 axum::http::header::RETRY_AFTER,
-                axum::http::HeaderValue::from_static("1"),
+                axum::http::HeaderValue::from(seconds),
             );
         }
         response
@@ -73,6 +88,11 @@ impl From<ds_core::error::DataServerError> for Tiles3dError {
         match e {
             E::ResourceExhausted | E::DeadlineExceeded => {
                 Tiles3dError::ServiceUnavailable(e.to_string())
+            }
+            // Logged at WARN: an upstream's throttling is no server fault.
+            E::Unavailable(_) => {
+                tracing::warn!("3D Tiles content error: {e}");
+                Tiles3dError::SourceUnavailable
             }
             E::InvalidParameter(m)
             | E::InvalidBbox(m)
@@ -92,5 +112,25 @@ impl From<ds_executor::ExecutionError> for Tiles3dError {
             ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
             other => Self::ServiceUnavailable(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ds_core::error::DataServerError;
+
+    /// A data source that keeps refusing reads (#1355) is a 503 with a
+    /// longer `Retry-After` than the busy answer, naming no upstream.
+    #[test]
+    fn an_unavailable_source_is_a_503_naming_no_upstream() {
+        let error = Tiles3dError::from(DataServerError::Unavailable(
+            "GET https://bucket.example/pvol.h5: 503 Slow Down".into(),
+        ));
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "10");
+        let busy = Tiles3dError::from(DataServerError::ResourceExhausted).into_response();
+        assert_eq!(busy.headers()[axum::http::header::RETRY_AFTER], "1");
     }
 }

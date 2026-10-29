@@ -735,8 +735,8 @@ impl GribEngine {
             return Ok(None);
         };
         let bytes = self.source.store.get_range(path, absolute).map_err(|e| {
-            DataServerError::Storage(format!(
-                "Failed to fetch GRIB message range {}/{}: {e}",
+            e.with_storage_context(format!(
+                "Failed to fetch GRIB message range {}/{}",
                 entry.param,
                 entry.level.map_or("sfc".to_string(), |l| l.to_string()),
             ))

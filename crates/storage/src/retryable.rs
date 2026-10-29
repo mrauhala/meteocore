@@ -164,7 +164,7 @@ mod tests {
     use object_store::path::Path;
 
     use super::*;
-    use crate::test_store::RangeServer;
+    use crate::test_store::{RangeServer, QUICK_S3_RETRY};
 
     /// The counts of `host`, as `(collection, status, count)`.
     fn counts(host: &str) -> Vec<(Option<String>, u16, u64)> {
@@ -215,7 +215,7 @@ mod tests {
     async fn an_s3_slowdown_counts_for_the_collection_and_host() {
         let (server, host) = server_with("/bucket/object");
         fail_next(&server, &["503 Slow Down"]);
-        let store = crate::build_s3_store_from_parts(&server.url, "bucket")
+        let store = crate::s3_store_from_parts(&server.url, "bucket", QUICK_S3_RETRY)
             .unwrap()
             .for_collection("nwp-slowdown");
         let added = added(&host, || {

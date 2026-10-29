@@ -34,6 +34,12 @@ const ALL: &[&str] = &[
 ];
 const RUN: &str = "2026-06-07T00:00:00Z";
 
+/// What a throttled stub's queries fail with: the upstream and its answer,
+/// which no client may see.
+const UPSTREAM: &str = "Failed to fetch GRIB message 10u/sfc: Generic S3 error: \
+    Error performing GET https://bucket.example/ifs/10u.grib2 - Server returned non-2xx \
+    status code: 503 Service Unavailable: SlowDown";
+
 fn run() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 6, 7, 0, 0, 0).unwrap()
 }
@@ -48,6 +54,9 @@ enum Answer {
     Late,
     /// An engine failure: the generic 500.
     Broken,
+    /// `Unavailable`: a data source that kept refusing the read, the 503
+    /// `SourceUnavailable` (#1355).
+    Throttled,
 }
 
 struct Stub {
@@ -87,6 +96,7 @@ impl Stub {
             Answer::Busy => Err(DataServerError::ResourceExhausted),
             Answer::Late => Err(DataServerError::DeadlineExceeded),
             Answer::Broken => Err(DataServerError::Engine("boom".into())),
+            Answer::Throttled => Err(DataServerError::Unavailable(UPSTREAM.into())),
         }
     }
 }
@@ -209,8 +219,9 @@ fn config(id: &str) -> CollectionConfig {
     }
 }
 
-/// `obs` answers every query type with data; `busy`, `late` and `broken`
-/// fail every one; `grid` has no locations, as a gridded engine does not.
+/// `obs` answers every query type with data; `busy`, `late`, `broken` and
+/// `throttled` fail every one; `grid` has no locations, as a gridded engine
+/// does not.
 fn app() -> axum::Router {
     let stub = |types, answer| Stub { types, answer };
     let engines = vec![
@@ -218,6 +229,7 @@ fn app() -> axum::Router {
         ("busy", stub(ALL, Answer::Busy)),
         ("late", stub(ALL, Answer::Late)),
         ("broken", stub(ALL, Answer::Broken)),
+        ("throttled", stub(ALL, Answer::Throttled)),
         ("grid", stub(&["position", "area", "radius"], Answer::Data)),
     ];
     let state = EdrState {
@@ -242,6 +254,7 @@ struct Reply {
     status: StatusCode,
     content_type: String,
     etag: Option<String>,
+    retry_after: Option<String>,
     body: Value,
 }
 
@@ -260,16 +273,18 @@ async fn send(app: &axum::Router, uri: &str, if_none_match: Option<&str>) -> Rep
             .get(name)
             .map(|v| v.to_str().unwrap().to_string())
     };
-    let (status, content_type, etag) = (
+    let (status, content_type, etag, retry_after) = (
         resp.status(),
         value(header::CONTENT_TYPE).unwrap_or_default(),
         value(header::ETAG),
+        value(header::RETRY_AFTER),
     );
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     Reply {
         status,
         content_type,
         etag,
+        retry_after,
         body: serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     }
 }
@@ -411,6 +426,7 @@ fn cases() -> Vec<(String, String, StatusCode)> {
                 ("busy", S::SERVICE_UNAVAILABLE),
                 ("late", S::GATEWAY_TIMEOUT),
                 ("broken", S::INTERNAL_SERVER_ERROR),
+                ("throttled", S::SERVICE_UNAVAILABLE),
             ] {
                 let uri = format!("/collections/{collection}{prefix}/{request}");
                 let path = format!("/edr/collections/{collection}{path_prefix}/{path}");
@@ -446,6 +462,39 @@ async fn every_status_a_route_answers_is_documented_for_it() {
                 assert!(reply.body[member].is_string(), "{uri}: {}", reply.body);
             }
         }
+    }
+}
+
+/// A data source that keeps refusing reads (#1355) fails every data query,
+/// instance routes included, with the 503 `SourceUnavailable`: a longer
+/// `Retry-After` than the busy answer's, and a description that names no
+/// upstream.
+#[tokio::test]
+async fn an_unavailable_source_is_a_503_naming_no_upstream() {
+    let app = app();
+    let throttled: Vec<String> = cases()
+        .into_iter()
+        .map(|(uri, _, _)| uri)
+        .filter(|uri| uri.starts_with("/collections/throttled/"))
+        .collect();
+    for query in ["/position?", "/area?", "/instances/"] {
+        assert!(
+            throttled.iter().any(|uri| uri.contains(query)),
+            "{query}: {throttled:#?}"
+        );
+    }
+    for uri in throttled {
+        let reply = send(&app, &uri, None).await;
+        assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        assert_eq!(reply.retry_after.as_deref(), Some("10"), "{uri}");
+        assert_eq!(
+            reply.body,
+            json!({
+                "code": "SourceUnavailable",
+                "description": "Data source temporarily unavailable, try again later",
+            }),
+            "{uri}"
+        );
     }
 }
 
@@ -659,10 +708,10 @@ async fn every_operation_lists_its_status_classes_and_parameters() {
             (&json!("form"), &json!(false))
         );
     }
-    // obs, busy, late and broken: seven query paths and four instance
-    // routes each; grid: position, area and radius, on the collection and
-    // on its run.
-    assert_eq!(queries, 4 * 11 + 2 * 3);
+    // obs, busy, late, broken and throttled: seven query paths and four
+    // instance routes each; grid: position, area and radius, on the
+    // collection and on its run.
+    assert_eq!(queries, 5 * 11 + 2 * 3);
     for path in [
         "/edr/collections/obs/instances",
         "/edr/collections/obs/instances/{instanceId}",
