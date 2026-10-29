@@ -55,6 +55,9 @@ y_wind_10m = "10 m wind along the grid's y axis"
 # The collection's own palette, for a variable no default matches: the
 # temperature palette over its own -90…50 °C, the first variable's.
 colormap = "temperature"
+# A WebP request without a quality of its own is lossy at 80: continuous
+# palettes exceed PNG8's 256 colours (README, "Choosing an image format").
+webp_quality = 80
 
 # Deliberately narrower than the default's ±40 m/s for wind components,
 # so common 10 m winds span the whole palette.

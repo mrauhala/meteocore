@@ -35,6 +35,9 @@ parameters = ["TMP", "DPT", "PRMSL", "UGRD", "VGRD", "GUST", "TCDC", "PRATE"]
 colormap = "pressure"
 min = 950.0
 max = 1050.0
+# A WebP request without a quality of its own is lossy at 80: continuous
+# palettes exceed PNG8's 256 colours (README, "Choosing an image format").
+webp_quality = 80
 
 # Named styles expose explicit fields through Maps collection discovery.
 [[wms.styles]]

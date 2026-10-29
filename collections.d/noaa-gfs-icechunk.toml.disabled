@@ -38,3 +38,6 @@ region = "us-west-2"
 # over its own -90…50 °C, as the layer's default.
 [wms]
 colormap = "temperature"
+# A WebP request without a quality of its own is lossy at 80: continuous
+# palettes exceed PNG8's 256 colours (README, "Choosing an image format").
+webp_quality = 80

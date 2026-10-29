@@ -344,6 +344,18 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   it; the meta-tile key needs none (its tiles are RGBA, encoded per
   request). Never re-derive the format from `params.format` after that
   point, or lossy and lossless responses alias in the rendered cache.
+- Continuous palettes: recommend lossy WebP, never switch formats (#1338).
+  A continuous palette (temperature, pressure, precipitation: linear stops)
+  draws more than 256 colours, so `encode_png` falls back to 32-bit RGBA: a
+  1024² temperature GetMap was 650–920 KB as PNG and 18–42 KB as
+  `image/webp` at `QUALITY=80` in a production deployment, for +3–4 ms of
+  encoding; precipitation with rain in view was 4–8× smaller. GetMap answers
+  the `FORMAT` asked for (PNG when absent), so the server cannot choose: the
+  advice lives in the README ("Choosing an image format") and in
+  `webp_quality = 80` in the shipped GRIB/NetCDF/Zarr NWP examples. Do not
+  change the server default: radar and discrete-class palettes stay lossless
+  (PNG8, or WebP 100), because lossy coding blurs class edges and shifts
+  pixels off the palette.
 
 ## Capabilities niceties
 

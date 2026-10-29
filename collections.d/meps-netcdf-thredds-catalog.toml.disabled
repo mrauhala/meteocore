@@ -89,6 +89,9 @@ y_wind_10m = "10 m wind along the grid's y axis"
 # take the built-in default their name and unit select.
 [wms]
 colormap = "temperature"
+# A WebP request without a quality of its own is lossy at 80: continuous
+# palettes exceed PNG8's 256 colours (README, "Choosing an image format").
+webp_quality = 80
 
 [[wms.parameters]]
 name = "x_wind_10m"

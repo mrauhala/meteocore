@@ -2059,14 +2059,23 @@ For multi-parameter engines, GetCapabilities emits a parent layer with no `<Name
 | `BBOX` | yes | Bounding box — axis order depends on CRS (see below) |
 | `WIDTH` | yes | Image width in pixels (max 8000) |
 | `HEIGHT` | yes | Image height in pixels (max 8000) |
-| `FORMAT` | yes | `image/png`, `image/jpeg`, or `image/webp` |
+| `FORMAT` | no | `image/png` (the default when absent), `image/jpeg`, or `image/webp`; see [Choosing an image format](#choosing-an-image-format) |
 | `STYLES` | no | One style name per layer, by position (empty or missing = `default`; `STYLES=a,,b`) |
 | `TIME` | no | ISO 8601 timestamp; defaults to the latest available |
 | `TRANSPARENT` | no | `FALSE` (default, as WMS 1.3.0 specifies) returns an opaque image with nodata painted in `BGCOLOR`; `TRUE` keeps nodata transparent. Send `TRUE` for a layer overlaid on others; OpenLayers' WMS sources do unless told otherwise. With several layers it applies once, to the image they make together |
 | `BGCOLOR` | no | `0xRRGGBB` background for `TRANSPARENT=FALSE` and JPEG output; default `0xFFFFFF` (white) |
 | `QUALITY` | no | Vendor parameter: encoder quality, an integer from 1 to 100, for `image/webp` and `image/jpeg`. WebP 1–99 is lossy at that quality, 100 lossless; without it WebP uses the collection's `[wms] webp_quality`, else lossless. JPEG defaults to 85. With `image/png`, or out of range, it is `InvalidParameterValue` (400). GetMap only: GetLegendGraphic ignores it and stays lossless. |
 
-Lossy WebP suits continuous-tone layers such as satellite IR, where a frame is several times smaller and faster to encode than lossless. Its alpha plane stays lossless, so `TRANSPARENT=TRUE` nodata stays exactly transparent. Keep colormapped layers with discrete classes, such as radar, lossless: lossy coding blurs class edges and shifts pixels off the palette. The rendered-image cache and the ETag key on the quality actually used, so a lossy and a lossless image of one view are never mixed up.
+### Choosing an image format
+
+The server encodes the format the request names, WMS `FORMAT` or Maps and Tiles `f`, and PNG when it names none; it never picks a format on its own. PNG is lossless, and an image of at most 256 colours, such as radar or another palette of discrete classes, is an 8-bit indexed PNG. A continuous palette (temperature, pressure, precipitation, wind, cloud cover: colours interpolated between stops) draws more than 256 colours in almost any view, so its PNG falls back to 32-bit RGBA and is large. Request continuous layers, NWP fields above all, as lossy WebP at a quality around 80:
+
+- WMS `FORMAT=image/webp&QUALITY=80`; Maps and Tiles `f=image/webp&quality=80`. A collection's `[wms] webp_quality = 80` sets that quality for every WebP request to it that names none, in all three APIs; the shipped GRIB, NetCDF and Zarr NWP examples set it. PNG and JPEG requests are unaffected.
+- In a production deployment, 1024 × 1024 temperature GetMaps were 650–920 KB as PNG and 18–42 KB as WebP at quality 80, 20–36 times smaller, for 3–4 ms more encoding. Precipitation frames with rain in view were 4–8 times smaller. A 24-frame animation drops from about 20 MB to under 1 MB, and on most client links the transfer, not the render, sets the frame rate: at 20 Mbit/s one PNG frame takes about 300 ms to arrive.
+- The committed GFS 2 m temperature fixture (`testdata/grib-gfs-complex`, 1°), drawn with the `noaa-gfs` example's style at 1024 × 1024 over Europe in EPSG:3857, is 792 KB as PNG, 343 KB as lossless WebP and 22 KB as WebP at quality 80.
+- Keep radar and other discrete-class palettes lossless: PNG, or WebP at quality 100, which is also WebP's default when the collection sets no `webp_quality`. Lossy coding blurs class edges and shifts pixels off the palette.
+
+Lossy WebP keeps its alpha plane lossless, so `TRANSPARENT=TRUE` nodata stays exactly transparent. The rendered-image cache and the ETag key on the quality actually used, so a lossy and a lossless image of one view are never mixed up.
 
 ### WMS 1.3.0 BBOX Axis Order
 
@@ -2303,7 +2312,7 @@ Or attach a reusable `[[style_bundles]]` block defined in top-level `config.toml
 | `styles` | no | — | Array of named styles |
 | `parameters` | no | — | Per-parameter default-style overrides (multi-parameter engines) |
 | `rendered_cache_mb` | no | — | Deprecated: set `[server] rendered_cache_mb` instead. The rendered-image cache is one server-wide cache; this key sizes it only while the `[server]` key is unset, and then the largest value among the WMS, Maps and Tiles collections wins. Either case logs a warning. |
-| `webp_quality` | no | lossless | Default quality, 1–100, for this collection's `image/webp` maps and tiles in WMS, Maps and Tiles: 1–99 lossy, 100 lossless. A request's own `QUALITY` / `quality` wins, including 100 for lossless. Not applied to JPEG. Validated at load. Collection-level only; style bundles do not carry it. |
+| `webp_quality` | no | lossless | Default quality, 1–100, for this collection's `image/webp` maps and tiles in WMS, Maps and Tiles: 1–99 lossy, 100 lossless. A request's own `QUALITY` / `quality` wins, including 100 for lossless. Not applied to JPEG. Validated at load. Collection-level only; style bundles do not carry it. 80 suits continuous NWP layers: see [Choosing an image format](#choosing-an-image-format). |
 
 ### Limits
 

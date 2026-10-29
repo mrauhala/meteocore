@@ -25,3 +25,6 @@ poll_interval_secs = 300
 # The collection's own layer draws the first variable, `msl`: the pressure
 # palette over its own 950…1050 hPa.
 colormap = "pressure"
+# A WebP request without a quality of its own is lossy at 80: continuous
+# palettes exceed PNG8's 256 colours (README, "Choosing an image format").
+webp_quality = 80
