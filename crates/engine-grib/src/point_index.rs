@@ -395,6 +395,26 @@ impl GribEngine {
         })
     }
 
+    /// Accept `bytes`, `field`'s whole message, as a position query's first
+    /// read of it does before the message cache admits it, for the
+    /// pre-warm (#1335): build its point index when [`Self::point_index_for`]
+    /// allows, else decode it in full. `field.coords` is empty: nothing is
+    /// sampled, and a later query samples from the index alone.
+    pub(crate) fn index_message(
+        &self,
+        field: &PointField<'_>,
+        bytes: &[u8],
+    ) -> Result<(), DataServerError> {
+        let entry = field.entry;
+        match self.point_index_for(entry, field.plan.fill) {
+            Some(index) => {
+                let key = MessageKey::new(Path::from(field.url).as_ref(), entry);
+                self.points_from(index, &key, field, bytes).map(drop)
+            }
+            None => reader::decode_message(bytes, &entry.param).map(drop),
+        }
+    }
+
     /// The point index, when this field may be read through it: the index is
     /// enabled, the parameter's messages have not shown a layout it cannot
     /// read, and the field is not one the decoded-grid cache would keep with

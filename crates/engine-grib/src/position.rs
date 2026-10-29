@@ -253,6 +253,18 @@ impl GribEngine {
                     })
             })
             .collect();
+        // A new run's steps of the parameter levels position queries read
+        // are pre-warmed (#1335); a derived wind reads its components here.
+        if let Some(prewarm) = &self.source.prewarm {
+            let read: HashSet<_> = fields
+                .iter()
+                .map(|(param, index, ..)| (*param, index % level_keys.len()))
+                .collect();
+            prewarm.reads.note(
+                read.into_iter()
+                    .filter_map(|(param, level)| level_keys[level].get(&params[param])),
+            );
+        }
         // What the messages weigh in the compressed-message cache; a tail
         // record of unknown length is fetched whole and not counted.
         let message_bytes = fields.iter().filter_map(|field| field.3.length).sum();

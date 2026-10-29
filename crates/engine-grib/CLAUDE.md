@@ -304,6 +304,38 @@ on the request path. Single-level and legacy views require exact metadata.
   stick. Map fills (`read`) are never kept: one-off reads must leave first.
   `message_cache::tests::a_full_cache_keeps_a_cold_position_window_for_its_next_run`
   pins it through the real position path.
+- Pre-warm (#1335, `prewarm.rs`): position queries note per source the
+  `ParameterKey` of every message they read (`RecentReads`, once per query
+  in `sample_parameters`, at most 256 keys, memory only: after a restart
+  nothing pre-warms until clients read again). A derived wind notes its
+  u/v; WMS GetFeatureInfo counts (it is a position query); area, radius,
+  cube, trajectory and maps do not. After `scan_at` publishes,
+  `prewarm_new_steps` takes the newest run's messages of the keys read
+  within 24 h that the previous catalog lacked, earliest steps first,
+  within 25 % of `message_cache_mb` per run, stopping at the first that
+  does not fit. A key is skipped while `holds` rejects its own messages
+  over the run (a query over it goes `Partial`); the other keys are still
+  planned. Checking all keys together would switch the pre-warm off where
+  it matters: five keys × 85 steps of 0.25° IFS is about 640 MB against a
+  512 MiB cache. Fetches run as `run_field_jobs` at 2 in flight on the
+  scan's runtime (the poll runtime), each a
+  `get_range_on_with_budget(.., FetchBudget::Background)`, under a 120 s
+  deadline per poll, which the poll loop waits for. Each message is
+  accepted as a query's first read accepts it (`index_message`: point
+  index, else full decode) before admission. Messages a poll did not fetch
+  (failed, cut off, over the share) are left to queries; later polls
+  consider only newer messages.
+- `MessageCache::prewarm` fetches outside the single-flight, so a request
+  never waits on a background GET past its deadline. It then claims the key
+  with zero wait, inserts and `keep`s it: in a full cache an unkept fill
+  goes to the cold ring and the next one evicts it
+  (`prewarm::tests::a_prewarm_into_a_full_cache_keeps_every_message_it_fetched`
+  fails without `keep`). Resident messages are not fetched; a fill counts no
+  hit or miss. With `prewarm` on, the cache is built `prewarmed()` (the
+  cache-plan caveat). `/metrics`: `grib_prewarm_{gets,bytes,hits}_total`;
+  hits counts a pre-warmed message's first request read, from an unread set
+  of at most 4096 keys pruned to resident ones before each pre-warm.
+  `[grib] prewarm = false` turns it off.
 - Key by source-local path, offset and indexed length. Like the decoded cache,
   this assumes immutable files at a given path/offset; engine reconstruction
   clears both caches. Changing the cache configuration triggers reconstruction

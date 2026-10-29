@@ -29,6 +29,7 @@ mod point_index;
 #[cfg(test)]
 mod point_index_tests;
 mod position;
+mod prewarm;
 pub mod reader;
 #[cfg(test)]
 mod retained_runs_tests;
@@ -233,6 +234,9 @@ struct GribSource {
     point_fields: point_index::PointFields,
     /// GETs and bytes the point path fetched, by mode (#1301).
     point_fetches: point_index::PointFetches,
+    /// What position queries read, to pre-warm a new run's steps of it
+    /// (#1335); `None` when `prewarm` is off or there is no message cache.
+    prewarm: Option<prewarm::Prewarm>,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
     /// Allowed parameters (None = all).
@@ -457,7 +461,12 @@ impl GribEngine {
         };
 
         let grid_cache = GridCache::new(config.grid_cache_mb);
-        let message_cache = message_cache::MessageCache::new(config.message_cache_mb);
+        let mut message_cache = message_cache::MessageCache::new(config.message_cache_mb);
+        if config.prewarm {
+            // Filled ahead of its reads: its churn reports say so (#1335).
+            message_cache = message_cache.map(message_cache::MessageCache::prewarmed);
+        }
+        let prewarm = prewarm::Prewarm::new(config.prewarm, message_cache.as_ref());
 
         let index_format = index::IndexFormat::from_config(config.index_format.as_deref())
             .ok_or_else(|| {
@@ -479,6 +488,7 @@ impl GribEngine {
                 point_index: point_index::PointIndex::new(config.effective_point_index_cache_mb()),
                 point_fields: point_index::PointFields::default(),
                 point_fetches: point_index::PointFetches::default(),
+                prewarm,
                 shutdown: Shutdown::new(),
                 param_filter: config.parameters.clone(),
                 time_window,
@@ -735,7 +745,8 @@ impl GribEngine {
         );
 
         // Start from existing catalog for incremental merge
-        let mut new_catalog = (*self.source.catalog.load_full()).clone();
+        let previous = self.source.catalog.load_full();
+        let mut new_catalog = (*previous).clone();
         let mut ambiguities = diagnostics::IndexAmbiguities::default();
 
         // Fetch one bounded chunk at a time: get_many retains the completed
@@ -908,6 +919,10 @@ impl GribEngine {
         // /collections endpoint returns empty labels/units until the first
         // actual query is served.
         self.probe_new_parameters();
+
+        // Fetch the new steps' messages of what position queries read
+        // (#1335), so their first query of the new run reads none.
+        self.prewarm_new_steps(&previous);
 
         Ok(())
     }
