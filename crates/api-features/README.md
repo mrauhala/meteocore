@@ -61,7 +61,7 @@ while the engines stay free of HTTP and JSON.
 | `/features/api/docs` | HTML | Swagger UI from embedded assets under `/features/api/docs/`; no CDN |
 | `/features/conformance` | JSON, HTML | |
 | `/features/collections` | JSON, HTML | collections that have a feature engine; Common collection search |
-| `/features/collections/{id}` | JSON, HTML | `itemType: "feature"`, `crs`, `storageCrs` (CRS84), `numberItems`, `extent`, an `items` link, and a `tilesets-vector` link when api-tiles serves the collection as vector tiles |
+| `/features/collections/{id}` | JSON, HTML | `itemType: "feature"`, `crs`, `storageCrs` (CRS84), `numberItems`, `extent`, an `items` link, and a `tilesets-vector` link when api-tiles serves the collection as vector tiles; WIS2 topic `themes`, configured or from a WIS2 subscription, and a WCMP2 `describedby` link where configured (#1356) |
 | `/features/collections/{id}/items` | GeoJSON, HTML | a page of features |
 | `/features/collections/{id}/items/{featureId}` | GeoJSON, HTML | one feature; takes only `f` and `crs` |
 

@@ -69,6 +69,7 @@ fn collection(id: &str, engine_type: &str) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        discovery: None,
         derive_humidity: None,
     }
 }
@@ -111,6 +112,7 @@ fn app() -> axum::Router {
             feature_engines: HashMap::new(),
             base_url: "https://example.org".into(),
             trust_proxy_headers: false,
+            discovery: Default::default(),
         },
     )))
 }

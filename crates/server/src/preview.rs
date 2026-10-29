@@ -1087,6 +1087,7 @@ mod tests {
             engines: HashMap::new(),
             feature_engines: HashMap::new(),
             collections: HashMap::new(),
+            discovery: Default::default(),
             styles: HashMap::new(),
             base_url: String::new(),
             trust_proxy_headers: false,
@@ -1097,6 +1098,7 @@ mod tests {
         api_features::handlers::FeaturesState {
             engines: HashMap::new(),
             collections: HashMap::new(),
+            discovery: Default::default(),
             base_url: String::new(),
             trust_proxy_headers: false,
             vector_tileset_ids: Default::default(),
@@ -1122,6 +1124,7 @@ mod tests {
         api_maps::handlers::MapsState {
             engines: HashMap::new(),
             collections: HashMap::new(),
+            discovery: Default::default(),
             styles: HashMap::new(),
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(1)),
             rendered_cache: Arc::new(ds_render::RenderedCache::new(1)),
@@ -1135,6 +1138,7 @@ mod tests {
         api_tiles::TilesState {
             map_engines: HashMap::new(),
             collections: HashMap::new(),
+            discovery: Default::default(),
             styles: HashMap::new(),
             feature_engines: HashMap::new(),
             feature_collections: HashMap::new(),
@@ -1240,6 +1244,7 @@ mod tests {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         }
     }

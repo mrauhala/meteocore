@@ -110,6 +110,7 @@ fn router() -> axum::Router {
     api_features::router(Arc::new(ArcSwap::from_pointee(FeaturesState {
         engines,
         collections: HashMap::from([("places".to_string(), config)]),
+        discovery: Default::default(),
         base_url: String::new(),
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),

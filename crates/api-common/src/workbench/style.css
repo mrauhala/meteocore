@@ -2826,6 +2826,7 @@ a.api-chip:hover{text-decoration-color:currentColor}
 .detail-heading .row-line .chip-row{margin:0}
 .detail-heading .license{margin-top:8px}
 .detail-heading .license a{color:var(--teal);text-decoration:underline;text-underline-offset:3px}
+.record-link{color:var(--teal);text-decoration:underline;text-underline-offset:3px;overflow-wrap:anywhere}
 .extent-rows{margin:0}
 .map-panel+.extent-rows{border-top:1px solid var(--line)}
 .extent-row{display:grid;grid-template-columns:7rem minmax(0,1fr);gap:8px 20px;padding:18px 20px}

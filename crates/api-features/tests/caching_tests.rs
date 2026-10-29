@@ -162,6 +162,7 @@ fn build_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -177,6 +178,7 @@ fn build_router() -> axum::Router {
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),
         collection_pages: Default::default(),
+        discovery: Default::default(),
     })))
 }
 

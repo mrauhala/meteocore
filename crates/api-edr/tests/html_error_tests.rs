@@ -105,6 +105,7 @@ fn router() -> axum::Router {
     let state = EdrState {
         engines,
         collections: HashMap::from([("g".to_string(), config)]),
+        discovery: Default::default(),
         styles: HashMap::new(),
         feature_engines: HashMap::new(),
         base_url: "https://example.org".to_string(),

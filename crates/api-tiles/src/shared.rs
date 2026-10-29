@@ -76,6 +76,10 @@ impl BuildingBlock for TilesBlock {
         handlers::request_base_url(&self.state.load(), headers)
     }
 
+    fn discovery(&self) -> ds_core::discovery::Discovery {
+        self.state.load().discovery.clone()
+    }
+
     fn collections(&self, root: &str) -> Vec<Contribution> {
         let state = self.state.load();
         handlers::tile_collections(&state)

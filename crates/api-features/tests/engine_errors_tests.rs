@@ -52,6 +52,7 @@ async fn get(fail: fn() -> DataServerError, uri: &str) -> (StatusCode, Option<St
             Arc::new(Failing(fail)) as Arc<dyn FeatureEngine>,
         )]),
         collections: HashMap::from([("grid".to_string(), collection())]),
+        discovery: Default::default(),
         base_url: String::new(),
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),

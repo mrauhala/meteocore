@@ -184,6 +184,7 @@ fn build_router_with(engine: Arc<dyn FeatureEngine>) -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -195,6 +196,7 @@ fn build_router_with(engine: Arc<dyn FeatureEngine>) -> axum::Router {
         trust_proxy_headers: false,
         vector_tileset_ids: Default::default(),
         collection_pages: Default::default(),
+        discovery: Default::default(),
     }));
     api_features::router(state)
 }
@@ -513,6 +515,7 @@ mod vector_tile_discovery {
                 preview: None,
                 derive_wind: None,
                 derive_geopotential_height: None,
+                discovery: None,
                 derive_humidity: None,
             },
         );
@@ -523,6 +526,7 @@ mod vector_tile_discovery {
             trust_proxy_headers: false,
             vector_tileset_ids: ["cities".to_string()].into(),
             collection_pages: Default::default(),
+            discovery: Default::default(),
         }))
     }
 
@@ -1182,6 +1186,7 @@ mod metadata_extras {
                 preview: None,
                 derive_wind: None,
                 derive_geopotential_height: None,
+                discovery: None,
                 derive_humidity: None,
             },
         );
@@ -1192,6 +1197,7 @@ mod metadata_extras {
             trust_proxy_headers: false,
             vector_tileset_ids: Default::default(),
             collection_pages: Default::default(),
+            discovery: Default::default(),
         }));
         api_features::router(state)
     }

@@ -1269,6 +1269,7 @@ fn member_label(key: &str) -> Option<&'static str> {
         "title" => "Title",
         "description" => "Description",
         "keywords" => "Keywords",
+        "themes" => "Themes",
         "attribution" => "Attribution",
         "extent" => "Extent",
         "crs" => "Coordinate systems",

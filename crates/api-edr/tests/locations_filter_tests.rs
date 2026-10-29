@@ -162,6 +162,7 @@ fn collection(id: &str) -> CollectionConfig {
         preview: None,
         derive_wind: None,
         derive_geopotential_height: None,
+        discovery: None,
         derive_humidity: None,
     }
 }
@@ -187,6 +188,7 @@ fn app() -> App {
         feature_engines: HashMap::new(),
         base_url: "https://example.test".into(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     }));
     App {
         router: api_edr::router(state),

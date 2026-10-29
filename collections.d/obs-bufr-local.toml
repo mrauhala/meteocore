@@ -36,3 +36,7 @@ max_age = "PT1H"
 time_step = "PT10M"
 marker_size = 6
 draw_missing = false
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes.
+[discovery]
+wis2_topic = "weather/surface-based-observations/synop"

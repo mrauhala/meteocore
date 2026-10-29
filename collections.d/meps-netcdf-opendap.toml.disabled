@@ -149,3 +149,7 @@ name = "y_wind_10m"
 colormap = "diverging"
 min = -20.0
 max = 20.0
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes.
+[discovery]
+wis2_topic = "weather/prediction/forecast/short-range/deterministic/limited-area"

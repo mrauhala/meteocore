@@ -37,3 +37,9 @@ max = 70.0
 [[wms.parameters]]
 name = "sf"
 colormap = "precipitation"
+
+# Discovery (#1356): the WIS2 topic is served as the collection's themes,
+# the WCMP2 record as a describedby link.
+[discovery]
+wis2_topic = "weather/prediction/forecast/medium-range/deterministic/global"
+wcmp2_record = "urn:wmo:md:int-ecmwf:aifs:oper:forecast"

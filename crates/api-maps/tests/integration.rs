@@ -168,6 +168,7 @@ fn build_state_with_engine_and_wms(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -199,6 +200,7 @@ fn build_state_with_engine_and_wms(
         base_url: String::new(),
         trust_proxy_headers: false,
         map_tileset_ids: Default::default(),
+        discovery: Default::default(),
     }))
 }
 
@@ -244,6 +246,7 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -297,6 +300,7 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
         } else {
             HashSet::new()
         },
+        discovery: Default::default(),
     }));
     api_maps::router(state)
 }
@@ -368,6 +372,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -380,6 +385,7 @@ async fn fetch_collection_json(engine: Arc<dyn MapEngine>, id: &str, apis: Vec<S
         base_url: String::new(),
         trust_proxy_headers: false,
         map_tileset_ids: Default::default(),
+        discovery: Default::default(),
     }));
     let (_, json) = get_on(api_maps::router(state), &format!("/collections/{id}")).await;
     json
@@ -425,6 +431,7 @@ fn router_with(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -437,6 +444,7 @@ fn router_with(
         base_url: String::new(),
         trust_proxy_headers: false,
         map_tileset_ids: Default::default(),
+        discovery: Default::default(),
     }));
     api_maps::router(state)
 }
@@ -1585,6 +1593,7 @@ fn build_empty_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -1618,6 +1627,7 @@ fn build_empty_router() -> axum::Router {
         base_url: String::new(),
         trust_proxy_headers: false,
         map_tileset_ids: Default::default(),
+        discovery: Default::default(),
     }));
     api_maps::router(state)
 }
@@ -1723,6 +1733,7 @@ fn build_multi_param_router() -> axum::Router {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -1756,6 +1767,7 @@ fn build_multi_param_router() -> axum::Router {
         base_url: String::new(),
         trust_proxy_headers: false,
         map_tileset_ids: Default::default(),
+        discovery: Default::default(),
     }));
     api_maps::router(state)
 }
@@ -2376,6 +2388,7 @@ mod searchable {
                     preview: None,
                     derive_wind: None,
                     derive_geopotential_height: None,
+                    discovery: None,
                     derive_humidity: None,
                 },
             );
@@ -2389,6 +2402,7 @@ mod searchable {
             base_url: String::new(),
             trust_proxy_headers: false,
             map_tileset_ids: Default::default(),
+            discovery: Default::default(),
         }));
         api_maps::router(state)
     }
@@ -2862,6 +2876,7 @@ fn build_router_with_engine_and_styles(
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -2875,6 +2890,7 @@ fn build_router_with_engine_and_styles(
         base_url: String::new(),
         trust_proxy_headers: false,
         map_tileset_ids: Default::default(),
+        discovery: Default::default(),
     }));
     api_maps::router(state)
 }
@@ -4012,11 +4028,13 @@ mod composites {
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         };
         let state = Arc::new(ArcSwap::from_pointee(MapsState {
             engines: HashMap::from([("radar".to_string(), engine)]),
             collections: HashMap::from([("radar".to_string(), config)]),
+            discovery: Default::default(),
             styles,
             render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
             rendered_cache: Arc::new(RenderedCache::new(16)),

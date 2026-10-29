@@ -14,8 +14,8 @@
 #      library's own licence file is listed in bundled_licences below.
 #   3. NOTICE files of the crates (Apache-2.0 section 4d).
 #   4. Components vendored in this repository: ds-bufr (tinybufr), Swagger UI,
-#      MapLibre GL JS, the Natural Earth land outlines and the ColorBrewer
-#      colour scheme of the `diverging` palette.
+#      MapLibre GL JS, the Natural Earth land outlines, the ColorBrewer
+#      colour scheme of the `diverging` palette and the WIS2 Topic Hierarchy.
 #
 # Needs cargo-about 0.9.2 (`cargo install --locked cargo-about --version
 # 0.9.2 --features cli`) and network access for `cargo fetch`.
@@ -238,6 +238,10 @@ done < "$work/crates"
   include crates/server/preview/vendor/LICENSE-workbench-land.txt
   entry "ColorBrewer RdBu colour scheme (Apache-2.0), the built-in diverging palette"
   include third-party/colorbrewer.txt
+  for dir in crates/core/assets/wis2-topic-hierarchy-*; do
+    entry "WMO WIS2 Topic Hierarchy ${dir##*-} (Apache-2.0), flattened: the topics of collection themes"
+    include "$dir/LICENSE"
+  done
 } > "$work/notices.txt"
 
 mv "$work/notices.txt" "$out"

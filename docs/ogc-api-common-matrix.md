@@ -171,6 +171,8 @@ collection.
 | Collection description `/collections/{id}` (§7.2) | Yes | Yes | Yes | Yes |
 | Collection identifier, title and description | Yes | Yes | Yes | Yes |
 | Collection keywords | Yes — configuration | Yes — configuration | Yes — configuration | Yes — configuration |
+| Collection `themes`: WIS2 topic | Yes — configuration or WIS2 subscription [13] | Yes — same [13] | Yes — same [13] | Yes — same [13] |
+| `describedby` link to a WCMP2 discovery record | Yes — when configured [13] | Yes — same [13] | Yes — same [13] | Yes — same [13] |
 | License links | Yes — when configured with a resolvable URL; `type` `text/html` or the configured `type` | Yes — same | Yes — same | Yes — same |
 | `attribution` / `attributionMediaType` | No | No | No | No |
 | `itemType` for individually accessible items | Omitted; EDR locations require applicability review | N/A — map access | N/A — tile access | Yes — `feature` |
@@ -209,7 +211,7 @@ collection.
 | Collection `bbox` intersection (§7.3) | Yes — horizontal extent [9] | Yes — same [9] | Yes — same [9] | Yes — same [9] |
 | Collection `bbox-crs` (§7.4) | Partial — CRS84 only | Partial — CRS84 only | Partial — CRS84 only | Partial — CRS84 only |
 | Collection `datetime`: instant, interval, open ends (§7.5) | Yes — engine extent [5] | Yes — raster extent [5] | Yes — raster or feature extent [5] | Yes — feature extent [5] |
-| Collection `q`: case-insensitive terms/phrases in title, description, keywords (§7.6) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
+| Collection `q`: case-insensitive terms/phrases in title, description, keywords, theme concept ids (§7.6) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
 | Collection `query`: required/excluded terms (§7.7) | Yes [10] | Yes [10] | Yes [10] | Yes [10] |
 | Collection page size `limit` (§7.8) | Yes — default/max 1,000; HTML default 24 [12] | Yes — same | Yes — same | Yes — same |
 | Collection `next` paging links (§7.8) | Yes | Yes | Yes | Yes |
@@ -299,8 +301,9 @@ collection.
    EDR `parameter_names` likewise do not establish Part 3 support.
 9. Four- and six-number boxes are accepted; six-number input discards the vertical
    axis. Antimeridian crossing is supported. No vertical filtering is implemented.
-10. `q` and `query` share whole-word/phrase matching across title, description
-    and individual keywords, with normalized whitespace and literal punctuation.
+10. `q` and `query` share whole-word/phrase matching across title, description,
+    individual keywords and theme concept ids, with normalized whitespace and
+    literal punctuation.
     Phrases never span properties. `query` adds required/excluded terms, which may
     match different properties, inside comma-separated OR alternatives. Operators
     apply only at the start or after whitespace; internal signs are literal.
@@ -325,6 +328,23 @@ collection.
     title; without `limit`, an HTML page holds 24 collections (#1141). A
     JSON/HTML alternate link spells out `limit` and `sortby`, so both
     representations of a page list the same collections in the same order.
+13. An experiment for the OGC MetOcean Common profile (#1356): a collection's
+    WIS2 topic is one Part 2 `themes` entry, scheme
+    `https://codes.wmo.int/wis/topic-hierarchy/earth-system-discipline`, one
+    concept per topic whose `id` is the topic path from the discipline level
+    down (any depth), `url` the scheme plus the path and `title` the
+    hierarchy's description of its last level. Topics come from
+    `[discovery] wis2_topic`, validated against the vendored WIS2 Topic
+    Hierarchy 1.3.0, or else from a collection's WIS2 subscriptions. A
+    `[discovery] wcmp2_record` adds a `describedby` link of type
+    `application/geo+json` to the record in the server's WIS2 Global
+    Discovery Catalogue. The shared root, `/edr`, Maps, Tiles and Features
+    describe them alike, in each collection document and `/collections`
+    entry, and the HTML pages show the topic and link the record. `q` and
+    `query` match concept ids, `/` separating words. Without CQL2 (§9) the
+    theme is not a queryable. WCMP2 records themselves encode a topic as one
+    theme per level; which form serves client filtering and record matching
+    is the open question this experiment reports back on.
 
 **Advertised conformance versus assessed behavior**
 

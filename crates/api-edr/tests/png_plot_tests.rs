@@ -187,6 +187,7 @@ fn router_with_styles(engine: Arc<dyn EdrEngine>, styles: StyleLayers) -> axum::
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
+            discovery: None,
             derive_humidity: None,
         },
     );
@@ -197,6 +198,7 @@ fn router_with_styles(engine: Arc<dyn EdrEngine>, styles: StyleLayers) -> axum::
         styles,
         base_url: String::new(),
         trust_proxy_headers: false,
+        discovery: Default::default(),
     })))
 }
 
