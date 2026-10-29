@@ -625,3 +625,172 @@ fn point_fetch_replay() {
         }
     }
 }
+
+/// A bucket that keeps answering a message's GETs `503 SlowDown` fails the
+/// field as `Unavailable` (#1355), the APIs' 503 with `Retry-After`, never a
+/// storage error's 500: through the point index's range read and the whole
+/// message's read, and on to an area query and a map. Its detail keeps the
+/// GRIB context and the upstream's status, for the WARN line. The point
+/// reads are asked directly, to reach each wrapper.
+#[test]
+fn a_throttled_message_read_stays_unavailable() {
+    let q = fixture();
+    let source = TestSource::new();
+    write_run(
+        &source,
+        "",
+        RUN,
+        &[vec![("q", q.clone()), ("w", q.clone())]],
+        true,
+    );
+    let unavailable = |result: Result<(), DataServerError>, context: &str| match result {
+        Err(DataServerError::Unavailable(detail)) => {
+            assert!(detail.starts_with(context), "{detail}");
+            assert!(detail.contains("503 Service Unavailable"), "{detail}");
+        }
+        other => panic!("{context}: {other:?}"),
+    };
+    let throttle = |store: &TestStore| {
+        let mut reads = store.reads.lock().unwrap();
+        reads.throttled.insert("f000.grib2".into());
+    };
+    let samples = |engine: &GribEngine, parameter: &str, fetch| {
+        let catalog = engine.catalog();
+        let run = catalog.latest_run().unwrap();
+        let file = run.steps.values().next().unwrap();
+        let entry = file.messages.iter().find(|m| m.param == parameter).unwrap();
+        let field = PointField {
+            url: file.message_url(entry),
+            entry,
+            run: run.reference_time,
+            coords: &[NORTH],
+            plan: FieldPlan {
+                concurrency: 1,
+                fill: GridFill::Bypass,
+                fetch,
+            },
+        };
+        engine.position_samples(&field).map(drop)
+    };
+
+    // `q` indexed, `w` read through the prefix it predicts.
+    let (engine, store) = counted(&source, 16, 0, 0);
+    series(&engine, "q", &[NORTH], RUN, None);
+    throttle(&store);
+    unavailable(
+        samples(&engine, "w", FieldFetch::Partial),
+        "Failed to fetch GRIB message range w/",
+    );
+
+    let (engine, store) = counted(&source, 0, 0, 0);
+    throttle(&store);
+    unavailable(
+        samples(&engine, "q", FieldFetch::Whole),
+        "Failed to fetch GRIB message q/",
+    );
+    let area = engine.query_area(
+        "POLYGON((20 55,30 55,30 65,20 65,20 55))",
+        None,
+        Some(&["q".to_owned()]),
+        Some(&[150.0]),
+        Some(at(RUN, 0)),
+    );
+    unavailable(area.map(drop), "Failed to fetch GRIB message q/");
+    let map = engine.get_raster_tile(
+        [20.0, 55.0, 30.0, 65.0],
+        8,
+        8,
+        Some(at(RUN, 0)),
+        &OutputCrs::Wgs84,
+        Some("q"),
+        Some(150.0),
+        None,
+    );
+    unavailable(map.map(drop), "Failed to fetch GRIB message q/");
+}
+
+/// A position query fails with `Unavailable` when a store kept refusing a
+/// field's read (#1355): nulls there would read as data, where the 503
+/// tells the client to retry. A field that does not decode still samples
+/// null, as ever.
+#[test]
+fn a_position_query_fails_on_a_throttled_field_and_nulls_a_corrupt_one() {
+    let q = fixture();
+    let source = TestSource::new();
+    write_run(
+        &source,
+        "",
+        RUN,
+        &[vec![("q", q.clone()), ("w", vec![0x55; q.len()])]],
+        true,
+    );
+    let (engine, store) = counted(&source, 16, 0, 0);
+    assert_eq!(series(&engine, "w", &[NORTH], RUN, None), [[None]]);
+
+    store
+        .reads
+        .lock()
+        .unwrap()
+        .throttled
+        .insert("f000.grib2".into());
+    let throttled = engine.query_positions(
+        &[format!("POINT({} {})", NORTH.0, NORTH.1)],
+        None,
+        Some(&["q".to_owned()]),
+        Some(&[150.0]),
+        Some(at(RUN, 0)),
+        &mut |_| Ok(()),
+    );
+    match throttled {
+        Err(DataServerError::Unavailable(detail)) => {
+            assert!(detail.contains("503 Service Unavailable"), "{detail}")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A trajectory reads its fields as a position series does (#1355): a
+/// field whose store kept refusing the read fails the query with
+/// `Unavailable`, a field that does not decode samples null.
+#[test]
+fn a_trajectory_fails_on_a_throttled_field_and_nulls_a_corrupt_one() {
+    let q = fixture();
+    let source = TestSource::new();
+    write_run(
+        &source,
+        "",
+        RUN,
+        &[vec![("q", q.clone()), ("w", vec![0x55; q.len()])]],
+        true,
+    );
+    let (engine, store) = counted(&source, 0, 0, 0);
+    let path = "LINESTRING(24 60,25 60.5)";
+    let trajectory = |parameter: &str| {
+        engine.query_trajectory(
+            path,
+            None,
+            Some(&[parameter.to_owned()]),
+            Some(&[150.0]),
+            Some(at(RUN, 0)),
+        )
+    };
+    let CoverageResponse::Single(corrupt) = trajectory("w").unwrap() else {
+        panic!("expected one trajectory")
+    };
+    let values = &corrupt.ranges["w"].values;
+    assert!(!values.is_empty());
+    assert!(values.iter().all(Option::is_none), "{values:?}");
+
+    store
+        .reads
+        .lock()
+        .unwrap()
+        .throttled
+        .insert("f000.grib2".into());
+    match trajectory("q") {
+        Err(DataServerError::Unavailable(detail)) => {
+            assert!(detail.contains("503 Service Unavailable"), "{detail}")
+        }
+        other => panic!("{other:?}"),
+    }
+}

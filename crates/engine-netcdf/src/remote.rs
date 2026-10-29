@@ -254,7 +254,9 @@ impl ReadFailure {
     }
 
     /// What a request is answered: a replaced file and a storage deadline
-    /// or admission failure are 503s; any other failure is a storage error.
+    /// or admission failure are 503s, and so is a host that kept refusing
+    /// the read (`Unavailable`, #1355); any other failure is a storage
+    /// error.
     pub(crate) fn to_error(&self) -> DataServerError {
         match self {
             ReadFailure::Replaced => DataServerError::ResourceExhausted,
@@ -263,6 +265,9 @@ impl ReadFailure {
             }
             ReadFailure::Failed(DataServerError::ResourceExhausted) => {
                 DataServerError::ResourceExhausted
+            }
+            ReadFailure::Failed(DataServerError::Unavailable(detail)) => {
+                DataServerError::Unavailable(detail.clone())
             }
             ReadFailure::Failed(e) => DataServerError::Storage(e.to_string()),
         }

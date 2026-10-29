@@ -494,7 +494,8 @@ ones only in the legacy layout.
   dispatching at expiry and drain running jobs before releasing query admission.
 - Validate all coordinates and the complete points × times × levels × parameters
   value budget before fetching. Preserve point/time/level ordering regardless of
-  job completion order, and sample missing fields as null for every point.
+  job completion order, and sample missing fields as null for every point, except a field whose
+  store kept refusing the read (`Unavailable`, #1355), which fails the query.
 - Tests: `field_plan_tests.rs` (an oversized window in every query kind
   leaves the cache's entries and bytes as they were and answers bit for bit
   as with no cache or a large one; resident fields are reused; the message
@@ -737,7 +738,10 @@ ones only in the legacy layout.
   under the query's `FieldPlan`:
   fetch/decode once, sample every point that reads it with the position
   query's `bilinear_value` + display conversion. Missing or unreadable
-  fields stay null; deadlines stay fatal. Never a job per sample.
+  fields stay null. Deadlines stay fatal, and so does a field whose store
+  kept refusing the read (`Unavailable`, #1355): position and trajectory
+  fail with a 503 rather than answer nulls a client would take as data.
+  Never a job per sample.
 - Z snaps to the run's available levels (`catalog.levels`), so a Z path
   never asks for a level the run lacks; `z` stays exact, like position.
 
@@ -754,7 +758,8 @@ ones only in the legacy layout.
   #1067) with the GRIB I/O runtime as the off-runtime fallback. Keep deadline
   propagation, blocking cache waits and drain-on-error behavior in that
   shared scheduler. Area read failures
-  are fatal; ordinary position field failures remain null samples.
+  are fatal; ordinary position field failures remain null samples, but
+  `Unavailable` fails a position query too (#1355).
 - Workers return small masked/converted subsets into fixed
   step/parameter/level slots. Preserve requested level order and missing upper-air nulls regardless
   of completion order. Validate grid axes before extracting each subset.

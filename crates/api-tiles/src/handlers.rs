@@ -2044,9 +2044,14 @@ async fn render_vector_tile(
         property_filters: Vec::new(),
     };
 
-    let page = engine
-        .get_features(&query)
-        .map_err(|e| TilesError::Internal(format!("Feature query failed: {e}")))?;
+    let page = engine.get_features(&query).map_err(|e| match e {
+        // A data source that kept refusing the reads (#1355).
+        ds_core::error::DataServerError::Unavailable(_) => {
+            tracing::warn!("Vector tile feature query for '{id}' failed: {e}");
+            TilesError::SourceUnavailable
+        }
+        e => TilesError::Internal(format!("Feature query failed: {e}")),
+    })?;
 
     if page.features.len() > params::MAX_FEATURES_PER_TILE {
         // 422 (Unprocessable Content), not 400: the request itself is
@@ -2842,6 +2847,12 @@ async fn render_tile(
         match e {
             DSE::ResourceExhausted | DSE::DeadlineExceeded => {
                 TilesError::ServiceUnavailable(e.to_string())
+            }
+            // A data source that kept refusing the reads (#1355): WARN, not
+            // a server fault, and a 503 naming no upstream.
+            DSE::Unavailable(_) => {
+                tracing::warn!("Tiles render error for collection '{}': {e}", collection_id);
+                TilesError::SourceUnavailable
             }
             DSE::InvalidParameter(_)
             | DSE::InvalidBbox(_)

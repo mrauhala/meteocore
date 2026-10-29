@@ -220,7 +220,8 @@ enum Finished {
 /// error tile are encoded by the worker that holds the CPU slot, under the
 /// render deadline, like every populated image (#1093). A shed or timed-out
 /// render (`ResourceExhausted`, `DeadlineExceeded`) stays an error, the 503,
-/// and encodes nothing.
+/// and encodes nothing; so does one whose data source kept refusing the
+/// reads (`Unavailable`, #1355).
 fn finish_render(
     rendered: Rendered,
     width: u32,
@@ -239,9 +240,11 @@ fn finish_render(
             ds_render::background_tile(width, height, background, format),
             path,
         ),
-        Err(e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded)) => {
-            return Err(e)
-        }
+        Err(
+            e @ (DataServerError::ResourceExhausted
+            | DataServerError::DeadlineExceeded
+            | DataServerError::Unavailable(_)),
+        ) => return Err(e),
         // Semi-transparent red, so the failed area stays visible; encoded
         // once per (w, h, background, format) like the empty image.
         Err(e) => Finished::Error(ds_render::error_tile(width, height, background, format), e),
@@ -987,7 +990,13 @@ pub async fn wms_handler(
                     (cached, "EMPTY")
                 }
                 // Only a shed or timed-out render (`ResourceExhausted`,
-                // `DeadlineExceeded`) is an error here, and it encoded nothing.
+                // `DeadlineExceeded`) is an error here, and it encoded nothing,
+                // or one whose data source kept refusing the reads (#1355):
+                // logged at WARN, its 503 naming no upstream.
+                Err(e @ DataServerError::Unavailable(_)) => {
+                    tracing::warn!("WMS render error for layer '{layer_names}': {e}");
+                    return Err(WmsError::SourceUnavailable);
+                }
                 Err(e) => {
                     return Err(WmsError::ServiceUnavailable(e.to_string()));
                 }

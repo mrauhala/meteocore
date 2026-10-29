@@ -189,8 +189,10 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
   turns down (`QueryTooLarge`, such as a station grid's analysis cap) is a
   400 with its message; one it cannot answer yet or now
   (`ResourceExhausted`, `DeadlineExceeded`: a station grid whose residuals
-  are still being computed) is a 503 with `Retry-After: 1`; a missing
-  feature is a 404; anything else is a 500.
+  are still being computed) is a 503 with `Retry-After: 1`; an object
+  store that kept refusing the read (`Unavailable`) is a 503
+  `SourceUnavailable` with `Retry-After: 10`; a missing feature is a 404;
+  anything else is a 500.
 
 ## HTML
 

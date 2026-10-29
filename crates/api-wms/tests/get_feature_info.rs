@@ -62,6 +62,8 @@ enum Answer {
     RunEvicted,
     /// `ResourceExhausted`.
     Busy,
+    /// `Unavailable`: the data source kept refusing the read (#1355).
+    Throttled,
     /// An internal failure whose message must not reach the client.
     Fails,
 }
@@ -281,6 +283,11 @@ impl EdrEngine for Nwp {
                 return Err(DataServerError::ReferenceTimeNotFound("evicted".into()));
             }
             Answer::Busy => return Err(DataServerError::ResourceExhausted),
+            Answer::Throttled => {
+                return Err(DataServerError::Unavailable(
+                    "GET https://secret-bucket.example/t2m.grib2: 503 Service Unavailable".into(),
+                ));
+            }
             Answer::Fails => {
                 return Err(DataServerError::Storage(
                     "connection refused at 10.0.0.5:9000/secret-bucket".into(),
@@ -984,6 +991,24 @@ async fn an_overloaded_engine_is_503_and_a_failing_one_leaks_nothing() {
     let reply = get(&router(Nwp::new(Answer::Busy)), &gfi("nwp/t2m", 0, 0, "")).await;
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(reply.retry_after.as_deref(), Some("1"));
+
+    // A data source that keeps refusing the read (#1355): the 503, a
+    // longer wait, and nothing of the upstream.
+    let reply = get(
+        &router(Nwp::new(Answer::Throttled)),
+        &gfi("nwp/t2m", 0, 0, ""),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reply.retry_after.as_deref(), Some("10"));
+    assert!(
+        reply
+            .body
+            .contains("Data source temporarily unavailable, try again later"),
+        "{}",
+        reply.body
+    );
+    assert!(!reply.body.contains("secret"), "{}", reply.body);
 
     let reply = get(&router(Nwp::new(Answer::Fails)), &gfi("nwp/t2m", 0, 0, "")).await;
     assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);

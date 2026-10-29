@@ -1792,6 +1792,12 @@ async fn render_map(
                 DSE::ResourceExhausted | DSE::DeadlineExceeded => {
                     MapsError::ServiceUnavailable(e.to_string())
                 }
+                // A data source that kept refusing the reads (#1355): WARN,
+                // not a server fault, and a 503 naming no upstream.
+                DSE::Unavailable(_) => {
+                    tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
+                    MapsError::SourceUnavailable
+                }
                 DSE::InvalidParameter(_)
                 | DSE::InvalidBbox(_)
                 | DSE::InvalidDatetime(_)

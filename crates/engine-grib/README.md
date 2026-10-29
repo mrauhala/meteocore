@@ -110,9 +110,9 @@ compares engines.
 
 | API | Query | Notes |
 |---|---|---|
-| EDR | `position` (also `MULTIPOINT`) | `PointSeries`; one `VerticalProfile` per step when several levels are selected |
+| EDR | `position` (also `MULTIPOINT`) | `PointSeries`; one `VerticalProfile` per step when several levels are selected. A field that cannot be read samples null; one whose object store kept answering 429, 502, 503 or 504 through all of its retries fails the query with 503 |
 | EDR | `area`, `radius` | native grid nodes over the polygon's bounding box; nodes outside the polygon are null |
-| EDR | `trajectory` | WKT `LINESTRING`, `Z`, `M`, `ZM`, densified at the grid spacing |
+| EDR | `trajectory` | WKT `LINESTRING`, `Z`, `M`, `ZM`, densified at the grid spacing. Fields that cannot be read sample null and throttled ones fail the query, as for `position` |
 | EDR | `cube` | pressure and model-level views only; `[t, z, y, x]`, nearest native node |
 | EDR | `/instances` | one per retained run |
 | WMS, Maps, Tiles | raster | one layer per parameter (`parameter-name`; WMS `{collection}/{parameter}`); WMS GetFeatureInfo runs the EDR position query |

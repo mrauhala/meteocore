@@ -87,7 +87,8 @@ Errors are JSON `{"error": "…"}`: 400 for a bad parameter (one given twice
 or of the wrong type included), an unsupported
 representation or a threshold too low to mesh; 404 for an unknown collection
 or no data for the request; 503 with `Retry-After: 1` when the queue is full
-or the 30 s deadline passed. A 500 never carries internal detail.
+or the 30 s deadline passed, and with `Retry-After: 10` when an object store
+kept refusing the read. A 500 never carries internal detail.
 
 ## Caching
 

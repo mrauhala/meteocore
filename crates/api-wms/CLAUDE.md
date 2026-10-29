@@ -328,8 +328,8 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   serve on the blocking worker that holds the CPU slot and the memory
   reservation, under the render deadline, and the handler only labels the
   result. Keep it there; `background_tile` and `error_tile` encode on a miss
-  and block a caller waiting for another's encode. A `ResourceExhausted` or
-  `DeadlineExceeded` render stays the 503 and encodes nothing. Maps and Tiles
+  and block a caller waiting for another's encode. A `ResourceExhausted`,
+  `DeadlineExceeded` or `Unavailable` render stays the 503 and encodes nothing. Maps and Tiles
   finish their empty image in the job the same way (`render_job`).
 
 ## QUALITY / `[wms] webp_quality`
@@ -501,7 +501,7 @@ compares them). Never unwrap it to `f64` on the way out.
   `LocationNotFound` / `FeatureNotFound` / `ReferenceTimeNotFound` /
   `CollectionNotFound` is an empty answer (value null): no data there, or no
   longer any after a run eviction or a reload. `ResourceExhausted` /
-  `DeadlineExceeded` 503; an engine `InvalidParameter` (and the other
+  `DeadlineExceeded` 503; `Unavailable` 503 with `Retry-After: 10`; an engine `InvalidParameter` (and the other
   client-error variants) a generic `InvalidParameterValue`; anything else
   `Internal`, its detail only in the log (Critical Rule 11).
 - **Formats.** `params::INFO_FORMATS` is the one list capabilities
@@ -520,7 +520,8 @@ compares them). Never unwrap it to `f64` on the way out.
   explicit `TIME` that resolved, with `content_version` 0, and only for an
   answer: every value and band non-null, or at least one feature. An empty
   answer always revalidates: GeoTIFF and GRIB answer a failed
-  read with a null sample, and GetMap never pins a failed render either. No
+  read with a null sample, except a GRIB read the store kept refusing,
+  which is the 503, and GetMap never pins a failed render either. No
   server-side cache: one point read is cheaper than a cache entry.
 
 GetMap cache misses use `ds-executor::RenderJob`: a bounded shared queue and
@@ -528,7 +529,7 @@ one absolute deadline across admission/render/encoding. A list of N layers
 is admitted with `acquire_layered_raster`: one slot, one layer's memory plus
 the image below, and N render deadlines (#1181). The worker retains
 CPU and memory permits after HTTP timeout/disconnect. Propagate
-`DeadlineExceeded` as 503 + Retry-After, never a successful transparent/error
+`DeadlineExceeded` and `Unavailable` as 503 + Retry-After, never a successful transparent/error
 image. Meta-tile fan-out checks the same deadline between tiles.
 
 Every served GetMap carries a `ds_executor::RenderTiming` (timed from the

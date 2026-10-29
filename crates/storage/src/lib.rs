@@ -1279,7 +1279,8 @@ impl DataStore {
 
     /// [`FetchBudget::Background`]: four attempts' worth, so a first attempt
     /// that stalls until its timeout leaves room for object_store's retry
-    /// (after a backoff that starts at 0.1 s) and for one more.
+    /// (after a backoff that starts at 0.1 s, 0.5 s on S3) and for one
+    /// more.
     pub const BACKGROUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
     /// Bridge async to sync. Uses `block_in_place` when inside a tokio runtime
@@ -1580,6 +1581,32 @@ pub fn build_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServe
     }
 }
 
+/// How every S3 store this crate builds retries what object_store retries
+/// (a 5xx, 429 Too Many Requests, 408, or a transport error, #1355).
+///
+/// A public bucket answers `503 SlowDown` to a large share of GETs while a
+/// few are in flight (#1336). object_store's default back-off starts at
+/// 0.1 s, and its 10 retries gave up within 2.5–11 s. From 0.5 s, doubling
+/// with jitter up to 4 s, the 10 back-offs add up to about 13 s at the
+/// median and 24 s at the 95th percentile. A request's deadline still
+/// bounds its fetch (EDR's 30 s, past which the query answers its 504), and
+/// a read that outlasts every retry is [`StorageError::Unavailable`], each
+/// API's 503.
+///
+/// `retry_timeout` is the background fetch budget: no fetch waits longer,
+/// and a first attempt that stalls until its 30 s timeout still leaves room
+/// for the retries (#1011). HTTP stores keep object_store's default, under
+/// their host's throttle (`throttle.rs`).
+pub(crate) const S3_RETRY: object_store::RetryConfig = object_store::RetryConfig {
+    backoff: object_store::BackoffConfig {
+        init_backoff: std::time::Duration::from_millis(500),
+        max_backoff: std::time::Duration::from_secs(4),
+        base: 2.0,
+    },
+    max_retries: 10,
+    retry_timeout: FetchBudget::Background.timeout(),
+};
+
 /// Build a `DataStore` from explicit S3 endpoint and bucket.
 ///
 /// Use this when endpoint and bucket are configured separately (not parsed
@@ -1592,6 +1619,16 @@ pub fn build_s3_store_from_parts(
     endpoint: &str,
     bucket: &str,
 ) -> Result<DataStore, DataServerError> {
+    s3_store_from_parts(endpoint, bucket, S3_RETRY)
+}
+
+/// [`build_s3_store_from_parts`] retrying as `retry` says: [`S3_RETRY`], or
+/// a short back-off in tests.
+fn s3_store_from_parts(
+    endpoint: &str,
+    bucket: &str,
+    retry: object_store::RetryConfig,
+) -> Result<DataStore, DataServerError> {
     let allow_http = has_scheme(endpoint, "http://");
 
     let store = object_store::aws::AmazonS3Builder::new()
@@ -1600,6 +1637,7 @@ pub fn build_s3_store_from_parts(
         .with_endpoint(endpoint)
         .with_allow_http(allow_http)
         .with_skip_signature(true)
+        .with_retry(retry)
         .with_http_connector(retryable::CountingConnector)
         .build()
         .map_err(|e| {
@@ -1653,6 +1691,7 @@ fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServer
 
     let builder = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
+        .with_retry(S3_RETRY)
         .with_http_connector(retryable::CountingConnector);
     // The endpoint and region object_store will use (`AWS_ENDPOINT_URL_S3`
     // over `AWS_ENDPOINT`), for the span's label only.
@@ -1738,6 +1777,7 @@ fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), Da
     // For public buckets, skip signing
     builder = builder
         .with_skip_signature(true)
+        .with_retry(S3_RETRY)
         .with_http_connector(retryable::CountingConnector);
 
     let store = builder
@@ -2603,6 +2643,20 @@ mod budget_tests {
             "the background budget must outlast a stalled attempt and its retry"
         );
         assert_eq!(FetchBudget::Request.timeout(), Duration::from_secs(30));
+        // S3's longer back-off (#1355) keeps that room: object_store retries
+        // for as long as the background budget runs.
+        let s3 = &S3_RETRY.backoff;
+        assert_eq!(
+            (
+                s3.init_backoff,
+                s3.max_backoff,
+                s3.base,
+                S3_RETRY.max_retries
+            ),
+            (Duration::from_millis(500), Duration::from_secs(4), 2.0, 10)
+        );
+        assert_eq!(S3_RETRY.retry_timeout, FetchBudget::Background.timeout());
+        assert!(S3_RETRY.retry_timeout >= 2 * DataStore::ATTEMPT_TIMEOUT + s3.init_backoff);
     }
 
     /// `scan.nc` holding ten bytes, every GET of it stalling

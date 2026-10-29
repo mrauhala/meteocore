@@ -264,6 +264,17 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   page with the same status; both carry `Vary: accept`. 500s carry no details. `/api` lists every
   status each operation answers: 304, 400, 404 and 500, plus 503 and 504 on
   data queries, `/locations` and `items`, and 204 on `/locations/{locId}`.
+- **Upstream throttling.** An object store that keeps answering 429, 502,
+  503 or 504 through all of its retries fails the query with 503
+  `SourceUnavailable` and `Retry-After: 10`, whose description names no
+  upstream. The server logs the whole error, the upstream's status
+  included, at WARN. S3 stores retry ten times, backing off from 0.5 s to
+  4 s, about 13 s in all at the median; a query that reaches its 30-second
+  deadline first answers 504. GRIB, NetCDF, Zarr and Satellite reads
+  answer this way, GRIB position and trajectory queries included, where a
+  field that cannot be read for any other reason samples null. GeoTIFF
+  and ODIM PVOL answer any remote read that keeps failing with 503
+  `ServerBusy` and `Retry-After: 1`.
 - **Caching.** Every 200 carries `Cache-Control` and a strong ETag, and
   `If-None-Match` gets a 304. Metadata and open-ended queries get
   `public, max-age=60`; a data query whose closed `datetime` window ended at

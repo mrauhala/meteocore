@@ -767,7 +767,8 @@ one never implies the other.
 - A new source cap must name the pixel space it counts and fail with
   `InvalidParameter`/`QueryTooLarge` (400 with its message in Maps/Tiles/EDR).
   `Engine(..)` is an opaque 500 there, and WMS GetMap turns every engine
-  error except `ResourceExhausted`/`DeadlineExceeded` (503) into the red tile.
+  error except `ResourceExhausted`/`DeadlineExceeded`/`Unavailable` (503)
+  into the red tile.
 
 ## Shared Domain Machinery (ds-core, `crates/core/`)
 
@@ -1069,6 +1070,18 @@ one never implies the other.
   `meteocore:nativeGrid` for every grid that is not lat/lon. Never add a
   `storageCrs` MeteoCore cannot render: Maps `/req/core/map-response` B
   makes it the default output.
+- **`DataServerError::Unavailable`** (#1355): ds-storage types a store
+  read as `Unavailable` when its last answer, after all retries, was
+  429/502/503/504.
+  - Every API answers it with 503, `Retry-After: 10` and the generic
+    `UNAVAILABLE_DESCRIPTION` (JSON code `SourceUnavailable`, via
+    `api_common::source_unavailable`), and logs it at WARN.
+  - An engine wrapping a store error adds context with
+    `DataServerError::with_storage_context`, never with
+    `Storage(format!(…{e}))`, which turns the 503 into a 500.
+  - GRIB position and trajectory queries fail with it, instead of sampling
+    the field as null.
+  - S3 stores retry per `S3_RETRY` in `crates/storage/src/lib.rs`.
 
 ## Engine Capabilities
 

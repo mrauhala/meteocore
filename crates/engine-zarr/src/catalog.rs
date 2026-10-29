@@ -1327,6 +1327,10 @@ pub(crate) fn chunk_read_error(error: ArrayError) -> DataServerError {
     {
         Some(DataServerError::ResourceExhausted) => return DataServerError::ResourceExhausted,
         Some(DataServerError::DeadlineExceeded) => return DataServerError::DeadlineExceeded,
+        // A store that kept refusing the read is each API's 503 (#1355).
+        Some(DataServerError::Unavailable(detail)) => {
+            return DataServerError::Unavailable(format!("Zarr chunk read failed: {detail}"))
+        }
         _ => {}
     }
     DataServerError::Engine(format!("Zarr chunk read failed: {error}"))
@@ -1633,6 +1637,25 @@ mod tests {
             }
             assert_eq!(budget.metrics().0, 0);
         }
+    }
+
+    /// A chunk the store kept refusing stays `Unavailable` through zarrs
+    /// (#1355), each API's 503, with the upstream's answer in its detail;
+    /// any other storage failure is the engine error it was.
+    #[test]
+    fn a_refused_chunk_read_stays_unavailable() {
+        let refused = DataServerError::Unavailable("503 Slow Down".into());
+        match chunk_read_error(crate::store::io_err(refused).into()) {
+            DataServerError::Unavailable(detail) => {
+                assert_eq!(detail, "Zarr chunk read failed: 503 Slow Down")
+            }
+            other => panic!("{other:?}"),
+        }
+        let failed = DataServerError::Storage("connection reset".into());
+        assert!(matches!(
+            chunk_read_error(crate::store::io_err(failed).into()),
+            DataServerError::Engine(_)
+        ));
     }
 
     #[test]

@@ -1113,3 +1113,17 @@ fn each_pressure_level_is_a_detached_fill_and_a_decode_of_its_own() {
     assert!(gets(&server.take()).is_empty(), "repeats are cached");
     assert_eq!(engine.field_decodes(), 2);
 }
+
+/// A host that kept refusing a read (#1355) stays `Unavailable` through
+/// the reader's failure: each API's 503 with `Retry-After`, never the
+/// storage error's 500.
+#[test]
+fn a_refused_read_stays_unavailable() {
+    let refused = ReadFailure::Failed(DataServerError::Unavailable("429 Too Many Requests".into()));
+    match refused.to_error() {
+        DataServerError::Unavailable(detail) => assert_eq!(detail, "429 Too Many Requests"),
+        other => panic!("{other:?}"),
+    }
+    let failed = ReadFailure::Failed(DataServerError::Engine("short body".into()));
+    assert!(matches!(failed.to_error(), DataServerError::Storage(_)));
+}

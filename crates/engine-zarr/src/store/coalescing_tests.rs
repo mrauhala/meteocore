@@ -175,9 +175,11 @@ fn failed_or_expired_owners_release_the_fill_for_a_waiters_retry() {
                     Some(DataServerError::DeadlineExceeded)
                 ));
             } else {
+                // The injected 503 is an upstream that refused the read
+                // (#1355).
                 assert!(matches!(
                     core_error(&error),
-                    Some(DataServerError::Storage(_))
+                    Some(DataServerError::Unavailable(_))
                 ));
             }
             drop(request);

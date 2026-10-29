@@ -40,3 +40,6 @@ http-body-util = "0.1"
 # Decode f=png plots to assert each panel's colours (#1159); already in the
 # graph via ds-render.
 png = "0.18"
+# Read the level and text of a query error's log line (#1355); already in
+# the graph via the server.
+tracing-subscriber = "0.3"

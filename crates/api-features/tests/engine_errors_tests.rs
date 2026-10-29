@@ -1,8 +1,9 @@
 //! An engine's error on `/items` and `/items/{featureId}` maps to its HTTP
 //! status: a request the engine turns down (a station grid's analysis cap)
 //! is a 400 with its message, an engine that is not ready a 503 with
-//! `Retry-After`, a missing feature a 404, and anything else a 500 that
-//! names nothing internal.
+//! `Retry-After`, a data source that keeps refusing reads a 503 with a
+//! longer one, a missing feature a 404, and anything else a 500 that names
+//! nothing internal.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,6 +94,21 @@ async fn engine_errors_map_to_their_status() {
         let (status, retry, _) = get(|| DataServerError::DeadlineExceeded, uri).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
         assert_eq!(retry.as_deref(), Some("1"));
+
+        // A data source that keeps refusing reads (#1355): a longer wait,
+        // and nothing of the upstream in the body.
+        let (status, retry, body) = get(
+            || DataServerError::Unavailable("GET https://bucket.example/x: 503 Slow Down".into()),
+            uri,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+        assert_eq!(retry.as_deref(), Some("10"));
+        assert_eq!(body["code"], "SourceUnavailable");
+        assert_eq!(
+            body["description"],
+            "Data source temporarily unavailable, try again later"
+        );
 
         let (status, _, body) = get(
             || DataServerError::Engine("secret detail at /var/lib".into()),

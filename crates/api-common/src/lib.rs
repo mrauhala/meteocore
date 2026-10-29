@@ -119,8 +119,30 @@ pub fn tag_api_kind(router: axum::Router, kind: &'static str) -> axum::Router {
 /// mirrors the client-visible body, so a 5xx whose body carries only a
 /// generic description (root CLAUDE.md Critical Rule 11) logs only that too.
 /// A 503 `ServerBusy` also carries `Retry-After: 1`, as every API's busy
-/// answer does.
+/// answer does, and a 503 [`SOURCE_UNAVAILABLE`] `Retry-After: 10`.
 pub struct JsonError(pub StatusCode, pub Json<Value>);
+
+/// The `code` of the 503 every API answers a data source that kept refusing
+/// a read with ([`DataServerError::Unavailable`], #1355).
+///
+/// [`DataServerError::Unavailable`]: ds_core::error::DataServerError::Unavailable
+pub const SOURCE_UNAVAILABLE: &str = "SourceUnavailable";
+
+/// The JSON 503 for a [`DataServerError::Unavailable`] (#1355): code
+/// [`SOURCE_UNAVAILABLE`], a description naming no upstream, and
+/// `Retry-After: 10`, which [`JsonError`] adds. The caller logs the error
+/// itself, at WARN: an upstream's throttling is no fault of the server.
+///
+/// [`DataServerError::Unavailable`]: ds_core::error::DataServerError::Unavailable
+pub fn source_unavailable() -> JsonError {
+    JsonError(
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "code": SOURCE_UNAVAILABLE,
+            "description": ds_core::error::DataServerError::UNAVAILABLE_DESCRIPTION,
+        })),
+    )
+}
 
 impl From<(StatusCode, Json<Value>)> for JsonError {
     fn from((status, body): (StatusCode, Json<Value>)) -> Self {
@@ -134,12 +156,19 @@ impl IntoResponse for JsonError {
         let field = |name| body.get(name).and_then(Value::as_str).unwrap_or_default();
         let reason =
             ds_core::error::ErrorReason(format!("{}: {}", field("code"), field("description")));
-        let busy = status == StatusCode::SERVICE_UNAVAILABLE && field("code") == "ServerBusy";
+        let retry_after = match field("code") {
+            _ if status != StatusCode::SERVICE_UNAVAILABLE => None,
+            "ServerBusy" => Some(HeaderValue::from_static("1")),
+            SOURCE_UNAVAILABLE => Some(HeaderValue::from(
+                ds_core::error::DataServerError::UNAVAILABLE_RETRY_AFTER_SECS,
+            )),
+            _ => None,
+        };
         let mut response = (status, body).into_response();
-        if busy {
+        if let Some(retry_after) = retry_after {
             response
                 .headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                .insert(header::RETRY_AFTER, retry_after);
         }
         response.extensions_mut().insert(reason);
         response
@@ -1091,7 +1120,8 @@ mod tests {
     }
 
     /// A busy 503 says when to retry (EDR's query capacity and response
-    /// budget, #1041); a 503 that retrying cannot fix does not.
+    /// budget, #1041), and so does a data source's (#1355), ten times
+    /// later; a 503 that retrying cannot fix does not.
     #[test]
     fn server_busy_carries_retry_after() {
         let busy = JsonError(
@@ -1100,6 +1130,9 @@ mod tests {
         )
         .into_response();
         assert_eq!(busy.headers()[header::RETRY_AFTER], "1");
+        let unavailable = source_unavailable().into_response();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.headers()[header::RETRY_AFTER], "10");
         let too_large = JsonError(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"code": "ResponseLimit", "description": "page it"})),
