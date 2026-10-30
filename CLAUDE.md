@@ -54,7 +54,8 @@ of these crates, read its file — it holds that crate's rules and gotchas:
 - `crates/ds-executor/CLAUDE.md` — bounded render queue, deadlines, worker permit ownership,
   the shared query runtime, the engines' fail-fast `ByteBudget`.
 - `crates/server/CLAUDE.md` — CLI flags, no-config boot, auto-collections,
-  reload/watcher trust model, proxy headers.
+  reload/watcher trust model, proxy headers, the container contract the
+  Helm chart (`charts/meteocore`) relies on.
 - `crates/api-common/CLAUDE.md` — shared discovery validation, metadata/navigation, OpenAPI and conformance.
 - `crates/api-wms/CLAUDE.md` — BBOX axis order, meta-tiling, TIME/ELEVATION/
   reference_time dimensions.
@@ -1578,6 +1579,9 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   A family labelled by `collection` registers through
   `admin::per_collection`, so a reload that removes the collection drops
   its series (`every_family_with_a_collection_label_is_pruned_on_reload`).
+  The Helm chart (`charts/meteocore`, #1365) also ships the dashboard,
+  compacted in a ConfigMap of at most 1 MiB; its workflow fails above
+  900 KB rendered.
 - **State:** API state wrapped in `ArcSwap` for lock-free reads. Render
   semaphore (`[server] render_concurrency`, default 2× CPU cores, min 8;
   fixed at boot, so restart to change) shared across Maps/Tiles/WMS. Engine

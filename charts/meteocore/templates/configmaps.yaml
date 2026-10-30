@@ -1,0 +1,73 @@
+{{- include "meteocore.validate" . }}
+{{- /*
+Every ConfigMap the pods mount. The pod template's checksum/config annotation
+hashes this file, so changing any of them rolls the pods.
+*/}}
+{{- if not .Values.config.existingConfigMap }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "meteocore.fullname" . }}-config
+  labels:
+    {{- include "meteocore.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    {{- .Values.config.toml | nindent 4 }}
+---
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "meteocore.fullname" . }}-collections
+  labels:
+    {{- include "meteocore.labels" . | nindent 4 }}
+{{- if or .Values.collections.files .Values.sample.enabled }}
+data:
+  {{- range $file, $toml := .Values.collections.files }}
+  {{ $file | quote }}: |
+    {{- $toml | nindent 4 }}
+  {{- end }}
+  {{- if .Values.sample.enabled }}
+  {{ include "meteocore.sampleFile" . }}: |
+    id = {{ .Values.sample.id | quote }}
+    title = "Sample observations"
+    description = "Hourly observations from three Finnish weather stations on 1 January 2026, an excerpt of the Finnish Meteorological Institute's open data. The Helm chart ships it so that a default install serves a collection: turn it off with sample.enabled=false."
+    engine_type = "csv"
+    apis = ["edr", "features"]
+    data_path = "/data/sample/observations.csv"
+    keywords = ["observations", "sample"]
+
+    [license]
+    title = "CC-BY-4.0"
+  {{- end }}
+{{- else }}
+data: {}
+{{- end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "meteocore.fullname" . }}-colormaps
+  labels:
+    {{- include "meteocore.labels" . | nindent 4 }}
+{{- with .Values.colormaps.files }}
+data:
+  {{- range $file, $palette := . }}
+  {{ $file | quote }}: |
+    {{- $palette | nindent 4 }}
+  {{- end }}
+{{- else }}
+data: {}
+{{- end }}
+{{- if .Values.sample.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "meteocore.fullname" . }}-sample
+  labels:
+    {{- include "meteocore.labels" . | nindent 4 }}
+data:
+  observations.csv: |
+    {{- .Files.Get "files/sample-observations.csv" | nindent 4 }}
+{{- end }}

@@ -1,0 +1,35 @@
+MeteoCore {{ .Chart.AppVersion }} is installed as {{ include "meteocore.fullname" . }}.
+
+Reach it from your machine:
+
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "meteocore.fullname" . }} 8000:{{ .Values.service.port }}
+  curl http://localhost:8000/health
+
+The landing page is http://localhost:8000/ and EDR is at http://localhost:8000/edr.
+{{- if .Values.sample.enabled }}
+
+The sample collection "{{ .Values.sample.id }}" serves three Finnish weather
+stations. Turn it off with sample.enabled=false once you add collections.
+{{- end }}
+{{- if or .Values.ingress.enabled .Values.httpRoute.enabled }}
+
+Every path is routed, /metrics and /admin/* included: the admin endpoints
+need ADMIN_TOKEN, and /metrics can be blocked at the proxy. Behind a proxy set
+[server] base_url or trust_proxy_headers in config.toml, or links point at
+the pod's own address.
+{{- end }}
+{{- if gt (int .Values.replicaCount) 1 }}
+
+WARNING: {{ .Values.replicaCount }} replicas each poll every source and hold their own WIS2
+subscriptions, multiplying the requests upstream object stores see.
+{{- end }}
+{{- if not .Values.stateDir.persistence.enabled }}
+
+state_dir is an emptyDir: WIS2 CAP and BUFR collections start empty after a
+pod restart. stateDir.persistence.enabled keeps it on a volume per pod.
+{{- end }}
+{{- if regexMatch "(?m)^\\s*watch_collections_dir\\s*=\\s*true" (.Values.config.toml | default "") }}
+
+WARNING: watch_collections_dir = true has not been tested on ConfigMap volumes.
+The chart already rolls the pods when a chart-managed file changes.
+{{- end }}

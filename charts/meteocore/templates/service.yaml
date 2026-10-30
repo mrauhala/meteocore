@@ -1,0 +1,42 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "meteocore.fullname" . }}
+  labels:
+    {{- include "meteocore.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "meteocore.selectorLabels" . | nindent 4 }}
+{{- if include "meteocore.statefulSet" . }}
+---
+# The StatefulSet's governing Service: stable per-pod DNS names. The
+# ServiceMonitor leaves it out by its component label, or every pod would be
+# scraped twice.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "meteocore.fullname" . }}-headless
+  labels:
+    {{- include "meteocore.labels" . | nindent 4 }}
+    app.kubernetes.io/component: headless
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "meteocore.selectorLabels" . | nindent 4 }}
+{{- end }}

@@ -510,3 +510,37 @@ when new families appear. Reload eviction already covers `{base}-*` IDs.
   `MALLOC_CONF`; a `background_thread` set there wins over the server's.
 - `jemalloc_retained_bytes` is address space, not memory: keep it off any
   panel plotted against RSS.
+
+## Container contract (Helm chart, #1365)
+
+`charts/meteocore` runs the image as it is. A change to any of these needs
+the chart, its README and `.github/workflows/helm.yml` changed in the same
+PR:
+
+- **Command:** the image has no ENTRYPOINT, so the chart sets
+  `command: ["dataserver"]` and passes `--config /data/config.toml --host
+  0.0.0.0 --port <containerPort>`.
+- **User:** uid and gid 999, from `useradd -r` in the Dockerfile; the chart
+  pins `runAsUser`, `runAsGroup` and `fsGroup` to 999. The root filesystem
+  is read-only: the server may write only to `state_dir`
+  (`/var/lib/meteocore`) and `/tmp`, both emptyDirs or volumes.
+- **Paths:** `config.toml` at `/data`, `collections.d` and `colormaps.d`
+  resolved against it.
+- **ConfigMap volumes are symlinks:** kubelet mounts each key as a symlink
+  into `..data/`. The `collections_dir` and `colormaps_dir` loaders take a
+  file by `Path::is_file()`, which follows symlinks;
+  `DirEntry::file_type().is_file()` does not, and would load nothing under
+  the chart.
+- **Required keys:** `[server] host` and `port`, and a collection's `title`
+  and `description`. The chart's default config and sample collection
+  carry them.
+- **Health:** the startup and readiness probes read `/health` (503 only
+  when every collection failed; 200 with no collections), and the startup
+  probe allows 10 minutes for the load between binding the port and
+  serving. Liveness is a TCP check.
+- **Metrics:** `/metrics` on the main port, for the ServiceMonitor.
+- **Shutdown:** the SIGTERM flush of `state_dir` snapshots must finish
+  within `terminationGracePeriodSeconds`, 60 s.
+- **Dashboard:** the chart ships `docker/grafana/dashboards/
+  meteocore-overview.json` compacted in a ConfigMap, at most 1 MiB;
+  `helm.yml` fails above 900 KB rendered.

@@ -1,0 +1,13 @@
+# Patterns to ignore when building the package.
+.DS_Store
+.git/
+.gitignore
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.idea/
+.vscode/
+# Values files for CI, not for users.
+ci/

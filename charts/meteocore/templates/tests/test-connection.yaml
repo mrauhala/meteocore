@@ -1,0 +1,57 @@
+{{- /*
+`helm test`: /health answers 200, and the sample collection, when enabled,
+serves an EDR query with its first observation. Runs the server's own image,
+which has curl, under the same pod security settings. Its labels leave out the
+Service's selector, which would otherwise route the test's requests to itself.
+*/}}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "meteocore.fullname" . }}-test
+  labels:
+    helm.sh/chart: {{ include "meteocore.chart" . }}
+    app.kubernetes.io/name: {{ include "meteocore.name" . }}-test
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  {{- with .Values.imagePullSecrets }}
+  imagePullSecrets:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .Values.podSecurityContext }}
+  securityContext:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  containers:
+    - name: check
+      image: {{ include "meteocore.image" . | quote }}
+      imagePullPolicy: {{ .Values.image.pullPolicy }}
+      command: ["sh", "-c"]
+      args:
+        - |
+          set -eu
+          base="http://{{ include "meteocore.fullname" . }}:{{ .Values.service.port }}"
+          curl -fsS --retry 10 --retry-connrefused --retry-delay 3 "$base/health"
+          echo
+          {{- if .Values.sample.enabled }}
+          curl -fsS "$base/edr/collections/{{ .Values.sample.id }}/area?coords=POLYGON((24%2060,26%2060,26%2061,24%2061,24%2060))&parameter-name=temperature" > /tmp/area.json
+          grep -q '"CoverageCollection"' /tmp/area.json
+          # Helsinki Kaisaniemi at 2026-01-01T00:00Z.
+          grep -q -- '-12.7' /tmp/area.json
+          echo "EDR area query on {{ .Values.sample.id }}: OK"
+          {{- end }}
+      {{- with .Values.securityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir: {}

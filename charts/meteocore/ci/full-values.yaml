@@ -1,0 +1,115 @@
+# Every optional resource, for lint and schema validation. Not installed in CI:
+# ServiceMonitor and HTTPRoute need their CRDs.
+image:
+  digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
+config:
+  toml: |
+    [server]
+    host = "0.0.0.0"
+    port = 8000
+    collections_dir = "collections.d"
+    colormaps_dir = "colormaps.d"
+    state_dir = "/var/lib/meteocore"
+    base_url = "https://meteocore.example.com"
+
+    [[style_bundles]]
+    id = "radar_multi"
+    [style_bundles.default]
+    colormap = "radar_dbz"
+collections:
+  files:
+    observations.toml: |
+      id = "observations"
+      title = "Observations"
+      description = "The sample observations under another id."
+      engine_type = "csv"
+      apis = ["edr", "features"]
+      data_path = "/data/sample/observations.csv"
+  existingConfigMaps:
+    - more-collections
+colormaps:
+  files:
+    temperature-fi.toml: |
+      title = "Temperature"
+      color_stops = [
+        { value = -30.0, color = "#0000ff" },
+        { value = 30.0, color = "#ff0000" },
+      ]
+  existingConfigMaps:
+    - more-colormaps
+env:
+  RUST_LOG: info,server=debug
+extraEnv:
+  - name: ADMIN_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: meteocore-secrets
+        key: admin-token
+extraArgs:
+  - --collections
+  - observations,sample-observations
+stateDir:
+  persistence:
+    enabled: true
+    storageClassName: standard
+    annotations:
+      example.com/backup: "true"
+podAnnotations:
+  example.com/team: weather
+resources:
+  requests:
+    cpu: 500m
+    memory: 2Gi
+  limits:
+    memory: 8Gi
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: meteocore.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - hosts:
+        - meteocore.example.com
+      secretName: meteocore-tls
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: gateway
+      namespace: gateway-system
+  hostnames:
+    - meteocore.example.com
+serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus
+grafanaDashboard:
+  enabled: true
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+extraVolumes:
+  - name: radar
+    persistentVolumeClaim:
+      claimName: radar-data
+      readOnly: true
+extraVolumeMounts:
+  - name: radar
+    mountPath: /meteo/data
+    readOnly: true
+nodeSelector:
+  kubernetes.io/os: linux
+tolerations:
+  - key: dedicated
+    operator: Equal
+    value: weather
+    effect: NoSchedule
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels:
+        app.kubernetes.io/name: meteocore
