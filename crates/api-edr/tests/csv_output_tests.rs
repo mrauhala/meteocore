@@ -25,6 +25,8 @@ use ds_core::model::*;
 
 #[path = "support/edr_schema.rs"]
 mod edr_schema;
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
 
 const BASE: &str = "https://api.example.com";
 const CONTENT_TYPE: &str = "text/csv; charset=utf-8; header=present";
@@ -757,14 +759,7 @@ async fn metadata_and_api_advertise_csv_where_served() {
 
     let (status, api) = get_json("/api").await;
     assert_eq!(status, StatusCode::OK);
-    let meta: Value =
-        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
-    let validator = jsonschema::Validator::new(&meta).unwrap();
-    let errors: Vec<String> = validator
-        .iter_errors(&api)
-        .map(|e| format!("{e} at {}", e.instance_path()))
-        .collect();
-    assert!(errors.is_empty(), "{errors:?}");
+    openapi_schema::assert_valid(&api, "CSV");
     let op = |path: &str| api["paths"][path]["get"].clone();
     let f_enum = |op: &Value| {
         op["parameters"]

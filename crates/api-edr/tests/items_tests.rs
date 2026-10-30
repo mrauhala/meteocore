@@ -25,6 +25,8 @@ use ds_core::model::{CoverageResponse, Location, LocationSnapshot};
 
 #[path = "support/edr_schema.rs"]
 mod edr_schema;
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
 
 /// 25 stations on a line from (20, 60) eastwards, one per 0.5°, each
 /// reporting at `T0 + i hours`. Implements both traits, like the station
@@ -663,14 +665,7 @@ async fn openapi_documents_the_items_paths_with_the_standard_parameters() {
     );
 
     // The whole document is valid OpenAPI 3.0 and every reference resolves.
-    let schema: Value =
-        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
-    let validator = jsonschema::Validator::new(&schema).unwrap();
-    let errors: Vec<String> = validator
-        .iter_errors(&api)
-        .map(|e| format!("{e} at {}", e.instance_path()))
-        .collect();
-    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    openapi_schema::assert_valid(&api, "items");
     let text = api.to_string();
     for reference in text.split("\"$ref\":\"#").skip(1) {
         let pointer = reference.split('"').next().unwrap();

@@ -24,6 +24,11 @@ use ds_core::instances::RunInfo;
 use ds_core::model::*;
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 
+#[path = "support/edr_schema.rs"]
+mod edr_schema;
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
+
 const LEVELS: [f64; 5] = [1000.0, 850.0, 700.0, 500.0, 250.0];
 
 fn run() -> DateTime<Utc> {
@@ -282,11 +287,19 @@ async fn cube_is_a_data_query_with_height_units_on_the_collection_and_its_runs()
         .as_str()
         .is_some_and(|d| !d.is_empty()));
     assert_eq!(variables["crs_details"][0]["crs"], "CRS84");
-    let bundle = schema("ogcapi-edr-1.1-bundled.json");
-    assert_valid(
-        &bundle["paths"]["/collections/{collectionId}"]["get"]["responses"]["200"]["content"]
-            ["application/json"]["schema"],
-        &doc,
+    let collection = "/collections/{collectionId}";
+    edr_schema::assert_valid(collection, edr_schema::JSON, &doc, "cube collection");
+    // Negative control: formats are asserted. Only 1.1 gives an interval
+    // bound `format: date-time`; 1.2 leaves it a plain string.
+    let mut bad = doc.clone();
+    assert!(bad["extent"]["temporal"]["interval"][0][0].is_string());
+    bad["extent"]["temporal"]["interval"][0][0] = json!("not-a-time");
+    let errors = edr_schema::errors(edr_schema::Edr::V1_1, collection, edr_schema::JSON, &bad);
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("/extent/temporal/interval/0/0")),
+        "{errors:?}"
     );
 
     let (status, _, instance) =
@@ -306,7 +319,7 @@ async fn api_documents_cube_with_the_standard_parameters() {
     ]);
     let (status, _, api) = get(&app, "/api").await;
     assert_eq!(status, StatusCode::OK);
-    assert_valid(&schema("openapi-3.0.json"), &api);
+    openapi_schema::assert_valid(&api, "cube");
     let resolve = |p: &Value| -> Value {
         match p["$ref"].as_str() {
             Some(r) => api.pointer(r.strip_prefix('#').unwrap()).unwrap().clone(),

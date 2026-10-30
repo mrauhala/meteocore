@@ -22,6 +22,9 @@ use ds_core::error::DataServerError;
 use ds_core::feature::*;
 use ds_core::feature_engine::FeatureEngine;
 
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
+
 // ---------------------------------------------------------------------------
 // Engines: one that advertises sortables, one that does not.
 // ---------------------------------------------------------------------------
@@ -472,19 +475,9 @@ async fn no_sortby_preserves_the_engines_natural_order() {
 /// typo in any future hand-written addition fails here instead of shipping.
 #[tokio::test]
 async fn api_definition_validates_against_the_openapi_30_metaschema() {
-    let schema: Value = serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json"))
-        .expect("bundled OpenAPI 3.0 meta-schema parses");
-    let validator = jsonschema::Validator::new(&schema).expect("meta-schema compiles");
-
     let (status, doc) = get("/api").await;
     assert_eq!(status, StatusCode::OK);
-
-    if let Err(errors) = validator.validate(&doc) {
-        let detail: Vec<String> = std::iter::once(errors)
-            .map(|e| format!("{} at {}", e, e.instance_path()))
-            .collect();
-        panic!("/api is not valid OpenAPI 3.0:\n{}", detail.join("\n"));
-    }
+    openapi_schema::assert_valid(&doc, "Features");
 }
 
 /// The `sortby` parameter must be declared exactly as OGC 24-030 specifies.

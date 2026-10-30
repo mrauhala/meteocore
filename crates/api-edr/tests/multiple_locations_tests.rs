@@ -31,6 +31,9 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
+
 /// An id with a comma in it, addressable as `Helsinki%2C%20Kaisaniemi`.
 const COMMA_ID: &str = "Helsinki, Kaisaniemi";
 /// Values each `big*` station returns: two of them exceed the combined budget.
@@ -471,7 +474,7 @@ async fn multiple_locations_is_advertised() {
 async fn openapi_declares_a_location_id_list() {
     let app = app();
     let (_, api) = app.get("/api").await;
-    validate("openapi-3.0.json", &api);
+    openapi_schema::assert_valid(&api, "multiple locations");
     let operation = &api["paths"]["/edr/collections/obs/locations/{locationId}"]["get"];
     let location_id = operation["parameters"]
         .as_array()

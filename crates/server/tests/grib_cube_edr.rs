@@ -1,8 +1,9 @@
 //! EDR cube queries (#925) on engine-grib, end to end over the committed
 //! ECMWF fixture (a global 0.25° `q` field at 150 hPa, served as a pressure
-//! level collection): the collection advertises cube, the CoverageJSON
-//! validates against `schemas/coveragejson.json`, resampling picks the
-//! native nodes, and the budget and antimeridian limits are 400s.
+//! level collection): the collection advertises cube and validates against
+//! the EDR 1.1 and 1.2 bundles, the CoverageJSON validates against
+//! `schemas/coveragejson.json`, resampling picks the native nodes, and the
+//! budget and antimeridian limits are 400s.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,6 +19,9 @@ use tower::ServiceExt;
 use ds_core::config::{CollectionConfig, GribConfig, GribLevelType};
 use ds_core::edr_engine::EdrEngine;
 use engine_grib::GribEngine;
+
+#[path = "../../api-edr/tests/support/edr_schema.rs"]
+mod edr_schema;
 
 const ID: &str = "forecast-pressure";
 
@@ -143,10 +147,9 @@ async fn grib_pressure_collection_serves_cube_queries() {
     let link = &collection["data_queries"]["cube"]["link"];
     assert_eq!(link["href"], format!("/edr/collections/{ID}/cube"));
     assert_eq!(link["variables"]["height_units"], json!(["hPa"]));
-    let edr = schema("ogcapi-edr-1.1-bundled.json");
-    assert_valid(
-        &edr["paths"]["/collections/{collectionId}"]["get"]["responses"]["200"]["content"]
-            ["application/json"]["schema"],
+    edr_schema::assert_valid(
+        "/collections/{collectionId}",
+        edr_schema::JSON,
         &collection,
         "EDR collection",
     );
