@@ -196,21 +196,6 @@ impl LinkView {
     }
 }
 
-/// One collection in a `/collections` list or a single `/collections/{id}` page.
-#[derive(Debug, Clone)]
-pub struct CollectionCard {
-    pub id: String,
-    pub title: String,
-    pub description: String,
-    /// Link to this collection's own metadata resource.
-    pub self_href: String,
-    /// Configured keywords (may be empty), rendered as chips.
-    pub keywords: Vec<String>,
-    /// Optional license as `(title, href?)`: rendered as a link when an href is
-    /// present, else as the plain name (a free-text license with no URL).
-    pub license: Option<(String, Option<String>)>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

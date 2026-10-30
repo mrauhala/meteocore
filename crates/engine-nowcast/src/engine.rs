@@ -2482,8 +2482,10 @@ impl EdrEngine for NowcastEngine {
             )
         })?;
 
-        // Blocks whose centre falls outside the polygon are null (#671);
-        // `MotionGrid` is row-major over y × x.
+        // Blocks outside the area are null, per `QueryPolygon::mask_cells`:
+        // a rectangle keeps the blocks whose footprint meets it (#966),
+        // any other polygon the blocks centred inside it, with the vertex
+        // fallback (#671). `MotionGrid` is row-major over y × x.
         ds_core::feature::check_mask_budget(grid.x.len() * grid.y.len(), &polygon)?;
         let mask = polygon.mask_cells(&grid.x, &grid.y);
         if !mask.iter().any(|&m| m) {
