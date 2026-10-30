@@ -1,7 +1,9 @@
 //! Offline validation of tileset and tile-matrix-set responses against the
 //! pinned OGC 2D Tile Matrix Set 2.0 JSON schemas (`schemas/tms-2.0`, see
 //! `schemas/README.md`). Relative `$ref`s resolve to the vendored copies; any
-//! other reference fails instead of downloading.
+//! other reference fails instead of downloading. The schemas are JSON Schema
+//! 2019-09, where `format` is only an annotation unless format validation is
+//! turned on, so it is: `uri` and `date-time` are asserted.
 use std::sync::LazyLock;
 
 use jsonschema::{Retrieve, Uri, Validator};
@@ -99,6 +101,7 @@ fn validator(file: &str) -> Validator {
     jsonschema::options()
         .with_base_uri(format!("{BASE}{file}"))
         .with_retriever(Pinned)
+        .should_validate_formats(true)
         .build(&serde_json::from_str(source).expect("pinned TMS schema parses"))
         .unwrap_or_else(|error| panic!("{file}: {error}"))
 }
@@ -128,4 +131,8 @@ pub fn assert_tile_matrix_set(body: &Value, context: &str) {
 
 pub fn is_valid_tileset(body: &Value) -> bool {
     TILESET.is_valid(body)
+}
+
+pub fn is_valid_tile_matrix_set(body: &Value) -> bool {
+    TILE_MATRIX_SET.is_valid(body)
 }

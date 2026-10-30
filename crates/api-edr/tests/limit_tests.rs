@@ -26,6 +26,9 @@ use ds_core::error::DataServerError;
 use ds_core::instances::RunInfo;
 use ds_core::model::*;
 
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
+
 const LOCATIONS: usize = 5;
 /// Coverages the mock's area query returns.
 const AREA_COVERAGES: usize = 4;
@@ -354,14 +357,24 @@ fn xs(json: &Value) -> Vec<f64> {
         .collect()
 }
 
-fn validate(schema_file: &str, json: &Value) {
+/// Every violation of `schema_file` in `json`, formats asserted:
+/// `edr-locations-geojson.json` has no `$schema`, so it compiles as 2020-12,
+/// where `format` is otherwise only an annotation.
+fn errors(schema_file: &str, json: &Value) -> Vec<String> {
     let path = format!("{}/../../schemas/{schema_file}", env!("CARGO_MANIFEST_DIR"));
     let schema: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-    let validator = jsonschema::Validator::new(&schema).unwrap();
-    let errors: Vec<String> = validator
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(&schema)
+        .unwrap();
+    validator
         .iter_errors(json)
         .map(|e| format!("{e} at {}", e.instance_path()))
-        .collect();
+        .collect()
+}
+
+fn validate(schema_file: &str, json: &Value) {
+    let errors = errors(schema_file, json);
     assert!(errors.is_empty(), "{schema_file}: {errors:?}\n{json}");
 }
 
@@ -566,6 +579,10 @@ async fn locations_pages_follow_next_links_through_the_inventory() {
     let (status, first) = app.get("/collections/obs/locations?limit=2").await;
     assert_eq!(status, StatusCode::OK);
     validate("edr-locations-geojson.json", &first);
+    // Negative control: the schema's `timeStamp` format is asserted.
+    let mut stamped = first.clone();
+    stamped["timeStamp"] = "yesterday".into();
+    assert_eq!(errors("edr-locations-geojson.json", &stamped).len(), 1);
     assert_eq!(ids(&first), ["s0", "s1"]);
     assert_eq!(first["numberMatched"], LOCATIONS);
     assert_eq!(first["numberReturned"], 2);
@@ -653,14 +670,7 @@ async fn locations_paging_rejects_bad_offsets_and_repeats() {
 async fn openapi_declares_limit_and_offset() {
     let app = app(1);
     let (_, api) = app.get("/api").await;
-    let schema: Value =
-        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
-    let validator = jsonschema::Validator::new(&schema).unwrap();
-    let errors: Vec<String> = validator
-        .iter_errors(&api)
-        .map(|e| format!("{e} at {}", e.instance_path()))
-        .collect();
-    assert!(errors.is_empty(), "{errors:?}");
+    openapi_schema::assert_valid(&api, "limit");
 
     let parameter = |path: &str, name: &str| -> Option<Value> {
         api["paths"][path]["get"]["parameters"]

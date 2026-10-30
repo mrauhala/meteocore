@@ -32,6 +32,8 @@ use ds_core::model::*;
 
 #[path = "support/edr_schema.rs"]
 mod edr_schema;
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
 
 const LOCATIONS_PATH: &str = "/collections/{collectionId}/locations";
 const ROOT: &str = "https://example.test/edr/collections/obs/locations";
@@ -538,14 +540,7 @@ async fn openapi_declares_bbox_and_datetime_on_locations() {
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let api: Value = serde_json::from_slice(&body).unwrap();
 
-    let meta: Value =
-        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
-    let validator = jsonschema::Validator::new(&meta).unwrap();
-    let errors: Vec<String> = validator
-        .iter_errors(&api)
-        .map(|e| format!("{e} at {}", e.instance_path()))
-        .collect();
-    assert!(errors.is_empty(), "{errors:?}");
+    openapi_schema::assert_valid(&api, "locations filters");
 
     let bundle: Value = serde_json::from_str(include_str!(
         "../../../schemas/ogcapi-edr-1.2-oas30-bundled.json"

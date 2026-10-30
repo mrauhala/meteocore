@@ -1253,6 +1253,8 @@ mod locations {
         }
     }
 
+    /// The schema has no `$schema`, so it compiles as 2020-12, where `format`
+    /// is only an annotation unless format validation is turned on.
     #[tokio::test]
     async fn validates_against_edr_locations_schema() {
         let schema_str = std::fs::read_to_string(concat!(
@@ -1261,7 +1263,10 @@ mod locations {
         ))
         .expect("Failed to read EDR locations GeoJSON schema");
         let schema: Value = serde_json::from_str(&schema_str).unwrap();
-        let validator = jsonschema::Validator::new(&schema).expect("Failed to compile schema");
+        let validator = jsonschema::options()
+            .should_validate_formats(true)
+            .build(&schema)
+            .expect("Failed to compile schema");
 
         let (_, json) = get("/collections/weather/locations").await;
 
@@ -1277,6 +1282,14 @@ mod locations {
                 serde_json::to_string_pretty(&json).unwrap()
             );
         }
+
+        // `/locations` emits no `timeStamp`; the schema's `date-time` format
+        // on it is asserted all the same.
+        let mut stamped = json.clone();
+        stamped["timeStamp"] = "2026-06-07T06:00:00Z".into();
+        assert!(validator.is_valid(&stamped));
+        stamped["timeStamp"] = "yesterday".into();
+        assert!(!validator.is_valid(&stamped));
     }
 
     #[tokio::test]

@@ -90,10 +90,13 @@ landing page, `/conformance`, `/collections`, collection documents (with
 locations, position, area and radius queries, vertical extents and
 per-parameter time axes), the instances list, one instance document, a
 collection with a long run axis and a page of its instances list, and the
-`/locations` GeoJSON. Neither bundle has an `/instances/{instanceId}`
-path; an instance document is validated against the instances list's item
-schema. A negative control removes one data query link's `title`, which 1.2
-requires and 1.1 does not, and expects 1.2 to reject the document.
+`/locations` GeoJSON. The cube suites (`cube_tests`, and the server's
+`grib_cube_edr`) check their collection documents through the same helper.
+Neither bundle has an `/instances/{instanceId}` path; an instance document is
+validated against the instances list's item schema. A negative control removes
+one data query link's `title`, which 1.2 requires and 1.1 does not, and
+expects 1.2 to reject the document. Another sets a collection's temporal
+interval start to a non-date-time, which 1.1's `format: date-time` rejects.
 
 The helper (`crates/api-edr/tests/support/edr_schema.rs`) works like the
 Common one above. It selects the `200` schema by the bundle's resource path
@@ -132,9 +135,11 @@ retrieved unmodified on 2026-09-25 from `https://schemas.opengis.net/tms/2.0/jso
 They are JSON Schema 2019-09 with relative `$ref`s; the test helper
 (`crates/server/tests/common_discovery/tms.rs`) serves these copies for their
 `schemas.opengis.net` URIs and fails on any other reference, so validation stays
-offline. The contract suite validates every tileset (list entries and
-resources) and tile matrix set the shared root and the per-API Tiles service
-advertise.
+offline. In 2019-09 `format` is only an annotation, so the helper turns format
+validation on: `uri` and `date-time` are asserted, and a negative control
+checks a malformed `uri`. The contract suite validates every tileset (list
+entries and resources) and tile matrix set the shared root and the per-API
+Tiles service advertise.
 
 | File | SHA-256 |
 |---|---|
@@ -163,5 +168,14 @@ record the date and hashes here, and run the contract suite.
 - `ogcapi-edr-1.1-bundled.json`: EDR 1.1 discovery response validation,
   next to the 1.2 bundle above, through the same helper.
 - `coveragejson.json`: CoverageJSON output validation.
-- `edr-locations-geojson.json`: EDR location GeoJSON validation.
-- `openapi-3.0.json`: generic OpenAPI document validation (Features `/api`).
+- `edr-locations-geojson.json`: EDR location GeoJSON validation. It has no
+  `$schema`, so it compiles as JSON Schema 2020-12, where `format` is only an
+  annotation; its checks turn format validation on, so `timeStamp` must be a
+  `date-time`.
+- `openapi-3.0.json`: the OpenAPI 3.0 meta-schema every `/api` check uses,
+  through one shared helper
+  (`crates/api-common/tests/support/openapi_schema.rs`). The meta-schema
+  declares Draft 4, where jsonschema knows no `uri-reference` and would skip
+  it, leaving every Reference Object `$ref` and the meta-schema's other URL
+  fields unchecked. The helper registers an RFC 3986 `uri-reference` check and
+  rejects any other unknown format.

@@ -14,6 +14,9 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
+
 // ---------------------------------------------------------------------------
 // Mock engine
 // ---------------------------------------------------------------------------
@@ -5079,16 +5082,9 @@ mod part1 {
     /// standard's (#945).
     #[tokio::test]
     async fn openapi_declares_the_part1_parameters() {
-        let schema: Value =
-            serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
-        let validator = jsonschema::Validator::new(&schema).unwrap();
         let (status, doc) = get("/api").await;
         assert_eq!(status, StatusCode::OK);
-        let errors: Vec<String> = validator
-            .iter_errors(&doc)
-            .map(|e| format!("{e} at {}", e.instance_path()))
-            .collect();
-        assert!(errors.is_empty(), "{}", errors.join("\n"));
+        openapi_schema::assert_valid(&doc, "Maps");
 
         let parameters = &doc["components"]["parameters"];
         assert_eq!(parameters["bbox"]["required"], false);

@@ -24,6 +24,9 @@ use ds_core::feature::Bbox;
 use ds_core::instances::RunInfo;
 use ds_core::model::*;
 
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
+
 const ALL: &[&str] = &[
     "locations",
     "position",
@@ -626,14 +629,7 @@ async fn every_operation_lists_its_status_classes_and_parameters() {
         "application/vnd.oai.openapi+json;version=3.0"
     );
     let api = reply.body;
-    let meta: Value =
-        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
-    let validator = jsonschema::Validator::new(&meta).unwrap();
-    let errors: Vec<String> = validator
-        .iter_errors(&api)
-        .map(|e| format!("{e} at {}", e.instance_path()))
-        .collect();
-    assert!(errors.is_empty(), "{errors:?}");
+    openapi_schema::assert_valid(&api, "EDR");
     check_refs(&api, &api);
 
     let data_query = |path: &str| {
@@ -734,6 +730,43 @@ fn check_refs(api: &Value, value: &Value) {
         }
         Value::Array(items) => items.iter().for_each(|v| check_refs(api, v)),
         _ => {}
+    }
+}
+
+/// The shared `/api` check asserts the meta-schema's `uri-reference` format,
+/// which jsonschema does not know under the meta-schema's Draft 4: a `$ref`
+/// with a space fails, and every RFC 3986 reference form passes.
+#[tokio::test]
+async fn the_openapi_check_asserts_uri_references() {
+    let api = api(&app()).await;
+    let with_ref = |reference: &str| {
+        let mut doc = api.clone();
+        let (_, item) = doc["paths"]
+            .as_object_mut()
+            .unwrap()
+            .iter_mut()
+            .next()
+            .unwrap();
+        item["get"]["responses"]["200"] = json!({ "$ref": reference });
+        doc
+    };
+    for malformed in [
+        "#/components/responses/has space",
+        "#/components/responses/a#b",
+        "https://example.test/%zz",
+    ] {
+        let errors = openapi_schema::errors(&with_ref(malformed));
+        assert_eq!(errors.len(), 1, "{malformed}: {errors:?}");
+        assert!(errors[0].contains("/get/responses/200"), "{errors:?}");
+    }
+    for valid in [
+        "#/components/responses/ok",
+        "responses.json#/ok",
+        "../common/responses.json",
+        "//example.test/responses.json",
+        "https://example.test/openapi.json#/components/responses/ok",
+    ] {
+        openapi_schema::assert_valid(&with_ref(valid), valid);
     }
 }
 

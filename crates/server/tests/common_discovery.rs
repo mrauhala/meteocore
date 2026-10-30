@@ -24,6 +24,8 @@ use http_body_util::BodyExt;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+#[path = "../../api-common/tests/support/openapi_schema.rs"]
+mod openapi_schema;
 #[path = "common_discovery/schema.rs"]
 mod schema;
 #[path = "common_discovery/tms.rs"]
@@ -1820,6 +1822,17 @@ async fn per_api_tilesets_validate_against_tms_2() {
         }
         let tms = get_json(&app, &format!("{prefix}/tileMatrixSets/WebMercatorQuad")).await;
         tms::assert_tile_matrix_set(&tms, surface);
+
+        // Negative controls: the schemas' `uri` format is asserted.
+        let malformed = "http://www.opengis.net/def/tilematrixset/OGC/1.0/Web Mercator Quad";
+        let mut tileset = list["tilesets"][0].clone();
+        assert!(tileset["tileMatrixSetURI"].is_string(), "{surface}");
+        tileset["tileMatrixSetURI"] = malformed.into();
+        assert!(!tms::is_valid_tileset(&tileset), "{surface}");
+        let mut matrix_set = tms;
+        assert!(matrix_set["uri"].is_string(), "{surface}");
+        matrix_set["uri"] = malformed.into();
+        assert!(!tms::is_valid_tile_matrix_set(&matrix_set), "{surface}");
     }
 }
 
@@ -1830,14 +1843,7 @@ async fn per_api_tilesets_validate_against_tms_2() {
 async fn shared_openapi_is_valid_and_blocks_agree_on_shared_components() {
     let (app, prefix) = app("shared");
     let doc = get_json(&app, &format!("{prefix}/api")).await;
-    let schema: Value =
-        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
-    let validator = jsonschema::Validator::new(&schema).unwrap();
-    let errors: Vec<_> = validator
-        .iter_errors(&doc)
-        .map(|e| format!("{e} at {}", e.instance_path()))
-        .collect();
-    assert!(errors.is_empty(), "{}", errors.join("\n"));
+    openapi_schema::assert_valid(&doc, "shared root");
     let mut ids = std::collections::HashSet::new();
     for item in doc["paths"].as_object().unwrap().values() {
         for operation in item.as_object().unwrap().values() {
@@ -2598,9 +2604,6 @@ async fn map_tiles_beside_every_map(app: &Router, prefix: &str) -> Result<usize,
 ///   (`/req/tilesets/tiles-parameters`).
 #[tokio::test]
 async fn declared_map_tile_classes_match_what_each_surface_serves() {
-    let schema: Value =
-        serde_json::from_str(include_str!("../../../schemas/openapi-3.0.json")).unwrap();
-    let validator = jsonschema::Validator::new(&schema).unwrap();
     for surface in ["shared", "maps", "tiles"] {
         let (app, prefix) = styled_app(surface);
         let conformance = get_json(&app, &format!("{prefix}/conformance")).await;
@@ -2626,11 +2629,7 @@ async fn declared_map_tile_classes_match_what_each_surface_serves() {
         }
 
         let api = get_json(&app, &format!("{prefix}/api")).await;
-        let errors: Vec<_> = validator
-            .iter_errors(&api)
-            .map(|e| format!("{e} at {}", e.instance_path()))
-            .collect();
-        assert!(errors.is_empty(), "{surface}: {}", errors.join("\n"));
+        openapi_schema::assert_valid(&api, surface);
         // Every tile operation, map and vector: the shared root's map,
         // styled map and vector tiles, the per-API mixed and styled tiles.
         let tile = "/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}";

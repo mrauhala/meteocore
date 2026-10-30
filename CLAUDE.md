@@ -619,7 +619,10 @@ Same pattern for api-edr, api-features, api-maps, api-tiles:
    incidental. `api-features` pins this with a test that validates `/api`
    against the bundled OpenAPI 3.0 meta-schema (`schemas/openapi-3.0.json`);
    the definition is hand-written `serde_json::json!`, so nothing else
-   catches a typo in it.
+   catches a typo in it. Validate `/api` only through the shared
+   `#[path]` helper `crates/api-common/tests/support/openapi_schema.rs`:
+   the meta-schema is Draft 4, where a plain `jsonschema::Validator::new`
+   skips `uri-reference` and so never checks a `$ref` (#1045).
 
 ## Performance & Concurrency Rules
 
