@@ -6,7 +6,10 @@
 # change.
 #
 # The install test runs the image the chart defaults to, the release named by
-# appVersion, so it tests what `helm install` gives a user today.
+# appVersion, so it tests what `helm install` gives a user today. On a release
+# commit, appVersion names a release whose image release.yml is still
+# building, for about two hours; until that image is on ghcr.io the test runs
+# `:main`, which every push to main publishes.
 #
 # Not a required check: a path-filtered workflow that does not run would
 # leave its required check pending forever.
@@ -219,6 +222,33 @@ jobs:
           version: v0.33.0
           cluster_name: meteocore
 
+      - name: Image to test
+        id: image
+        run: |
+          set -euo pipefail
+          app=$(sed -n 's/^appVersion: "\(.*\)"$/\1/p' "$CHART/Chart.yaml")
+          repo="${GITHUB_REPOSITORY,,}"
+          token=$(curl -sSf "https://ghcr.io/token?scope=repository:${repo}:pull" | jq -r .token)
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${token}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/${repo}/manifests/${app}")
+          case "$code" in
+            200) tag="$app" ;;
+            404)
+              tag=main
+              echo "::notice::Image ${app} is not on ghcr.io yet, as on a release commit before release.yml publishes it: testing the chart with :main."
+              ;;
+            *)
+              echo "::error::ghcr.io answered ${code} for ${repo}:${app}."
+              exit 1
+              ;;
+          esac
+          echo "Testing with image tag ${tag}."
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
       # Namespaces that reject any pod the `restricted` Pod Security
       # Standard does not admit, the test pod included.
       - name: Restricted namespaces
@@ -232,12 +262,17 @@ jobs:
           done
 
       - name: Install with the default values
+        env:
+          TAG: ${{ steps.image.outputs.tag }}
         run: |
           set -euo pipefail
-          helm install meteocore "$CHART" --namespace mc-default --wait --timeout 10m
+          helm install meteocore "$CHART" --namespace mc-default --set image.tag="$TAG" \
+            --wait --timeout 10m
           helm test meteocore --namespace mc-default --logs
 
       - name: A config change rolls the pods
+        env:
+          TAG: ${{ steps.image.outputs.tag }}
         run: |
           set -euo pipefail
           checksum() {
@@ -245,7 +280,7 @@ jobs:
               | jq -r '.spec.template.metadata.annotations["checksum/config"]'
           }
           before=$(checksum)
-          helm upgrade meteocore "$CHART" --namespace mc-default \
+          helm upgrade meteocore "$CHART" --namespace mc-default --set image.tag="$TAG" \
             -f "$CHART/ci/rollout-values.yaml" --wait --timeout 10m
           after=$(checksum)
           echo "checksum/config ${before} -> ${after}"
@@ -263,10 +298,12 @@ jobs:
           echo "${pod} serves the added collection."
 
       - name: Per-pod state volumes
+        env:
+          TAG: ${{ steps.image.outputs.tag }}
         run: |
           set -euo pipefail
           ns=mc-state
-          helm install meteocore "$CHART" --namespace "$ns" \
+          helm install meteocore "$CHART" --namespace "$ns" --set image.tag="$TAG" \
             -f "$CHART/ci/statefulset-values.yaml" --wait --timeout 10m
           bound=$(kubectl --namespace "$ns" get pvc -o json \
             | jq '[.items[] | select(.status.phase == "Bound")] | length')
