@@ -55,8 +55,15 @@ pub struct AnalysisGrid {
 }
 
 fn weigh(_: &GridKey, grid: &Arc<AnalysisGrid>) -> u64 {
-    let residuals = grid.residuals.len() * std::mem::size_of::<crate::residuals::Residual>();
-    grid_bytes(grid.values.len()) + residuals as u64 + 128
+    entry_bytes(grid.values.len(), grid.residuals.len())
+}
+
+/// The weight of a cached grid of `cells` cells computed from `stations`
+/// stations: its values, a residual per station and the entry's overhead.
+/// The cache's demand counts grids with it before they exist (#1309).
+pub(crate) fn entry_bytes(cells: usize, stations: usize) -> u64 {
+    let residuals = stations * std::mem::size_of::<crate::residuals::Residual>();
+    grid_bytes(cells) + residuals as u64 + 128
 }
 
 /// Bytes of a grid of `cells` cells.

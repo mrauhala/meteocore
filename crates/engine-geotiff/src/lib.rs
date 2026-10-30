@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use ds_cache::plan::{CacheDemand, DemandSlot, Scope};
 use ds_core::native_grid::NativeGrid;
 use ds_poll::Shutdown;
 use ds_storage::discovery::{
@@ -245,7 +246,20 @@ pub struct GeoTiffEngine {
     republished: AtomicU64,
     /// Rate limit for the WARN about forbidden tile ranges (#1074).
     forbidden_warnings: gone::ForbiddenWarnings,
+    /// What the collection needs of its tile cache (#1309), published with
+    /// each `RasterInfo` snapshot.
+    demand: DemandSlot,
+    /// Serializes computing the demand and publishing it, so a poll and a
+    /// render path refreshing at once cannot leave a stale catalog's demand
+    /// published last.
+    demand_lock: Mutex<()>,
 }
+
+/// How a remote collection's tile cache demand is computed (#1309).
+const REMOTE_TILE_DEMAND_RULE: &str = "frames in the window × mean encoded frame bytes";
+/// A local collection's: its tile cache holds nothing.
+const LOCAL_TILE_DEMAND_RULE: &str = "none: a local collection reads its files through the page \
+                                      cache";
 
 /// Most newly discovered STAC items whose metadata one poll cycle preloads
 /// (#90), newest first. A cold start or a poll after an outage can discover a
@@ -564,6 +578,54 @@ impl GeoTiffEngine {
     /// `do_load_metadata`), where it must never trigger `DataStore`/`block_in_place`.
     fn refresh_raster_info(&self) {
         self.raster_info.store(Arc::new(self.build_raster_info()));
+        // Here too on a render path that found an object gone or loaded a
+        // STAC item: only a change is published, so a request pays no plan
+        // check. Under the lock, from the catalog current then.
+        let _publishing = self.demand_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let demand = self.tile_cache_demand_of(&self.catalog.load());
+        if self.demand.get() != demand {
+            match demand {
+                Some(demand) => {
+                    if let Some(short) = self.demand.publish(demand) {
+                        tracing::warn!("{short}");
+                    }
+                }
+                None => self.demand.clear(),
+            }
+        }
+    }
+
+    /// What `catalog` needs of the tile cache (#1309): nothing for a local
+    /// collection, whose cache is built empty; for a remote one every frame
+    /// in the window at the mean encoded size of those whose size the
+    /// listing gave, which counts every overview level, as the cache would
+    /// hold a frame read whole. `None` while no frame's size is known (STAC
+    /// items without `file:size`, or no frame yet): unknown, not 0.
+    fn tile_cache_demand_of(&self, catalog: &Catalog) -> Option<CacheDemand> {
+        const SETTING: &str = "[geotiff] tile_cache_mb";
+        if self.reads_local_files() {
+            return Some(CacheDemand::demand(0, LOCAL_TILE_DEMAND_RULE, SETTING));
+        }
+        let (mut frames, mut sized, mut bytes) = (0u64, 0u64, 0u64);
+        for (_, entry) in catalog.live() {
+            frames += 1;
+            if entry.file_size > 0 {
+                sized += 1;
+                bytes += entry.file_size;
+            }
+        }
+        let mean = bytes.checked_div(sized)?;
+        Some(
+            CacheDemand::demand(frames * mean, REMOTE_TILE_DEMAND_RULE, SETTING)
+                .input("frames", frames)
+                .input("frame_bytes", mean),
+        )
+    }
+
+    /// What the collection last published as its tile cache's demand
+    /// (#1309).
+    pub fn tile_cache_demand(&self) -> Option<CacheDemand> {
+        self.demand.get()
     }
 
     /// Derive [`RasterInfo`] from the current catalog — a pure read of what's
@@ -838,6 +900,15 @@ impl GeoTiffEngine {
             gone: gone::GoneObjects::default(),
             republished: AtomicU64::new(0),
             forbidden_warnings: gone::ForbiddenWarnings::default(),
+            demand: DemandSlot::new(
+                "tile_cache",
+                Scope::Collection {
+                    engine: "geotiff",
+                    id: collection_id.to_string(),
+                },
+                collection_id,
+            ),
+            demand_lock: Mutex::new(()),
         };
 
         // Initial scan — STAC mode fetches collection extent only (no items)

@@ -26,6 +26,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use ds_cache::plan::{CacheDemand, DemandSlot, Scope};
 use ds_cache::CacheEntry;
 use ds_core::config::SatelliteConfig;
 use ds_core::edr_engine::EdrEngine;
@@ -170,8 +171,14 @@ pub struct SatelliteEngine {
     window: Option<TimeWindow>,
     poll_interval: Duration,
     catalog: ArcSwap<Catalog>,
+    /// What this collection's window needs of [`FRAMES`] (#1309), published
+    /// by each poll.
+    demand: DemandSlot,
     shutdown: Shutdown,
 }
+
+/// The scan cache's demand rule (#1309), for every satellite collection.
+const WINDOW_RULE: &str = "scans in each time window × scan bytes, summed over collections";
 
 impl SatelliteEngine {
     /// Build the engine. No I/O: the poll loop's first, immediate tick lists
@@ -289,6 +296,11 @@ impl SatelliteEngine {
             window,
             poll_interval: Duration::from_secs(config.poll_interval_secs),
             catalog: ArcSwap::from_pointee(catalog),
+            demand: DemandSlot::new(
+                "satellite_frame_cache",
+                Scope::Engine("satellite"),
+                collection_id,
+            ),
             shutdown: Shutdown::new(),
         })
     }
@@ -512,7 +524,27 @@ impl SatelliteEngine {
         });
         self.catalog.store(catalog.clone());
         cache::record_window(self.engine, &self.collection_id, catalog.window_bytes);
+        if let Some(short) = self.demand.publish(self.window_demand(&catalog)) {
+            tracing::warn!("{short}");
+        }
         self.keep_resident(&catalog, &listed, &downloads);
+    }
+
+    /// What `catalog`'s time window needs of [`FRAMES`] (#1309): the bytes
+    /// of its scans, as ingested. Every satellite collection's together
+    /// are the cache's demand; below it, scans in a window are evicted, and
+    /// [`Self::keep_resident`] stops downloading them back.
+    fn window_demand(&self, catalog: &Catalog) -> CacheDemand {
+        let scans: u64 = catalog.frames.iter().map(|f| f.len() as u64).sum();
+        CacheDemand::demand(
+            catalog.window_bytes,
+            WINDOW_RULE,
+            "MC_SATELLITE_FRAME_CACHE_MB",
+        )
+        .ahead()
+        .input("products", self.products.len() as u64)
+        .input("scans", scans)
+        .input("scan_bytes", catalog.window_bytes / scans.max(1))
     }
 
     /// Remove from memory this engine's scans that `frames` does not hold:
@@ -535,8 +567,9 @@ impl SatelliteEngine {
     /// `MC_SATELLITE_FRAME_CACHE_MB` ([`FRAMES`] is one shard, so then
     /// nothing in a window is evicted). Past that, a download would evict
     /// another in-window scan and the next poll would fetch that one back,
-    /// forever. Then a scan is downloaded only into free room, and one WARN
-    /// per poll names the sizes.
+    /// forever. Then a scan is downloaded only into free room. The windows
+    /// are the cache's demand, which the poll has just published: the plan
+    /// says once, with the sizes, that they do not fit (#1309).
     fn keep_resident(&self, catalog: &Catalog, listed: &[bool], downloads: &[usize]) {
         let capacity = FRAMES.capacity_bytes();
         if capacity == 0 {
@@ -552,7 +585,6 @@ impl SatelliteEngine {
         let windows = cache::windows();
         let total: u64 = windows.iter().map(|(_, bytes)| bytes).sum();
         let fits = total <= capacity;
-        let mut missing = 0usize;
         for (index, scans) in catalog.frames.iter().enumerate() {
             let mut budget = if listed[index] {
                 MAX_INGEST_PER_POLL.saturating_sub(downloads[index])
@@ -565,30 +597,9 @@ impl SatelliteEngine {
                 }
                 if budget > 0 && (fits || FRAMES.weight() + held.weight <= capacity) {
                     budget -= 1;
-                    if self.reingest(index, time, held) {
-                        continue;
-                    }
+                    self.reingest(index, time, held);
                 }
-                missing += 1;
             }
-        }
-        if !fits && missing > 0 {
-            let mb = |bytes: u64| format!("{:.1}", bytes as f64 / ds_cache::MIB as f64);
-            tracing::warn!(
-                "[{}] {missing} scan(s) in the time window are not in memory and are not \
-                 downloaded again: the time windows of all satellite collections hold {} MB \
-                 of scans ({}), more than MC_SATELLITE_FRAME_CACHE_MB={}. Requests for them \
-                 download them from the source. Raise MC_SATELLITE_FRAME_CACHE_MB above the \
-                 total or shorten a time_window",
-                self.collection_id,
-                mb(total),
-                windows
-                    .iter()
-                    .map(|(collection, bytes)| format!("{collection} {} MB", mb(*bytes)))
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                capacity / ds_cache::MIB
-            );
         }
     }
 

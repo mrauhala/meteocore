@@ -32,7 +32,9 @@ level type) exposes every parameter; each retained run is an EDR instance.
   decoded-grid miss. Both caches are per source, shared by its level views.
   A full cache keeps a new entry until its next read in a ring sized for
   one decoded 0.1° field, which takes a `grid_cache_mb` of 52 or more:
-  below, a 0.1° map decodes each frame several times.
+  below, a 0.1° map decodes each frame several times. `/admin/cache-plan`
+  reports each cache's demand, 16 decoded fields of the source's grid and
+  16 of its mean messages, and suggests sizes.
 - **Long EDR windows.** An EDR query (position, trajectory, area, radius,
   cube) whose fields, at the grid's decoded size, add up to more than
   `grid_cache_mb` reads them without keeping them: inserting them would

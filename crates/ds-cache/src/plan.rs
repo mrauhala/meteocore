@@ -19,6 +19,10 @@
 //! [`SAMPLE_EVERY`], so a row carries what its cache did over the last
 //! [`WINDOW`]: its [`Activity`], with a [`Label`] saying whether it needs
 //! more memory (#1308).
+//!
+//! Engines publish what each cache must hold for their data ([`demand`],
+//! #1309): a row carries its cache's [`Demand`], from which the plan
+//! suggests a size and says when the configured one is short.
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -28,6 +32,9 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use crate::{CacheMetrics, Churn, MIB};
+
+pub mod demand;
+pub use demand::{check_rows, CacheDemand, Demand, DemandSlot, Shortfall, DEMAND_FIELDS};
 
 /// A cache holds entries for reuse; a budget admits transient work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -236,6 +243,10 @@ pub struct Row {
     /// sampled when that is less, but at least [`SAMPLE_EVERY`]. `None`
     /// for a budget, and for a cache sampled for less than that.
     pub window: Option<Activity>,
+    /// What the cache must hold for its collections' data, as their
+    /// engines last published it (#1309). `None` for a budget, and for a
+    /// cache no engine publishes a demand for.
+    pub demand: Option<Demand>,
 }
 
 /// How often [`snapshot`] samples a cache's counters, at most. `/metrics`
@@ -500,6 +511,7 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
         registry.retain(|r| r.owner.strong_count() > 0);
         registry.clone()
     };
+    let demands = demand::demands();
     // Read outside the lock: a cache's usage takes its own shard locks.
     let mut rows: Vec<(u64, Row)> = registered
         .iter()
@@ -510,12 +522,17 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .observe(now, &usage);
+            let demand = match r.entry.kind {
+                Kind::Cache => demands.get(&(r.entry.id, r.entry.scope.clone())).cloned(),
+                Kind::Budget => None,
+            };
             Some((
                 r.seq,
                 Row {
                     entry: r.entry.clone(),
                     usage,
                     window,
+                    demand,
                 },
             ))
         })

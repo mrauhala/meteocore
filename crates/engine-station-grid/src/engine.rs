@@ -39,6 +39,7 @@ use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration, Utc};
+use ds_cache::plan::{CacheDemand, DemandSlot, Scope};
 use ds_cache::CacheEntry;
 use ds_core::config::StationGridConfig;
 use ds_core::cube::{axis_positions, check_cube_budget, CubeResolution};
@@ -174,7 +175,14 @@ pub struct StationGridEngine {
     inner: Arc<Inner>,
     shutdown: Shutdown,
     config: StationGridConfig,
+    /// What the collection needs of the grid cache (#1309), published at
+    /// construction and after every poll ([`Self::publish_demand`]).
+    demand: DemandSlot,
 }
+
+/// How the grid cache's demand is computed (#1309), for every collection.
+const GRID_DEMAND_RULE: &str = "parameters × precompute (at least 1) × grid bytes, summed over \
+                                collections; the terrain and mask are held beside the cache";
 
 impl StationGridEngine {
     /// Build the engine over the station collection `source`. Checks every
@@ -440,11 +448,59 @@ impl StationGridEngine {
             provenance,
         });
         inner.publish(inner.build_times());
-        Ok(Self {
+        let engine = Self {
+            demand: DemandSlot::new(
+                "station_grid_cache",
+                Scope::Engine("station-grid"),
+                collection_id,
+            ),
             inner,
             shutdown: Shutdown::new(),
             config: config.clone(),
-        })
+        };
+        engine.publish_demand();
+        Ok(engine)
+    }
+
+    /// What the collection needs of the grid cache (#1309): the grids its
+    /// poll computes ahead, `precompute` times of each parameter, and a
+    /// request's own one when it computes none ahead, each weighed as the
+    /// cache weighs it with the stations of the latest analysis. The
+    /// terrain and mask are an input of their own: the engine holds them,
+    /// not the cache, though the load check counts them against it.
+    pub fn grid_demand(&self) -> CacheDemand {
+        let inner = &self.inner;
+        let stations = inner
+            .latest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .flatten()
+            .map(|(_, stations, _)| *stations)
+            .max()
+            .unwrap_or(0);
+        let cells = inner.geom.cells();
+        let grid = compute::entry_bytes(cells, stations);
+        let parameters = inner.params.len() as u64;
+        let grids = parameters * inner.precompute.max(1) as u64;
+        CacheDemand::demand(grids * grid, GRID_DEMAND_RULE, "MC_STATION_GRID_CACHE_MB")
+            .ahead()
+            .input("parameters", parameters)
+            .input("precompute", inner.precompute as u64)
+            .input("cells", cells as u64)
+            .input("stations", stations as u64)
+            .input("grid_bytes", grid)
+            .input("terrain_mask_bytes", inner.corrections.resident_bytes())
+    }
+
+    /// Publish [`Self::grid_demand`], and log the plan's WARN when the grid
+    /// cache has just fallen below the demand of every collection.
+    fn publish_demand(&self) {
+        // Entered in the plan, so the publish finds its size.
+        compute::cache_capacity();
+        if let Some(short) = self.demand.publish(self.grid_demand()) {
+            warn!("{short}");
+        }
     }
 
     pub fn collection_id(&self) -> &str {
@@ -566,6 +622,7 @@ impl StationGridEngine {
             }
         }
         inner.recheck_older(&times);
+        self.publish_demand();
     }
 
     /// Stop the poll loop and drop this instance's grids.

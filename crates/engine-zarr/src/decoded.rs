@@ -119,6 +119,28 @@ impl DecodedArray {
         })
     }
 
+    /// The weight the cache gives the first inner chunk of `array`, a full
+    /// one unless the array is smaller: its native bytes and its key
+    /// (#1309). `None` for a chunk it never keeps (over `MAX_CHUNK_BYTES`)
+    /// or of no fixed element size.
+    pub(crate) fn chunk_weight(&self, array: &Array<EngineStore>) -> Option<u64> {
+        let size = array.data_type().fixed_size()?;
+        let indices = vec![0; array.shape().len()];
+        let chunk = self
+            .grid
+            .subset(&indices)
+            .ok()??
+            .overlap(&array.subset_all())
+            .ok()?;
+        let bytes = byte_length(chunk.shape(), size).ok()? as u64;
+        let key = Key {
+            revision: self.revision.clone(),
+            array: self.name.clone(),
+            indices,
+        };
+        (bytes <= MAX_CHUNK_BYTES).then(|| bytes.saturating_add(overhead(&key)))
+    }
+
     /// The resident shard indexes, which catalog build loads ahead for
     /// the default run.
     pub(crate) fn shard_indexes(&self) -> Option<&shards::ShardIndexes> {

@@ -209,7 +209,7 @@ max_files = 24
 | `cadence_secs` | — | `odim`, template | Spacing of probed timestamps; required in template mode |
 | `resampling` | `"nearest"` | `odim-volume` | Map render: `"nearest"` or `"bilinear"` (EDR and 3D Tiles always use nearest) |
 | `prewarm_sweeps` | `1` | `odim-volume` | Lowest sweeps pre-decoded per volume; `0` disables |
-| `prewarm_quantities` | default quantity | `odim-volume` | Quantities pre-decoded at those sweeps, e.g. `["DBZH", "VRADH"]`; one a volume lacks is skipped. Size `MC_PVOL_PIXEL_CACHE_MB` to about twice sites × retained volumes × sweeps × quantities × one sweep |
+| `prewarm_quantities` | default quantity | `odim-volume` | Quantities pre-decoded at those sweeps, e.g. `["DBZH", "VRADH"]`; one a volume lacks is skipped. `/admin/cache-plan` reports the floor this puts on `MC_PVOL_PIXEL_CACHE_MB`, twice the pre-warm set, and a WARN names it when the cache is below |
 
 Example collections in `collections.d/`: `radar-eu-composite-dbzh-s3-h5`
 (public S3 bucket), `radar-de-composite-dbzh-http-h5` (HTTP template

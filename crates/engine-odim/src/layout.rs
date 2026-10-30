@@ -370,6 +370,7 @@ pub(crate) mod tests {
                     nodata: 255.0,
                     undetect: 0.0,
                     dataset_path: path.into(),
+                    cell_bytes: 1,
                     spans: None,
                 }],
             }],

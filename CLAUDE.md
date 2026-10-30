@@ -373,6 +373,19 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   every_cache_and_budget_on_metrics_is_in_the_plan` fails when a
   `*_cache_bytes` or `*_capacity_bytes` family has no entry: a new engine
   type adds its fixture collection there.
+  An engine whose data fixes what a cache must hold (a time window, a
+  pre-warm set, a grid) publishes it as a `plan::CacheDemand` through its
+  own `plan::DemandSlot`, under the cache id and scope the plan lists the
+  cache by, computed where those facts change (poll, catalog refresh),
+  never per request, weighing entries with the cache's own weight function
+  (#1309); `.ahead()` marks a cache the engine fills ahead of requests.
+  The plan sums a cache's slots, suggests demand + 15 % (a floor as is),
+  and returns a `Shortfall` for the engine to log, with hysteresis: again
+  only on a size change or 15 % more demand, forgotten under 90 % of the
+  size. A collection's or source's slot checks only the cache entry its
+  own engine registered after it, never a replaced engine's;
+  `cache_plan::snapshot` covers the rest. A disabled cache (0) is never
+  short. Never hand-roll a per-engine "cache too small" WARN.
   Every cache counts churn (#1308, `ds_cache::Churn`) in its `quick_cache`
   `Lifecycle`: evictions by ring, admitted and evicted bytes, refusals
   (heavier than a shard's hot target, not evictions) and bypasses. The hooks
@@ -1550,7 +1563,11 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   Each cache row also carries `churn` and a `last_hour` label (#1308):
   `idle`, `thrashing`, `scan`, `churning` (no ghost ring to tell) or
   `healthy`, with the hit ratio at 1.5, 2 and 3 × the size; the Grafana Cache
-  churn row mirrors it.
+  churn row mirrors it. A cache whose engines publish a demand (#1309) also
+  carries `demand_bytes`, `demand_rule`, `demand_kind`, `suggested_bytes`
+  and `demand_inputs`; `/metrics` has `cache_demand_bytes` and
+  `cache_demand_ratio`, one series per such cache, labelled as
+  `cache_size_source` is.
 - **Grafana dashboards live in this repo:**
   `docker/grafana/dashboards/meteocore-overview.json`, provisioned via
   `docker/grafana/provisioning/`: a `dashboard.grafana.app/v2` resource

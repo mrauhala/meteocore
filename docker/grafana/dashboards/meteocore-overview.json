@@ -1367,6 +1367,19 @@
                                     "name": "panel-120"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 12,
+                                  "width": 24,
+                                  "height": 10,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-145"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -18005,7 +18018,7 @@
         "spec": {
           "id": 120,
           "title": "Cache plan",
-          "description": "Every cache and admission budget with where its size came from: default, env:<variable>, config:<[server] key>, collection:<collection key> or constant (/admin/cache-plan has the same list). Capacity is the configured size and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used.",
+          "description": "Every cache and admission budget with where its size came from: default, env:<variable>, config:<[server] key>, collection:<collection key> or constant (/admin/cache-plan has the same list). Capacity is the configured size and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used. Demand is what the engines say the cache must hold for their data (cache_demand_bytes; a floor for PVOL pixels), empty for a cache without one; /admin/cache-plan has its inputs and the suggested size.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -18079,6 +18092,29 @@
                       }
                     }
                   }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "D",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (cache, collection) (cache_demand_bytes{job=~\"$job\"})",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
                 }
               ],
               "transformations": [
@@ -18125,14 +18161,16 @@
                         "collection": 1,
                         "source": 2,
                         "Value #B": 3,
-                        "Value #C": 4
+                        "Value #C": 4,
+                        "Value #D": 5
                       },
                       "renameByName": {
                         "cache": "Cache",
                         "collection": "Collection",
                         "source": "Source",
                         "Value #B": "Capacity",
-                        "Value #C": "Used"
+                        "Value #C": "Used",
+                        "Value #D": "Demand"
                       }
                     }
                   }
@@ -18157,7 +18195,8 @@
                   "countRows": false,
                   "fields": [
                     "Capacity",
-                    "Used"
+                    "Used",
+                    "Demand"
                   ]
                 },
                 "sortBy": [
@@ -18247,6 +18286,22 @@
                       {
                         "id": "decimals",
                         "value": 1
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "Demand"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "bytes"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 0
                       }
                     ]
                   }
@@ -21166,6 +21221,116 @@
                     }
                   ],
                   "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-145": {
+        "kind": "Panel",
+        "spec": {
+          "id": 145,
+          "title": "Demand by cache",
+          "description": "Each cache's demand over its own configured capacity (cache_demand_ratio): what the engines say a cache must hold for their data, a process-wide cache's summed over its collections, a per-collection cache's its collection's. Above 1, the red line, a cache is below its demand, and the server logged one WARN naming the inputs and the size to set. A disabled cache has no series. The PVOL pixel cache's demand is a floor, twice the pre-warm set: requests need more. /admin/cache-plan lists each demand's inputs and the suggested size; the Cache plan table has the demand in bytes.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (cache, collection) (cache_demand_ratio{job=~\"$job\", collection=~\"$collection|\"})",
+                        "legendFormat": "{{cache}} {{collection}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Last *",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "line"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      },
+                      {
+                        "color": "red",
+                        "value": 1
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 1
                 },
                 "overrides": []
               }

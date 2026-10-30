@@ -19,6 +19,12 @@
 //! whether it needs memory (#1308): idle, thrashing, scan or healthy, with
 //! the hit ratio a cache 1.5, 2 or 3 times as large would have had. The
 //! hour is sampled by `/metrics` scrapes ([`ds_cache::plan::SAMPLE_EVERY`]).
+//!
+//! Where an engine publishes what a cache must hold for its data (#1309),
+//! each listing carries that demand and the size it suggests, and every
+//! [`snapshot`] logs a WARN for a cache that has just fallen below it
+//! (`ds_cache::plan::demand`): at boot, after a reload that resized it, or
+//! when a scrape is the first to see it. Nothing applies a suggestion.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -27,14 +33,14 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use ds_cache::plan::{self, Activity, Entry, Kind, Row, Scope, SizeSource, Usage};
+use ds_cache::plan::{self, Activity, Demand, Entry, Kind, Row, Scope, SizeSource, Usage};
 use ds_cache::{Churn, MIB};
 use ds_core::config::{
     CollectionConfig, GribConfig, ServerConfig, DEFAULT_GRID_CACHE_MB, DEFAULT_METATILE_CACHE_MB,
     DEFAULT_POINT_INDEX_CACHE_MB, DEFAULT_TILE_CACHE_MB, DEFAULT_ZARR_CACHE_MB,
 };
 use serde_json::{json, Value};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::admin::{AdminState, MemoryReading, ServerState};
 
@@ -228,7 +234,8 @@ pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_z
 
 /// The plan's entries: the registry, less the caches of collections the
 /// accepted config no longer has, whose engines a request in flight may
-/// still hold for a moment.
+/// still hold for a moment. Logs a WARN for each cache that has just
+/// fallen below its demand (#1309).
 pub(crate) fn snapshot(state: &ServerState) -> Vec<Row> {
     let live: HashSet<String> = state
         .last_collections
@@ -237,7 +244,7 @@ pub(crate) fn snapshot(state: &ServerState) -> Vec<Row> {
         .keys()
         .cloned()
         .collect();
-    plan::snapshot()
+    let rows: Vec<Row> = plan::snapshot()
         .into_iter()
         .filter(|row| {
             row.entry
@@ -245,7 +252,11 @@ pub(crate) fn snapshot(state: &ServerState) -> Vec<Row> {
                 .collection()
                 .is_none_or(|id| live.contains(id))
         })
-        .collect()
+        .collect();
+    for short in plan::check_rows(&rows) {
+        warn!("{short}");
+    }
+    rows
 }
 
 /// Count, capacity and current use of the entries of one kind.
@@ -283,13 +294,17 @@ pub async fn handler(
 /// totals, and the process and allocator memory `/metrics` reports. A cache
 /// also has its cumulative `churn` and, once sampled for a while, what it
 /// did over the `last_hour` ([`last_hour_json`]); both are null for a
-/// budget.
+/// budget. A cache whose engines publish its demand (#1309) has it:
+/// `demand_bytes`, `demand_rule`, `demand_kind` (`demand`, or `floor` when
+/// the requests' working set comes on top), `suggested_bytes` (the demand
+/// plus 15 %, or the floor, in whole MiB) and `demand_inputs`
+/// ([`demand_inputs_json`]); null otherwise.
 pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
     let entries = |kind: Kind| -> Vec<Value> {
         rows.iter()
             .filter(|row| row.entry.kind == kind)
             .map(|row| {
-                let (entry, usage) = (&row.entry, &row.usage);
+                let (entry, usage, demand) = (&row.entry, &row.usage, row.demand.as_ref());
                 json!({
                     "id": entry.id,
                     "scope": entry.scope.kind(),
@@ -303,6 +318,11 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
                     "misses": usage.misses,
                     "churn": usage.churn.as_ref().map(churn_json),
                     "last_hour": row.window.as_ref().map(last_hour_json),
+                    "demand_bytes": demand.map(|d| d.bytes),
+                    "demand_rule": demand.map(|d| d.rule),
+                    "demand_kind": demand.map(Demand::kind),
+                    "suggested_bytes": demand.map(Demand::suggested_bytes),
+                    "demand_inputs": demand.map(demand_inputs_json),
                 })
             })
             .collect()
@@ -329,6 +349,23 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
         },
         "memory": memory,
     })
+}
+
+/// Each collection's part of a cache's demand (#1309), with the facts its
+/// engine computed it from.
+fn demand_inputs_json(demand: &Demand) -> Value {
+    demand
+        .parts
+        .iter()
+        .map(|(collection, part)| {
+            let inputs: serde_json::Map<String, Value> = part
+                .inputs
+                .iter()
+                .map(|(name, value)| (name.to_string(), json!(value)))
+                .collect();
+            json!({"collection": collection, "bytes": part.bytes, "inputs": inputs})
+        })
+        .collect()
 }
 
 /// What a cache admitted, refused and evicted since it was built.
@@ -443,7 +480,8 @@ pub(crate) fn mib(bytes: u64) -> String {
 
 /// The log block: a heading with the totals, then one line per cache and
 /// per budget, grouped by scope, with its capacity and source. A line whose
-/// size differs from `previous` shows the size it had.
+/// size differs from `previous` shows the size it had; a cache with a
+/// demand (#1309) shows it and the size it suggests.
 pub(crate) fn render(rows: &[Row], heading: &str, previous: Option<&Logged>) -> String {
     let caches = Totals::of(rows, Kind::Cache);
     let budgets = Totals::of(rows, Kind::Budget);
@@ -487,6 +525,15 @@ pub(crate) fn render(rows: &[Row], heading: &str, previous: Option<&Logged>) -> 
             .filter(|capacity| *capacity != row.usage.capacity_bytes);
         if let Some(was) = was {
             let _ = write!(out, " (was {})", mib(was));
+        }
+        if let Some(demand) = &row.demand {
+            let _ = write!(
+                out,
+                ", {} {}, suggested {}",
+                demand.kind(),
+                mib(demand.bytes),
+                mib(demand.suggested_bytes())
+            );
         }
     }
     out

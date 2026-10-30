@@ -76,6 +76,11 @@ pub struct PolarMoment {
     /// (`/datasetN/dataM/data`), for the lazy pixel read. The array is
     /// shape `(nrays, nbins)`, indexed `[ray, bin]`.
     pub dataset_path: String,
+    /// Bytes one decoded cell of this moment holds in the pixel cache,
+    /// from the dataset's HDF5 type (`reader::cell_bytes`): 1, 2 or 4, and
+    /// 0 for a type the decoder refuses. What the pre-warm floor counts
+    /// before any decode (#1309).
+    pub cell_bytes: u8,
     /// The byte spans of the volume file the decode of this moment reads,
     /// recorded when a scan had the file's bytes (`crate::layout::probe`,
     /// #1047), so a cold miss fetches only these. `None` when not recorded
@@ -411,6 +416,7 @@ fn read_moment(
         )));
     }
 
+    let cell_bytes = crate::reader::cell_bytes(ds.dtype());
     Ok(PolarMoment {
         quantity,
         gain,
@@ -418,6 +424,7 @@ fn read_moment(
         nodata,
         undetect,
         dataset_path,
+        cell_bytes,
         spans: None,
     })
 }
@@ -542,6 +549,30 @@ mod tests {
             results.iter().map(|(_, ok)| *ok).collect::<Vec<_>>(),
             vec![true, false, true]
         );
+    }
+
+    /// #1309: a moment's `cell_bytes`, read from its HDF5 type at parse
+    /// time, is the size of a decoded cell: the decode of each moment of
+    /// the fixture (`u8`) holds exactly rays × bins × it.
+    #[test]
+    fn cell_bytes_are_the_decoded_size_of_a_cell() {
+        let bytes = Bytes::from_static(COLD_BATCH);
+        let volume = read_polar_volume(&bytes).unwrap();
+        let mut moments = 0;
+        for sweep in &volume.sweeps {
+            for moment in &sweep.moments {
+                assert_eq!(moment.cell_bytes, 1, "{}", moment.dataset_path);
+                let pixels =
+                    read_moment_pixels(&bytes, &moment.dataset_path, sweep.nrays, sweep.nbins)
+                        .unwrap();
+                assert_eq!(
+                    pixels.size_bytes(),
+                    sweep.nrays * sweep.nbins * usize::from(moment.cell_bytes)
+                );
+                moments += 1;
+            }
+        }
+        assert_eq!(moments, 4);
     }
 
     /// The canonical FMI `/what/source` string carries all three

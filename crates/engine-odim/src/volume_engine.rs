@@ -47,13 +47,14 @@
 //! `time_window` bounds both the date-partitioned prefixes scanned and
 //! the timestamps kept.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
+use ds_cache::plan::{CacheDemand, DemandSlot, Scope};
 use ds_core::config::ResamplingMethod;
 use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 use ds_core::error::DataServerError;
@@ -3006,6 +3007,18 @@ fn prewarm_requests<'v>(
     volume: &'v PolarVolume,
     prewarm: &Prewarm,
 ) -> Vec<(&'v str, usize, usize)> {
+    prewarm_moments(volume, prewarm)
+        .into_iter()
+        .map(|(s, m)| (m.dataset_path.as_str(), s.nrays, s.nbins))
+        .collect()
+}
+
+/// The moments [`prewarm_requests`] names, each with its sweep: what the
+/// pre-warm decodes and the pre-warm floor counts (#1309).
+fn prewarm_moments<'v>(
+    volume: &'v PolarVolume,
+    prewarm: &Prewarm,
+) -> Vec<(&'v Sweep, &'v PolarMoment)> {
     let mut present: Vec<&str> = volume
         .sweeps
         .iter()
@@ -3022,13 +3035,44 @@ fn prewarm_requests<'v>(
         .sweeps
         .iter()
         .take(prewarm.sweeps)
-        .flat_map(|s| {
-            s.moments
-                .iter()
-                .filter(|m| warmed(&m.quantity))
-                .map(move |m| (m.dataset_path.as_str(), s.nrays, s.nbins))
-        })
+        .flat_map(|s| s.moments.iter().map(move |m| (s, m)))
+        .filter(|(_, m)| warmed(&m.quantity))
         .collect()
+}
+
+/// How the pixel cache's floor is computed (#1309), for every PVOL source.
+const PREWARM_FLOOR_RULE: &str = "2 × the pre-warm set: retained volumes × pre-warm sweeps × \
+                                  quantities × sweep bytes, summed over sources";
+
+/// `catalog`'s floor on the pixel cache (#1309): twice the entries the
+/// pre-warm puts there for the volumes the catalog retains, each weighed
+/// as the cache weighs it, from the moments' sizes and cell types
+/// ([`PolarMoment::cell_bytes`]) without decoding any. Below it, pre-warmed
+/// sweeps evict each other before a request reads them (#476). A floor:
+/// the requests' own moments come on top.
+fn prewarm_floor(source: &Source, catalog: &Catalog, prewarm: &Prewarm) -> CacheDemand {
+    let (mut bytes, mut moments, mut volumes) = (0u64, 0u64, 0u64);
+    let mut quantities = BTreeSet::new();
+    for entry in catalog.by_site.values().flatten() {
+        volumes += 1;
+        let cache_id = pixel_cache_id(source, &entry.id);
+        for (sweep, moment) in prewarm_moments(&entry.volume, prewarm) {
+            let pixels = (sweep.nrays * sweep.nbins) as u64 * u64::from(moment.cell_bytes);
+            bytes += crate::pixel_cache::entry_weight(&cache_id, &moment.dataset_path, pixels);
+            moments += 1;
+            quantities.insert(moment.quantity.as_str());
+        }
+    }
+    CacheDemand::floor(
+        crate::pixel_cache::prewarm_floor(bytes),
+        PREWARM_FLOOR_RULE,
+        "MC_PVOL_PIXEL_CACHE_MB",
+    )
+    .input("sites", catalog.by_site.len() as u64)
+    .input("volumes", volumes)
+    .input("sweeps", prewarm.sweeps as u64)
+    .input("quantities", quantities.len() as u64)
+    .input("sweep_bytes", bytes / moments.max(1))
 }
 
 /// The quantity an unqualified request renders, from a site's or volume's
@@ -3425,8 +3469,20 @@ pub struct PolarVolumeEngine {
     /// volume (`OdimConfig.prewarm_sweeps`, `0` disables, and
     /// `prewarm_quantities`). See [`prewarm_pixels`].
     prewarm: Prewarm,
+    /// This source's floor on the pixel cache (#1309), published after
+    /// every scan ([`Self::publish_prewarm_floor`]).
+    demand: DemandSlot,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
+}
+
+/// A slot for `collection_id`'s floor on the pixel cache.
+fn pixel_demand_slot(collection_id: &str) -> DemandSlot {
+    DemandSlot::new(
+        "pvol_pixel_cache",
+        Scope::Engine("odim-volume"),
+        collection_id,
+    )
 }
 
 impl PolarVolumeEngine {
@@ -3513,7 +3569,7 @@ impl PolarVolumeEngine {
             );
         }
 
-        Ok(Self {
+        let engine = Self {
             collection_id: collection_id.to_string(),
             source,
             max_files: config.max_files,
@@ -3522,8 +3578,11 @@ impl PolarVolumeEngine {
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             resampling: config.resampling,
             prewarm,
+            demand: pixel_demand_slot(collection_id),
             shutdown: Shutdown::new(),
-        })
+        };
+        engine.publish_prewarm_floor();
+        Ok(engine)
     }
 
     /// Re-scan the source and atomically swap the catalog. Exits
@@ -3577,7 +3636,7 @@ impl PolarVolumeEngine {
             &Prewarm::default_quantity(1),
             None,
         )?;
-        Ok(Self {
+        let engine = Self {
             collection_id: collection_id.to_string(),
             source,
             max_files: None,
@@ -3586,8 +3645,11 @@ impl PolarVolumeEngine {
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
             prewarm: Prewarm::default_quantity(1),
+            demand: pixel_demand_slot(collection_id),
             shutdown: Shutdown::new(),
-        })
+        };
+        engine.publish_prewarm_floor();
+        Ok(engine)
     }
 
     /// Signal the poll loop to stop. Idempotent; safe to call before
@@ -3603,6 +3665,23 @@ impl PolarVolumeEngine {
     /// read is O(1).
     pub fn catalog_bytes(&self) -> u64 {
         self.catalog.load().heap_bytes
+    }
+
+    /// Publish the catalog's floor on the pixel cache ([`prewarm_floor`],
+    /// #1309), and log the plan's WARN when the cache has just fallen
+    /// below it. After every scan, on the scan's thread.
+    fn publish_prewarm_floor(&self) {
+        // Entered in the plan, so the publish finds its size.
+        std::sync::LazyLock::force(&PIXEL_CACHE);
+        let floor = prewarm_floor(&self.source, &self.catalog.load(), &self.prewarm);
+        if let Some(short) = self.demand.publish(floor) {
+            tracing::warn!("{short}");
+        }
+    }
+
+    /// The floor this source last published on the pixel cache (#1309).
+    pub fn pixel_cache_floor(&self) -> Option<CacheDemand> {
+        self.demand.get()
     }
 
     /// Re-scan the source and atomically swap the catalog.
@@ -3658,6 +3737,7 @@ impl PolarVolumeEngine {
                     );
                 }
                 self.catalog.store(Arc::new(catalog));
+                self.publish_prewarm_floor();
             }
             Err(e) => {
                 tracing::warn!("[{}] PVOL catalog refresh failed: {e}", self.collection_id);
@@ -7905,6 +7985,75 @@ mod tests {
         assert_eq!(default_quantity_of::<&str>(&[]), None);
     }
 
+    /// #1309: the pixel cache's floor is twice the entries the pre-warm
+    /// puts there for every retained volume, each weighed as the cache
+    /// weighs it, from the moment's shape and cell type, before any decode;
+    /// its inputs name the sites, volumes, sweeps, quantities and the
+    /// mean entry.
+    #[test]
+    fn the_prewarm_floor_is_twice_the_prewarm_set() {
+        let source = Source::Local {
+            data_dir: PathBuf::from("/floor-1309"),
+            time_window: None,
+        };
+        let volume = |id: &str, f32_dbzh: bool| {
+            let mut volume = two_quantity_volume(24.5, 60.3);
+            if f32_dbzh {
+                volume.sweeps[0].moments[1].cell_bytes = 4;
+            }
+            VolumeEntry {
+                id: id.to_string(),
+                volume: Arc::new(volume),
+            }
+        };
+        let mut by_site = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![
+                volume("/floor-1309/a.h5", false),
+                volume("/floor-1309/b.h5", false),
+            ],
+        );
+        by_site.insert("fikor".to_string(), vec![volume("/floor-1309/c.h5", true)]);
+        let catalog = derive_catalog(by_site, &Mutex::new(HashMap::new()), None);
+        // A 360 × 100 sweep of 2-byte cells, its 16-byte file id, its
+        // 20-byte dataset path and 64 bytes of overhead.
+        let u16_entry = 360 * 100 * 2 + 16 + 20 + 64;
+        let f32_entry = 360 * 100 * 4 + 16 + 20 + 64;
+
+        // The default quantity of the lowest sweep: one entry per volume.
+        let floor = prewarm_floor(&source, &catalog, &Prewarm::default_quantity(1));
+        assert!(floor.floor);
+        assert_eq!(floor.setting, "MC_PVOL_PIXEL_CACHE_MB");
+        let set = 2 * u16_entry + f32_entry;
+        assert_eq!(floor.bytes, 2 * set);
+        assert_eq!(
+            floor.inputs,
+            [
+                ("sites", 2),
+                ("volumes", 3),
+                ("sweeps", 1),
+                ("quantities", 1),
+                ("sweep_bytes", set / 3),
+            ]
+        );
+
+        // Two quantities of two sweeps: four entries per volume.
+        let prewarm = Prewarm {
+            sweeps: 2,
+            quantities: Some(["DBZH", "CCORH"].map(String::from).into()),
+        };
+        let floor = prewarm_floor(&source, &catalog, &prewarm);
+        let set = 11 * u16_entry + f32_entry;
+        assert_eq!(floor.bytes, 2 * set);
+        assert_eq!(floor.inputs[2..4], [("sweeps", 2), ("quantities", 2)]);
+        assert_eq!(floor.inputs[4], ("sweep_bytes", set / 12));
+
+        // Pre-warm off: no floor.
+        let floor = prewarm_floor(&source, &catalog, &Prewarm::default_quantity(0));
+        assert_eq!(floor.bytes, 0);
+    }
+
     /// #1046: `prewarm_quantities` names the quantities warmed, each at the
     /// lowest `prewarm_sweeps` sweeps; one a volume lacks is skipped, an
     /// empty list warms nothing, and an empty name is a load error.
@@ -8327,6 +8476,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            cell_bytes: 2,
             spans: None,
         };
         let pix = test_pixels();
@@ -10567,6 +10717,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            cell_bytes: 2,
             spans: None,
         };
         let sweep = Sweep {
@@ -10867,6 +11018,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            cell_bytes: 2,
             spans: None,
         };
         (moment, RawPixels::U16(data))
@@ -11080,6 +11232,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            cell_bytes: 2,
             spans: None,
         };
         let sweep = Sweep {
@@ -11167,6 +11320,7 @@ mod tests {
             nodata: 65_535.0,
             undetect: 65_534.0,
             dataset_path: SYNTHETIC_DS.to_string(),
+            cell_bytes: 2,
             spans: None,
         };
         let sweep = Sweep {
@@ -12590,6 +12744,7 @@ mod tests {
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
             prewarm: Prewarm::default_quantity(1),
+            demand: pixel_demand_slot(collection_id),
             shutdown: Shutdown::new(),
         }
     }

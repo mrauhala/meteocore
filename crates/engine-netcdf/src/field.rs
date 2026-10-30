@@ -119,7 +119,46 @@ pub(crate) struct FieldKey {
 const TYPICAL_FIELD_BYTES: u64 = 4 * ds_cache::MIB;
 
 fn weigh(key: &FieldKey, values: &Values) -> u64 {
-    std::mem::size_of_val::<[f32]>(values) as u64 + key.variable.len() as u64 + 96
+    field_weight(values.len() as u64, &key.variable)
+}
+
+/// The weight of a decoded field of `cells` values of `variable`: its
+/// values, the key's name and the entry's overhead.
+fn field_weight(cells: u64, variable: &str) -> u64 {
+    cells * std::mem::size_of::<f32>() as u64 + variable.len() as u64 + 96
+}
+
+/// How the field cache's demand is computed (#1309), for every collection.
+const FIELD_DEMAND_RULE: &str = "16 × decoded field bytes, summed over collections";
+
+/// What a collection of `catalog` needs of the field cache (#1309):
+/// [`ds_cache::plan::DEMAND_FIELDS`] fields of its grid, each weighed as
+/// the cache weighs it under its longest variable name. `None` before the
+/// first file gives the grid.
+pub(crate) fn field_demand(
+    catalog: &crate::catalog::Catalog,
+) -> Option<ds_cache::plan::CacheDemand> {
+    use ds_cache::plan::{CacheDemand, DEMAND_FIELDS};
+    let layout = catalog.layout.as_ref()?;
+    let (width, height) = layout.grid.size();
+    let cells = u64::from(width) * u64::from(height);
+    let name = layout
+        .variables
+        .iter()
+        .map(|v| &*v.name)
+        .max_by_key(|name| name.len())
+        .unwrap_or_default();
+    let field = field_weight(cells, name);
+    Some(
+        CacheDemand::demand(
+            DEMAND_FIELDS * field,
+            FIELD_DEMAND_RULE,
+            "MC_NETCDF_FIELD_CACHE_MB",
+        )
+        .input("fields", DEMAND_FIELDS)
+        .input("cells", cells)
+        .input("field_bytes", field),
+    )
 }
 
 /// Decoded fields, `MC_NETCDF_FIELD_CACHE_MB` (default 256 MiB), shared by
