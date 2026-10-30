@@ -1,0 +1,200 @@
+{{- $statefulSet := include "meteocore.statefulSet" . }}
+apiVersion: apps/v1
+kind: {{ if $statefulSet }}StatefulSet{{ else }}Deployment{{ end }}
+metadata:
+  name: {{ include "meteocore.fullname" . }}
+  labels:
+    {{- include "meteocore.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  {{- if $statefulSet }}
+  serviceName: {{ include "meteocore.fullname" . }}-headless
+  # Replicas are independent servers: no ordered start or stop.
+  podManagementPolicy: Parallel
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "meteocore.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmaps.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "meteocore.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "meteocore.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      containers:
+        - name: meteocore
+          image: {{ include "meteocore.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # The image has no ENTRYPOINT, so args alone would replace the command.
+          command: ["dataserver"]
+          args:
+            - --config
+            - /data/config.toml
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ .Values.containerPort | quote }}
+            {{- range .Values.extraArgs }}
+            - {{ . | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.containerPort }}
+              protocol: TCP
+          {{- if or .Values.env .Values.extraEnv }}
+          env:
+            {{- range $name, $value := .Values.env }}
+            {{- if not (kindIs "invalid" $value) }}
+            - name: {{ $name }}
+              value: {{ $value | toString | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: config
+              mountPath: /data/config.toml
+              subPath: config.toml
+              readOnly: true
+            - name: collections
+              mountPath: /data/collections.d
+              readOnly: true
+            - name: colormaps
+              mountPath: /data/colormaps.d
+              readOnly: true
+            {{- if .Values.sample.enabled }}
+            - name: sample
+              mountPath: /data/sample
+              readOnly: true
+            {{- end }}
+            - name: state
+              mountPath: /var/lib/meteocore
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            {{- if .Values.config.existingConfigMap }}
+            name: {{ .Values.config.existingConfigMap }}
+            items:
+              - key: {{ .Values.config.existingConfigMapKey }}
+                path: config.toml
+            {{- else }}
+            name: {{ include "meteocore.fullname" . }}-config
+            {{- end }}
+        - name: collections
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "meteocore.fullname" . }}-collections
+              {{- range .Values.collections.existingConfigMaps }}
+              - configMap:
+                  name: {{ . }}
+              {{- end }}
+        - name: colormaps
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "meteocore.fullname" . }}-colormaps
+              {{- range .Values.colormaps.existingConfigMaps }}
+              - configMap:
+                  name: {{ . }}
+              {{- end }}
+        {{- if .Values.sample.enabled }}
+        - name: sample
+          configMap:
+            name: {{ include "meteocore.fullname" . }}-sample
+        {{- end }}
+        {{- if not $statefulSet }}
+        - name: state
+          emptyDir: {}
+        {{- end }}
+        - name: tmp
+          emptyDir: {}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if $statefulSet }}
+  volumeClaimTemplates:
+    - metadata:
+        name: state
+        {{- with .Values.stateDir.persistence.annotations }}
+        annotations:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.stateDir.persistence.accessModes | nindent 10 }}
+        {{- with .Values.stateDir.persistence.storageClassName }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.stateDir.persistence.size | quote }}
+  {{- end }}

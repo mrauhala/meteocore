@@ -1,0 +1,321 @@
+# The Helm chart in charts/meteocore (#1365): lint, schema validation of the
+# rendered manifests, and an install on a kind cluster under the `restricted`
+# Pod Security Standard. release.yml publishes the chart; this workflow also
+# packages it and runs the repository-index script on a scratch index, so the
+# publishing steps that run only at a release are exercised on every chart
+# change.
+#
+# The install test runs the image the chart defaults to, the release named by
+# appVersion, so it tests what `helm install` gives a user today.
+#
+# Not a required check: a path-filtered workflow that does not run would
+# leave its required check pending forever.
+
+name: helm chart
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/helm.yml
+      - charts/**
+      - docker/grafana/dashboards/**
+      - scripts/helm_repo_index.sh
+      - crates/server/Cargo.toml
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/helm.yml
+      - charts/**
+      - docker/grafana/dashboards/**
+      - scripts/helm_repo_index.sh
+      - crates/server/Cargo.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CHART: charts/meteocore
+  # Schemas for the rendered manifests: Kubernetes, then the CRDs catalog for
+  # ServiceMonitor and HTTPRoute.
+  KUBERNETES_VERSION: 1.34.0
+  KUBECONFORM_VERSION: v0.8.0
+  KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+
+jobs:
+  lint:
+    name: lint (Helm ${{ matrix.helm }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Helm 4 and the last Helm 3 release: users run both.
+        helm: [v4.3.1, v3.22.1]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ matrix.helm }}
+
+      - name: Chart version and appVersion follow the server
+        run: |
+          set -euo pipefail
+          server=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/server/Cargo.toml)
+          version=$(sed -n 's/^version: \(.*\)$/\1/p' "$CHART/Chart.yaml")
+          app=$(sed -n 's/^appVersion: "\(.*\)"$/\1/p' "$CHART/Chart.yaml")
+          echo "server ${server}, chart ${version}, appVersion ${app}"
+          if [ -z "$server" ] || [ "$version" != "$server" ] || [ "$app" != "$server" ]; then
+            echo "::error file=$CHART/Chart.yaml::version and appVersion must both equal crates/server/Cargo.toml's version, ${server}. The release PR bumps all three."
+            exit 1
+          fi
+
+      - name: helm lint
+        run: |
+          set -euo pipefail
+          for values in "$CHART"/ci/*-values.yaml; do
+            echo "::group::helm lint --strict -f ${values}"
+            helm lint "$CHART" --strict -f "$values"
+            echo "::endgroup::"
+          done
+
+      - name: Install kubeconform
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "${RUNNER_TEMP}/kubeconform.tar.gz" \
+            "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
+          echo "${KUBECONFORM_SHA256}  ${RUNNER_TEMP}/kubeconform.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/kubeconform.tar.gz" -C "${RUNNER_TEMP}" kubeconform
+          sudo install "${RUNNER_TEMP}/kubeconform" /usr/local/bin/kubeconform
+
+      - name: Validate rendered manifests
+        run: |
+          set -euo pipefail
+          for values in "$CHART"/ci/*-values.yaml; do
+            echo "::group::kubeconform: ${values}"
+            helm template meteocore "$CHART" -f "$values" \
+              | kubeconform -strict -summary \
+                  -kubernetes-version "$KUBERNETES_VERSION" \
+                  -schema-location default \
+                  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+            echo "::endgroup::"
+          done
+
+      # A ConfigMap holds at most 1 MiB. The dashboard grows with every
+      # metric family, so fail here, with room to spare, before an install
+      # fails.
+      - name: Dashboard ConfigMap size
+        run: |
+          set -euo pipefail
+          bytes=$(helm template meteocore "$CHART" --set grafanaDashboard.enabled=true \
+            --show-only templates/grafana-dashboard.yaml | wc -c)
+          echo "Dashboard ConfigMap: ${bytes} bytes"
+          if [ "$bytes" -gt 900000 ]; then
+            echo "::error::The dashboard ConfigMap is ${bytes} bytes; a ConfigMap holds at most 1048576."
+            exit 1
+          fi
+
+      - name: Rejected values
+        run: |
+          set -uo pipefail
+          # Each must fail with the given message.
+          expect_failure() {
+            local message=$1; shift
+            if out=$(helm template meteocore "$CHART" "$@" 2>&1); then
+              echo "::error::helm template $* succeeded; expected: ${message}"
+              return 1
+            fi
+            if ! grep -qF -- "$message" <<<"$out"; then
+              echo "::error::helm template $* failed without '${message}':"
+              echo "$out"
+              return 1
+            fi
+            echo "ok: $*"
+          }
+          status=0
+          expect_failure "persistance" --set stateDir.persistance.enabled=true || status=1
+          expect_failure 'colormaps_dir = "colormaps.d"' --set-string 'colormaps.files.radar\.toml=title = "Radar"' || status=1
+          expect_failure 'collections_dir = "collections.d"' --set-string 'config.toml=[server]' || status=1
+          expect_failure "the sample collection's file" --set-string 'collections.files.sample-observations\.toml=id = "x"' || status=1
+          expect_failure "a/b.toml" --set-string 'collections.files.a/b\.toml=id = "x"' || status=1
+          exit $status
+
+      - name: Package and index
+        if: matrix.helm == 'v4.3.1'
+        run: |
+          set -euo pipefail
+          dist="${RUNNER_TEMP}/dist"
+          helm package "$CHART" --destination "$dist"
+          version=$(sed -n 's/^version: \(.*\)$/\1/p' "$CHART/Chart.yaml")
+          tgz="${dist}/meteocore-${version}.tgz"
+          # The dashboard is a symlink in the chart; the package holds the file.
+          tar -xzf "$tgz" -O meteocore/dashboards/meteocore-overview.json \
+            | cmp - docker/grafana/dashboards/meteocore-overview.json
+          if tar -tzf "$tgz" | grep -q '^meteocore/ci/'; then
+            echo "::error::The package holds the chart's ci/ values files."
+            exit 1
+          fi
+          # Index it twice: another version is kept, the same one replaced.
+          index="${RUNNER_TEMP}/index.yaml"
+          helm package "$CHART" --destination "${RUNNER_TEMP}/older" --version 0.0.1 --app-version 0.0.1
+          scripts/helm_repo_index.sh "${RUNNER_TEMP}/older/meteocore-0.0.1.tgz" https://example.com/v0.0.1 "$index"
+          scripts/helm_repo_index.sh "$tgz" https://example.com/first "$index"
+          scripts/helm_repo_index.sh "$tgz" "https://example.com/v${version}" "$index"
+          cat "$index"
+          urls=$(yq '.entries.meteocore[].urls[]' "$index" | sort | tr '\n' ' ')
+          expected=$(printf '%s\n' "https://example.com/v${version}/meteocore-${version}.tgz" \
+            https://example.com/v0.0.1/meteocore-0.0.1.tgz | sort | tr '\n' ' ')
+          if [ "$urls" != "$expected" ]; then
+            echo "::error::Index URLs are '${urls}', expected '${expected}'."
+            exit 1
+          fi
+
+  chart-testing:
+    name: ct lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+
+      - uses: helm/chart-testing-action@720270857a28afd41e2426521a7801db09e9b510 # v2.9.0
+
+      # The chart's version moves only with a release, so ct's version
+      # increment check does not apply. Maintainers are not listed.
+      - name: ct lint
+        run: |
+          ct lint --charts "$CHART" --target-branch main \
+            --check-version-increment=false --validate-maintainers=false
+
+  install:
+    name: install on kind
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.3.1
+
+      - uses: helm/kind-action@1544676c07bb3570fcb70166beaa07c4528fd4aa # v1.15.1
+        with:
+          version: v0.33.0
+          cluster_name: meteocore
+
+      # Namespaces that reject any pod the `restricted` Pod Security
+      # Standard does not admit, the test pod included.
+      - name: Restricted namespaces
+        run: |
+          set -euo pipefail
+          for ns in mc-default mc-state; do
+            kubectl create namespace "$ns"
+            kubectl label namespace "$ns" \
+              pod-security.kubernetes.io/enforce=restricted \
+              pod-security.kubernetes.io/enforce-version=latest
+          done
+
+      - name: Install with the default values
+        run: |
+          set -euo pipefail
+          helm install meteocore "$CHART" --namespace mc-default --wait --timeout 10m
+          helm test meteocore --namespace mc-default --logs
+
+      - name: A config change rolls the pods
+        run: |
+          set -euo pipefail
+          checksum() {
+            kubectl --namespace mc-default get deployment meteocore -o json \
+              | jq -r '.spec.template.metadata.annotations["checksum/config"]'
+          }
+          before=$(checksum)
+          helm upgrade meteocore "$CHART" --namespace mc-default \
+            -f "$CHART/ci/rollout-values.yaml" --wait --timeout 10m
+          after=$(checksum)
+          echo "checksum/config ${before} -> ${after}"
+          if [ "$before" = "$after" ]; then
+            echo "::error::Adding a collection file did not change the pod template."
+            exit 1
+          fi
+          kubectl --namespace mc-default rollout status deployment/meteocore --timeout 10m
+          pod=$(kubectl --namespace mc-default get pods -l app.kubernetes.io/name=meteocore,app.kubernetes.io/instance=meteocore -o json \
+            | jq -r --arg sum "$after" '[.items[]
+                | select(.metadata.deletionTimestamp == null
+                  and .metadata.annotations["checksum/config"] == $sum)][0].metadata.name')
+          kubectl --namespace mc-default exec "$pod" -- \
+            curl -fsS http://localhost:8000/edr/collections/sample-copy > /dev/null
+          echo "${pod} serves the added collection."
+
+      - name: Per-pod state volumes
+        run: |
+          set -euo pipefail
+          ns=mc-state
+          helm install meteocore "$CHART" --namespace "$ns" \
+            -f "$CHART/ci/statefulset-values.yaml" --wait --timeout 10m
+          bound=$(kubectl --namespace "$ns" get pvc -o json \
+            | jq '[.items[] | select(.status.phase == "Bound")] | length')
+          if [ "$bound" != 2 ]; then
+            echo "::error::Expected 2 bound PersistentVolumeClaims, one per pod, found ${bound}."
+            kubectl --namespace "$ns" get pvc
+            exit 1
+          fi
+          kubectl --namespace "$ns" exec meteocore-0 -- sh -c 'echo kept > /var/lib/meteocore/probe'
+          uid=$(kubectl --namespace "$ns" get pod meteocore-0 -o jsonpath='{.metadata.uid}')
+          kubectl --namespace "$ns" delete pod meteocore-0 --wait
+          for _ in $(seq 1 60); do
+            now=$(kubectl --namespace "$ns" get pod meteocore-0 -o jsonpath='{.metadata.uid}' 2>/dev/null || true)
+            if [ -n "$now" ] && [ "$now" != "$uid" ]; then break; fi
+            sleep 2
+          done
+          kubectl --namespace "$ns" wait --for=condition=Ready pod/meteocore-0 --timeout 10m
+          test "$(kubectl --namespace "$ns" exec meteocore-0 -- cat /var/lib/meteocore/probe)" = kept
+          kubectl --namespace "$ns" exec meteocore-1 -- sh -c '! test -e /var/lib/meteocore/probe'
+          echo "meteocore-0 kept its state across a restart; meteocore-1 has its own volume."
+          helm test meteocore --namespace "$ns" --logs
+
+      - name: No errors in the server logs
+        run: |
+          set -euo pipefail
+          status=0
+          for ns in mc-default mc-state; do
+            for pod in $(kubectl --namespace "$ns" get pods -l app.kubernetes.io/name=meteocore,app.kubernetes.io/instance=meteocore \
+                -o jsonpath='{.items[*].metadata.name}'); do
+              logs=$(kubectl --namespace "$ns" logs "$pod" -c meteocore)
+              grep '"level":"WARN"' <<<"$logs" || true
+              if grep '"level":"ERROR"' <<<"$logs"; then
+                echo "::error::${ns}/${pod} logged errors."
+                status=1
+              fi
+            done
+          done
+          exit $status
+
+      - name: Cluster state
+        if: failure()
+        run: |
+          for ns in mc-default mc-state; do
+            echo "::group::${ns}"
+            kubectl --namespace "$ns" get all,pvc,configmaps -o wide || true
+            kubectl --namespace "$ns" get events --sort-by=.lastTimestamp || true
+            kubectl --namespace "$ns" describe pods || true
+            for pod in $(kubectl --namespace "$ns" get pods -o jsonpath='{.items[*].metadata.name}'); do
+              kubectl --namespace "$ns" logs "$pod" --all-containers --tail=200 || true
+            done
+            echo "::endgroup::"
+          done

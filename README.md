@@ -109,6 +109,28 @@ Each GitHub release carries the server, named `dataserver`, for:
   `process_resident_memory_bytes` and `process_swap_memory_bytes` are read
   from `/proc` and stay 0 off Linux.
 
+### Deploy on Kubernetes
+
+The Helm chart in [`charts/meteocore`](charts/meteocore/README.md) runs the
+container image. Each release publishes it, with the server's version, on two
+channels:
+
+```bash
+# OCI, on ghcr.io beside the image
+helm install meteocore oci://ghcr.io/mrauhala/charts/meteocore --version <version>
+
+# The classic repository
+helm repo add meteocore https://mrauhala.github.io/meteocore
+helm install meteocore meteocore/meteocore --version <version>
+```
+
+With no values the chart serves a small sample collection, as uid 999 with a
+read-only root filesystem, and passes the `restricted` Pod Security Standard.
+`config.toml`, collections and palettes come from chart values or existing
+ConfigMaps, and secrets such as `ADMIN_TOKEN` from existing Secrets. Keep one
+replica unless request load needs more: every replica polls every source
+itself. The [chart README](charts/meteocore/README.md) describes every value.
+
 ### Command-Line Options
 
 ```

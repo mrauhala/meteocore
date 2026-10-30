@@ -1,0 +1,11 @@
+# Applied as an upgrade over the defaults: a second collection file must roll
+# the pods and be served after the rollout.
+collections:
+  files:
+    sample-copy.toml: |
+      id = "sample-copy"
+      title = "Sample observations, again"
+      description = "The sample observations under another id."
+      engine_type = "csv"
+      apis = ["edr"]
+      data_path = "/data/sample/observations.csv"

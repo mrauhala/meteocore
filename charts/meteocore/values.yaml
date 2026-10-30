@@ -1,0 +1,213 @@
+# Default values for the MeteoCore chart. README.md in this directory
+# describes each one and shows complete examples.
+
+image:
+  repository: ghcr.io/mrauhala/meteocore
+  # Defaults to the chart's appVersion, the release the chart was published with.
+  tag: ""
+  # An image digest, sha256:…; it wins over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Every replica polls its sources and holds its own WIS2 subscriptions, so
+# N replicas make N times the upstream requests, and object stores answer
+# that with 503 SlowDown or 429. Scale out only for request load the caches
+# cannot absorb.
+replicaCount: 1
+
+# config.toml, mounted at /data/config.toml. Relative paths in it resolve
+# against /data. The server runs with --host 0.0.0.0 --port <containerPort>,
+# which win over [server] host and port in the file.
+config:
+  toml: |
+    [server]
+    # Required, but the chart's --host and --port win over them.
+    host = "0.0.0.0"
+    port = 8000
+    # collections.files, collections.existingConfigMaps and the sample collection.
+    collections_dir = "collections.d"
+    # Uncomment with colormaps.files or colormaps.existingConfigMaps.
+    # colormaps_dir = "colormaps.d"
+    # Engine state: WIS2 CAP alert sets and WIS2 BUFR report stores. See stateDir.
+    state_dir = "/var/lib/meteocore"
+  # A ConfigMap holding config.toml, used instead of config.toml above.
+  existingConfigMap: ""
+  existingConfigMapKey: config.toml
+
+# Per-collection files, one collection per file, mounted in /data/collections.d.
+collections:
+  # File name → TOML.
+  files: {}
+  # Names of ConfigMaps whose keys are mounted there too. File names must not
+  # repeat across them.
+  existingConfigMaps: []
+
+# Palette files, mounted in /data/colormaps.d: .toml, GMT .cpt, GRLevelX .pal,
+# GDAL color-relief .txt/.clr or SLD .sld, named after the file.
+colormaps:
+  files: {}
+  existingConfigMaps: []
+
+# A CSV collection of hourly observations from three Finnish weather stations
+# (Finnish Meteorological Institute open data, CC BY 4.0), so that a default
+# install serves something. Turn it off once you have collections of your own.
+sample:
+  enabled: true
+  id: sample-observations
+
+# Plain environment variables, name → value. Set a name to null to drop a
+# default.
+env:
+  LOG_FORMAT: json
+  RUST_LOG: info
+  # Reaches only C libraries that allocate with glibc malloc; the server
+  # itself allocates with jemalloc.
+  MALLOC_ARENA_MAX: "2"
+# Full EnvVar objects, for secrets: ADMIN_TOKEN, the [mcp] token_env variable,
+# PostGIS dsn_env variables.
+extraEnv: []
+envFrom: []
+
+# Extra server arguments, e.g. ["--collections", "radar,nwp"].
+extraArgs: []
+
+containerPort: 8000
+
+# The state_dir mount, /var/lib/meteocore. Without persistence it is an
+# emptyDir, and push-fed collections (WIS2 CAP and BUFR) start empty after a
+# pod restart. With persistence the chart runs a StatefulSet with one
+# PersistentVolumeClaim per pod: two servers must never share a state_dir.
+stateDir:
+  persistence:
+    enabled: false
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
+    size: 1Gi
+    annotations: {}
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # The server never calls the Kubernetes API.
+  automount: false
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  runAsGroup: 999
+  fsGroup: 999
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# On SIGTERM the server stops polling, finishes in-flight requests and writes
+# its state snapshots.
+terminationGracePeriodSeconds: 60
+
+service:
+  type: ClusterIP
+  port: 8000
+  annotations: {}
+
+# /health answers 200 unless every collection has failed. The server binds its
+# port before loading collections but serves nothing until they are loaded,
+# which can take minutes for large remote catalogs.
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 5
+  timeoutSeconds: 5
+  failureThreshold: 120
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+# A TCP check: /health turns 503 when every upstream is down, and restarting
+# the pod would not fix that.
+livenessProbe:
+  tcpSocket:
+    port: http
+  periodSeconds: 20
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+# Size the memory limit above the cache plan: GET /admin/cache-plan lists every
+# cache and admission budget. The server does not yet size its caches from the
+# container's limit.
+resources: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: meteocore.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Gateway API HTTPRoute.
+httpRoute:
+  enabled: false
+  annotations: {}
+  parentRefs: []
+  hostnames: []
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+
+# Prometheus Operator ServiceMonitor for /metrics.
+serviceMonitor:
+  enabled: false
+  labels: {}
+  interval: 30s
+  scrapeTimeout: ""
+  relabelings: []
+  metricRelabelings: []
+
+# The repository's Grafana dashboard as a ConfigMap for the Grafana sidecar.
+# It is a dashboard.grafana.app/v2 resource: Grafana 13 or later.
+grafanaDashboard:
+  enabled: false
+  # Defaults to the release namespace.
+  namespace: ""
+  labels:
+    grafana_dashboard: "1"
+  annotations: {}
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: null
+  maxUnavailable: 1
+
+extraVolumes: []
+extraVolumeMounts: []
+
+priorityClassName: ""
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []

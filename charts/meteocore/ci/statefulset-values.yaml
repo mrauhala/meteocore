@@ -1,0 +1,8 @@
+# Per-pod state volumes: a StatefulSet with one PersistentVolumeClaim per pod.
+replicaCount: 2
+stateDir:
+  persistence:
+    enabled: true
+    size: 64Mi
+podDisruptionBudget:
+  enabled: true

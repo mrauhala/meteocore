@@ -23,7 +23,8 @@
 #      renders the unreleased changelog section from ALL Conventional
 #      Commits since the last tag — whatever paths they touch. If anything
 #      is releasable, the job regenerates branch `release-pr/main` (version
-#      bump in Cargo.toml + Cargo.lock, CHANGELOG section prepended) and
+#      bump in Cargo.toml + Cargo.lock and the Helm chart's Chart.yaml,
+#      CHANGELOG section prepended) and
 #      opens/updates a PR titled "chore: release X.Y.Z". Merging that PR is
 #      what half 1 reacts to on the next push. Nothing releasable → no PR.
 #
@@ -301,13 +302,25 @@ jobs:
             echo "::error::Cargo.lock server entry was not updated"
             exit 1
           fi
+          # The Helm chart's version and appVersion follow the server's
+          # (#1365): the chart is published with each release and defaults
+          # to its image.
+          chart=charts/meteocore/Chart.yaml
+          for key in version appVersion; do
+            if [ "$(grep -c "^${key}: " "$chart")" != "1" ]; then
+              echo "::error::Expected exactly one ${key} line in ${chart}"
+              exit 1
+            fi
+          done
+          sed -i -e 's/^version: .*$/version: '"${next}"'/' \
+            -e 's/^appVersion: .*$/appVersion: "'"${next}"'"/' "$chart"
           git-cliff --unreleased --tag "${next_tag}" --prepend crates/server/CHANGELOG.md
           git-cliff --unreleased --tag "${next_tag}" --strip all > "${RUNNER_TEMP}/pr-body.md"
-          printf '\n---\nMerging this PR releases **%s**: the next push to main tags it, publishes the notes above, and builds the binaries + container image (.github/workflows/release.yml, #220).\n' "${next_tag}" >> "${RUNNER_TEMP}/pr-body.md"
+          printf '\n---\nMerging this PR releases **%s**: the next push to main tags it, publishes the notes above, and builds the binaries, the container image and the Helm chart (.github/workflows/release.yml, #220).\n' "${next_tag}" >> "${RUNNER_TEMP}/pr-body.md"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -B release-pr/main
-          git add crates/server/Cargo.toml Cargo.lock crates/server/CHANGELOG.md
+          git add crates/server/Cargo.toml Cargo.lock crates/server/CHANGELOG.md "$chart"
           git commit -m "chore: release ${next}"
           git push --force origin release-pr/main
           pr=$(gh pr list --head release-pr/main --state open --json number --jq '.[0].number' || true)
@@ -499,3 +512,122 @@ jobs:
             dist/*.tar.gz
             dist/*.zip
             dist/SHA256SUMS
+
+  # The Helm chart (#1365), on two channels: an OCI artifact next to the
+  # image on ghcr.io, and a classic repository whose index.yaml lives on
+  # the gh-pages branch and points at the chart attached to this release.
+  # After the image, so the chart never names an image that is not there.
+  publish-chart:
+    name: helm chart
+    needs: [resolve-target, build-container]
+    # See build-binary above — `always()` defeats transitive skip
+    # propagation from the dispatch-path-skipped `release` job.
+    if: >-
+      always() && needs.resolve-target.result == 'success' &&
+      needs.build-container.result == 'success'
+    # gh-pages has one writer at a time; a second run waits, never cancels.
+    concurrency:
+      group: gh-pages
+      cancel-in-progress: false
+    permissions:
+      contents: write   # attach the chart to the release, push gh-pages
+      packages: write   # push the chart to ghcr.io
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve-target.outputs.tag }}
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+      ACTOR: ${{ github.actor }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ needs.resolve-target.outputs.tag }}
+
+      # Direct pinned-checksum download, deliberately not an action:
+      # every third-party action in a `contents: write` job is a
+      # credential-exfil vector (see the header Security note). The
+      # checksum is the one get.helm.sh publishes beside the archive.
+      - name: Install Helm
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "${RUNNER_TEMP}/helm.tar.gz" \
+            https://get.helm.sh/helm-v4.3.1-linux-amd64.tar.gz
+          echo "0403a88ae20913d11b10a2467b50087721fea7581736da6b9d3992f5357fe54b  ${RUNNER_TEMP}/helm.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/helm.tar.gz" -C "${RUNNER_TEMP}" linux-amd64/helm
+          sudo install "${RUNNER_TEMP}/linux-amd64/helm" /usr/local/bin/helm
+          helm version
+
+      # A tag cut before the chart existed has nothing to publish; one whose
+      # Chart.yaml disagrees with the tag fails rather than publish a chart
+      # that names another release's image.
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          chart=charts/meteocore
+          if [ ! -f "${chart}/Chart.yaml" ]; then
+            echo "::notice::${TAG} has no Helm chart; nothing to publish."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          version="${TAG#v}"
+          chart_version=$(sed -n 's/^version: \(.*\)$/\1/p' "${chart}/Chart.yaml")
+          app_version=$(sed -n 's/^appVersion: "\(.*\)"$/\1/p' "${chart}/Chart.yaml")
+          if [ "$chart_version" != "$version" ] || [ "$app_version" != "$version" ]; then
+            echo "::error::${chart}/Chart.yaml has version ${chart_version} and appVersion ${app_version}; the release is ${version}."
+            exit 1
+          fi
+          helm package "$chart" --destination "${RUNNER_TEMP}/chart"
+          package="${RUNNER_TEMP}/chart/meteocore-${version}.tgz"
+          test -f "$package"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "package=${package}" >> "$GITHUB_OUTPUT"
+
+      - name: Push to ghcr.io
+        if: steps.package.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ steps.package.outputs.package }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
+          # OCI references are lowercase.
+          helm push "$PACKAGE" "oci://ghcr.io/${OWNER,,}/charts"
+
+      - name: Attach to the release
+        if: steps.package.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE: ${{ steps.package.outputs.package }}
+        run: gh release upload "$TAG" "$PACKAGE" --clobber --repo "$REPO"
+
+      # The classic repository: gh-pages holds only index.yaml, whose
+      # entries point at the charts attached to their releases. The branch
+      # is created on the first publish; GitHub Pages serves it once Pages
+      # is enabled for it in the repository settings.
+      - name: Index on gh-pages
+        if: steps.package.outputs.skip == 'false'
+        env:
+          PACKAGE: ${{ steps.package.outputs.package }}
+        run: |
+          set -euo pipefail
+          pages="${RUNNER_TEMP}/gh-pages"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git worktree add "$pages" FETCH_HEAD
+          else
+            git worktree add --orphan -b gh-pages "$pages"
+          fi
+          # Serve index.yaml as it is, without Jekyll.
+          touch "${pages}/.nojekyll"
+          scripts/helm_repo_index.sh "$PACKAGE" \
+            "https://github.com/${REPO}/releases/download/${TAG}" "${pages}/index.yaml"
+          git -C "$pages" add index.yaml .nojekyll
+          if git -C "$pages" diff --cached --quiet; then
+            echo "index.yaml already lists ${TAG}'s chart."
+            exit 0
+          fi
+          git -C "$pages" commit -m "chore(helm): index meteocore ${TAG#v}"
+          git -C "$pages" push origin HEAD:gh-pages
