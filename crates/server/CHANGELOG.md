@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/mrauhala/meteocore/compare/v0.13.0...v0.14.0) (2026-10-30)
+
+
+### Features
+
+* **helm:** Helm chart for Kubernetes, published to ghcr.io and GitHub Pages ([#1366](https://github.com/mrauhala/meteocore/issues/1366)) ([54e43b2](https://github.com/mrauhala/meteocore/commit/54e43b2acfff67d03da7a92c5688cd8f6210d3bd))
+
 ## [0.13.0](https://github.com/mrauhala/meteocore/compare/v0.12.0...v0.13.0) (2026-10-29)
 
 
