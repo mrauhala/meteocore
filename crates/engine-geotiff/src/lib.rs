@@ -23,6 +23,8 @@ mod tile_fetch_failure_tests;
 /// Snapshot of the process-global decoded-chunk cache (#463) for `/metrics`:
 /// `(hits, misses, bytes, capacity_bytes)`.
 pub use decoded_cache::metrics as decoded_chunk_cache_metrics;
+/// Resize the decoded-chunk cache in place (#1311).
+pub use decoded_cache::resize as resize_decoded_chunk_cache;
 pub mod stac;
 
 /// Re-exports for fuzz testing. Not part of the public API.
@@ -704,6 +706,43 @@ impl GeoTiffEngine {
     /// cache and never the tile cache: its tile cache is built empty.
     pub fn reads_local_files(&self) -> bool {
         matches!(self.store_mode, StoreMode::Local { .. })
+    }
+
+    /// The tile cache size `config` gives this engine's source: none for
+    /// local files, read through the page cache.
+    fn tile_cache_bytes(&self, config: &GeoTiffConfig) -> u64 {
+        if self.reads_local_files() {
+            0
+        } else {
+            config.tile_cache_mb.saturating_mul(ds_cache::MIB)
+        }
+    }
+
+    /// Whether [`Self::apply_cache_sizes`] can give the tile cache
+    /// `config`'s size in place (#1311): it keeps behaving as one built at
+    /// that size ([`cache::TileCache::resizes_in_place_to`]). Otherwise the
+    /// engine is built anew, its cache empty at the new size.
+    pub fn resizes_caches_in_place(&self, config: &GeoTiffConfig) -> bool {
+        self.tile_cache
+            .resizes_in_place_to(self.tile_cache_bytes(config))
+    }
+
+    /// Give the tile cache `config`'s size in place, keeping the tiles that
+    /// fit (#1311): a reload that changed only `tile_cache_mb` reuses the
+    /// engine and calls this once it is accepted, after
+    /// [`Self::resizes_caches_in_place`] said it can.
+    pub fn apply_cache_sizes(&self, config: &GeoTiffConfig) {
+        let bytes = self.tile_cache_bytes(config);
+        let capacity = self.tile_cache.capacity();
+        if capacity != bytes {
+            tracing::info!(
+                "Collection '{}': tile cache resized from {} to {} MiB in place",
+                self.collection_id,
+                capacity / ds_cache::MIB,
+                bytes / ds_cache::MIB
+            );
+            self.tile_cache.resize(bytes);
+        }
     }
 
     /// Return current tile cache utilization as (bytes_used, capacity_bytes, entries).

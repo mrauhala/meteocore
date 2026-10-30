@@ -223,6 +223,29 @@ pub fn chunk_cache_metrics() -> ds_cache::CacheMetrics {
     CHUNKS.metrics()
 }
 
+/// Resize the block cache to `bytes` in place, keeping the blocks that
+/// fit, and never below [`MIN_BLOCK_CACHE_MB`] (#1311). Its size comes from
+/// the environment, which cannot change without a restart: nothing calls
+/// this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_block_cache(bytes: u64) -> u64 {
+    BLOCKS.set_capacity(bytes.max(MIN_BLOCK_CACHE_MB.saturating_mul(ds_cache::MIB)))
+}
+
+/// Resize the chunk cache to `bytes` in place, keeping the chunks and
+/// replies that fit (#1311). Its size comes from the environment, which
+/// cannot change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_chunk_cache(bytes: u64) -> u64 {
+    CHUNKS.set_capacity(bytes)
+}
+
 /// Why a remote read failed. The reader sees it as an I/O error; the
 /// engine finds it again in the error chain ([`ReadFailure::find`]).
 #[derive(Debug, thiserror::Error)]

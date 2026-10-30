@@ -127,3 +127,10 @@ rejection; `try_reserve`, a batch's probe for one more slot, and
 one. It checks no deadline and reads no environment: the engine owns its
 static, env var, default, deadline checks and planning, and exports
 `metrics()` (used, capacity, rejected) to `/metrics` unchanged.
+Both budgets' capacities are atomic and `resize` in place (#1311): granted
+reservations stay, so a shrink below them admits nothing until they are
+released. `RenderBudget::resize` wakes every waiter: one that now fits is
+admitted, one that never can is shed at once as `rejected_oversize`, not
+left to its deadline (`a_render_budget_shrink_sheds_a_queued_render_that_cannot_fit`).
+Nothing calls them on reload yet: their sizes still come from the
+environment.

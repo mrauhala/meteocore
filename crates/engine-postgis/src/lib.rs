@@ -12,7 +12,7 @@ pub mod station_map;
 
 pub use engine::PostgisEngine;
 pub use health::{Health, HealthSnapshot, HealthStatus, LiveHealth};
-pub use maps::strike_window_cache_metrics;
+pub use maps::{resize_strike_window_cache, strike_window_cache_metrics};
 pub use metadata::LocationsCut;
 pub use station_map::{station_frame_cache_metrics, StationSymbols, NODATA_MARKER};
 

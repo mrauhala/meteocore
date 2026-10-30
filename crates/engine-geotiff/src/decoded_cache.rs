@@ -220,6 +220,17 @@ pub fn metrics() -> ds_cache::CacheMetrics {
     CACHE.metrics()
 }
 
+/// Resize the decoded-chunk cache to `bytes` in place, keeping the chunks
+/// that fit (#1311). Its size comes from the environment, which cannot
+/// change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize(bytes: u64) -> u64 {
+    CACHE.set_capacity(bytes)
+}
+
 /// Fetch the decoded chunk for `(scope, ifd, chunk)` from the cache, or run
 /// `decode` and insert. `get_or_insert_with` is the single-flight: concurrent
 /// callers for the SAME chunk block on one decode. A decode error is returned
@@ -391,5 +402,16 @@ mod tests {
         assert!(err.is_err());
         let ok = get_or_decode(&scope, 0, 1, || Ok(DecodingResult::U8(vec![42]))).unwrap();
         assert!(matches!(*ok, DecodingResult::U8(ref v) if v == &[42]));
+    }
+
+    /// #1311: the process-wide cache resizes in place and reports its new
+    /// capacity.
+    #[test]
+    fn the_decoded_chunk_cache_resizes_in_place() {
+        let before = metrics().capacity_bytes;
+        resize(before + ds_cache::MIB);
+        assert_eq!(metrics().capacity_bytes, before + ds_cache::MIB);
+        resize(before);
+        assert_eq!(metrics().capacity_bytes, before);
     }
 }

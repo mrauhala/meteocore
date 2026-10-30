@@ -381,6 +381,75 @@ impl GribEngine {
             .unwrap_or((0, 0, 0))
     }
 
+    /// Whether [`Self::apply_cache_sizes`] can give this source's caches
+    /// `config`'s sizes in place (#1311): each cache stays on or off, and
+    /// each one resized keeps behaving as one built at its new size would
+    /// ([`GridCache`]'s hot share). Otherwise the engine is built anew, its
+    /// caches empty at the new sizes.
+    pub fn resizes_caches_in_place(&self, config: &GribConfig) -> bool {
+        fn fits<C>(cache: Option<&C>, mb: u64, in_place: impl Fn(&C, u64) -> bool) -> bool {
+            match cache {
+                Some(cache) => mb > 0 && in_place(cache, mb.saturating_mul(ds_cache::MIB)),
+                None => mb == 0,
+            }
+        }
+        let source = &*self.source;
+        fits(
+            source.grid_cache.as_ref(),
+            config.grid_cache_mb,
+            GridCache::resizes_in_place_to,
+        ) && fits(
+            source.message_cache.as_ref(),
+            config.message_cache_mb,
+            message_cache::MessageCache::resizes_in_place_to,
+        ) && fits(
+            source.point_index.as_ref(),
+            config.effective_point_index_cache_mb(),
+            point_index::PointIndex::resizes_in_place_to,
+        )
+    }
+
+    /// Give this source's caches `config`'s sizes in place, keeping what
+    /// fits (#1311): a reload that changed only cache sizes reuses the
+    /// engine and calls this once it is accepted, after
+    /// [`Self::resizes_caches_in_place`] said it can. Shared by every level
+    /// view of the source.
+    pub fn apply_cache_sizes(&self, config: &GribConfig) {
+        let source = &*self.source;
+        let resize = |name: &str, capacity: u64, mb: u64, resize: &dyn Fn(u64)| {
+            let bytes = mb.saturating_mul(ds_cache::MIB);
+            if capacity != bytes {
+                tracing::info!(
+                    "Collection '{}': {name} resized from {} to {mb} MiB in place",
+                    self.collection_id,
+                    capacity / ds_cache::MIB
+                );
+                resize(bytes);
+            }
+        };
+        if let Some(cache) = &source.grid_cache {
+            resize("grid cache", cache.capacity(), config.grid_cache_mb, &|b| {
+                cache.resize(b)
+            });
+        }
+        if let Some(cache) = &source.message_cache {
+            resize(
+                "message cache",
+                cache.capacity_bytes(),
+                config.message_cache_mb,
+                &|b| cache.resize(b),
+            );
+        }
+        if let Some(index) = &source.point_index {
+            resize(
+                "point-index cache",
+                index.metrics().capacity_bytes,
+                config.effective_point_index_cache_mb(),
+                &|b| index.resize(b),
+            );
+        }
+    }
+
     /// Compressed-message cache counters and resident byte budget, per source.
     pub fn message_cache_metrics(&self) -> ds_cache::CacheMetrics {
         self.source
@@ -2694,6 +2763,82 @@ mod tests {
             assert_eq!(keys["UGRD"].levtype, "hag");
             assert_eq!(keys["UGRD"].level, Some(10));
         }
+    }
+
+    /// #1311: a source's caches take new sizes in place while each stays
+    /// on or off and keeps its behaviour; turning one on or off, or a
+    /// share that would no longer hold a fill, needs a new engine.
+    #[test]
+    fn cache_sizes_apply_in_place_while_each_cache_keeps_its_behaviour() {
+        let with = |change: serde_json::Value| -> GribConfig {
+            let mut value = serde_json::json!({
+                "data_path": "../../testdata/grib-local", "index_format": "ecmwf-json",
+                "grid_cache_mb": 32, "message_cache_mb": 256
+            });
+            for (key, v) in change.as_object().unwrap() {
+                value[key] = v.clone();
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let cfg = with(serde_json::json!({}));
+        let engine = GribEngine::new("resize-test", &cfg).unwrap();
+        assert!(engine.resizes_caches_in_place(&cfg));
+        let resized = with(serde_json::json!({
+            "grid_cache_mb": 48, "message_cache_mb": 1024, "point_index_cache_mb": 32
+        }));
+        assert!(engine.resizes_caches_in_place(&resized));
+        for off_or_on in [
+            serde_json::json!({ "grid_cache_mb": 0 }),
+            serde_json::json!({ "message_cache_mb": 0 }),
+            serde_json::json!({ "point_index_cache_mb": 0 }),
+            // 32 MiB holds no 0.1° field at any share; 256 MiB does.
+            serde_json::json!({ "grid_cache_mb": 256 }),
+            serde_json::json!({ "message_cache_mb": 128 }),
+        ] {
+            assert!(
+                !engine.resizes_caches_in_place(&with(off_or_on.clone())),
+                "{off_or_on}"
+            );
+        }
+        engine.source.grid_cache.as_ref().unwrap().insert(
+            "kept",
+            0,
+            Arc::new(DecodedGrid {
+                ni: 2,
+                nj: 2,
+                lon_first: 0.0,
+                lat_first: 1.0,
+                lon_inc: 1.0,
+                lat_inc: -1.0,
+                values: Arc::new(vec![1.0; 4]),
+                triple: (0, 0, 0),
+                centre: 7,
+                first_surface_type: 1,
+                first_surface_value: None,
+                statistic: None,
+                uv_frame: ds_core::wind::VectorFrame::Earth,
+            }),
+        );
+        engine.apply_cache_sizes(&resized);
+        assert_eq!(
+            engine.grid_cache_metrics().capacity_bytes,
+            48 * ds_cache::MIB
+        );
+        assert_eq!(
+            engine.message_cache_metrics().capacity_bytes,
+            1024 * ds_cache::MIB
+        );
+        assert_eq!(
+            engine.point_index_cache_metrics().capacity_bytes,
+            32 * ds_cache::MIB
+        );
+        assert!(engine
+            .source
+            .grid_cache
+            .as_ref()
+            .unwrap()
+            .get_untracked("kept", 0)
+            .is_some());
     }
 
     #[test]

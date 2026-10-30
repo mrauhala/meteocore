@@ -117,6 +117,21 @@ impl VectorTileCache {
         self.cache.capacity_bytes()
     }
 
+    /// Resize to `capacity_mb` in place, keeping the tiles that fit
+    /// ([`ds_cache::ByteBoundedCache::set_capacity`], #1311).
+    pub fn resize(&self, capacity_mb: u64) {
+        self.cache
+            .set_capacity(capacity_mb.saturating_mul(ds_cache::MIB));
+    }
+
+    /// Whether to keep this cache and [`Self::resize`] it to `capacity_mb`
+    /// rather than build one at that size
+    /// ([`ds_cache::ByteBoundedCache::resizes_in_place_to`]).
+    pub fn resizes_in_place_to(&self, capacity_mb: u64) -> bool {
+        self.cache
+            .resizes_in_place_to(capacity_mb.saturating_mul(ds_cache::MIB))
+    }
+
     pub fn hits(&self) -> u64 {
         self.cache.stats().0
     }
@@ -300,5 +315,17 @@ mod tests {
         cache.insert(k2.clone(), CachedTile::new(Bytes::from_static(b"two")));
         assert_eq!(&cache.get(&k1).unwrap().bytes[..], b"one");
         assert_eq!(&cache.get(&k2).unwrap().bytes[..], b"two");
+    }
+
+    /// #1311: a resize changes the reported capacity in place.
+    #[test]
+    fn resizes_in_place() {
+        let cache = VectorTileCache::new(16);
+        cache.resize(32);
+        assert_eq!(cache.capacity_bytes(), 32 * ds_cache::MIB);
+        assert_eq!(cache.metrics().capacity_bytes, 32 * ds_cache::MIB);
+        cache.resize(0);
+        assert_eq!(cache.capacity_bytes(), 0);
+        assert!(!cache.resizes_in_place_to(16));
     }
 }

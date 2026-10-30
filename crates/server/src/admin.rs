@@ -2605,6 +2605,9 @@ pub struct LoadResult {
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
     pub nowcast_engines: Vec<Arc<engine_nowcast::NowcastEngine>>,
     nowcast_dependency_updates: Vec<engine_nowcast::engine::DependencyUpdate>,
+    /// New sizes for the caches this load reuses, applied once it is
+    /// accepted ([`Self::apply_cache_resizes`], #1311).
+    cache_resizes: Vec<CacheResize>,
     pub station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>>,
     /// Every successfully built (or reused) poll-loop engine, keyed by
     /// collection id — the reuse pool for the NEXT incremental reload (#574).
@@ -2614,6 +2617,12 @@ pub struct LoadResult {
     /// source registers one per level family).
     pub wind_by_id: WindHandles,
 }
+
+/// A new size for a cache a reload reuses: the render caches, and a reused
+/// engine's own caches when only their sizes changed, with that engine's
+/// memory-plan entry (#1311). Staged like a nowcast's dependency update, so
+/// a rejected reload leaves every live cache and the plan as they were.
+type CacheResize = Box<dyn FnOnce() + Send>;
 
 /// Derived-parameter wrappers by configured collection id, then registered
 /// id. Named for wind, the first derivation.
@@ -2629,6 +2638,22 @@ impl LoadResult {
         for update in self.nowcast_dependency_updates.drain(..) {
             update.apply();
         }
+    }
+
+    /// Give the caches this load reused their new sizes (#1311). Like the
+    /// dependency updates, only after the reload is accepted: a shrink
+    /// evicts from caches the live registry serves from. [`apply_load`]
+    /// takes them and applies them after the per-collection eviction.
+    #[cfg(test)]
+    fn apply_cache_resizes(&mut self) {
+        apply_cache_resizes(std::mem::take(&mut self.cache_resizes));
+    }
+}
+
+/// Run staged [`CacheResize`]s, in the order the load staged them.
+fn apply_cache_resizes(resizes: Vec<CacheResize>) {
+    for resize in resizes {
+        resize();
     }
 }
 
@@ -2827,7 +2852,10 @@ impl EngineReuse {
 /// Decide which collections of the NEW config may reuse their live engine
 /// (#574): the collection's full `CollectionConfig` is unchanged (derived
 /// `PartialEq` — any field difference, including `[wms]`, forces a rebuild)
-/// AND a live engine exists for it. Derived nowcast collections additionally
+/// AND a live engine exists for it. A GRIB or GeoTIFF collection whose
+/// config changed only in its cache sizes counts as unchanged when its live
+/// engine can take the new sizes in place ([`cache_sizes_only`], #1311):
+/// [`load_collections`] stages them for the accepted reload. Derived nowcast collections additionally
 /// require their raster `source` to be reusable: equal geometry alone cannot
 /// establish a rebuilt source's provenance. Auxiliary joins are revalidated
 /// against the new registries, then rebound atomically on accepted reloads.
@@ -2848,8 +2876,11 @@ pub(crate) fn reusable_collections(
     new: &[CollectionConfig],
     live: &HashMap<String, EngineHandle>,
 ) -> std::collections::HashSet<String> {
-    let unchanged =
-        |c: &CollectionConfig| old.get(&c.id).is_some_and(|o| o == c) && live.contains_key(&c.id);
+    let unchanged = |c: &CollectionConfig| {
+        old.get(&c.id)
+            .is_some_and(|o| o == c || cache_sizes_only(o, c, live.get(&c.id)))
+            && live.contains_key(&c.id)
+    };
     let base: std::collections::HashSet<String> = new
         .iter()
         .filter(|c| {
@@ -2892,6 +2923,44 @@ pub(crate) fn reusable_collections(
         }
     }
     out
+}
+
+/// Whether `new` differs from `old` only in the sizes of the caches its
+/// live engine owns, and that engine can take them in place (#1311): GRIB's
+/// `grid_cache_mb`, `message_cache_mb` and `point_index_cache_mb`, GeoTIFF's
+/// `tile_cache_mb`. The engine is then reused with its caches warm, rather
+/// than built anew with them empty. A cache turned on or off, or one that
+/// would not keep behaving as a cache built at its new size, still rebuilds.
+fn cache_sizes_only(
+    old: &CollectionConfig,
+    new: &CollectionConfig,
+    live: Option<&EngineHandle>,
+) -> bool {
+    let in_place = match (live, new.grib.as_ref(), new.geotiff.as_ref()) {
+        (Some(EngineHandle::Grib(engine)), Some(config), _) => {
+            engine.resizes_caches_in_place(config)
+        }
+        (Some(EngineHandle::Geotiff(engine)), _, Some(config)) => {
+            engine.resizes_caches_in_place(config)
+        }
+        _ => false,
+    };
+    in_place && without_cache_sizes(old) == without_cache_sizes(new)
+}
+
+/// `config` with the cache sizes [`cache_sizes_only`] lets a live engine
+/// take in place cleared.
+fn without_cache_sizes(config: &CollectionConfig) -> CollectionConfig {
+    let mut config = config.clone();
+    if let Some(grib) = config.grib.as_mut() {
+        grib.grid_cache_mb = 0;
+        grib.message_cache_mb = 0;
+        grib.point_index_cache_mb = None;
+    }
+    if let Some(geotiff) = config.geotiff.as_mut() {
+        geotiff.tile_cache_mb = 0;
+    }
+    config
 }
 
 /// MCP state plus the guard that protects it.
@@ -3150,6 +3219,7 @@ pub fn load_collections(
     let mut engines_by_id: HashMap<String, EngineHandle> = HashMap::new();
     let mut wind_by_id: WindHandles = HashMap::new();
     let mut nowcast_dependency_updates = Vec::new();
+    let mut cache_resizes: Vec<CacheResize> = Vec::new();
 
     // A CSV or BUFR station collection's symbol layers (#1204), when
     // `station_map_wiring` turns them on: styles resolved on every load,
@@ -3432,12 +3502,21 @@ pub fn load_collections(
                     }
                 };
 
+                let mut reused_engine = false;
                 let engine = match engine_reuse.take_geotiff(&collection.id) {
                     Some(e) => {
+                        reused_engine = true;
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
                         );
+                        let (engine, config) = (e.clone(), collection.clone());
+                        cache_resizes.push(Box::new(move || {
+                            if let Some(geotiff) = &config.geotiff {
+                                engine.apply_cache_sizes(geotiff);
+                            }
+                            crate::cache_plan::register_geotiff(&config, &engine);
+                        }));
                         e
                     }
                     None => match engine_geotiff::GeoTiffEngine::new(
@@ -3474,7 +3553,12 @@ pub fn load_collections(
                 }
 
                 geotiff_engines.push(engine.clone());
-                crate::cache_plan::register_geotiff(collection, &engine);
+                // A reused engine's entry, whose size source may be new, is
+                // staged with its resize: a rejected reload leaves the plan
+                // as it was (#1311).
+                if !reused_engine {
+                    crate::cache_plan::register_geotiff(collection, &engine);
+                }
 
                 if collection.apis.contains(&"edr".to_string()) {
                     edr_engines.insert(
@@ -3739,6 +3823,13 @@ pub fn load_collections(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
                         );
+                        let (engine, config) = (e.clone(), collection.clone());
+                        cache_resizes.push(Box::new(move || {
+                            if let Some(grib) = &config.grib {
+                                engine.apply_cache_sizes(grib);
+                            }
+                            crate::cache_plan::register_grib(&config, &engine);
+                        }));
                         e
                     }
                     None => match engine_grib::GribEngine::new(&collection.id, grib_config) {
@@ -3771,7 +3862,10 @@ pub fn load_collections(
                 }
 
                 grib_engines.push(engine.clone());
-                crate::cache_plan::register_grib(collection, &engine);
+                // Staged for a reused engine, as for GeoTIFF above.
+                if !reused_engine {
+                    crate::cache_plan::register_grib(collection, &engine);
+                }
 
                 let views: Vec<_> = if grib_config.level_types.is_some() {
                     engine
@@ -5716,32 +5810,44 @@ pub fn load_collections(
     // render_concurrency`, else 2× cores, min 8); the slots survive reloads.
     let render_concurrency = ds_executor::render_concurrency();
     let render_semaphore = ds_executor::RENDER_SLOTS.clone();
-    // Reuse the live render caches across a reload when their configured byte
-    // size is unchanged, so a reload preserves the warm cache instead of
-    // dumping GBs of meta-tiles and forcing a cold re-warm (see
-    // [`ReusableCaches`]). A size change (or startup, where `reuse` is empty)
-    // builds fresh. Stale entries survive harmlessly: a removed collection's
-    // layer 404s before its cached tiles can be served (they then age out via
-    // LRU), and a changed colormap re-colors as new timesteps render (the cache
-    // key carries `time`); a hard guarantee for an in-place colormap swap still
-    // needs a restart.
-    let mb = |m: u64| m.saturating_mul(1024 * 1024);
+    // Reuse the live render caches across a reload and give them their new
+    // size in place (#1311), keeping what fits: a reload preserves the warm
+    // cache instead of dumping GBs of meta-tiles and forcing a cold re-warm
+    // (see [`ReusableCaches`]). The resize is staged until the reload is
+    // accepted. Startup, where `reuse` is empty, builds fresh, and so does a
+    // size whose shards differ too much from a cache built at it, or a
+    // disabled cache grown, which holds nothing to keep
+    // (`resizes_in_place_to`). Stale entries survive harmlessly: a removed
+    // collection's layer 404s before its cached tiles can be served (they
+    // then age out via LRU), and a changed colormap re-colors as new
+    // timesteps render (the cache key carries `time`); a hard guarantee for
+    // an in-place colormap swap still needs a restart.
     let rendered_cache = match reuse.rendered {
-        Some(c) if c.capacity() == mb(rendered_cache_mb) => c,
+        Some(c) if c.resizes_in_place_to(rendered_cache_mb) => {
+            let cache = c.clone();
+            cache_resizes.push(Box::new(move || cache.resize(rendered_cache_mb)));
+            c
+        }
         _ => Arc::new(ds_render::RenderedCache::new(rendered_cache_mb)),
     };
     let tile_cache = match reuse.tile {
-        Some(c) if c.capacity() == mb(metatile_cache_mb) => c,
+        Some(c) if c.resizes_in_place_to(metatile_cache_mb) => {
+            let cache = c.clone();
+            cache_resizes.push(Box::new(move || cache.resize(metatile_cache_mb)));
+            c
+        }
         _ => Arc::new(ds_render::TilePixelCache::new(metatile_cache_mb)),
     };
     // Vector-tile (MVT) cache is independent of the raster cache because the
     // workloads differ (1–50 KB vs 30–200 KB per tile). Fixed size, kept in a
-    // single constant so the build and the reuse-capacity check can't drift (a
-    // mismatch would silently always rebuild). Reused across reloads on the same
-    // terms as the raster caches.
+    // single constant; reused across reloads like the raster caches.
     const VECTOR_TILE_CACHE_MB: u64 = 128;
     let vector_tile_cache = match reuse.vector {
-        Some(c) if c.capacity_bytes() == mb(VECTOR_TILE_CACHE_MB) => c,
+        Some(c) if c.resizes_in_place_to(VECTOR_TILE_CACHE_MB) => {
+            let cache = c.clone();
+            cache_resizes.push(Box::new(move || cache.resize(VECTOR_TILE_CACHE_MB)));
+            c
+        }
         _ => Arc::new(ds_mvt::VectorTileCache::new(VECTOR_TILE_CACHE_MB)),
     };
 
@@ -5850,6 +5956,7 @@ pub fn load_collections(
         postgis_engines,
         nowcast_engines,
         nowcast_dependency_updates,
+        cache_resizes,
         station_grid_engines,
         engines_by_id,
         wind_by_id,
@@ -7019,6 +7126,9 @@ fn apply_load(
         )
         .collect();
     result.apply_nowcast_dependency_updates();
+    // Applied after the per-collection eviction below: a shrink then keeps
+    // the warm entries of reused collections, not those of rebuilt ones.
+    let cache_resizes = std::mem::take(&mut result.cache_resizes);
 
     // Reload accepted: remember the style fingerprint so the NEXT reload
     // can tell whether style config changed again.
@@ -7249,6 +7359,7 @@ fn apply_load(
             stale.len()
         );
     }
+    apply_cache_resizes(cache_resizes);
     // Metric-label hygiene (#446): only REMOVED collections lose their
     // render-latency series; a rebuilt one keeps its history. (A render in
     // flight on the old registry can re-create a series after this — the
@@ -9789,6 +9900,87 @@ mod tests {
         assert!(properties["value"].is_number(), "{body}");
     }
 
+    /// A GRIB collection over the local fixture with `grib` merged into its
+    /// `[grib]` table. Its id is its own: the memory plan is process-wide.
+    fn grib_collection(grib: serde_json::Value) -> CollectionConfig {
+        let mut table = serde_json::json!({
+            "data_path": "../../testdata/grib-local", "index_format": "ecmwf-json"
+        });
+        for (key, value) in grib.as_object().unwrap() {
+            table[key] = value.clone();
+        }
+        serde_json::from_value(serde_json::json!({
+            "id": "resize-forecast", "title": "Forecast", "description": "GRIB",
+            "engine_type": "grib", "apis": ["edr", "wms"], "grib": table
+        }))
+        .unwrap()
+    }
+
+    /// #1311 acceptance: a reload changing only `[grib] grid_cache_mb`
+    /// reuses the engine, its poll loop and warm caches, and gives the grid
+    /// cache the new size, and its plan entry the new source, once the
+    /// reload is accepted. A change the cache
+    /// cannot take in place (turned off, or a shrink below what keeps a
+    /// 0.1° fill) builds a new engine, its cache at the new size.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reload_changing_grid_cache_mb_resizes_the_live_engine() {
+        const MB: u64 = 1024 * 1024;
+        let old = vec![grib_collection(serde_json::json!({ "grid_cache_mb": 256 }))];
+        let first = load_with_reuse(&old, super::EngineReuse::default());
+        let grib = |result: &super::LoadResult| match &result.engines_by_id["resize-forecast"] {
+            super::EngineHandle::Grib(engine) => engine.clone(),
+            _ => unreachable!("a GRIB engine"),
+        };
+        let engine = grib(&first);
+        assert_eq!(engine.grid_cache_metrics().capacity_bytes, 256 * MB);
+
+        let new = vec![grib_collection(serde_json::json!({ "grid_cache_mb": 512 }))];
+        let mut reloaded = load_with_reuse(&new, reuse_pool(&old, &new, &first.engines_by_id));
+        assert!(Arc::ptr_eq(&engine, &grib(&reloaded)), "the live engine");
+        // Its memory-plan entry, by where its size came from.
+        let planned = || {
+            let scope = ds_cache::plan::Scope::Source {
+                engine: "grib",
+                id: "resize-forecast".into(),
+            };
+            ds_cache::plan::snapshot()
+                .into_iter()
+                .filter(|row| row.entry.id == "grid_cache" && row.entry.scope == scope)
+                .map(|row| (row.entry.source.to_string(), row.usage.capacity_bytes))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            engine.grid_cache_metrics().capacity_bytes,
+            256 * MB,
+            "not before the reload is accepted"
+        );
+        assert_eq!(planned(), [("default".to_string(), 256 * MB)]);
+        reloaded.apply_cache_resizes();
+        assert_eq!(engine.grid_cache_metrics().capacity_bytes, 512 * MB);
+        assert_eq!(
+            planned(),
+            [("collection:[grib] grid_cache_mb".to_string(), 512 * MB)]
+        );
+
+        for (rebuilt, mb) in [
+            (serde_json::json!({ "grid_cache_mb": 0 }), 0),
+            (serde_json::json!({ "grid_cache_mb": 128 }), 128),
+            (
+                serde_json::json!({ "grid_cache_mb": 512, "poll_interval_secs": 601 }),
+                512,
+            ),
+        ] {
+            let changed = vec![grib_collection(rebuilt.clone())];
+            let built = load_with_reuse(
+                &changed,
+                reuse_pool(&new, &changed, &reloaded.engines_by_id),
+            );
+            let other = grib(&built);
+            assert!(!Arc::ptr_eq(&engine, &other), "{rebuilt}");
+            assert_eq!(other.grid_cache_metrics().capacity_bytes, mb * MB);
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn grib_level_collections_register_metadata_queries_and_reuse_one_owner() {
         use axum::{
@@ -10578,120 +10770,131 @@ prewarm_sweeps = 0
         );
     }
 
-    #[test]
-    fn reload_reuses_render_caches_when_size_unchanged() {
-        // Startup-equivalent: fresh caches (empty collections is fine — the
-        // render caches are built unconditionally).
-        let first = super::load_collections(
+    /// Load no collections with render caches of `metatile_mb` and
+    /// `rendered_mb`, reusing `reuse`.
+    fn load_render_caches(
+        metatile_mb: u64,
+        rendered_mb: u64,
+        reuse: super::ReusableCaches,
+    ) -> super::LoadResult {
+        super::load_collections(
             &ds_render::StyleContext::with_builtins(),
             &[],
             &[],
             "http://x",
             false,
             &Default::default(),
-            64,
-            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
-            super::ReusableCaches::default(),
+            metatile_mb,
+            rendered_mb,
+            reuse,
             super::EngineReuse::default(),
-        );
+        )
+    }
+
+    /// The live render caches of `result`, to hand the next load.
+    fn reusable(result: &super::LoadResult) -> super::ReusableCaches {
+        super::ReusableCaches {
+            rendered: Some(result.wms_state.rendered_cache.clone()),
+            tile: Some(result.wms_state.tile_cache.clone()),
+            vector: Some(result.tiles_state.vector_tile_cache.clone()),
+        }
+    }
+
+    /// #1311: a reload reuses every render cache, the same `Arc`, whatever
+    /// its size: a changed size is staged and applied once the reload is
+    /// accepted, so a warm cache survives a size edit instead of being
+    /// dumped. A disabled cache grown is built anew: it holds nothing.
+    #[test]
+    fn reload_resizes_render_caches_in_place() {
+        const MB: u64 = 1024 * 1024;
+        let rendered_mb = ds_core::config::DEFAULT_RENDERED_CACHE_MB;
+        let first = load_render_caches(64, rendered_mb, super::ReusableCaches::default());
+        assert!(first.cache_resizes.is_empty(), "startup builds fresh");
         let tile0 = first.wms_state.tile_cache.clone();
         let rendered0 = first.wms_state.rendered_cache.clone();
         let vector0 = first.tiles_state.vector_tile_cache.clone();
+        let same = |result: &super::LoadResult| {
+            Arc::ptr_eq(&tile0, &result.wms_state.tile_cache)
+                && Arc::ptr_eq(&rendered0, &result.wms_state.rendered_cache)
+                && Arc::ptr_eq(&vector0, &result.tiles_state.vector_tile_cache)
+        };
 
-        // Reload with the SAME meta-tile size → every cache is reused (same
-        // `Arc`), so a warm cache survives a reload instead of being dumped.
-        let second = super::load_collections(
-            &ds_render::StyleContext::with_builtins(),
-            &[],
-            &[],
-            "http://x",
-            false,
-            &Default::default(),
-            64,
-            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
-            super::ReusableCaches {
-                rendered: Some(rendered0.clone()),
-                tile: Some(tile0.clone()),
-                vector: Some(vector0.clone()),
-            },
-            super::EngineReuse::default(),
-        );
-        assert!(
-            Arc::ptr_eq(&tile0, &second.wms_state.tile_cache),
-            "tile cache reused"
-        );
-        assert!(
-            Arc::ptr_eq(&rendered0, &second.wms_state.rendered_cache),
-            "rendered cache reused"
-        );
-        assert!(
-            Arc::ptr_eq(&vector0, &second.tiles_state.vector_tile_cache),
-            "vector cache reused"
-        );
+        let mut second = load_render_caches(64, rendered_mb, reusable(&first));
+        assert!(same(&second), "unchanged sizes reuse every cache");
+        second.apply_cache_resizes();
+        assert_eq!(tile0.capacity(), 64 * MB);
 
-        // Reload with a CHANGED meta-tile size → the tile cache is rebuilt (a
-        // differently-sized cache can't be reused); the unchanged rendered/
-        // vector caches are still reused.
-        let third = super::load_collections(
-            &ds_render::StyleContext::with_builtins(),
-            &[],
-            &[],
-            "http://x",
-            false,
-            &Default::default(),
-            128,
-            ds_core::config::DEFAULT_RENDERED_CACHE_MB,
-            super::ReusableCaches {
-                rendered: Some(rendered0.clone()),
-                tile: Some(tile0.clone()),
-                vector: Some(vector0.clone()),
-            },
-            super::EngineReuse::default(),
-        );
-        assert!(
-            !Arc::ptr_eq(&tile0, &third.wms_state.tile_cache),
-            "tile cache rebuilt on size change"
-        );
-        assert!(
-            Arc::ptr_eq(&rendered0, &third.wms_state.rendered_cache),
-            "rendered cache unchanged → reused"
-        );
-        assert!(
-            Arc::ptr_eq(&vector0, &third.tiles_state.vector_tile_cache),
-            "vector cache unchanged → reused"
-        );
+        // Changed sizes: the same caches, at the old size until accepted.
+        let mut third = load_render_caches(128, rendered_mb * 2, reusable(&second));
+        assert!(same(&third), "changed sizes reuse every cache too");
+        assert_eq!(tile0.capacity(), 64 * MB);
+        assert_eq!(rendered0.capacity(), rendered_mb * MB);
+        third.apply_cache_resizes();
+        assert_eq!(tile0.capacity(), 128 * MB);
+        assert_eq!(rendered0.capacity(), rendered_mb * 2 * MB);
+        assert_eq!(vector0.capacity_bytes(), 128 * MB);
 
-        // Reload with a CHANGED rendered-image size (#1028) → that cache is
-        // rebuilt at the new size; the unchanged meta-tile cache is reused.
-        let tile1 = third.wms_state.tile_cache.clone();
-        let fourth = super::load_collections(
-            &ds_render::StyleContext::with_builtins(),
-            &[],
-            &[],
-            "http://x",
-            false,
-            &Default::default(),
-            128,
-            ds_core::config::DEFAULT_RENDERED_CACHE_MB * 2,
-            super::ReusableCaches {
-                rendered: Some(rendered0.clone()),
-                tile: Some(tile1.clone()),
-                vector: Some(vector0.clone()),
-            },
-            super::EngineReuse::default(),
-        );
-        assert!(
-            !Arc::ptr_eq(&rendered0, &fourth.wms_state.rendered_cache),
-            "rendered cache rebuilt on size change"
-        );
+        // A rejected reload drops its staged sizes with it.
+        drop(load_render_caches(32, rendered_mb, reusable(&third)));
+        assert_eq!(tile0.capacity(), 128 * MB);
+
+        // Disabling meta-tiling resizes in place; enabling it again builds
+        // a fresh cache, at the new size.
+        let mut off = load_render_caches(0, rendered_mb, reusable(&third));
+        assert!(Arc::ptr_eq(&tile0, &off.wms_state.tile_cache));
+        off.apply_cache_resizes();
+        assert_eq!(tile0.capacity(), 0);
+        let on = load_render_caches(64, rendered_mb, reusable(&off));
+        assert!(!Arc::ptr_eq(&tile0, &on.wms_state.tile_cache));
+        assert_eq!(on.wms_state.tile_cache.capacity(), 64 * MB);
+    }
+
+    /// #1311 acceptance: `[server] metatile_cache_mb` 8192 → 6144 on reload
+    /// keeps the resident meta-tiles that fit 6144 MiB, and growing back
+    /// keeps them all. A shrink to sizes whose cache would have far fewer
+    /// shards, 8192 → 16 MiB, builds a new cache instead: its slices would
+    /// refuse every tile.
+    #[test]
+    fn a_reload_changing_the_metatile_cache_size_keeps_its_tiles() {
+        const MB: u64 = 1024 * 1024;
+        let rendered_mb = ds_core::config::DEFAULT_RENDERED_CACHE_MB;
+        let first = load_render_caches(8192, rendered_mb, super::ReusableCaches::default());
+        let tiles = first.wms_state.tile_cache.clone();
+        // About 7 GiB of 256 KiB tiles sharing one buffer: past 6144 MiB.
+        // A shard the keys' hashes favour may already evict a few: the
+        // shrink's evictions are counted from here.
+        tiles.fill_for_test("radar", 28_000);
+        let filled = tiles.len();
+        let evicted_by_fill = tiles.metrics().churn.evictions();
+        assert!(tiles.weight() > 6144 * MB, "{}", tiles.weight());
+
+        let mut smaller = load_render_caches(6144, rendered_mb, reusable(&first));
+        assert!(Arc::ptr_eq(&tiles, &smaller.wms_state.tile_cache));
+        assert_eq!(tiles.len(), filled, "nothing evicted before acceptance");
+        smaller.apply_cache_resizes();
+        assert_eq!(tiles.capacity(), 6144 * MB);
+        let kept = tiles.len();
+        // Each shard keeps its coldest tiles up to its slice: the cache
+        // holds all but under a tile per shard of its new size.
+        assert!(tiles.weight() <= 6144 * MB);
+        assert!(tiles.weight() > 6144 * MB * 97 / 100, "{}", tiles.weight());
+        assert!(kept < filled);
         assert_eq!(
-            fourth.wms_state.rendered_cache.capacity(),
-            ds_core::config::DEFAULT_RENDERED_CACHE_MB * 2 * 1024 * 1024
+            tiles.metrics().churn.evictions() - evicted_by_fill,
+            (filled - kept) as u64
         );
-        assert!(
-            Arc::ptr_eq(&tile1, &fourth.wms_state.tile_cache),
-            "tile cache unchanged → reused"
-        );
+
+        let mut larger = load_render_caches(8192, rendered_mb, reusable(&smaller));
+        assert!(Arc::ptr_eq(&tiles, &larger.wms_state.tile_cache));
+        larger.apply_cache_resizes();
+        assert_eq!(tiles.capacity(), 8192 * MB);
+        assert_eq!(tiles.len(), kept, "a growth keeps every tile");
+        assert_eq!(tiles.metrics().capacity_bytes, 8192 * MB);
+
+        let tiny = load_render_caches(16, rendered_mb, reusable(&larger));
+        assert!(!Arc::ptr_eq(&tiles, &tiny.wms_state.tile_cache));
+        assert_eq!(tiny.wms_state.tile_cache.capacity(), 16 * MB);
+        assert_eq!(tiles.capacity(), 8192 * MB, "the live cache stays");
     }
 
     // --- incremental reload: engine reuse by config diff (#574) ---

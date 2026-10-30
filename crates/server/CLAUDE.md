@@ -74,12 +74,32 @@ disk, no TOML needed.
   config error rejects the whole reload, live registry untouched), but the
   build phase diffs per collection id against the last accepted config
   (`ServerState::last_collections`, derived `PartialEq` on
-  `CollectionConfig`):
+  `CollectionConfig`; a GRIB or GeoTIFF config changed only in its cache
+  sizes counts as unchanged when its engine can take them in place, below):
   - **Unchanged → the live engine `Arc` is reused verbatim** (from
     `ServerState::engine_handles` via `EngineReuse`): poll loop keeps
     running, catalog/caches stay warm, no remote re-bootstrap. Poll-loop
     rotation is by `Arc` identity (`diff_by_identity`): reused engines are
     neither `shutdown()` nor re-spawned (either would break — #442).
+  - **Cache sizes only (#1311):** a GRIB config differing only in
+    `grid_cache_mb` / `message_cache_mb` / `point_index_cache_mb`, or a
+    GeoTIFF one only in `tile_cache_mb`, reuses its engine when
+    `resizes_caches_in_place` (`cache_sizes_only`). Its `apply_cache_sizes`
+    and its `cache_plan::register_*` are staged in `LoadResult::cache_resizes`,
+    not run in `load_collections`: a rejected reload leaves its caches and
+    the plan as they were. A cache turned on or off, or one that would stop
+    behaving like a cache built at its new size, rebuilds as before.
+  - **Render caches are always reused (#1311)**, rendered, meta-tile and
+    MVT, when `resizes_in_place_to` the new size; their resize is staged
+    too. Built at their configured size, never with a ceiling: quick_cache
+    already gives the most shards that keep 32 entries each. A style
+    fingerprint change still drops them, and a disabled cache grown, or a
+    size too far from the old one, is built anew.
+  - `apply_load` takes the staged resizes after the ready guard accepts the
+    load and runs them after the per-collection eviction, so a shrink keeps
+    the warm entries of reused collections, not those of rebuilt ones. A
+    test calling `load_collections` directly applies them itself
+    (`apply_cache_resizes`).
   - **Exceptions:** `csv`/`geojson` always rebuild to reread changed files.
     A station grid keeps its engine only when its source, `elevation_source`
     and `land_mask_source` collections keep theirs (#1082, #1206).
@@ -238,7 +258,9 @@ need no reload pruning.
 - `register_render_caches` runs after every accepted load (`main`,
   `apply_load`, the test `build_state`). Per-collection caches register in
   `load_collections` right after their engine is pushed, reused engines
-  too; registering an owner again replaces its entry.
+  too, except a reused GRIB or GeoTIFF engine, which registers in its
+  staged `cache_resizes` closure once the load is accepted (#1311);
+  registering an owner again replaces its entry.
 - A recovery-loop reload logs the block only when the plan changed.
 - `cache_plan::snapshot` runs `plan::check_rows` and logs each new
   `Shortfall` at WARN (#1309), so a reload that shrinks a cache below its

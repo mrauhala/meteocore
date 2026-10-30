@@ -140,6 +140,24 @@ impl MessageCache {
         self.cache.capacity_bytes()
     }
 
+    /// Whether [`Self::resize`] to `bytes` leaves the cache one built at
+    /// that size would be: its hot share, kept from its build, still keeps
+    /// a fill as large as a decoded 0.1° field (#1311, as
+    /// [`GridCache::resizes_in_place_to`]).
+    pub(crate) fn resizes_in_place_to(&self, bytes: u64) -> bool {
+        let largest = GridCache::estimated_weight(LARGEST_GRID_NODES);
+        let hot = self.cache.hot_allocation();
+        let fresh = ds_cache::hot_allocation_holding(bytes, largest);
+        self.cache.resizes_in_place_to(bytes)
+            && ((fresh - hot).abs() < 1e-6 || ds_cache::holding_keeps(hot, bytes, largest))
+    }
+
+    /// Resize to `bytes` in place, keeping the messages that fit (#1311).
+    /// The pre-warm's share follows the new budget.
+    pub(crate) fn resize(&self, bytes: u64) {
+        self.cache.set_capacity(bytes);
+    }
+
     /// Whether `key` is resident, without touching its recency or a counter.
     pub(crate) fn is_resident(&self, key: &MessageKey) -> bool {
         self.cache.contains_key(key)

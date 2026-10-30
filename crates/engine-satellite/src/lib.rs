@@ -48,7 +48,9 @@ use ds_storage::discovery::TimeWindow;
 use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::FetchBudget;
 
-pub use cache::{frame_metrics, frame_reingests, strip_metrics};
+pub use cache::{
+    frame_metrics, frame_reingests, resize_frame_cache, resize_strip_cache, strip_metrics,
+};
 
 use cache::{BlockKey, FrameKey, FRAMES, STRIPS};
 use frame::{Format, Frame, FrameOptions};

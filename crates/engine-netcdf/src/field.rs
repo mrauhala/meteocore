@@ -177,6 +177,17 @@ pub fn field_cache_metrics() -> ds_cache::CacheMetrics {
     FIELDS.metrics()
 }
 
+/// Resize the field cache to `bytes` in place, keeping the fields that fit
+/// (#1311). Its size comes from the environment, which cannot change
+/// without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_field_cache(bytes: u64) -> u64 {
+    FIELDS.set_capacity(bytes)
+}
+
 /// Detached fills running at once, over every collection: twice the
 /// requests a host takes at once ([`crate::remote::HOST_REQUEST_LIMIT`]),
 /// so the next frames' fetches queue behind the current ones without
@@ -1090,5 +1101,27 @@ mod tests {
         assert_eq!(column, [3.0, 2.5, 2.0, 1.5]);
         let as_stored = Raw::U8(vec![2, 4]).decode(&packing, false, 2);
         assert_eq!(as_stored, [2.0, 3.0]);
+    }
+
+    /// Grow a process-wide cache by 1 MiB through `resize`, check `metrics`
+    /// reports it, and give it its size back: other tests share it.
+    fn resizes_in_place(metrics: impl Fn() -> ds_cache::CacheMetrics, resize: fn(u64) -> u64) {
+        let before = metrics().capacity_bytes;
+        resize(before + ds_cache::MIB);
+        assert_eq!(metrics().capacity_bytes, before + ds_cache::MIB);
+        resize(before);
+        assert_eq!(metrics().capacity_bytes, before);
+    }
+
+    /// #1311: the process-wide field, block and chunk caches resize in place
+    /// and report their new capacities.
+    #[test]
+    fn the_process_wide_caches_resize_in_place() {
+        use crate::remote::{
+            block_cache_metrics, chunk_cache_metrics, resize_block_cache, resize_chunk_cache,
+        };
+        resizes_in_place(field_cache_metrics, resize_field_cache);
+        resizes_in_place(block_cache_metrics, resize_block_cache);
+        resizes_in_place(chunk_cache_metrics, resize_chunk_cache);
     }
 }

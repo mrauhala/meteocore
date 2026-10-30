@@ -340,6 +340,12 @@ impl RenderJob {
             .map_err(|_| {
                 memory.reject_deadline();
                 timeout_error(&TIMED_OUT_QUEUE)
+            })?
+            // The budget shrank below it while it waited (#1311): shed like
+            // a request larger than the budget, not left to its deadline.
+            .ok_or_else(|| {
+                memory.reject_oversize();
+                ExecutionError::Busy
             })?;
         let permit = tokio::time::timeout_at(deadline.into(), slots.acquire_owned())
             .await
@@ -748,6 +754,40 @@ mod tests {
         assert_eq!(memory.rejected(), 0);
         assert_eq!(slots.available_permits(), 24);
         assert_eq!(waiting.available_permits(), 72);
+    }
+
+    /// #1311: a render queued for memory when the budget shrinks below
+    /// its charge is shed at once as oversize, its queue place released,
+    /// instead of waiting out its deadline.
+    #[tokio::test]
+    async fn a_render_budget_shrink_sheds_a_queued_render_that_cannot_fit() {
+        let memory = Arc::new(budget::RenderBudget::new(4 * budget::BYTES_PER_PIXEL));
+        let slots = Arc::new(Semaphore::new(1));
+        let waiting = Arc::new(Semaphore::new(1));
+        let held = memory.try_reserve(budget::raster_bytes(4, 1, 1)).unwrap();
+        let queued = tokio::spawn(RenderJob::acquire_raster_on(
+            slots.clone(),
+            waiting.clone(),
+            Duration::from_secs(30),
+            memory.clone(),
+            2,
+            1,
+        ));
+        while waiting.available_permits() > 0 {
+            tokio::task::yield_now().await;
+        }
+        memory.resize(budget::BYTES_PER_PIXEL);
+        let shed = tokio::time::timeout(Duration::from_secs(10), queued)
+            .await
+            .expect("shed at once, not at its deadline")
+            .unwrap();
+        assert!(matches!(shed, Err(ExecutionError::Busy)));
+        assert_eq!(
+            (memory.rejected_oversize(), memory.rejected_deadline()),
+            (1, 0)
+        );
+        assert_eq!(waiting.available_permits(), 1);
+        drop(held);
     }
 
     #[tokio::test]

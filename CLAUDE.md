@@ -395,6 +395,30 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   10–20 ns per miss) for ghost hits at 0.5, 1 and 2 × capacity; count such a
   cache's misses with `record_miss_for(key)`. `prewarmed()` marks a cache
   filled ahead of its reads.
+  Every cache resizes in place (`set_capacity`, #1311), keeping what fits,
+  and returns the capacity it applied. A shrink goes in steps of at most a
+  tenth of the capacity. quick_cache calls `end_request` under the shard
+  lock; during a resize it only parks the evicted entries, and the resize
+  counts them (`record_evictions`) and drops them after quick_cache
+  returns, as an insert does. Never count or drop in `end_request`. An
+  insert or fill weighed while the cache was disabled counts nothing.
+  A resize keeps the shard count and the hot share the cache was built
+  with; a growth from 0 takes quick_cache's 0.97 (it resets a share only
+  from 0, only to its default). So a shrink stops where each shard still
+  holds 32 estimated entries, and `resizes_in_place_to(bytes)` compares the
+  shards with a cache built at that size without a ceiling: a shrink is in
+  place with no more of them, a growth with at least a quarter. A
+  `hot_allocation_holding` cache also checks `holding_keeps`. A caller that
+  can, builds a new cache otherwise. Build every cache at its configured
+  size: `new_resizable(.., ceiling, ..)` counts shards from a ceiling, and
+  only shrinks slices; it is for the computed plan (#1312), unused today.
+  `with_entry_floor()` (satellite scans, station grids) never shrinks below
+  4 × the heaviest entry admitted. `ByteBudget::resize` /
+  `RenderBudget::resize` resize the admission budgets; the latter wakes its
+  waiters, and a waiter that no longer fits is shed as oversize. A
+  process-wide static has a `resize_*` next to its metrics accessor, which
+  returns the applied size; nothing calls them until their sizes come from
+  config.
 - **API crates depend on ds-core and api-common** (shared Common HTTP glue),
   plus ds-executor for bounded render execution and the shared query runtime,
   ds-render for

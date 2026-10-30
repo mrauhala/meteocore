@@ -201,6 +201,17 @@ pub fn pixel_cache_metrics() -> PixelCacheMetrics {
     }
 }
 
+/// Resize the PVOL pixel cache to `bytes` in place, keeping the moments
+/// that fit (#1311). Its size comes from the environment, which cannot
+/// change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_pixel_cache(bytes: u64) -> u64 {
+    PIXEL_CACHE.set_capacity(bytes)
+}
+
 /// Default resampled voxel-grid cache size (MB) when
 /// `MC_PVOL_VOXEL_GRID_CACHE_MB` is unset. A grid is `4 B × cells` (≈ 8.5 MB
 /// `low`, 21 MB `med`, 47 MB `high`), and the 3D Tiles mesh products
@@ -249,6 +260,17 @@ static VOXEL_GRID_CACHE: std::sync::LazyLock<
 /// Snapshot of the process-global voxel-grid cache for `/metrics`.
 pub fn voxel_grid_cache_metrics() -> ds_cache::CacheMetrics {
     VOXEL_GRID_CACHE.metrics()
+}
+
+/// Resize the voxel-grid cache to `bytes` in place, keeping the grids that
+/// fit (#1311). Its size comes from the environment, which cannot change
+/// without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_voxel_grid_cache(bytes: u64) -> u64 {
+    VOXEL_GRID_CACHE.set_capacity(bytes)
 }
 
 /// Days of date-partitioned prefixes to scan when an S3 source has no
@@ -13077,5 +13099,29 @@ mod tests {
             feature_version_of(&nods, &height_fixed),
             "height change"
         );
+    }
+
+    /// Grow a process-wide cache by 1 MiB through `resize`, check `metrics`
+    /// reports it, and give it its size back: other tests share it.
+    fn resizes_in_place(metrics: impl Fn() -> ds_cache::CacheMetrics, resize: fn(u64) -> u64) {
+        let before = metrics().capacity_bytes;
+        resize(before + ds_cache::MIB);
+        assert_eq!(metrics().capacity_bytes, before + ds_cache::MIB);
+        resize(before);
+        assert_eq!(metrics().capacity_bytes, before);
+    }
+
+    /// #1311: the process-wide pixel, voxel-grid, composite and cell-set
+    /// caches resize in place and report their new capacities. Never to 0:
+    /// other tests read a disabled pixel cache as pre-warm off.
+    #[test]
+    fn the_process_wide_caches_resize_in_place() {
+        resizes_in_place(|| pixel_cache_metrics().cache, resize_pixel_cache);
+        resizes_in_place(voxel_grid_cache_metrics, resize_voxel_grid_cache);
+        resizes_in_place(
+            crate::composite_cache_metrics,
+            crate::resize_composite_cache,
+        );
+        resizes_in_place(crate::cell_set_cache_metrics, crate::resize_cell_set_cache);
     }
 }

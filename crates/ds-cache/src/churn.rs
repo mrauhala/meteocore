@@ -12,7 +12,10 @@
 //! `quick_cache`'s default lifecycle does so the entry drops outside the
 //! lock, and note whether `before_evict` announced it. [`Counting::record`]
 //! weighs, hashes and counts them once the insert has released the lock:
-//! nothing extra runs under it.
+//! nothing extra runs under it. A resize ([`crate::ByteBoundedCache::set_capacity`])
+//! is a request `quick_cache` finishes itself, under each shard's lock: its
+//! `end_request` only parks the evicted entries, which the resize counts
+//! and drops once `quick_cache` returns (#1311).
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
@@ -42,6 +45,10 @@ const STRIPES: usize = 16;
 /// `quick_cache`'s default share of a shard for its hot ring, which its
 /// `options` module keeps private.
 pub(crate) const DEFAULT_HOT_ALLOCATION: f64 = 0.97;
+
+/// `quick_cache`'s default size of its list of recently evicted keys, as a
+/// share of the item estimate, also private there.
+pub(crate) const DEFAULT_GHOST_ALLOCATION: f64 = 0.5;
 
 /// What a cache admitted, refused and evicted since it was built, as
 /// cumulative counters. Part of [`crate::CacheMetrics`].
@@ -120,17 +127,25 @@ enum Ring {
 /// shard) and the cache itself.
 pub(crate) struct Counters {
     /// The configured capacity; `0` for a disabled cache, which counts
-    /// nothing.
-    capacity: u64,
+    /// nothing. Follows a resize.
+    capacity: AtomicU64,
     /// The weight above which a shard refuses an entry: its hot target.
-    /// Set once, when the cache is built and its shards are known.
+    /// Set when the cache is built and its shards are known, and moved by
+    /// each resize as `quick_cache` moves it.
     hot_target: AtomicU64,
+    /// The heaviest entry admitted since the cache was built: what a cache
+    /// built [`crate::ByteBoundedCache::with_entry_floor`] is never resized
+    /// below a multiple of.
+    largest: AtomicU64,
     inserted_bytes: AtomicU64,
     refused: AtomicU64,
     evicted: [AtomicU64; 2],
     evicted_bytes: AtomicU64,
     bypasses: AtomicU64,
     prewarmed: AtomicBool,
+    /// [`crate::ByteBoundedCache::with_ghosts`] asked for a ring: one is
+    /// kept whenever the cache is enabled, also by a resize from `0`.
+    wants_ghosts: AtomicBool,
     ghosts: OnceLock<Ghosts>,
     /// Hashes evicted keys and missed lookups alike for the ghost ring, and
     /// inserted keys to tell a new value of a resident key from an eviction.
@@ -140,17 +155,48 @@ pub(crate) struct Counters {
 impl Counters {
     pub(crate) fn new(capacity: u64, hasher: DefaultHashBuilder) -> Self {
         Counters {
-            capacity,
+            capacity: AtomicU64::new(capacity),
             hot_target: AtomicU64::new(0),
+            largest: AtomicU64::new(0),
             inserted_bytes: AtomicU64::new(0),
             refused: AtomicU64::new(0),
             evicted: [AtomicU64::new(0), AtomicU64::new(0)],
             evicted_bytes: AtomicU64::new(0),
             bypasses: AtomicU64::new(0),
             prewarmed: AtomicBool::new(false),
+            wants_ghosts: AtomicBool::new(false),
             ghosts: OnceLock::new(),
             hasher,
         }
+    }
+
+    /// Follow a resize to `capacity` bytes, after its evictions are
+    /// counted: `0` stops the counting. Every shard went from
+    /// `old_shard` to `new_shard` bytes, and its hot target with it as
+    /// `quick_cache` moves it: in proportion, or to its default share from
+    /// a shard of no capacity. A ring asked for starts when the cache is
+    /// enabled, and its depths follow the capacity.
+    pub(crate) fn resize(&self, capacity: u64, old_shard: u64, new_shard: u64) {
+        let target = if old_shard == 0 {
+            (new_shard as f64 * DEFAULT_HOT_ALLOCATION) as u64
+        } else {
+            let hot_ratio = self.hot_target() as f64 / old_shard as f64;
+            (new_shard as f64 * hot_ratio) as u64
+        };
+        self.hot_target
+            .store(target.clamp(new_shard.min(1), new_shard), Ordering::Relaxed);
+        self.capacity.store(capacity, Ordering::Relaxed);
+        if self.wants_ghosts.load(Ordering::Relaxed) {
+            self.keep_ghosts();
+        }
+        if let Some(ghosts) = self.ghosts.get() {
+            ghosts.set_capacity(capacity);
+        }
+    }
+
+    /// The heaviest entry admitted since the cache was built.
+    pub(crate) fn largest(&self) -> u64 {
+        self.largest.load(Ordering::Relaxed)
     }
 
     /// Set the hot target from the shard budget `quick_cache` chose and the
@@ -171,10 +217,12 @@ impl Counters {
     }
 
     /// Start remembering evictions, if not already. A disabled cache evicts
-    /// nothing and keeps no ring.
+    /// nothing and keeps no ring until a resize enables it.
     pub(crate) fn keep_ghosts(&self) {
-        if self.capacity > 0 {
-            self.ghosts.get_or_init(|| Ghosts::new(self.capacity));
+        self.wants_ghosts.store(true, Ordering::Relaxed);
+        let capacity = self.capacity.load(Ordering::Relaxed);
+        if capacity > 0 {
+            self.ghosts.get_or_init(|| Ghosts::new(capacity));
         }
     }
 
@@ -182,8 +230,12 @@ impl Counters {
         self.bypasses.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Look a missed `key` up in the ghost ring, if the cache keeps one.
+    /// Look a missed `key` up in the ghost ring, if the cache keeps one and
+    /// is enabled.
     pub(crate) fn record_ghost<Q: Hash + ?Sized>(&self, key: &Q) {
+        if !self.counting() {
+            return;
+        }
         if let Some(ghosts) = self.ghosts.get() {
             let now = self.evicted_bytes.load(Ordering::Relaxed);
             ghosts.lookup(self.hash(key), now);
@@ -195,7 +247,7 @@ impl Counters {
     }
 
     pub(crate) fn counting(&self) -> bool {
-        self.capacity > 0
+        self.capacity.load(Ordering::Relaxed) > 0
     }
 
     pub(crate) fn snapshot(&self) -> Churn {
@@ -222,15 +274,48 @@ pub(crate) struct Insert {
     pub weight: u64,
 }
 
+/// What a resize's requests evicted, while it runs ([`Counting::park`]).
+type Parked<K, V> = Option<Vec<Evicted<K, V>>>;
+
 /// The cache's [`Lifecycle`]: counts what each insert evicted.
 pub(crate) struct Counting<K, V> {
     counters: Arc<Counters>,
     weigh: WeighFn<K, V>,
+    /// While a resize runs, what the requests `quick_cache` finishes itself
+    /// evicted, to count and drop once it releases the shard locks. Shared
+    /// by the lifecycles of every shard.
+    parked: Arc<Mutex<Parked<K, V>>>,
 }
 
 impl<K, V> Counting<K, V> {
     pub(crate) fn new(counters: Arc<Counters>, weigh: WeighFn<K, V>) -> Self {
-        Counting { counters, weigh }
+        Counting {
+            counters,
+            weigh,
+            parked: Arc::default(),
+        }
+    }
+
+    fn parked(&self) -> std::sync::MutexGuard<'_, Parked<K, V>> {
+        self.parked.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Park what the requests `quick_cache` finishes itself evict from now
+    /// on, instead of counting it under the shard lock: a resize's, for
+    /// [`Self::record_evictions`].
+    pub(crate) fn park(&self) {
+        *self.parked() = Some(Vec::new());
+    }
+
+    /// What was parked since [`Self::park`], and stop parking.
+    pub(crate) fn unpark(&self) -> Vec<Evicted<K, V>> {
+        self.parked().take().unwrap_or_default()
+    }
+
+    /// Whether a resize is parking what it evicts.
+    #[cfg(test)]
+    pub(crate) fn parking(&self) -> bool {
+        self.parked().is_some()
     }
 
     pub(crate) fn counters(&self) -> &Counters {
@@ -248,13 +333,14 @@ impl<K, V> Clone for Counting<K, V> {
         Counting {
             counters: Arc::clone(&self.counters),
             weigh: self.weigh,
+            parked: Arc::clone(&self.parked),
         }
     }
 }
 
 impl<K: Hash, V> Counting<K, V> {
-    /// Count what one request evicted, after the shard lock is released,
-    /// and the outcome of its `insert`, if it inserted.
+    /// Count what one insert evicted, after the shard lock is released,
+    /// and the insert's outcome.
     ///
     /// - An entry heavier than the hot target is a refused insert, never
     ///   admitted. Such a request evicts nothing else: what else it reports
@@ -263,29 +349,52 @@ impl<K: Hash, V> Counting<K, V> {
     ///   did not is the inserted key's old value, replaced: `quick_cache`
     ///   calls `before_evict` for every eviction and refusal, never for a
     ///   replacement.
+    /// - `None` is an insert weighed while the cache was disabled, or a
+    ///   fill claimed then: nothing is counted, even if a resize enabled
+    ///   the cache before it landed. Its value may be one the new hot
+    ///   target refuses, which would read as an eviction.
     pub(crate) fn record(&self, evicted: Evicted<K, V>, insert: Option<Insert>) {
         let counters = &*self.counters;
+        let Some(insert) = insert else {
+            return;
+        };
         if !counters.counting() {
             return;
         }
-        let hot_target = counters.hot_target.load(Ordering::Relaxed);
-        if insert.is_some_and(|insert| insert.weight > hot_target) {
+        if insert.weight > counters.hot_target() {
             counters.refused.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        counters.largest.fetch_max(insert.weight, Ordering::Relaxed);
+        if !self.count_evictions(evicted) {
+            counters
+                .inserted_bytes
+                .fetch_add(insert.weight, Ordering::Relaxed);
+        }
+    }
+
+    /// Count what a resize ([`Self::park`]) evicted, after the shard lock
+    /// is released: every entry, each announced by `before_evict`. The hot
+    /// target the resize moved does not bound them: they were admitted
+    /// under a larger one.
+    pub(crate) fn record_evictions(&self, evicted: Evicted<K, V>) {
+        if self.counters.counting() {
+            self.count_evictions(evicted);
+        }
+    }
+
+    /// Count each announced entry of `evicted` as an eviction; whether an
+    /// unannounced one, a replaced value, was among them.
+    fn count_evictions(&self, evicted: Evicted<K, V>) -> bool {
+        let counters = &*self.counters;
         let ghosts = counters.ghosts.get();
         let mut replaced = false;
         for entry in evicted.into_iter() {
-            let weight = self.weigh(&entry.key, &entry.value);
-            if weight > hot_target {
-                // A refused fill: `quick_cache` held the claim's
-                // placeholder, so there was no old value.
-                return;
-            }
             if !entry.announced {
                 replaced = true;
                 continue;
             }
+            let weight = self.weigh(&entry.key, &entry.value);
             counters.evicted[entry.from as usize].fetch_add(1, Ordering::Relaxed);
             // The evicted bytes are the ghost ring's clock.
             let before = counters.evicted_bytes.fetch_add(weight, Ordering::Relaxed);
@@ -293,11 +402,7 @@ impl<K: Hash, V> Counting<K, V> {
                 ghosts.remember(counters.hash(&entry.key), before, before + weight);
             }
         }
-        if let (Some(insert), false) = (insert, replaced) {
-            counters
-                .inserted_bytes
-                .fetch_add(insert.weight, Ordering::Relaxed);
-        }
+        replaced
     }
 }
 
@@ -326,10 +431,19 @@ impl<K: Hash, V> Lifecycle<K, V> for Counting<K, V> {
 
     /// For the requests `quick_cache` finishes itself. The cache's own
     /// inserts take the `_with_lifecycle` forms and call
-    /// [`Counting::record`] with what they inserted. Note that
-    /// `quick_cache`'s `set_capacity` calls this under the shard lock.
+    /// [`Counting::record`] with what they inserted. `quick_cache`'s
+    /// `set_capacity`, the only other request, calls this under the shard
+    /// lock: while [`Counting::park`]ed it only keeps the entries, for the
+    /// resize to count and drop once the lock is released.
     fn end_request(&self, state: Evicted<K, V>) {
-        self.record(state, None);
+        let mut parked = self.parked();
+        match parked.as_mut() {
+            Some(parked) => parked.push(state),
+            None => {
+                drop(parked);
+                self.record_evictions(state);
+            }
+        }
     }
 }
 
@@ -388,8 +502,8 @@ pub(crate) struct Ghosts {
     stripes: [Stripe; STRIPES],
     hits: [AtomicU64; 3],
     /// 0.5 ×, 1 × and 2 × the capacity: [`GHOST_DEPTHS`] in bytes. The
-    /// deepest is how far back the ring remembers.
-    depths: [u64; 3],
+    /// deepest is how far back the ring remembers. They follow a resize.
+    depths: [AtomicU64; 3],
 }
 
 /// One stripe of a ghost ring, on a cache line of its own.
@@ -408,11 +522,26 @@ struct Remembered {
 
 impl Ghosts {
     fn new(capacity: u64) -> Self {
-        Ghosts {
+        let ghosts = Ghosts {
             stripes: Default::default(),
             hits: Default::default(),
-            depths: [capacity / 2, capacity, capacity.saturating_mul(2)],
+            depths: Default::default(),
+        };
+        ghosts.set_capacity(capacity);
+        ghosts
+    }
+
+    /// Measure the depths in `capacity`: a resized cache's ghost hits are
+    /// what a cache that much larger than its new size would have hit.
+    fn set_capacity(&self, capacity: u64) {
+        let depths = [capacity / 2, capacity, capacity.saturating_mul(2)];
+        for (depth, bytes) in self.depths.iter().zip(depths) {
+            depth.store(bytes, Ordering::Relaxed);
         }
+    }
+
+    fn depth(&self, depth: usize) -> u64 {
+        self.depths[depth].load(Ordering::Relaxed)
     }
 
     /// The stripe of `hash`, picked by bits that neither the stripe's hash
@@ -427,11 +556,12 @@ impl Ghosts {
     /// twice the capacity ago, or past the stripe's share of
     /// [`MAX_GHOSTS`].
     fn remember(&self, hash: u64, before: u64, after: u64) {
+        let reach = self.depth(2);
         let mut stripe = self.stripe(hash);
         stripe.index.insert(hash, before);
         stripe.order.push_back((hash, before));
         while let Some(&(oldest, at)) = stripe.order.front() {
-            let reached = after.saturating_sub(at) <= self.depths[2];
+            let reached = after.saturating_sub(at) <= reach;
             if reached && stripe.order.len() <= MAX_GHOSTS / STRIPES {
                 break;
             }
@@ -457,8 +587,8 @@ impl Ghosts {
         let Some(distance) = self.distance(hash, now) else {
             return;
         };
-        for (hits, depth) in self.hits.iter().zip(self.depths) {
-            if distance <= depth {
+        for (depth, hits) in self.hits.iter().enumerate() {
+            if distance <= self.depth(depth) {
                 hits.fetch_add(1, Ordering::Relaxed);
             }
         }

@@ -17,5 +17,11 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 serde_json = "1"
 
+[features]
+# `test-util`: `TilePixelCache::fill_for_test`, which fills gigabytes of a
+# meta-tile cache's budget with a few megabytes, for the server's reload
+# tests (#1311). Enabled only on dev-dependencies.
+test-util = []
+
 [dev-dependencies]
 toml = "1.1"

@@ -30,7 +30,7 @@ mod rasters;
 pub mod residuals;
 mod source;
 
-pub use compute::{budget_metrics, cache_metrics, pool_workers, AnalysisGrid};
+pub use compute::{budget_metrics, cache_metrics, pool_workers, resize_cache, AnalysisGrid};
 pub use correction::Auxiliary;
 pub use engine::StationGridEngine;
 pub use inventory::HEIGHT_PROPERTY;

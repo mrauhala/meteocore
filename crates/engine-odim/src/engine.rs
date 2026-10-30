@@ -106,6 +106,17 @@ pub fn composite_cache_metrics() -> ds_cache::CacheMetrics {
     COMPOSITE_CACHE.metrics()
 }
 
+/// Resize the composite cache to `bytes` in place, keeping the composites
+/// that fit (#1311). Its size comes from the environment, which cannot
+/// change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_composite_cache(bytes: u64) -> u64 {
+    COMPOSITE_CACHE.set_capacity(bytes)
+}
+
 /// Where an [`OdimEngine`] reads ODIM files from.
 #[derive(Clone)]
 enum Source {
