@@ -687,6 +687,23 @@ impl RenderedCache {
         }
     }
 
+    /// Resize to `capacity_mb` in place, keeping the images that fit
+    /// ([`ds_cache::ByteBoundedCache::set_capacity`]). A shrink stops where
+    /// its shards' slices still hold 32 images each: check
+    /// [`Self::resizes_in_place_to`] first.
+    pub fn resize(&self, capacity_mb: u64) {
+        self.cache
+            .set_capacity(capacity_mb.saturating_mul(ds_cache::MIB));
+    }
+
+    /// Whether to keep this cache and [`Self::resize`] it to `capacity_mb`
+    /// rather than build one at that size
+    /// ([`ds_cache::ByteBoundedCache::resizes_in_place_to`]).
+    pub fn resizes_in_place_to(&self, capacity_mb: u64) -> bool {
+        self.cache
+            .resizes_in_place_to(capacity_mb.saturating_mul(ds_cache::MIB))
+    }
+
     pub fn get(&self, key: &CacheKey) -> Option<CachedRendered> {
         self.cache.get(key)
     }

@@ -192,6 +192,12 @@ engine-zarr.
   either.
   Marked `prewarmed()` (#1308): its eviction and ghost-hit numbers undervalue
   pre-warmed tiles.
+  A reload changing only `tile_cache_mb` resizes it in place
+  (`GeoTiffEngine::apply_cache_sizes`, #1311) while its shards, kept from
+  its build, suit the new size (`ds_cache::ByteBoundedCache::resizes_in_place_to`):
+  a shrink to fewer shards' worth would give slices that refuse 512 KiB
+  tiles, a growth past four times its shards has little to keep, and a
+  growth from 0 would lose `HOT_ALLOCATION`. Those rebuild the engine.
 - **Rendered image cache** (default 256 MB, `[server] rendered_cache_mb`) shared
   across WMS/Maps/Tiles; see `crates/api-wms/CLAUDE.md`.
 - **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of

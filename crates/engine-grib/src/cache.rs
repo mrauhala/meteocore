@@ -764,6 +764,25 @@ impl GridCache {
         }
     }
 
+    /// Whether [`Self::resize`] to `bytes` leaves the cache a cache built
+    /// at that size would be (#1311): one shard, and a hot share that
+    /// keeps a 0.1° fill (#1332). The share stays what the cache was built
+    /// with; a shrink below that size, or a growth from one too small to
+    /// hold a fill, would leave the cold ring without room for one.
+    pub(crate) fn resizes_in_place_to(&self, bytes: u64) -> bool {
+        let largest = Self::estimated_weight(LARGEST_GRID_NODES);
+        let hot = self.cache.hot_allocation();
+        let fresh = ds_cache::hot_allocation_holding(bytes, largest);
+        self.cache.resizes_in_place_to(bytes)
+            && ((fresh - hot).abs() < 1e-6 || ds_cache::holding_keeps(hot, bytes, largest))
+    }
+
+    /// Resize to `bytes` in place, keeping the grids that fit (#1311). See
+    /// [`Self::resizes_in_place_to`].
+    pub(crate) fn resize(&self, bytes: u64) {
+        self.cache.set_capacity(bytes);
+    }
+
     /// Whether `fields` decoded grids of `nodes` values each fit this
     /// cache's budget together (#1297): their estimated weight, as
     /// [`weigh_grid`] would count each, against the budget of the one shard
@@ -932,6 +951,34 @@ mod tests {
         let churn = cache.metrics().churn;
         assert_eq!(churn.ghost_hits, Some([0; 3]));
         assert_eq!(churn.evictions(), 24 - cache.len() as u64);
+    }
+
+    /// #1311: a grid cache grown in place keeps its grids, and its share,
+    /// built for its old size, keeps a 0.1° fill at the new one: a loop
+    /// decodes each field once. A shrink below its build size, or a growth
+    /// of a cache too small to have had a holding share, would leave the
+    /// cold ring too small for one, so neither is in place.
+    #[test]
+    fn a_grid_cache_grown_in_place_keeps_a_tenth_degree_field() {
+        let cache = GridCache::new(256).unwrap();
+        cache.insert("kept", 0, Arc::new(grid_2x2()));
+        assert!(cache.resizes_in_place_to(1024 * ds_cache::MIB));
+        assert!(!cache.resizes_in_place_to(128 * ds_cache::MIB));
+        cache.resize(1024 * ds_cache::MIB);
+        assert_eq!(cache.capacity(), 1024 * ds_cache::MIB);
+        assert!(resident(&cache, "kept", 0));
+        assert_eq!(map_loop(&cache, 3600, 1801, 24, 25), 24);
+        assert_eq!(cache.metrics().churn.ghost_hits, Some([0; 3]));
+
+        let small = GridCache::new(32).unwrap();
+        assert!(
+            small.resizes_in_place_to(48 * ds_cache::MIB),
+            "both too small"
+        );
+        assert!(!small.resizes_in_place_to(256 * ds_cache::MIB));
+        let large = GridCache::new(1024).unwrap();
+        assert!(large.resizes_in_place_to(2048 * ds_cache::MIB));
+        assert!(!large.resizes_in_place_to(512 * ds_cache::MIB));
     }
 
     /// GFS 0.25° fields fit the cold ring at either share: a loop longer

@@ -22,10 +22,13 @@
 //! built [`ByteBoundedCache::with_ghosts`] how many misses asked for a key it
 //! evicted recently: the signal that more memory would help ([`Churn`],
 //! #1308).
+//!
+//! Every cache can be resized in place ([`ByteBoundedCache::set_capacity`],
+//! #1311), keeping what still fits.
 
 use std::hash::Hash;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Re-exported so call sites can name the borrowed-key-lookup bound without
 /// depending on `quick_cache` directly.
@@ -41,6 +44,10 @@ use churn::{Counters, Counting, Insert};
 
 /// One mebibyte, for `*_MB` → bytes conversions.
 pub const MIB: u64 = 1024 * 1024;
+
+/// A cache built [`ByteBoundedCache::with_entry_floor`] is never resized
+/// below this many of its heaviest entry.
+pub const FLOOR_ENTRIES: u64 = 4;
 
 /// Parse a cache size (in MB) from the environment: `MC_*_CACHE_MB`-style
 /// variables are trimmed and parsed as `u64`, with unset/unparseable values
@@ -70,6 +77,19 @@ pub fn hot_allocation_holding(capacity_bytes: u64, entry_bytes: u64) -> f64 {
     } else {
         hot.min(churn::DEFAULT_HOT_ALLOCATION)
     }
+}
+
+/// Whether a one-shard cache of `capacity_bytes` whose hot ring targets
+/// `hot_allocation` of it both admits an entry of `entry_bytes` and keeps
+/// such a fill in its cold ring until its next read, as
+/// [`hot_allocation_holding`] arranges: what a cache resized in place, which
+/// keeps its share ([`ByteBoundedCache::set_capacity`]), still does.
+pub fn holding_keeps(hot_allocation: f64, capacity_bytes: u64, entry_bytes: u64) -> bool {
+    let capacity = capacity_bytes as f64;
+    let entry = entry_bytes as f64;
+    // A byte of slack: the share `hot_allocation_holding` gives leaves the
+    // cold ring exactly the room, up to rounding.
+    hot_allocation * capacity >= entry && (1.0 - hot_allocation) * capacity + 1.0 >= 1.1 * entry
 }
 
 /// `var` trimmed and parsed as a whole number, if it is set to one.
@@ -138,6 +158,9 @@ impl<K, V> quick_cache::Weighter<K, V> for WeighFn<K, V> {
 ///   entries refused, entries evicted from each ring. A cache built
 ///   [`Self::with_ghosts`] also counts the misses that ask for a key it
 ///   evicted recently.
+/// - **The capacity can change** ([`Self::set_capacity`], #1311); the shard
+///   count cannot. A cache that may grow is built with a ceiling
+///   ([`Self::new_resizable`]).
 pub struct ByteBoundedCache<K: Eq + Hash, V: Clone> {
     /// Shared so the memory plan can read it weakly ([`Self::register`]).
     inner: Arc<Inner<K, V>>,
@@ -161,15 +184,99 @@ struct Inner<K: Eq + Hash, V: Clone> {
     cache: Store<K, V>,
     /// The store's lifecycle, to count the requests the cache finishes.
     lifecycle: Counting<K, V>,
-    capacity_bytes: u64,
+    shape: Shape,
+    /// The configured capacity; a resize moves it.
+    capacity_bytes: AtomicU64,
+    /// Held by a resize, so two never interleave their steps.
+    resizing: Mutex<()>,
+    /// Built [`ByteBoundedCache::with_entry_floor`].
+    entry_floor: AtomicBool,
     hits: AtomicU64,
     misses: AtomicU64,
 }
 
+/// What a cache was built from besides its capacity: what decides its
+/// shards, so a resize can tell what shards a cache built at another size
+/// would have.
+#[derive(Clone, Copy)]
+struct Shape {
+    approx_entry_bytes: u64,
+    /// Shards asked for; `quick_cache`'s four per CPU when `None`.
+    shards: Option<usize>,
+    ceiling_bytes: Option<u64>,
+}
+
+impl Shape {
+    /// `quick_cache`'s options for a cache of `capacity_bytes`, but its hot
+    /// share.
+    fn options(&self, capacity_bytes: u64) -> quick_cache::OptionsBuilder {
+        // `max(16)` keeps a small/zero capacity valid (a near-disabled cache
+        // that holds nothing still needs a non-zero item estimate).
+        let items = |bytes: u64| (bytes / self.approx_entry_bytes.max(1)).max(16);
+        let capacity_items = items(capacity_bytes);
+        let estimated_items = self
+            .ceiling_bytes
+            .map_or(capacity_items, |ceiling| items(ceiling).max(capacity_items));
+        let mut options = quick_cache::OptionsBuilder::new();
+        options
+            .estimated_items_capacity(estimated_items as usize)
+            .weight_capacity(capacity_bytes.max(1));
+        if estimated_items > capacity_items {
+            // `quick_cache` sizes its list of recently evicted keys from the
+            // item estimate and scales it with each resize: sized from the
+            // ceiling, growing to it would multiply the list by the growth.
+            options.ghost_allocation(
+                churn::DEFAULT_GHOST_ALLOCATION * capacity_items as f64 / estimated_items as f64,
+            );
+        }
+        if let Some(shards) = self.shards {
+            options.shards(shards);
+        }
+        options
+    }
+
+    /// The shards `quick_cache` gives a cache of this shape built at
+    /// `capacity_bytes` without a ceiling: the most that keep about 32
+    /// estimated entries each. An empty one, built and dropped, to ask.
+    fn shards_at(&self, capacity_bytes: u64) -> usize {
+        let uncapped = Shape {
+            ceiling_bytes: None,
+            ..*self
+        };
+        let options = uncapped
+            .options(capacity_bytes)
+            .build()
+            .expect("item estimate and weight capacity are set");
+        quick_cache::sync::Cache::<u8, u8>::with_options(
+            options,
+            quick_cache::UnitWeighter,
+            quick_cache::DefaultHashBuilder::default(),
+            quick_cache::sync::DefaultLifecycle::default(),
+        )
+        .num_shards()
+    }
+
+    /// The smallest capacity at which a cache built without a ceiling
+    /// would have `shards` shards, or more: where each slice still holds
+    /// `quick_cache`'s 32 estimated entries. `0` for one shard, which
+    /// `quick_cache` keeps at any size.
+    fn slice_floor(&self, shards: usize) -> u64 {
+        if shards <= 1 {
+            return 0;
+        }
+        // `quick_cache` halves its shards while ⌈items / shards⌉ < 32.
+        (31 * shards as u64 + 1).saturating_mul(self.approx_entry_bytes.max(1))
+    }
+}
+
 impl<K: Eq + Hash, V: Clone> Inner<K, V> {
+    fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes.load(Ordering::Relaxed)
+    }
+
     fn usage(&self) -> plan::Usage {
         plan::Usage {
-            capacity_bytes: self.capacity_bytes,
+            capacity_bytes: self.capacity_bytes(),
             used_bytes: self.cache.weight(),
             entries: Some(self.cache.len() as u64),
             hits: Some(self.hits.load(Ordering::Relaxed)),
@@ -201,11 +308,42 @@ impl<K: Eq + Hash, V: Clone> Inner<K, V> {
             .then(|| self.lifecycle.weigh(&key.to_owned(), &value));
         let _ = publish(&self.lifecycle, claim, value, weight);
     }
+
+    /// One step of a resize: set the store to `store_bytes` (`0` only on the
+    /// way up from a disabled cache), count and drop what it evicted once
+    /// `quick_cache` has released every shard lock, then let the counters
+    /// follow, `capacity_bytes` the configured capacity after the step.
+    fn resize_store(&self, store_bytes: u64, capacity_bytes: u64) {
+        let old_shard = self.cache.shard_capacity();
+        self.lifecycle.park();
+        self.cache.set_capacity(store_bytes);
+        for evicted in self.lifecycle.unpark() {
+            self.lifecycle.record_evictions(evicted);
+        }
+        self.counters()
+            .resize(capacity_bytes, old_shard, self.cache.shard_capacity());
+        self.capacity_bytes.store(capacity_bytes, Ordering::Relaxed);
+    }
 }
 
-/// Publish `value` (of weight `weight`, `None` for a disabled cache) to a
-/// single-flight claim and count the insert. Returns the value if the claim
-/// was displaced by an explicit insert or removal of the key.
+/// The capacities a shrink from `from` to `to` bytes passes through: steps
+/// of at most a tenth of `from`, so no shard lock is held while more than a
+/// tenth of the cache is evicted, ending at `to`.
+fn shrink_steps(from: u64, to: u64) -> impl Iterator<Item = u64> {
+    let step = from.div_ceil(10).max(1);
+    let mut at = from;
+    std::iter::from_fn(move || {
+        (at > to).then(|| {
+            at = at.saturating_sub(step).max(to);
+            at
+        })
+    })
+}
+
+/// Publish `value` (of weight `weight`, `None` for a claim taken while the
+/// cache was disabled) to a single-flight claim and count the insert, if it
+/// has a weight. Returns the value if the claim was displaced by an
+/// explicit insert or removal of the key.
 fn publish<K: Eq + Hash, V: Clone>(
     lifecycle: &Counting<K, V>,
     claim: Placeholder<'_, K, V>,
@@ -223,7 +361,62 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// is only a hash-map sizing hint (expected typical entry weight); the
     /// eviction budget is always `capacity_bytes`.
     pub fn new(capacity_bytes: u64, approx_entry_bytes: u64, weigh: fn(&K, &V) -> u64) -> Self {
-        Self::build(capacity_bytes, approx_entry_bytes, weigh, None, None)
+        Self::build(capacity_bytes, approx_entry_bytes, weigh, None, None, None)
+    }
+
+    /// Like [`Self::new`], for a cache that may grow ([`Self::set_capacity`]):
+    /// its shards are counted from `ceiling_bytes`, the largest it is
+    /// expected to reach, not from `capacity_bytes`. `quick_cache` fixes the
+    /// shard count when the cache is built, halving four shards per CPU
+    /// until each one's item estimate reaches 32, so a cache built at 0 or
+    /// 1 MiB would stay one shard, one lock, however large it grows. Each
+    /// shard holds an equal slice of the capacity, and admits at most
+    /// [`Self::new_with_hot_allocation`]'s bound of it: a ceiling far above
+    /// the capacity refuses entries the capacity alone would admit.
+    ///
+    /// For the computed memory plan (#1312), which grants caches sizes
+    /// between a floor and a ceiling; nothing uses it yet. Its limit: a
+    /// shrink stops where each of its shards still holds 32 estimated
+    /// entries, so a cache built under that, with the ceiling's shards,
+    /// grows but never shrinks back to its build size.
+    pub fn new_resizable(
+        capacity_bytes: u64,
+        ceiling_bytes: u64,
+        approx_entry_bytes: u64,
+        weigh: fn(&K, &V) -> u64,
+    ) -> Self {
+        Self::build(
+            capacity_bytes,
+            approx_entry_bytes,
+            weigh,
+            None,
+            None,
+            Some(ceiling_bytes),
+        )
+    }
+
+    /// [`Self::new_resizable`] with `hot_allocation` (in `(0, 1]`) of each
+    /// shard's budget as the hot ring's target
+    /// ([`Self::new_with_hot_allocation`]).
+    pub fn new_resizable_with_hot_allocation(
+        capacity_bytes: u64,
+        ceiling_bytes: u64,
+        approx_entry_bytes: u64,
+        weigh: fn(&K, &V) -> u64,
+        hot_allocation: f64,
+    ) -> Self {
+        assert!(
+            hot_allocation > 0.0 && hot_allocation <= 1.0,
+            "hot_allocation must be in (0, 1], got {hot_allocation}"
+        );
+        Self::build(
+            capacity_bytes,
+            approx_entry_bytes,
+            weigh,
+            None,
+            Some(hot_allocation),
+            Some(ceiling_bytes),
+        )
     }
 
     /// Like [`Self::new`], but with `hot_allocation` (in `(0, 1]`) of each
@@ -267,6 +460,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             weigh,
             None,
             Some(hot_allocation),
+            None,
         )
     }
 
@@ -282,7 +476,14 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         approx_entry_bytes: u64,
         weigh: fn(&K, &V) -> u64,
     ) -> Self {
-        Self::build(capacity_bytes, approx_entry_bytes, weigh, Some(1), None)
+        Self::build(
+            capacity_bytes,
+            approx_entry_bytes,
+            weigh,
+            Some(1),
+            None,
+            None,
+        )
     }
 
     /// [`Self::new_single_shard`] with `hot_allocation` (in `(0, 1]`) of the
@@ -305,6 +506,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             weigh,
             Some(1),
             Some(hot_allocation),
+            None,
         )
     }
 
@@ -314,17 +516,14 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         weigh: fn(&K, &V) -> u64,
         shards: Option<usize>,
         hot_allocation: Option<f64>,
+        ceiling_bytes: Option<u64>,
     ) -> Self {
-        // `max(16)` keeps a small/zero capacity valid (a near-disabled cache
-        // that holds nothing still needs a non-zero item estimate).
-        let estimated_items = (capacity_bytes / approx_entry_bytes.max(1)).max(16) as usize;
-        let mut options = quick_cache::OptionsBuilder::new();
-        options
-            .estimated_items_capacity(estimated_items)
-            .weight_capacity(capacity_bytes.max(1));
-        if let Some(shards) = shards {
-            options.shards(shards);
-        }
+        let shape = Shape {
+            approx_entry_bytes,
+            shards,
+            ceiling_bytes,
+        };
+        let mut options = shape.options(capacity_bytes);
         if let Some(hot_allocation) = hot_allocation {
             options.hot_allocation(hot_allocation);
         }
@@ -347,11 +546,130 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             inner: Arc::new(Inner {
                 cache,
                 lifecycle,
-                capacity_bytes,
+                shape,
+                capacity_bytes: AtomicU64::new(capacity_bytes),
+                resizing: Mutex::new(()),
+                entry_floor: AtomicBool::new(false),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Resize the cache to `capacity_bytes` in place (#1311), keeping the
+    /// entries that still fit: `quick_cache` evicts each shard's coldest
+    /// until it fits its slice. `0` disables the cache, as at construction,
+    /// and drops everything. Evictions count as any other ([`Churn`]), and
+    /// the ghost depths and [`Self::shard_capacity_bytes`] follow. Returns
+    /// the capacity applied: a shrink can stop short of `capacity_bytes`.
+    ///
+    /// - A shrink goes in steps of at most a tenth of the capacity, each
+    ///   holding one shard's lock at a time while it evicts. The evicted
+    ///   entries are counted, hashed into the ghost ring and dropped once
+    ///   each step has released the locks, as an insert's are.
+    /// - The shard count stays what the cache was built with, so a shrink
+    ///   stops where each shard's slice still holds the 32 estimated
+    ///   entries a cache built at that size would give it: below, slices
+    ///   would refuse entries such a cache admits. A growth keeps fewer,
+    ///   larger shards than such a cache: more contention, nothing refused.
+    /// - The hot share stays what the cache was built with: `quick_cache`
+    ///   keeps each shard's hot target in proportion. A cache sized by
+    ///   [`hot_allocation_holding`] keeps its share at the new size, where
+    ///   it may no longer hold a fill ([`holding_keeps`]).
+    /// - A cache grown from `0` takes `quick_cache`'s defaults instead: a
+    ///   hot share of `0.97` whatever it was built with, and no list of
+    ///   recently evicted keys to readmit to the hot ring. `quick_cache`
+    ///   resets a shard's share only from a capacity of `0`, and only to
+    ///   its default.
+    /// - A cache built [`Self::with_entry_floor`] shrinks no further than
+    ///   [`FLOOR_ENTRIES`] of its heaviest entry.
+    ///
+    /// No floor makes a shrink grow the cache, or stops a disable.
+    /// [`Self::resizes_in_place_to`] says when a cache built at the new
+    /// size would differ. Resizes are serialized; lookups and inserts go on
+    /// during one, an insert racing a step counted against the hot target
+    /// before or after it.
+    pub fn set_capacity(&self, capacity_bytes: u64) -> u64 {
+        let inner = &*self.inner;
+        let _resizing = inner.resizing.lock().unwrap_or_else(|e| e.into_inner());
+        let from = inner.capacity_bytes();
+        let mut target = capacity_bytes;
+        if target > 0 && target < from {
+            let mut floor = inner.shape.slice_floor(inner.cache.num_shards());
+            if inner.entry_floor.load(Ordering::Relaxed) {
+                floor = floor.max(FLOOR_ENTRIES.saturating_mul(inner.counters().largest()));
+            }
+            target = target.max(floor.min(from));
+        }
+        if target > from {
+            if from == 0 {
+                // From its 1-byte clamp `quick_cache` would keep a hot
+                // share of 1 and scale its evicted-key list from one byte.
+                // From 0 it starts both again from its defaults.
+                inner.resize_store(0, 0);
+            }
+            inner.resize_store(target, target);
+        } else {
+            for step in shrink_steps(from, target) {
+                inner.resize_store(step.max(1), step);
+            }
+        }
+        target
+    }
+
+    /// Whether [`Self::set_capacity`] to `capacity_bytes` leaves a cache
+    /// close enough to one built at that size, without a ceiling and with
+    /// the same hot share, for a caller to keep it rather than build a new
+    /// one (#1311):
+    ///
+    /// - a shrink, when the cache has no more shards than such a cache
+    ///   would: never smaller slices, which would refuse entries;
+    /// - a growth, when it has at least a quarter of their shards: fewer
+    ///   shards are more contention, and below a quarter the cache holds
+    ///   under about a quarter of the new size, little to keep;
+    /// - never a growth of a disabled cache, which takes `quick_cache`'s
+    ///   defaults and holds nothing to keep.
+    ///
+    /// A share from [`hot_allocation_holding`] is the caller's to check
+    /// ([`holding_keeps`]).
+    pub fn resizes_in_place_to(&self, capacity_bytes: u64) -> bool {
+        let from = self.capacity_bytes();
+        if capacity_bytes == 0 || capacity_bytes == from {
+            return true;
+        }
+        if from == 0 {
+            return false;
+        }
+        let shards = self.shards();
+        let fresh = self.inner.shape.shards_at(capacity_bytes);
+        if capacity_bytes < from {
+            shards <= fresh
+        } else {
+            shards.saturating_mul(4) >= fresh
+        }
+    }
+
+    /// The number of shards, fixed when the cache was built.
+    pub fn shards(&self) -> usize {
+        self.inner.cache.num_shards()
+    }
+
+    /// The share of each shard's budget the hot ring targets: what the
+    /// cache was built with, as `quick_cache` rounds it.
+    pub fn hot_allocation(&self) -> f64 {
+        let shard = self.inner.cache.shard_capacity();
+        self.inner.counters().hot_target() as f64 / shard.max(1) as f64
+    }
+
+    /// Never shrink this cache below [`FLOOR_ENTRIES`] of the heaviest
+    /// entry it has admitted, except to disable it. For a cache sized from
+    /// its engine's demand, of few large entries (satellite scans of
+    /// 30–157 MB): a shard admits at most its hot share of its slice, so a
+    /// smaller cache would refuse every entry like it and the engine would
+    /// read each one again on every request.
+    pub fn with_entry_floor(self) -> Self {
+        self.inner.entry_floor.store(true, Ordering::Relaxed);
+        self
     }
 
     /// Keep a ghost ring: the hashes of recently evicted keys, back over
@@ -656,7 +974,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// The **configured** capacity in bytes (`0` = disabled), not the
     /// internal 1-byte clamp.
     pub fn capacity_bytes(&self) -> u64 {
-        self.inner.capacity_bytes
+        self.inner.capacity_bytes()
     }
 
     /// The budget of one shard in bytes: what entries that must all stay
@@ -665,7 +983,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// so entries that fit the total can still overflow the shard they hash
     /// to.
     pub fn shard_capacity_bytes(&self) -> u64 {
-        if self.inner.capacity_bytes == 0 {
+        if self.inner.capacity_bytes() == 0 {
             0
         } else {
             self.inner.cache.shard_capacity()
@@ -694,7 +1012,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             hits,
             misses,
             bytes: self.weight(),
-            capacity_bytes: self.inner.capacity_bytes,
+            capacity_bytes: self.inner.capacity_bytes(),
             churn: self.churn(),
         }
     }
@@ -815,8 +1133,14 @@ mod tests {
     /// hot ring is then full of the oldest entries), insert 10 fresh entries,
     /// then 30 more, and count the fresh entries still resident.
     fn fresh_survivors(hot_allocation: Option<f64>) -> usize {
-        let cache =
-            ByteBoundedCache::build(100 * 1000, 1000, weigh_declared, Some(1), hot_allocation);
+        let cache = ByteBoundedCache::build(
+            100 * 1000,
+            1000,
+            weigh_declared,
+            Some(1),
+            hot_allocation,
+            None,
+        );
         for i in 0..300 {
             cache.insert(format!("old{i}"), 1000);
         }
@@ -853,6 +1177,7 @@ mod tests {
             weigh_declared,
             Some(1024),
             Some(0.5),
+            None,
         );
         cache.insert("fits".to_string(), 4 * MIB);
         assert!(cache.contains_key(&"fits".to_string()));
@@ -990,8 +1315,14 @@ mod tests {
     /// each kept when `keep`; then `scan` one-off fills. How many of the
     /// window are resident at the end.
     fn window_resident(hot_allocation: Option<f64>, keep: bool, window: u64, scan: u64) -> u64 {
-        let cache =
-            ByteBoundedCache::build(200 * 1000, 1000, weigh_declared, Some(1), hot_allocation);
+        let cache = ByteBoundedCache::build(
+            200 * 1000,
+            1000,
+            weigh_declared,
+            Some(1),
+            hot_allocation,
+            None,
+        );
         for i in 0..400 {
             fill(&cache, &format!("old{i}"), 1000);
         }
@@ -1278,6 +1609,28 @@ mod tests {
         assert!(listed().is_none());
     }
 
+    /// #1311: the memory plan reads a resized cache's capacity live, as
+    /// `/admin/cache-plan` and the `/metrics` gauges then report it.
+    #[test]
+    fn the_plan_reports_a_resized_capacity() {
+        let _serial = plan::serial();
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str).registered(
+            "ds_cache_test_resized",
+            plan::Scope::Engine("test"),
+            plan::SizeSource::Env("MC_DS_CACHE_TEST_MB"),
+        );
+        cache.set_capacity(3 * MIB);
+        let capacity = || {
+            plan::snapshot()
+                .into_iter()
+                .find(|row| row.entry.id == "ds_cache_test_resized")
+                .map(|row| row.usage.capacity_bytes)
+        };
+        assert_eq!(capacity(), Some(3 * MIB));
+        cache.set_capacity(0);
+        assert_eq!(capacity(), Some(0));
+    }
+
     /// Weight = the value, in a one-shard cache of `entries` entries of
     /// 1000 bytes with a ghost ring.
     fn ghost_cache(entries: u64) -> ByteBoundedCache<String, u64> {
@@ -1372,9 +1725,15 @@ mod tests {
     #[test]
     fn a_refusal_is_not_an_eviction() {
         for (shards, hot_allocation) in [(Some(1), None), (Some(1), Some(0.5)), (None, None)] {
-            let cache =
-                ByteBoundedCache::build(64 * 1000, 1000, weigh_declared, shards, hot_allocation)
-                    .with_ghosts();
+            let cache = ByteBoundedCache::build(
+                64 * 1000,
+                1000,
+                weigh_declared,
+                shards,
+                hot_allocation,
+                None,
+            )
+            .with_ghosts();
             let shard = cache.shard_capacity_bytes();
             let target = (shard as f64 * hot_allocation.unwrap_or(0.97)) as u64;
             cache.insert("resident".to_string(), 1000);
@@ -1465,5 +1824,461 @@ mod tests {
         let cache = ByteBoundedCache::new(MIB, 1000, weigh_declared).prewarmed();
         assert!(cache.metrics().churn.prewarmed);
         assert!(!ghost_cache(1).churn().prewarmed);
+    }
+
+    // --- resize in place (#1311) ---
+
+    /// Fill `cache` with `count` entries of 1000 bytes, keyed `k{i}`.
+    fn fill_declared(cache: &ByteBoundedCache<String, u64>, count: u64) {
+        for i in 0..count {
+            cache.insert(format!("k{i}"), 1000);
+        }
+    }
+
+    /// A shrink keeps what fits its new size, and reports it at once; a
+    /// growth keeps everything.
+    #[test]
+    fn a_resize_keeps_what_fits() {
+        let cache = ghost_cache(100);
+        fill_declared(&cache, 100);
+        assert_eq!((cache.len(), cache.weight()), (100, 100 * 1000));
+        cache.set_capacity(200 * 1000);
+        assert_eq!((cache.len(), cache.capacity_bytes()), (100, 200 * 1000));
+        assert_eq!(cache.metrics().capacity_bytes, 200 * 1000);
+        assert_eq!(cache.shard_capacity_bytes(), 200 * 1000);
+        // Growing evicts nothing, and the growth is room for more.
+        fill_declared(&cache, 200);
+        assert_eq!((cache.len(), cache.churn().evictions()), (200, 0));
+
+        cache.set_capacity(150 * 1000);
+        // `quick_cache` evicts until the shard fits, and may evict a few hot
+        // entries more as it moves read entries to the smaller hot ring.
+        let kept = cache.len() as u64;
+        assert!((145..=150).contains(&kept), "{kept}");
+        assert_eq!(cache.weight(), kept * 1000);
+        assert_eq!(cache.metrics().capacity_bytes, 150 * 1000);
+        let churn = cache.churn();
+        assert_eq!(churn.evictions(), 200 - kept);
+        assert_eq!(churn.evicted_bytes, (200 - kept) * 1000);
+        // The hot share stays the default, now of the smaller shard.
+        assert!((cache.hot_allocation() - 0.97).abs() < 1e-6);
+    }
+
+    /// The steps of a shrink: at most a tenth of the starting capacity
+    /// each, ending at the target.
+    #[test]
+    fn a_shrink_steps_a_tenth_at_a_time() {
+        let steps = |from, to| shrink_steps(from, to).collect::<Vec<_>>();
+        assert_eq!(steps(100, 0), [90, 80, 70, 60, 50, 40, 30, 20, 10, 0]);
+        assert_eq!(steps(8192, 6144), [7372, 6552, 6144]);
+        assert_eq!(steps(5, 0), [4, 3, 2, 1, 0]);
+        assert_eq!(steps(1, 0), [0]);
+        assert_eq!(steps(100, 100), Vec::<u64>::new());
+    }
+
+    /// One step of a shrink counts what it evicts exactly as `quick_cache`'s
+    /// own `set_capacity` counted it under the shard lock before #1311:
+    /// the same rings, bytes and remembered keys.
+    #[test]
+    fn a_shrink_counts_its_evictions_as_before() {
+        let build = || {
+            let cache = ghost_cache(100);
+            fill_declared(&cache, 150);
+            // Read a few, so some evictions come from the hot ring.
+            for i in 50..60 {
+                assert!(cache.get(&format!("k{i}")).is_some());
+            }
+            cache
+        };
+        let resized = build();
+        resized.set_capacity(90 * 1000);
+        // Before: quick_cache ends the request under the lock, unparked.
+        // The counters then follow the size as a resize's do.
+        let before = build();
+        before.inner.cache.set_capacity(90 * 1000);
+        let shard = before.inner.cache.shard_capacity();
+        before.inner.counters().resize(90 * 1000, 100 * 1000, shard);
+        let (now, then) = (resized.churn(), before.churn());
+        assert!(now.evictions() > 0);
+        assert_eq!(now, then);
+        let resident = |cache: &ByteBoundedCache<String, u64>| {
+            (0..150)
+                .filter(|i| cache.contains_key(&format!("k{i}")))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(resident(&resized), resident(&before));
+        // The evicted keys are in the ring: a miss of each is a ghost hit.
+        for cache in [&resized, &before] {
+            for i in 0..150 {
+                let _ = cache.get(&format!("k{i}"));
+            }
+        }
+        assert_eq!(resized.churn(), before.churn());
+        assert!(resized.churn().ghost_hits.unwrap()[0] > 0);
+    }
+
+    /// A shrink in steps counts every entry it evicts once, down to a
+    /// disabled cache, which then counts nothing more.
+    #[test]
+    fn a_shrink_to_zero_counts_every_eviction_and_disables() {
+        let cache = ghost_cache(100);
+        fill_declared(&cache, 100);
+        cache.set_capacity(0);
+        let churn = cache.churn();
+        assert_eq!((churn.evictions(), churn.evicted_bytes), (100, 100 * 1000));
+        assert_eq!((cache.len(), cache.weight()), (0, 0));
+        assert_eq!(cache.capacity_bytes(), 0);
+        assert_eq!(cache.shard_capacity_bytes(), 0);
+        cache.insert("a".to_string(), 1000);
+        assert!(cache.get(&"a".to_string()).is_none());
+        assert_eq!(cache.churn(), churn, "a disabled cache counts no churn");
+    }
+
+    /// A cache grown from disabled admits, counts and keeps a ghost ring
+    /// it asked for, with `quick_cache`'s default hot share: the 1-byte
+    /// clamp's share would be 1.
+    #[test]
+    fn a_disabled_cache_grows_with_the_default_hot_share() {
+        let cache =
+            ByteBoundedCache::new_single_shard_with_hot_allocation(0, 1000, weigh_declared, 0.5)
+                .with_ghosts();
+        assert!(!cache.resizes_in_place_to(100 * 1000));
+        assert!(cache.resizes_in_place_to(0));
+        cache.set_capacity(100 * 1000);
+        assert!((cache.hot_allocation() - 0.97).abs() < 1e-6);
+        assert!(cache.resizes_in_place_to(50 * 1000));
+        fill_declared(&cache, 150);
+        assert_eq!(cache.len(), 100);
+        let churn = cache.churn();
+        assert_eq!(churn.inserted_bytes, 150 * 1000);
+        assert_eq!(churn.evictions(), 50);
+        // The ring was started by the growth: misses of evicted keys hit it.
+        for i in 0..150 {
+            let _ = cache.get(&format!("k{i}"));
+        }
+        assert!(cache.churn().ghost_hits.unwrap()[0] > 0);
+    }
+
+    /// A resized cache counts inserts against its new hot target: an entry
+    /// the smaller shard refuses is a refusal, and an insert that evicts an
+    /// entry admitted under the larger target, now heavier than it, is
+    /// counted with that eviction.
+    #[test]
+    fn a_resized_cache_counts_against_its_new_hot_target() {
+        let cache = ghost_cache(100);
+        cache.insert("big".to_string(), 70 * 1000);
+        cache.set_capacity(72 * 1000);
+        assert!(cache.contains_key(&"big".to_string()), "it still fits");
+        assert!(cache.hot_allocation() * 72.0 * 1000.0 < 70.0 * 1000.0);
+        cache.insert("refused".to_string(), 70 * 1000);
+        assert_eq!(cache.churn().refused, 1);
+        cache.insert("next".to_string(), 3 * 1000);
+        assert!(!cache.contains_key(&"big".to_string()));
+        let churn = cache.churn();
+        assert_eq!(churn.refused, 1);
+        assert_eq!(churn.inserted_bytes, 73 * 1000);
+        assert_eq!((churn.evictions(), churn.evicted_bytes), (1, 70 * 1000));
+    }
+
+    /// A cache with an entry floor is never shrunk below four of its
+    /// heaviest entry, except to disable it.
+    #[test]
+    fn an_entry_floor_keeps_room_for_four_of_the_heaviest_entry() {
+        let cache =
+            ByteBoundedCache::new_single_shard(100 * 1000, 1000, weigh_declared).with_entry_floor();
+        cache.insert("scan".to_string(), 20 * 1000);
+        cache.insert("small".to_string(), 1000);
+        cache.set_capacity(10 * 1000);
+        assert_eq!(cache.capacity_bytes(), FLOOR_ENTRIES * 20 * 1000);
+        assert!(cache.contains_key(&"scan".to_string()));
+        cache.set_capacity(0);
+        assert_eq!(cache.capacity_bytes(), 0);
+        // A floor above the size stops a shrink there, never grows it.
+        let tight =
+            ByteBoundedCache::new_single_shard(50 * 1000, 1000, weigh_declared).with_entry_floor();
+        tight.insert("scan".to_string(), 20 * 1000);
+        tight.set_capacity(40 * 1000);
+        assert_eq!(tight.capacity_bytes(), 50 * 1000);
+        // Without the floor the same shrink goes all the way.
+        let plain = ByteBoundedCache::new_single_shard(100 * 1000, 1000, weigh_declared);
+        plain.insert("scan".to_string(), 20 * 1000);
+        plain.set_capacity(10 * 1000);
+        assert_eq!(plain.capacity_bytes(), 10 * 1000);
+        assert!(!plain.contains_key(&"scan".to_string()));
+    }
+
+    /// A cache built small with a large ceiling has the ceiling's shards:
+    /// as many as a cache built at the ceiling, where a cache built small
+    /// without one is a single shard.
+    #[test]
+    fn a_ceiling_fixes_the_shard_count() {
+        const ENTRY: u64 = 256 * 1024;
+        let shards = |cache: &ByteBoundedCache<String, u64>| cache.inner.cache.num_shards();
+        let at_ceiling = ByteBoundedCache::new(1024 * MIB, ENTRY, weigh_declared);
+        // 4096 items: four shards per CPU, at least four.
+        assert!(shards(&at_ceiling) >= 4);
+        for capacity in [0, MIB] {
+            let plain = ByteBoundedCache::new(capacity, ENTRY, weigh_declared);
+            assert_eq!(shards(&plain), 1, "{capacity}");
+            let resizable =
+                ByteBoundedCache::new_resizable(capacity, 1024 * MIB, ENTRY, weigh_declared);
+            assert_eq!(shards(&resizable), shards(&at_ceiling), "{capacity}");
+            assert_eq!(resizable.capacity_bytes(), capacity);
+            resizable.set_capacity(1024 * MIB);
+            assert_eq!(shards(&resizable), shards(&at_ceiling));
+            assert_eq!(
+                resizable.shard_capacity_bytes(),
+                at_ceiling.shard_capacity_bytes()
+            );
+        }
+        let hot = ByteBoundedCache::new_resizable_with_hot_allocation(
+            MIB,
+            1024 * MIB,
+            ENTRY,
+            weigh_declared,
+            0.5,
+        );
+        assert_eq!(shards(&hot), shards(&at_ceiling));
+        assert!((hot.hot_allocation() - 0.5).abs() < 1e-3);
+        // A ceiling under the capacity is the capacity.
+        let under = ByteBoundedCache::new_resizable(1024 * MIB, MIB, ENTRY, weigh_declared);
+        assert_eq!(shards(&under), shards(&at_ceiling));
+    }
+
+    /// #1311: against a cache built at the new size without a ceiling, a
+    /// shrink is in place with no more shards, a growth with at least a
+    /// quarter of them; a disabled cache grown never is.
+    #[test]
+    fn a_resize_is_in_place_while_the_shards_suit_the_new_size() {
+        const ENTRY: u64 = 256 * 1024;
+        let fresh = |capacity| ByteBoundedCache::new(capacity, ENTRY, weigh_declared).shards();
+        // Meta-tiles at 8 GiB: 32 768 items, four shards per CPU, at least
+        // four. At 16 MiB a new cache has two: smaller slices refuse tiles.
+        let large = ByteBoundedCache::new(8192 * MIB, ENTRY, weigh_declared);
+        assert!(large.shards() >= 4 && fresh(16 * MIB) == 2);
+        assert!(!large.resizes_in_place_to(16 * MIB));
+        assert_eq!(
+            large.resizes_in_place_to(6144 * MIB),
+            large.shards() <= fresh(6144 * MIB)
+        );
+        assert!(large.resizes_in_place_to(8192 * MIB));
+        assert!(large.resizes_in_place_to(0));
+        // A growth keeps a quarter of a new cache's shards or more.
+        let small = ByteBoundedCache::new(MIB, ENTRY, weigh_declared);
+        assert_eq!(small.shards(), 1);
+        for to in [4 * MIB, 32 * MIB, 8192 * MIB] {
+            assert_eq!(small.resizes_in_place_to(to), 4 >= fresh(to), "{to}");
+        }
+        assert!(!small.resizes_in_place_to(8192 * MIB) || fresh(8192 * MIB) <= 4);
+        // A ceiling is no excuse for a shrink to smaller slices.
+        let ceiling = ByteBoundedCache::new_resizable(MIB, 8192 * MIB, ENTRY, weigh_declared);
+        assert_eq!(ceiling.shards(), large.shards());
+        assert!(!ceiling.resizes_in_place_to(MIB / 2));
+        assert!(ceiling.resizes_in_place_to(8192 * MIB));
+        let single = ByteBoundedCache::new_single_shard(256 * MIB, ENTRY, weigh_declared);
+        assert!(single.resizes_in_place_to(MIB));
+        assert!(single.resizes_in_place_to(1024 * 1024 * MIB));
+        let disabled = ByteBoundedCache::new_single_shard(0, ENTRY, weigh_declared);
+        assert!(!disabled.resizes_in_place_to(MIB));
+        assert!(disabled.resizes_in_place_to(0));
+    }
+
+    /// A shrink stops where each shard's slice still holds the 32
+    /// estimated entries a cache built there would give it, never grows
+    /// the cache, and still disables it; a one-shard cache shrinks to any
+    /// size. It returns the capacity applied.
+    #[test]
+    fn a_shrink_stops_where_the_slices_hold_32_entries() {
+        let sharded =
+            ByteBoundedCache::build(256 * 1000, 1000, weigh_declared, Some(4), None, None);
+        assert_eq!(sharded.shards(), 4);
+        let floor = (31 * 4 + 1) * 1000;
+        assert_eq!(sharded.set_capacity(64 * 1000), floor);
+        assert_eq!(sharded.capacity_bytes(), floor);
+        // `quick_cache` itself gives a cache built at the floor 4 shards,
+        // and one an entry smaller 2.
+        let built = |bytes| {
+            ByteBoundedCache::build(bytes, 1000, weigh_declared, Some(4), None, None).shards()
+        };
+        assert_eq!((built(floor), built(floor - 1000)), (4, 2));
+        assert_eq!(sharded.set_capacity(100 * 1000), floor, "never grows");
+        assert_eq!(sharded.set_capacity(0), 0);
+        let single = ghost_cache(100);
+        assert_eq!(single.set_capacity(1000), 1000);
+    }
+
+    /// #1311: a fill claimed while the cache is disabled carries no weight.
+    /// Grown before the fill lands, the cache refuses a value heavier than
+    /// its new hot target, and counts neither a refusal nor an eviction.
+    #[test]
+    fn a_fill_claimed_while_disabled_counts_nothing() {
+        let cache = ByteBoundedCache::new_single_shard(0, 1000, weigh_declared).with_ghosts();
+        let CacheEntry::Vacant(claim) =
+            cache.get_value_or_guard_untracked("big", std::time::Duration::ZERO)
+        else {
+            panic!("a disabled cache claims every fill");
+        };
+        cache.set_capacity(10 * 1000);
+        claim.insert(20 * 1000).unwrap();
+        assert!(!cache.contains_key(&"big".to_string()));
+        assert_eq!(cache.churn().evictions(), 0);
+        assert_eq!(cache.churn().inserted_bytes, 0);
+        // A plain insert weighed while enabled still counts.
+        cache.insert("small".to_string(), 1000);
+        assert_eq!(cache.churn().inserted_bytes, 1000);
+    }
+
+    /// A holding share keeps a fill at its own size and above; below, the
+    /// cold ring is too small, and a share too large admits no fill.
+    #[test]
+    fn a_holding_share_keeps_a_fill_from_its_own_size_up() {
+        let hot = hot_allocation_holding(256 * MIB, TENTH_DEGREE_GRID);
+        assert!(holding_keeps(hot, 256 * MIB, TENTH_DEGREE_GRID));
+        assert!(holding_keeps(hot, 1024 * MIB, TENTH_DEGREE_GRID));
+        assert!(!holding_keeps(hot, 128 * MIB, TENTH_DEGREE_GRID));
+        assert!(!holding_keeps(0.97, 256 * MIB, TENTH_DEGREE_GRID));
+        assert!(holding_keeps(0.97, 1024 * MIB, TENTH_DEGREE_GRID));
+        assert!(!holding_keeps(0.1, 64 * MIB, TENTH_DEGREE_GRID));
+    }
+
+    /// A value whose drop looks its key up in [`DROP_PROBE`] while armed: a
+    /// drop under that cache's shard lock never returns.
+    #[derive(Clone)]
+    struct Probe(u64);
+
+    static DROP_PROBE: std::sync::OnceLock<ByteBoundedCache<u64, Probe>> =
+        std::sync::OnceLock::new();
+    static PROBE_ARMED: AtomicBool = AtomicBool::new(false);
+    static PROBED: AtomicU64 = AtomicU64::new(0);
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            if PROBE_ARMED.load(Ordering::SeqCst) {
+                if let Some(cache) = DROP_PROBE.get() {
+                    let _ = cache.contains_key(&self.0);
+                    PROBED.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// The entries a shrink evicts are counted and dropped once the shard
+    /// lock is released: a drop that reads the shard it was evicted from
+    /// would otherwise never return.
+    #[test]
+    fn a_shrink_drops_its_evictions_outside_the_shard_lock() {
+        let cache = DROP_PROBE.get_or_init(|| {
+            ByteBoundedCache::new_single_shard(100 * 1000, 1000, |_, _| 1000).with_ghosts()
+        });
+        for i in 0..100 {
+            cache.insert(i, Probe(i));
+        }
+        PROBE_ARMED.store(true, Ordering::SeqCst);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            cache.set_capacity(40 * 1000);
+            done.send(()).unwrap();
+        });
+        let shrunk = finished.recv_timeout(std::time::Duration::from_secs(30));
+        PROBE_ARMED.store(false, Ordering::SeqCst);
+        assert!(
+            shrunk.is_ok(),
+            "an evicted value dropped under the shard lock"
+        );
+        assert_eq!(PROBED.load(Ordering::SeqCst), 60);
+        assert_eq!(cache.churn().evictions(), 60);
+    }
+
+    /// Blocks the first weighing, under a shard lock of [`GATED`]'s
+    /// resize, of a key in shard [`GATED_SHARD`] in each of two steps,
+    /// until the test releases it.
+    static GATED: std::sync::OnceLock<ByteBoundedCache<u64, u64>> = std::sync::OnceLock::new();
+    static GATED_SHARD: AtomicU64 = AtomicU64::new(u64::MAX);
+    static GATE: std::sync::Mutex<(u64, bool)> = std::sync::Mutex::new((0, false));
+    static GATE_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+    fn weigh_gated(key: &u64, value: &u64) -> u64 {
+        let Some(cache) = GATED.get() else {
+            return *value;
+        };
+        // Under a shard lock of a resize, `quick_cache` is still evicting:
+        // its requests are being parked.
+        let resizing = cache.inner.lifecycle.parking();
+        let shard = cache.inner.cache.shard_index(key) as u64;
+        if !resizing || shard != GATED_SHARD.load(Ordering::SeqCst) {
+            return *value;
+        }
+        let mut gate = GATE.lock().unwrap();
+        let step = cache.capacity_bytes();
+        if gate.0 < 2 && !gate.1 && STEPS_SEEN.lock().unwrap().insert(step) {
+            gate.1 = true;
+            GATE_MOVED.notify_all();
+            while gate.1 {
+                gate = GATE_MOVED.wait(gate).unwrap();
+            }
+        }
+        *value
+    }
+
+    /// The steps whose first weighing [`weigh_gated`] blocked.
+    static STEPS_SEEN: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+    /// Wait until [`weigh_gated`] blocks a step, and return that step's
+    /// starting capacity; fail after 30 s rather than hang.
+    fn wait_for_gate(cache: &ByteBoundedCache<u64, u64>) -> u64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut gate = GATE.lock().unwrap();
+        while !gate.1 {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "the shrink never reached the gated shard");
+            gate = GATE_MOVED.wait_timeout(gate, left).unwrap().0;
+        }
+        cache.capacity_bytes()
+    }
+
+    fn release_gate() {
+        let mut gate = GATE.lock().unwrap();
+        gate.0 += 1;
+        gate.1 = false;
+        GATE_MOVED.notify_all();
+    }
+
+    /// While a shrink holds one shard's lock, a lookup in another shard
+    /// returns; and the shrink releases every lock between its steps: the
+    /// second step starts after the first set the capacity it reached.
+    #[test]
+    fn lookups_go_on_while_a_shard_shrinks() {
+        let cache = GATED.get_or_init(|| {
+            ByteBoundedCache::build(256 * 1000, 1000, weigh_gated, Some(4), None, None)
+        });
+        assert_eq!(cache.inner.cache.num_shards(), 4);
+        for i in 0..1024 {
+            cache.insert(i, 1000);
+        }
+        let shard_of = |key: u64| cache.inner.cache.shard_index(&key) as u64;
+        let resident: Vec<u64> = (0..1024).filter(|k| cache.contains_key(k)).collect();
+        let held = shard_of(resident[0]);
+        let other = *resident.iter().find(|k| shard_of(**k) != held).unwrap();
+        GATED_SHARD.store(held, Ordering::SeqCst);
+        // A lookup in another shard, on a thread of its own: it must return,
+        // a hit or, once its shard has shrunk too, maybe a miss.
+        let look_up = move || {
+            let (found, returned) = std::sync::mpsc::channel();
+            std::thread::spawn(move || found.send(cache.get(&other)).unwrap());
+            returned.recv_timeout(std::time::Duration::from_secs(30))
+        };
+        let shrink = std::thread::spawn(move || cache.set_capacity(128 * 1000));
+
+        assert_eq!(wait_for_gate(cache), 256 * 1000, "the first step");
+        assert!(look_up().is_ok(), "blocked by another shard's shrink");
+        release_gate();
+        let second = wait_for_gate(cache);
+        assert!(second < 256 * 1000 && second > 128 * 1000, "{second}");
+        assert!(look_up().is_ok(), "blocked by another shard's shrink");
+        release_gate();
+        shrink.join().unwrap();
+        assert_eq!(cache.capacity_bytes(), 128 * 1000);
+        assert!(cache.weight() <= 128 * 1000);
     }
 }

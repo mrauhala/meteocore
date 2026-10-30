@@ -74,11 +74,15 @@ pub(crate) fn grid_bytes(cells: usize) -> u64 {
 pub(crate) static CACHE: LazyLock<ByteBoundedCache<GridKey, Arc<AnalysisGrid>>> =
     LazyLock::new(|| {
         let (bytes, source) = plan::env_bytes("MC_STATION_GRID_CACHE_MB", 256);
-        ByteBoundedCache::new_single_shard(bytes, 4 * MIB, weigh).registered(
-            "station_grid_cache",
-            plan::Scope::Engine("station-grid"),
-            source,
-        )
+        // A demand cache (#1311): its shard admits at most its hot share,
+        // so a resize below its grids would refuse every grid.
+        ByteBoundedCache::new_single_shard(bytes, 4 * MIB, weigh)
+            .with_entry_floor()
+            .registered(
+                "station_grid_cache",
+                plan::Scope::Engine("station-grid"),
+                source,
+            )
     });
 
 /// Admission for grids being computed.
@@ -100,6 +104,18 @@ pub(crate) const COMPUTE_SLACK_BYTES: u64 = 4 * MIB;
 /// Snapshot of the grid cache for `/metrics`.
 pub fn cache_metrics() -> CacheMetrics {
     CACHE.metrics()
+}
+
+/// Resize the grid cache to `bytes` in place, keeping the grids that fit,
+/// and never below four of its largest grid (#1311). Its size comes from
+/// the environment, which cannot change without a restart: nothing calls
+/// this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_cache(bytes: u64) -> u64 {
+    CACHE.set_capacity(bytes)
 }
 
 /// `(reserved bytes, capacity bytes, rejected admissions)` of the
@@ -194,4 +210,20 @@ pub(crate) fn spawn(job: impl FnOnce() + Send + 'static) {
         };
         tokio::task::block_in_place(job);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1311: the process-wide grid cache resizes in place and reports its
+    /// new capacity.
+    #[test]
+    fn the_grid_cache_resizes_in_place() {
+        let before = cache_metrics().capacity_bytes;
+        resize_cache(before + MIB);
+        assert_eq!(cache_metrics().capacity_bytes, before + MIB);
+        resize_cache(before);
+        assert_eq!(cache_metrics().capacity_bytes, before);
+    }
 }

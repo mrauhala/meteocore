@@ -65,6 +65,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+# `test-util`: filling a meta-tile cache past a reload's new size (#1311).
+ds-render = { path = "../render", features = ["test-util"] }
 http-body-util = "0.1"
 jsonschema = { version = "0.58", default-features = false }
 robotstxt = "0.3"

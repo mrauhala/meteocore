@@ -274,6 +274,16 @@ on the request path. Single-level and legacy views require exact metadata.
   before serving a finer global grid. Its cost: a small cache of coarser
   grids gives up hot ring, at 64 MiB a 0.25° one-lookup-per-frame loop
   longer than the cache decodes 15 instead of 9 on its first pass.
+- A reload resizes the grid, message and point-index caches in place
+  (`GribEngine::apply_cache_sizes`, #1311), but a resize keeps the hot share
+  the cache was built with. `resizes_caches_in_place` allows it only while
+  each cache stays on or off and its kept share still holds a 0.1° fill at
+  the new size (`ds_cache::holding_keeps`), or equals the share a new cache
+  would get. A growth from a holding share is in place; a shrink below the
+  size it was built for is not, nor a cache built under 52 MiB (at 0.97)
+  grown to a size whose 3 % cold ring holds no 0.1° field. Those rebuild
+  the engine. `GribSource.config` keeps the sizes it was built with; read
+  live sizes from the caches.
 - Run `cargo run --release -p engine-grib --example bench_grid_cache` for a
   reproducible memory/cache replay and sampling benchmark using the committed
   ECMWF fixture. It prints a query-output fingerprint for before/after checks;

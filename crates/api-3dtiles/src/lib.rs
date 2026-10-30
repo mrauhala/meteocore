@@ -17,7 +17,7 @@ pub mod error;
 pub mod handlers;
 pub mod quantity;
 
-pub use cache::content_cache_metrics;
+pub use cache::{content_cache_metrics, resize_content_cache};
 pub use error::Tiles3dError;
 pub use handlers::{AppState, TilesState3d, CONTENT_SLOTS};
 pub use quantity::{default_point_colormap, quantity_styles, QuantityStyle, QuantityStyles};

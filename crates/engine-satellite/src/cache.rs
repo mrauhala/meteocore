@@ -53,11 +53,15 @@ type StripCache = ds_cache::ByteBoundedCache<BlockKey, Arc<[u16]>>;
 /// entries at a low lookup rate make one lock free.
 pub(crate) static FRAMES: LazyLock<FrameCache> = LazyLock::new(|| {
     let (bytes, source) = plan::env_bytes("MC_SATELLITE_FRAME_CACHE_MB", 1024);
-    FrameCache::new_single_shard(bytes, 30 << 20, |_, frame| frame.weight).registered(
-        "satellite_frame_cache",
-        plan::Scope::Engine("satellite"),
-        source,
-    )
+    // A demand cache (#1311): its shard admits at most its hot share, so a
+    // resize below its scans would refuse every scan.
+    FrameCache::new_single_shard(bytes, 30 << 20, |_, frame| frame.weight)
+        .with_entry_floor()
+        .registered(
+            "satellite_frame_cache",
+            plan::Scope::Engine("satellite"),
+            source,
+        )
 });
 
 /// Decoded blocks, ~260 KB each for a 24-row 2 km full-disk strip.
@@ -75,9 +79,32 @@ pub fn frame_metrics() -> ds_cache::CacheMetrics {
     FRAMES.metrics()
 }
 
+/// Resize the scan cache to `bytes` in place, keeping the scans that fit,
+/// and never below four of its largest scan (#1311). Its size comes from
+/// the environment, which cannot change without a restart: nothing calls
+/// this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_frame_cache(bytes: u64) -> u64 {
+    FRAMES.set_capacity(bytes)
+}
+
 /// Snapshot of the decoded-block cache for `/metrics`.
 pub fn strip_metrics() -> ds_cache::CacheMetrics {
     STRIPS.metrics()
+}
+
+/// Resize the decoded-block cache to `bytes` in place, keeping the blocks
+/// that fit (#1311). Its size comes from the environment, which cannot
+/// change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_strip_cache(bytes: u64) -> u64 {
+    STRIPS.set_capacity(bytes)
 }
 
 static NEXT_ENGINE: AtomicU64 = AtomicU64::new(1);
@@ -157,4 +184,27 @@ pub(crate) fn release(engine: u64) {
     FRAMES.retain(|key, _| key.engine != engine);
     STRIPS.retain(|key, _| key.frame.engine != engine);
     windows_lock().remove(&engine);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Grow a process-wide cache by 1 MiB through `resize`, check `metrics`
+    /// reports it, and give it its size back: other tests share it.
+    fn resizes_in_place(metrics: impl Fn() -> ds_cache::CacheMetrics, resize: fn(u64) -> u64) {
+        let before = metrics().capacity_bytes;
+        resize(before + ds_cache::MIB);
+        assert_eq!(metrics().capacity_bytes, before + ds_cache::MIB);
+        resize(before);
+        assert_eq!(metrics().capacity_bytes, before);
+    }
+
+    /// #1311: the process-wide scan and block caches resize in place and
+    /// report their new capacities.
+    #[test]
+    fn the_process_wide_caches_resize_in_place() {
+        resizes_in_place(frame_metrics, resize_frame_cache);
+        resizes_in_place(strip_metrics, resize_strip_cache);
+    }
 }

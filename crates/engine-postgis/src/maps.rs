@@ -225,6 +225,17 @@ pub fn strike_window_cache_metrics() -> ds_cache::CacheMetrics {
     strike_window_cache().metrics()
 }
 
+/// Resize the strike-window cache to `bytes` in place, keeping the windows
+/// that fit (#1311). Its size comes from the environment, which cannot
+/// change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_strike_window_cache(bytes: u64) -> u64 {
+    strike_window_cache().set_capacity(bytes)
+}
+
 /// Run one built query on a pooled connection from a `spawn_blocking`
 /// thread. `Handle::block_on` is the ONLY valid bridge there — the engine's
 /// `block_in_place` helper panics off a runtime worker. Outside any runtime
@@ -784,5 +795,19 @@ mod tests {
             &OutputCrs::Wgs84,
         );
         assert!(tile.is_empty());
+    }
+
+    /// #1311: the process-wide strike-window cache resizes in place and
+    /// reports its new capacity.
+    #[test]
+    fn the_strike_window_cache_resizes_in_place() {
+        let before = strike_window_cache_metrics().capacity_bytes;
+        resize_strike_window_cache(before + ds_cache::MIB);
+        assert_eq!(
+            strike_window_cache_metrics().capacity_bytes,
+            before + ds_cache::MIB
+        );
+        resize_strike_window_cache(before);
+        assert_eq!(strike_window_cache_metrics().capacity_bytes, before);
     }
 }

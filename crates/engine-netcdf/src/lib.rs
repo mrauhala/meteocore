@@ -61,8 +61,10 @@ use ds_storage::discovery::{
 use ds_storage::DataStore;
 use netcdf_reader::DynStorage;
 
-pub use field::{detached_fill_metrics, field_cache_metrics};
-pub use remote::{block_cache_metrics, chunk_cache_metrics};
+pub use field::{detached_fill_metrics, field_cache_metrics, resize_field_cache};
+pub use remote::{
+    block_cache_metrics, chunk_cache_metrics, resize_block_cache, resize_chunk_cache,
+};
 
 use catalog::{Catalog, Identity, Layout, OpenFile, Param, Run, RunKey, Selected, Step};
 use discover::{Listed, Names};

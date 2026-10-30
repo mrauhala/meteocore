@@ -80,7 +80,8 @@ pub static RENDER_MEMORY: LazyLock<Arc<RenderBudget>> = LazyLock::new(|| {
 /// [`ByteBudget`], the engines' source-read budget, which never waits.
 #[derive(Debug)]
 pub struct RenderBudget {
-    capacity: u64,
+    /// Moved by [`Self::resize`].
+    capacity: AtomicU64,
     used: AtomicU64,
     /// The most reserved at once since [`Self::take_peak`] last read it.
     peak: AtomicU64,
@@ -94,7 +95,7 @@ pub struct RenderBudget {
 impl RenderBudget {
     pub fn new(capacity: u64) -> Self {
         Self {
-            capacity,
+            capacity: AtomicU64::new(capacity),
             used: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             oversize: AtomicU64::new(0),
@@ -104,7 +105,19 @@ impl RenderBudget {
     }
 
     pub fn capacity(&self) -> u64 {
-        self.capacity
+        self.capacity.load(Ordering::Relaxed)
+    }
+
+    /// Change the capacity to `capacity` bytes in place (#1311), waking
+    /// every render waiting for memory to look again. Granted reservations
+    /// stay: a shrink below what is reserved admits nothing until enough
+    /// are released. A growth admits the waiters that now fit; a shrink
+    /// sheds at once those that never can ([`Self::reserve`]), as a request
+    /// larger than the whole budget is shed before it queues. A request
+    /// shed before a growth is not revisited.
+    pub fn resize(&self, capacity: u64) {
+        self.capacity.store(capacity, Ordering::Release);
+        self.released.notify_waiters();
     }
 
     /// Enter this budget in the memory plan (`ds_cache::plan`, #1306) as
@@ -119,7 +132,7 @@ impl RenderBudget {
         plan::register_budget(
             plan::Entry::budget(id, scope, source),
             self,
-            |budget| plan::Usage::budget(budget.capacity, budget.used.load(Ordering::Relaxed)),
+            |budget| plan::Usage::budget(budget.capacity(), budget.used.load(Ordering::Relaxed)),
             Self::take_peak,
         );
     }
@@ -132,7 +145,7 @@ impl RenderBudget {
     }
 
     pub fn available(&self) -> u64 {
-        self.capacity
+        self.capacity()
             .saturating_sub(self.used.load(Ordering::Relaxed))
     }
     /// Every rejection: [`Self::rejected_oversize`] plus [`Self::rejected_deadline`].
@@ -152,7 +165,7 @@ impl RenderBudget {
 
     /// Whether a charge of `bytes` (from [`raster_bytes`]) can ever fit.
     pub(crate) fn fits(&self, bytes: Option<u64>) -> bool {
-        bytes.is_some_and(|bytes| bytes <= self.capacity)
+        bytes.is_some_and(|bytes| bytes <= self.capacity())
     }
 
     pub(crate) fn reject_oversize(&self) {
@@ -163,14 +176,20 @@ impl RenderBudget {
         self.expired.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) async fn reserve(self: &Arc<Self>, bytes: Option<u64>) -> RenderPermit {
+    /// Wait for `bytes` to fit, then reserve them. `None` once they can
+    /// never fit: a [`Self::resize`] shrank the budget below them while
+    /// they waited.
+    pub(crate) async fn reserve(self: &Arc<Self>, bytes: Option<u64>) -> Option<RenderPermit> {
         loop {
             let released = self.released.notified();
             tokio::pin!(released);
             // Register before checking availability so a concurrent release cannot be lost.
             released.as_mut().enable();
+            if !self.fits(bytes) {
+                return None;
+            }
             if let Some(permit) = self.try_reserve(bytes) {
-                return permit;
+                return Some(permit);
             }
             released.await;
         }
@@ -182,7 +201,7 @@ impl RenderBudget {
                 .used
                 .try_update(Ordering::AcqRel, Ordering::Relaxed, |used| {
                     used.checked_add(bytes)
-                        .filter(|&total| total <= self.capacity)
+                        .filter(|&total| total <= self.capacity())
                 })
             {
                 self.peak.fetch_max(before + bytes, Ordering::Relaxed);
@@ -224,7 +243,8 @@ impl Drop for RenderPermit {
 /// must, checks before reserving.
 #[derive(Debug)]
 pub struct ByteBudget {
-    capacity: u64,
+    /// Moved by [`Self::resize`].
+    capacity: AtomicU64,
     used: AtomicU64,
     /// The most reserved at once since [`Self::take_peak`] last read it.
     peak: AtomicU64,
@@ -236,7 +256,7 @@ pub struct ByteBudget {
 impl ByteBudget {
     pub fn new(capacity: u64) -> Self {
         Self {
-            capacity,
+            capacity: AtomicU64::new(capacity),
             used: AtomicU64::new(0),
             peak: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -244,7 +264,15 @@ impl ByteBudget {
     }
 
     pub fn capacity(&self) -> u64 {
-        self.capacity
+        self.capacity.load(Ordering::Relaxed)
+    }
+
+    /// Change the capacity to `capacity` bytes in place (#1311). Granted
+    /// permits stay: a shrink below what is reserved refuses every
+    /// reservation until enough are released. Nothing waits on this
+    /// budget, so a growth has no one to wake.
+    pub fn resize(&self, capacity: u64) {
+        self.capacity.store(capacity, Ordering::Relaxed);
     }
 
     /// Enter this budget in the memory plan (`ds_cache::plan`, #1306) as
@@ -260,7 +288,7 @@ impl ByteBudget {
         plan::register_budget(
             plan::Entry::budget(id, scope, source),
             self,
-            |budget| plan::Usage::budget(budget.capacity, budget.used.load(Ordering::Relaxed)),
+            |budget| plan::Usage::budget(budget.capacity(), budget.used.load(Ordering::Relaxed)),
             Self::take_peak,
         );
     }
@@ -276,7 +304,7 @@ impl ByteBudget {
     pub fn metrics(&self) -> (u64, u64, u64) {
         (
             self.used.load(Ordering::Relaxed),
-            self.capacity,
+            self.capacity(),
             self.rejected.load(Ordering::Relaxed),
         )
     }
@@ -292,7 +320,7 @@ impl ByteBudget {
     /// request. The caller must [`Self::reject`] if even its first slot
     /// cannot fit.
     pub fn try_reserve(self: &Arc<Self>, bytes: u64) -> Option<BytePermit> {
-        self.admit(bytes, self.capacity)
+        self.admit(bytes, self.capacity())
     }
 
     /// Count one rejected admission and return its error, for a caller whose
@@ -305,7 +333,7 @@ impl ByteBudget {
     /// The most background work may hold, together with every request:
     /// half the budget. A background reservation larger than this never fits.
     pub fn background_limit(&self) -> u64 {
-        self.capacity / 2
+        self.capacity() / 2
     }
 
     /// Admission for background work, such as engine-geotiff's poll-cycle
@@ -619,5 +647,99 @@ mod tests {
         assert_eq!(peak("budget_test_render"), Some(2 * BYTES_PER_PIXEL));
         drop((held, bytes));
         assert_eq!(listed("budget_test_bytes"), None);
+    }
+
+    /// A resized byte budget admits against its new capacity at once; a
+    /// shrink keeps the permits it granted and refuses until they go, and
+    /// the plan reports the new capacity (#1311).
+    #[test]
+    fn a_byte_budget_resizes_in_place() {
+        let budget = Arc::new(ByteBudget::new(100));
+        let held = budget.reserve(80).unwrap();
+        budget.resize(200);
+        assert_eq!(budget.metrics(), (80, 200, 0));
+        assert_eq!(budget.background_limit(), 100);
+        let more = budget.reserve(120).unwrap();
+        budget.resize(50);
+        assert_eq!(budget.metrics(), (200, 50, 0));
+        assert!(budget.try_reserve(1).is_none());
+        drop((held, more));
+        assert!(budget.reserve(50).is_ok());
+        assert!(budget.reserve(51).is_err());
+        budget.register(
+            "budget_test_resized",
+            plan::Scope::Engine("test"),
+            plan::SizeSource::Default,
+        );
+        budget.resize(70);
+        let row = plan::snapshot()
+            .into_iter()
+            .find(|row| row.entry.id == "budget_test_resized")
+            .unwrap();
+        assert_eq!(row.usage, plan::Usage::budget(70, 0));
+    }
+
+    /// A render waiting for memory is admitted when the budget grows, with
+    /// nothing released; a shrink sheds at once a waiter that can never
+    /// fit, and admits nothing more until releases bring the reservations
+    /// under it (#1311).
+    #[tokio::test]
+    async fn a_render_budget_growth_wakes_its_waiters() {
+        let budget = Arc::new(RenderBudget::new(4 * BYTES_PER_PIXEL));
+        let held = budget.try_reserve(raster_bytes(4, 1, 1)).unwrap();
+        let waiter = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.reserve(raster_bytes(2, 1, 1)).await }
+        });
+        // Let the waiter find the budget full and wait.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiter.is_finished());
+        budget.resize(6 * BYTES_PER_PIXEL);
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("the growth woke the waiter")
+            .unwrap();
+        assert_eq!(budget.available(), 0);
+        assert_eq!(budget.capacity(), 6 * BYTES_PER_PIXEL);
+
+        let permit = permit.expect("it fits the grown budget");
+
+        // A shrink sheds at once a waiter that can never fit, and keeps
+        // one that can waiting for releases.
+        let never = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.reserve(raster_bytes(3, 1, 1)).await }
+        });
+        let later = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.reserve(raster_bytes(2, 1, 1)).await }
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!never.is_finished() && !later.is_finished());
+        budget.resize(2 * BYTES_PER_PIXEL);
+        let shed = tokio::time::timeout(std::time::Duration::from_secs(10), never)
+            .await
+            .expect("the shrink woke the waiter")
+            .unwrap();
+        assert!(shed.is_none(), "3 pixels never fit 2");
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!later.is_finished(), "6 pixels are still reserved");
+        drop(held);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!later.is_finished(), "2 still are, of a budget of 2");
+        drop(permit);
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(10), later)
+            .await
+            .expect("the release woke the waiter")
+            .unwrap();
+        assert!(admitted.is_some());
     }
 }

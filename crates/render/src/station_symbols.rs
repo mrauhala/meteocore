@@ -242,6 +242,17 @@ pub fn station_frame_cache_metrics() -> ds_cache::CacheMetrics {
     frame_cache().metrics()
 }
 
+/// Resize the station-frame cache to `bytes` in place, keeping the frames
+/// that fit (#1311). Its size comes from the environment, which cannot
+/// change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_station_frame_cache(bytes: u64) -> u64 {
+    frame_cache().set_capacity(bytes)
+}
+
 /// A process-unique frame source id: each engine instance takes one, and
 /// [`FrameKey`] leads with it, so two engines (of any type) never share a
 /// frame.
@@ -661,5 +672,19 @@ mod tests {
             Some(end)
         );
         assert_eq!(layers.frame_end(&[end], None), Some(end));
+    }
+
+    /// #1311: the process-wide frame cache resizes in place and reports
+    /// its new capacity.
+    #[test]
+    fn the_frame_cache_resizes_in_place() {
+        let before = station_frame_cache_metrics().capacity_bytes;
+        resize_station_frame_cache(before + ds_cache::MIB);
+        assert_eq!(
+            station_frame_cache_metrics().capacity_bytes,
+            before + ds_cache::MIB
+        );
+        resize_station_frame_cache(before);
+        assert_eq!(station_frame_cache_metrics().capacity_bytes, before);
     }
 }

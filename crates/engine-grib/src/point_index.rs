@@ -195,6 +195,17 @@ impl PointIndex {
         self.cache.metrics()
     }
 
+    /// Whether [`Self::resize`] to `bytes` leaves the cache one built at
+    /// that size would be: always, one shard at the default hot share.
+    pub(crate) fn resizes_in_place_to(&self, bytes: u64) -> bool {
+        self.cache.resizes_in_place_to(bytes)
+    }
+
+    /// Resize to `bytes` in place, keeping the indexes that fit (#1311).
+    pub(crate) fn resize(&self, bytes: u64) {
+        self.cache.set_capacity(bytes);
+    }
+
     /// Whether `key`'s messages may be indexed: not yet seen, or the last
     /// one could be.
     pub(crate) fn may_read(&self, key: &ParameterKey) -> bool {

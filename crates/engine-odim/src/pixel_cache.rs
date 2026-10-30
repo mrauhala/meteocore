@@ -560,6 +560,12 @@ impl PixelCache {
         self.inner.capacity_bytes()
     }
 
+    /// Resize to `bytes` in place, keeping the moments that fit (#1311,
+    /// [`ByteBoundedCache::set_capacity`]).
+    pub fn set_capacity(&self, bytes: u64) -> u64 {
+        self.inner.set_capacity(bytes)
+    }
+
     /// Cumulative `(hits, misses)`.
     pub fn stats(&self) -> (u64, u64) {
         self.inner.stats()

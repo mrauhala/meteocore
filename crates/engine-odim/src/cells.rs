@@ -144,6 +144,17 @@ pub fn cell_set_cache_metrics() -> ds_cache::CacheMetrics {
     CELL_SET_CACHE.metrics()
 }
 
+/// Resize the cell-set cache to `bytes` in place, keeping the segmentations
+/// that fit (#1311). Its size comes from the environment, which cannot
+/// change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_cell_set_cache(bytes: u64) -> u64 {
+    CELL_SET_CACHE.set_capacity(bytes)
+}
+
 /// The extraction options as an exact key component: two requests share an
 /// entry iff every knob is bit-identical (no hash, no collision).
 fn extraction_key(opts: &CellExtractionOptions) -> (u64, u64, u64) {

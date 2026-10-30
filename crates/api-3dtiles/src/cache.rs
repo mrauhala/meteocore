@@ -222,6 +222,17 @@ pub fn content_cache_metrics() -> CacheMetrics {
     CONTENT_CACHE.metrics()
 }
 
+/// Resize the global content cache to `bytes` in place, keeping the
+/// content that fits (#1311). Its size comes from the environment, which
+/// cannot change without a restart: nothing calls this on reload yet.
+///
+/// Returns the capacity applied: a shrink stops where the cache's shards
+/// still hold 32 entries each, and a growth from 0 takes `quick_cache`'s
+/// default hot share ([`ds_cache::ByteBoundedCache::set_capacity`]).
+pub fn resize_content_cache(bytes: u64) -> u64 {
+    CONTENT_CACHE.cache.set_capacity(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -430,5 +441,19 @@ mod tests {
         .unwrap();
         assert!(matches!(result, Err(Tiles3dError::Internal(_))));
         assert!(cache.inflight.lock().unwrap().is_empty());
+    }
+
+    /// #1311: the global content cache resizes in place and reports its new
+    /// capacity.
+    #[test]
+    fn the_content_cache_resizes_in_place() {
+        let before = content_cache_metrics().capacity_bytes;
+        resize_content_cache(before + ds_cache::MIB);
+        assert_eq!(
+            content_cache_metrics().capacity_bytes,
+            before + ds_cache::MIB
+        );
+        resize_content_cache(before);
+        assert_eq!(content_cache_metrics().capacity_bytes, before);
     }
 }

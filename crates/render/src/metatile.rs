@@ -237,6 +237,51 @@ impl TilePixelCache {
         }
     }
 
+    /// Resize to `capacity_mb` in place, keeping the tiles that fit
+    /// ([`ds_cache::ByteBoundedCache::set_capacity`]); `0` disables
+    /// meta-tiling, as at construction. A shrink stops where its shards'
+    /// slices still hold 32 tiles each: check [`Self::resizes_in_place_to`]
+    /// first.
+    pub fn resize(&self, capacity_mb: u64) {
+        self.cache
+            .set_capacity(capacity_mb.saturating_mul(ds_cache::MIB));
+    }
+
+    /// Insert `tiles` full tiles of `layer` that share one pixel buffer, so
+    /// a test can fill gigabytes of budget with a few megabytes (#1311).
+    /// Only in tests and with the `test-util` feature.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fill_for_test(&self, layer: &str, tiles: i64) {
+        let rgba: Arc<[u8]> = vec![0u8; TILE_PX as usize * TILE_PX as usize * 4].into();
+        for col in 0..tiles {
+            let key = TileKey {
+                layer: layer.to_string(),
+                parameter: None,
+                style: "default".into(),
+                time: None,
+                z: None,
+                reference_time: None,
+                content_version: 0,
+                grid: Grid::WebMercator,
+                level: 20,
+                col,
+                row: 0,
+            };
+            let pixels = CachedTilePixels {
+                rgba: Some(rgba.clone()),
+            };
+            self.cache.insert(key, pixels);
+        }
+    }
+
+    /// Whether to keep this cache and [`Self::resize`] it to `capacity_mb`
+    /// rather than build one at that size
+    /// ([`ds_cache::ByteBoundedCache::resizes_in_place_to`]).
+    pub fn resizes_in_place_to(&self, capacity_mb: u64) -> bool {
+        self.cache
+            .resizes_in_place_to(capacity_mb.saturating_mul(ds_cache::MIB))
+    }
+
     /// (hits, misses) counters.
     pub fn stats(&self) -> (u64, u64) {
         self.cache.stats()
@@ -881,6 +926,35 @@ mod tests {
         assert!(!cache.cache.contains_key(&key_for("radar")));
         assert!(!cache.cache.contains_key(&key_for("radar-fivih")));
         assert!(cache.cache.contains_key(&key_for("lightning")));
+    }
+
+    /// #1311: a resize keeps the tiles that fit; a growth keeps them all,
+    /// and the cache reports its new capacity at once. A shrink stops where
+    /// its shards' slices still hold 32 tiles.
+    #[test]
+    fn a_resized_tile_cache_keeps_what_fits() {
+        let cache = TilePixelCache::new(64);
+        cache.fill_for_test("radar", 16);
+        let before = cache.len();
+        assert!(before > 0);
+        cache.resize(128);
+        assert_eq!(cache.capacity(), 128 * ds_cache::MIB);
+        assert_eq!(cache.metrics().capacity_bytes, 128 * ds_cache::MIB);
+        assert_eq!(cache.len(), before, "a growth keeps every tile");
+        assert!(cache.resizes_in_place_to(64));
+        cache.resize(64);
+        assert_eq!(
+            (cache.capacity(), cache.len()),
+            (64 * ds_cache::MIB, before)
+        );
+        // At 1 MiB a new cache is one shard; this one keeps its slices.
+        assert!(!cache.resizes_in_place_to(1));
+        cache.resize(1);
+        assert!(cache.capacity() >= ds_cache::MIB);
+        assert!(cache.weight() <= cache.capacity());
+        cache.resize(0);
+        assert_eq!((cache.capacity(), cache.len()), (0, 0));
+        assert!(!cache.resizes_in_place_to(64));
     }
 
     /// A 2×1-texel mosaic in one tile: texel (0,0)=`a`, texel (1,0)=`b`, rest

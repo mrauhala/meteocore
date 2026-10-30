@@ -190,6 +190,21 @@ impl TileCache {
     pub fn metrics(&self) -> ds_cache::CacheMetrics {
         self.inner.metrics()
     }
+
+    /// Whether to keep this cache and [`Self::resize`] it to `max_bytes`
+    /// rather than build one at that size (#1311): its shards, kept from
+    /// its build, leave no smaller slices, so a tile under 512 KiB is still
+    /// admitted, nor a quarter of a new cache's shards or fewer; and the
+    /// hot share stays [`HOT_ALLOCATION`], which a cache grown from 0 would
+    /// not keep ([`ds_cache::ByteBoundedCache::resizes_in_place_to`]).
+    pub(crate) fn resizes_in_place_to(&self, max_bytes: u64) -> bool {
+        self.inner.resizes_in_place_to(max_bytes)
+    }
+
+    /// Resize to `max_bytes` in place, keeping the tiles that fit (#1311).
+    pub(crate) fn resize(&self, max_bytes: u64) {
+        self.inner.set_capacity(max_bytes);
+    }
 }
 
 #[cfg(test)]
@@ -326,6 +341,36 @@ mod tests {
             cache.insert(path, 1, 0, 0, heavier.clone());
             assert!(!cache.contains_untracked(path, 1, 0, 0), "{mb} MiB");
         }
+    }
+
+    /// #1311: a growth in place keeps the tiles and the pre-warm's hot
+    /// share. A cache with under a quarter of the shards a new cache would
+    /// have, a shrink to smaller slices than a new cache's, or a growth from
+    /// 0, is not in place.
+    #[test]
+    fn a_tile_cache_grows_in_place() {
+        const MIB: u64 = 1024 * 1024;
+        let path = Path::new("d/kept.tif");
+        let cache = TileCache::new(256 * MIB);
+        cache.insert(path, 1, 0, 0, Bytes::from(vec![1u8; 100]));
+        assert!(cache.resizes_in_place_to(1024 * MIB));
+        cache.resize(1024 * MIB);
+        assert_eq!(cache.capacity(), 1024 * MIB);
+        assert!(cache.contains_untracked(path, 1, 0, 0));
+        assert!((cache.inner.hot_allocation() - HOT_ALLOCATION).abs() < 1e-6);
+        let shards = |mb: u64| TileCache::new(mb * MIB).inner.shards();
+        // 1 MiB is one shard; 8 GiB, four per CPU.
+        assert_eq!(shards(1), 1);
+        assert_eq!(
+            TileCache::new(MIB).resizes_in_place_to(8192 * MIB),
+            4 >= shards(8192)
+        );
+        assert_eq!(
+            TileCache::new(256 * MIB).resizes_in_place_to(MIB),
+            shards(256) == 1
+        );
+        assert!(!TileCache::new(0).resizes_in_place_to(256 * MIB));
+        assert!(TileCache::new(256 * MIB).resizes_in_place_to(0));
     }
 
     /// #1318: an unread collection's cache keeps one object's tiles, every
