@@ -258,7 +258,9 @@ need no reload pruning.
 - `register_render_caches` runs after every accepted load (`main`,
   `apply_load`, the test `build_state`). Per-collection caches register in
   `load_collections` right after their engine is pushed, reused engines
-  too; registering an owner again replaces its entry.
+  too, except a reused GRIB or GeoTIFF engine, which registers in its
+  staged `cache_resizes` closure once the load is accepted (#1311);
+  registering an owner again replaces its entry.
 - A recovery-loop reload logs the block only when the plan changed.
 - `cache_plan::snapshot` runs `plan::check_rows` and logs each new
   `Shortfall` at WARN (#1309), so a reload that shrinks a cache below its
