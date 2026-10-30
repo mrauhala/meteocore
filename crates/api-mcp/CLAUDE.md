@@ -152,9 +152,18 @@ postgis engine issues a COUNT against the database.
   localhost.
 - Responses are SSE-framed (`data: {...}`) whenever the client accepts
   `text/event-stream`, which MCP clients must. Tests unwrap it.
-- MCP requires an `initialize` handshake plus the `initialized` notification
-  before any other method; a test helper that builds a fresh app per call
-  loses the session.
+- A **session** client needs the `initialize` handshake plus the
+  `initialized` notification before any other method; a test helper that
+  builds a fresh app per call loses the session. **A request declaring
+  protocol 2026-07-28 needs neither** (#1050): rmcp serves it per request,
+  without a session, even in the default legacy session mode we keep. It
+  must carry the version in `_meta` and in a matching
+  `MCP-Protocol-Version` header, `clientCapabilities` in `_meta`, and the
+  `Mcp-Method` / `Mcp-Name` headers, or it is a 400. The bearer guard and
+  the Host allowlist still apply to it. A tool's argument error there is
+  HTTP 200 with -32602, as on the session path. An `initialize` asking for
+  2026-07-28 opens a 2025-11-25 session. rmcp minors keep changing this
+  path; `tests/mcp_tests.rs` pins it.
 - Argument errors surface as JSON-RPC `invalid_params` rather than
   `isError: true` tool content. Both reach the client; the result channel
   would be marginally better for model self-correction. Revisit if models are

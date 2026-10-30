@@ -246,12 +246,24 @@ fn app() -> axum::Router {
 /// One JSON-RPC call against a given app instance.
 ///
 /// Takes the app rather than building one, so a session survives across calls
-/// — MCP requires an `initialize` handshake before any other method, and a
-/// fresh app each time would lose it.
+/// — a session client must complete the `initialize` handshake before any
+/// other method, and a fresh app each time would lose it.
 async fn call(
     app: &axum::Router,
     token: Option<&str>,
     session: Option<&str>,
+    body: Value,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let session = session.map(|sid| ("mcp-session-id", sid));
+    post(app, token, session.as_slice(), body).await
+}
+
+/// One POST with extra request headers, such as the protocol headers the
+/// 2026-07-28 per-request path reads.
+async fn post(
+    app: &axum::Router,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
     body: Value,
 ) -> (StatusCode, axum::http::HeaderMap, String) {
     let mut req = Request::builder()
@@ -265,8 +277,8 @@ async fn call(
     if let Some(t) = token {
         req = req.header("authorization", format!("Bearer {t}"));
     }
-    if let Some(sid) = session {
-        req = req.header("mcp-session-id", sid);
+    for (name, value) in headers {
+        req = req.header(*name, *value);
     }
     let res = app
         .clone()
@@ -1646,4 +1658,376 @@ async fn a_floor_over_an_oversized_frame_says_its_counts_are_partial() {
     )
     .await;
     assert!(!out["note"].as_str().unwrap().contains("checked"), "{out}");
+}
+
+// ---------------------------------------------------------------------------
+// Per-request path (protocol 2026-07-28)
+// ---------------------------------------------------------------------------
+//
+// rmcp serves a request that declares protocol 2026-07-28 without a session:
+// the version and the client's capabilities ride in the request's own
+// `_meta`, and no `initialize` comes first. Our transport keeps rmcp's
+// default legacy session mode, which leaves this path on. These tests pin
+// what rmcp 3.7 does there, so a minor bump that changes it fails here
+// rather than in a client (#1050).
+
+const PER_REQUEST_VERSION: &str = "2026-07-28";
+
+/// The `_meta` a 2026-07-28 request carries in place of the handshake.
+fn per_request_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": PER_REQUEST_VERSION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "0"}
+    })
+}
+
+/// `tools/call` params for `get_storm_cells`.
+fn storm_cells_call(arguments: Value, meta: Value) -> Value {
+    json!({"name": "get_storm_cells", "arguments": arguments, "_meta": meta})
+}
+
+/// One sessionless 2026-07-28 request, with the headers that version
+/// requires: `MCP-Protocol-Version` matching `_meta`, and the SEP-2243
+/// routing headers `Mcp-Method`, plus `Mcp-Name` for a `tools/call`.
+async fn per_request(
+    app: &axum::Router,
+    token: Option<&str>,
+    method: &str,
+    params: Value,
+) -> (StatusCode, axum::http::HeaderMap, String) {
+    let name = params["name"].as_str().map(str::to_owned);
+    let mut headers = vec![
+        ("mcp-protocol-version", PER_REQUEST_VERSION),
+        ("mcp-method", method),
+    ];
+    if let Some(name) = name.as_deref() {
+        headers.push(("mcp-name", name));
+    }
+    let body = json!({"jsonrpc": "2.0", "id": 9, "method": method, "params": params});
+    post(app, token, &headers, body).await
+}
+
+fn initialize_at(version: &str) -> Value {
+    let mut init = initialize();
+    init["params"]["protocolVersion"] = json!(version);
+    init
+}
+
+#[tokio::test]
+async fn a_per_request_call_reaches_the_tools_without_a_session() {
+    let app = app();
+    let (status, headers, body) = per_request(
+        &app,
+        Some(TOKEN),
+        "tools/call",
+        storm_cells_call(json!({"collection": "cells"}), per_request_meta()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        headers.get("mcp-session-id").is_none(),
+        "the per-request path must not open a session"
+    );
+    let doc = parse_rpc(&body);
+    let text = doc["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text content in {doc}"));
+    let out: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(out["cells"][0]["id"], "42", "{out}");
+}
+
+/// Without the 2026-07-28 declaration a sessionless call still needs the
+/// handshake: rmcp 3.7 answers 400 here, where 3.5.1 answered 422.
+#[tokio::test]
+async fn a_sessionless_call_without_the_declaration_needs_the_handshake() {
+    let (status, headers, body) = call(
+        &app(),
+        Some(TOKEN),
+        None,
+        json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+               "params": {"name": "get_storm_cells", "arguments": {"collection": "cells"}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("Session ID is required"), "{body}");
+    assert!(headers.get("mcp-session-id").is_none());
+}
+
+/// Since rmcp 3.5 a tool's `invalid_params` on the per-request path is HTTP
+/// 200 carrying the JSON-RPC error, as on the session path; 3.4 answered 400.
+#[tokio::test]
+async fn a_per_request_argument_error_is_http_200_with_invalid_params() {
+    let (status, _, body) = per_request(
+        &app(),
+        Some(TOKEN),
+        "tools/call",
+        storm_cells_call(
+            json!({"collection": "cells", "limit": 0}),
+            per_request_meta(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc = parse_rpc(&body);
+    assert_eq!(doc["error"]["code"], -32602, "{doc}");
+    assert!(
+        doc["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("limit must be between")),
+        "the tool's own message must reach the caller: {doc}"
+    );
+}
+
+/// 400 stays for a request that is malformed itself. The same bad `limit` as
+/// above, so the status follows the `_meta`, not the arguments.
+#[tokio::test]
+async fn a_per_request_call_whose_meta_lacks_required_keys_is_400() {
+    let app = app();
+    let bad_limit = json!({"collection": "cells", "limit": 0});
+
+    // `_meta` declares the version but lacks `clientCapabilities`: the request
+    // is dispatched, and rmcp maps the handler's -32602 to 400 only because the
+    // `_meta` was incomplete (`jsonrpc_http_status`).
+    let (status, _, body) = per_request(
+        &app,
+        Some(TOKEN),
+        "tools/call",
+        storm_cells_call(
+            bad_limit.clone(),
+            json!({"io.modelcontextprotocol/protocolVersion": PER_REQUEST_VERSION}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let doc = parse_rpc(&body);
+    assert_eq!(doc["error"]["code"], -32602, "{doc}");
+    assert!(
+        doc["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("io.modelcontextprotocol/clientCapabilities")),
+        "the missing key must be named: {doc}"
+    );
+
+    // Declared by the header alone, with no `_meta` at all: refused before
+    // dispatch, with the same code and status.
+    let (status, _, body) = per_request(
+        &app,
+        Some(TOKEN),
+        "tools/call",
+        json!({"name": "get_storm_cells", "arguments": bad_limit}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let doc = parse_rpc(&body);
+    assert_eq!(doc["error"]["code"], -32602, "{doc}");
+    assert!(
+        doc["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("io.modelcontextprotocol/protocolVersion")),
+        "{doc}"
+    );
+}
+
+/// `_meta` alone does not select the per-request path: without the matching
+/// `MCP-Protocol-Version` header it is a header mismatch (-32020).
+#[tokio::test]
+async fn the_meta_version_needs_the_matching_header() {
+    let app = app();
+    let body = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                      "params": storm_cells_call(json!({"collection": "cells"}), per_request_meta())});
+    for headers in [
+        vec![
+            ("mcp-method", "tools/call"),
+            ("mcp-name", "get_storm_cells"),
+        ],
+        vec![
+            ("mcp-protocol-version", "2025-06-18"),
+            ("mcp-method", "tools/call"),
+            ("mcp-name", "get_storm_cells"),
+        ],
+    ] {
+        let (status, _, out) = post(&app, Some(TOKEN), &headers, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{headers:?}: {out}");
+        assert_eq!(
+            parse_rpc(&out)["error"]["code"],
+            -32020,
+            "{headers:?}: {out}"
+        );
+    }
+}
+
+/// 2026-07-28 requires the SEP-2243 routing headers, which a middlebox may
+/// route on without reading the body, so a missing or contradicting one is
+/// refused (-32020) before the tool runs.
+#[tokio::test]
+async fn a_per_request_call_needs_routing_headers_that_match_the_body() {
+    let app = app();
+    let body = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                      "params": storm_cells_call(json!({"collection": "cells"}), per_request_meta())});
+    let version = ("mcp-protocol-version", PER_REQUEST_VERSION);
+    for headers in [
+        vec![version, ("mcp-name", "get_storm_cells")],
+        vec![version, ("mcp-method", "tools/call")],
+        vec![
+            version,
+            ("mcp-method", "tools/list"),
+            ("mcp-name", "get_storm_cells"),
+        ],
+        vec![
+            version,
+            ("mcp-method", "tools/call"),
+            ("mcp-name", "get_cell_track"),
+        ],
+    ] {
+        let (status, _, out) = post(&app, Some(TOKEN), &headers, body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{headers:?}: {out}");
+        assert_eq!(
+            parse_rpc(&out)["error"]["code"],
+            -32020,
+            "{headers:?}: {out}"
+        );
+    }
+}
+
+/// The bearer guard wraps the whole router, so the per-request path is behind
+/// it too and fails exactly as the handshake does.
+#[tokio::test]
+async fn the_per_request_path_is_behind_the_same_guard() {
+    let app = app();
+    let request = || storm_cells_call(json!({"collection": "cells"}), per_request_meta());
+    let (status, _, missing) = per_request(&app, None, "tools/call", request()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{missing}");
+    for wrong in ["", "test-token", "test-token-abc1234", "nope"] {
+        let (status, _, body) = per_request(&app, Some(wrong), "tools/call", request()).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "token {wrong:?} must not be accepted"
+        );
+        assert_eq!(body, missing, "missing and wrong must be indistinguishable");
+    }
+    let (_, handshake_failure) = rpc(None, initialize()).await;
+    assert_eq!(
+        missing, handshake_failure,
+        "the same body as the handshake's auth failure"
+    );
+}
+
+/// The Host allowlist is checked before rmcp picks a path, so the per-request
+/// path keeps the DNS-rebinding protection.
+#[tokio::test]
+async fn the_per_request_path_keeps_the_host_check() {
+    let body = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                      "params": storm_cells_call(json!({"collection": "cells"}), per_request_meta())});
+    let res = app()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/")
+                .header("content-type", "application/json")
+                .header("host", "evil.example.com")
+                .header("accept", "application/json, text/event-stream")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("mcp-protocol-version", PER_REQUEST_VERSION)
+                .header("mcp-method", "tools/call")
+                .header("mcp-name", "get_storm_cells")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// 2026-07-28 has no handshake. `get_info` leaves the server at rmcp's
+/// latest version, which cannot answer one, so an `initialize` asking for
+/// 2026-07-28 is answered with the newest version that has a handshake, and
+/// opens a session at it.
+#[tokio::test]
+async fn initialize_asking_for_2026_07_28_negotiates_2025_11_25() {
+    let app = app();
+    let (status, headers, body) =
+        call(&app, Some(TOKEN), None, initialize_at(PER_REQUEST_VERSION)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        parse_rpc(&body)["result"]["protocolVersion"],
+        "2025-11-25",
+        "{body}"
+    );
+    assert!(
+        headers.get("mcp-session-id").is_some(),
+        "the handshake still opens a session"
+    );
+}
+
+/// A 2026-07-28 peer gets cache hints on `tools/list`: `ttlMs` 0, so no client
+/// treats our tool list as fresh without asking again, and `cacheScope`
+/// "public". Both come from the `list_tools` that `#[tool_handler]` generates;
+/// rmcp's own default, "private", fills only a scope the handler left unset.
+/// A session peer at 2025-06-18 gets the older shape, with neither field.
+#[tokio::test]
+async fn a_per_request_tools_list_carries_cache_hints() {
+    let app = app();
+    let (status, _, body) = per_request(
+        &app,
+        Some(TOKEN),
+        "tools/list",
+        json!({"_meta": per_request_meta()}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let doc = parse_rpc(&body);
+    let result = &doc["result"];
+    assert!(
+        result["tools"].as_array().is_some_and(|t| t.len() == 4),
+        "{doc}"
+    );
+    assert_eq!(result["ttlMs"], 0, "{doc}");
+    assert_eq!(result["cacheScope"], "public", "{doc}");
+
+    let sid = handshake(&app).await;
+    let (_, _, body) = call(
+        &app,
+        Some(TOKEN),
+        Some(&sid),
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+    )
+    .await;
+    let doc = parse_rpc(&body);
+    assert!(
+        doc["result"].get("ttlMs").is_none() && doc["result"].get("cacheScope").is_none(),
+        "{doc}"
+    );
+}
+
+/// A middlebox routes on `Mcp-Method`, so an `initialize` declaring
+/// 2026-07-28 whose header names another method is refused before a session
+/// is opened. A matching header is accepted.
+#[tokio::test]
+async fn an_initialize_whose_mcp_method_contradicts_the_body_is_400() {
+    let app = app();
+    let version = ("mcp-protocol-version", PER_REQUEST_VERSION);
+    let (status, headers, body) = post(
+        &app,
+        Some(TOKEN),
+        &[version, ("mcp-method", "tools/list")],
+        initialize_at(PER_REQUEST_VERSION),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(parse_rpc(&body)["error"]["code"], -32020, "{body}");
+    assert!(
+        headers.get("mcp-session-id").is_none(),
+        "a refused initialize must not open a session"
+    );
+
+    let (status, _, body) = post(
+        &app,
+        Some(TOKEN),
+        &[version, ("mcp-method", "initialize")],
+        initialize_at(PER_REQUEST_VERSION),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
