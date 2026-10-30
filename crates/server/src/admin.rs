@@ -633,6 +633,39 @@ static CACHE_SIZE_SOURCE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     per_collection(gauge)
 });
 
+// What each cache must hold for its collections' data, as their engines
+// publish it (#1309), and that as a share of its size: one series per cache
+// of the plan with a demand, labelled as `cache_size_source` is, so each
+// demand is compared with its own cache, a process-wide one's summed over
+// its collections.
+static CACHE_DEMAND: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "cache_demand_bytes",
+            "What a cache of /admin/cache-plan must hold for its collections' data, as their \
+             engines compute it: cache is the /metrics family, collection empty for a \
+             process-wide one, whose demand sums its collections'. The PVOL pixel cache's is a \
+             floor: requests need more",
+        ),
+        &["cache", "collection"],
+    )
+    .unwrap();
+    per_collection(gauge)
+});
+
+static CACHE_DEMAND_RATIO: LazyLock<GaugeVec> = LazyLock::new(|| {
+    let gauge = GaugeVec::new(
+        Opts::new(
+            "cache_demand_ratio",
+            "cache_demand_bytes over the cache's configured capacity: above 1 the cache is below \
+             its demand and the server has logged a WARN. No series for a disabled cache",
+        ),
+        &["cache", "collection"],
+    )
+    .unwrap();
+    per_collection(gauge)
+});
+
 static MEMORY_CAPACITY_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
         Opts::new(
@@ -651,11 +684,25 @@ static MEMORY_CAPACITY_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 /// the last scrape.
 fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
     CACHE_SIZE_SOURCE.reset();
+    CACHE_DEMAND.reset();
+    CACHE_DEMAND_RATIO.reset();
     for row in rows {
         let collection = row.entry.scope.collection().unwrap_or("");
         CACHE_SIZE_SOURCE
             .with_label_values(&[row.entry.id, collection, &row.entry.source.to_string()])
             .set(1);
+        if let Some(demand) = &row.demand {
+            let labels = [row.entry.id, collection];
+            CACHE_DEMAND
+                .with_label_values(&labels)
+                .set(demand.bytes.min(i64::MAX as u64) as i64);
+            let capacity = row.usage.capacity_bytes;
+            if capacity > 0 {
+                CACHE_DEMAND_RATIO
+                    .with_label_values(&labels)
+                    .set(demand.bytes as f64 / capacity as f64);
+            }
+        }
     }
     for kind in [ds_cache::plan::Kind::Cache, ds_cache::plan::Kind::Budget] {
         let total = crate::cache_plan::Totals::of(rows, kind);

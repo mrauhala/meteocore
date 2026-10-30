@@ -292,6 +292,7 @@ mod tests {
                 nodata: 65535.0,
                 undetect: 65534.0,
                 dataset_path: "test".into(),
+                cell_bytes: 2,
                 spans: None,
             }],
         }

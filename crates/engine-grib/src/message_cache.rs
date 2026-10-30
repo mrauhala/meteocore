@@ -53,6 +53,12 @@ fn entry_weight(payload: usize, key_bytes: usize) -> u64 {
     (payload + key_bytes + size_of::<Bytes>() + 96) as u64
 }
 
+/// The weight the cache gives the message of `length` bytes at `path`, for
+/// the cache's demand before it is read (#1309).
+pub(crate) fn message_weight(path: &str, length: u64) -> u64 {
+    length.saturating_add(entry_weight(0, path.len() + size_of::<MessageKey>()))
+}
+
 pub(crate) struct MessageCache {
     cache: ByteBoundedCache<MessageKey, Bytes>,
     /// What the pre-warm fetched and requests then read (#1335).

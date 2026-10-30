@@ -263,6 +263,18 @@ struct GribSource {
     discovery: RwLock<discovery::Discovery>,
     /// Last attempted name, so failing probes cannot starve later parameters.
     probe_cursor: Mutex<Option<String>>,
+    /// What the source needs of its decoded-grid and message caches
+    /// (#1309), published as its grid geometry and catalog are.
+    grid_demand: ds_cache::plan::DemandSlot,
+    message_demand: ds_cache::plan::DemandSlot,
+}
+
+/// At most how many values a decoded field of a grid of `grid_size` cells
+/// (`RasterInfo::grid_size`) holds: cells count the intervals between
+/// nodes, a global grid's cyclic closing cell included, so one more per
+/// axis bounds the values from above.
+fn decoded_nodes(grid_size: Option<[u32; 2]>) -> Option<u64> {
+    grid_size.map(|[x, y]| (u64::from(x) + 1) * (u64::from(y) + 1))
 }
 
 /// Whether a field read may keep its decoded grid in the decoded-grid cache
@@ -499,6 +511,8 @@ impl GribEngine {
                 param_meta: RwLock::new(ParamMetadataCache::default()),
                 probe_cursor: Mutex::new(None),
                 discovery: RwLock::new(discovery::Discovery::default()),
+                grid_demand: discovery::demand_slot("grid_cache", collection_id),
+                message_demand: discovery::demand_slot("grib_message_cache", collection_id),
             }),
         };
 
@@ -1240,13 +1254,7 @@ impl GribEngine {
     /// ([`FieldFetch::Partial`], #1301) when the source has no message cache,
     /// or one that cannot hold them all.
     pub(crate) fn field_plan(&self, fields: usize, point_bytes: Option<u64>) -> FieldPlan {
-        // Cells count the intervals between nodes, a global grid's cyclic
-        // closing cell included, so one more per axis bounds the decoded
-        // values from above.
-        let nodes = self
-            .raster_info_shared()
-            .grid_size
-            .map(|[x, y]| (u64::from(x) + 1) * (u64::from(y) + 1));
+        let nodes = decoded_nodes(self.raster_info_shared().grid_size);
         let fill = match (&self.source.grid_cache, nodes) {
             (Some(cache), Some(nodes)) if !cache.holds(fields, nodes) => GridFill::Bypass,
             _ => GridFill::Insert,

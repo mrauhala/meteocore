@@ -29,8 +29,22 @@ type PixelKey = (Arc<str>, Arc<str>);
 
 /// Byte-weights each entry by its decoded array size (plus key/Arc overhead).
 fn weigh_pixels(key: &PixelKey, val: &Arc<RawPixels>) -> u64 {
-    // Decoded array bytes + the two key strings + Arc/control overhead.
-    val.size_bytes() as u64 + key.0.len() as u64 + key.1.len() as u64 + 64
+    entry_weight(&key.0, &key.1, val.size_bytes() as u64)
+}
+
+/// The weight of a moment's entry: its decoded `pixel_bytes`, the two key
+/// strings (`cache_id`, the file's id in this cache, and the dataset
+/// `path`) and Arc/control overhead. The pre-warm floor counts the entries
+/// the pre-warm will insert with it before any is decoded (#1309).
+pub(crate) fn entry_weight(cache_id: &str, path: &str, pixel_bytes: u64) -> u64 {
+    pixel_bytes + cache_id.len() as u64 + path.len() as u64 + 64
+}
+
+/// The smallest cache that keeps `prewarm_bytes` of pre-warmed entries
+/// until they are read (#1309): unread inserts get the cold share of the
+/// budget, `1 − PIXEL_CACHE_HOT_ALLOCATION`, so twice the pre-warm set.
+pub(crate) fn prewarm_floor(prewarm_bytes: u64) -> u64 {
+    (prewarm_bytes as f64 / (1.0 - PIXEL_CACHE_HOT_ALLOCATION)).ceil() as u64
 }
 
 /// Share of each cache shard's budget targeted for `quick_cache`'s "hot"

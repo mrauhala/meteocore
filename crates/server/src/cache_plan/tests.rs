@@ -423,6 +423,76 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
         .filter(|row| row.entry.kind == Kind::Cache)
         .all(|row| row.usage.churn.is_some()));
 
+    // What the engines publish as each cache's demand (#1309), from what
+    // they loaded: a local GeoTIFF none, a plain Zarr store none, the PVOL
+    // pre-warm (off here) a floor of none; the GRIB sources sixteen fields
+    // and messages; the station grid its pre-computed grids. NetCDF (no
+    // file yet) and satellite (no poll yet) have published nothing.
+    let demand = |id: &str, collection: Option<&str>| {
+        row(id, collection)
+            .unwrap_or_else(|| panic!("{id} {collection:?}"))
+            .demand
+            .clone()
+    };
+    for (id, collection) in [
+        ("tile_cache", Some("radar")),
+        ("zarr_decoded_cache", Some("zarr")),
+        ("pvol_pixel_cache", None),
+    ] {
+        let d = demand(id, collection).unwrap_or_else(|| panic!("{id} has no demand"));
+        assert_eq!((d.bytes, d.suggested_bytes()), (0, 0), "{id}");
+    }
+    assert_eq!(demand("pvol_pixel_cache", None).unwrap().kind(), "floor");
+    for (id, collection) in [
+        ("grid_cache", Some("grib-default")),
+        ("grib_message_cache", Some("grib-sized")),
+        ("station_grid_cache", None),
+    ] {
+        let d = demand(id, collection).unwrap_or_else(|| panic!("{id} has no demand"));
+        assert!(d.bytes > 0, "{id}: {d:?}");
+        assert!(d.suggested_bytes() >= d.bytes, "{id}");
+    }
+    assert_eq!(
+        demand("station_grid_cache", None).unwrap().parts[0].0,
+        "grid"
+    );
+    assert_eq!(demand("netcdf_field_cache", None), None);
+    assert_eq!(demand("satellite_frame_cache", None), None);
+    // One `cache_demand_bytes` series per cache with a demand, labelled as
+    // `cache_size_source` is; `cache_demand_ratio` the same over the cache's
+    // capacity, none for a disabled cache (GRIB messages by default).
+    let grid = demand("grid_cache", Some("grib-default")).unwrap().bytes;
+    let station_grid = demand("station_grid_cache", None).unwrap().bytes;
+    for line in [
+        "cache_demand_bytes{cache=\"tile_cache\",collection=\"radar\"} 0".to_string(),
+        "cache_demand_bytes{cache=\"pvol_pixel_cache\",collection=\"\"} 0".into(),
+        format!(
+            "cache_demand_bytes{{cache=\"station_grid_cache\",collection=\"\"}} {station_grid}"
+        ),
+        format!(
+            "cache_demand_ratio{{cache=\"grid_cache\",collection=\"grib-default\"}} {}",
+            grid as f64 / (256 * MIB) as f64
+        ),
+    ] {
+        assert!(metrics.contains(&line), "{line}");
+    }
+    let count = |family: &str| {
+        metrics
+            .lines()
+            .filter(|l| l.starts_with(&format!("{family}{{")))
+            .count()
+    };
+    let with_demand = || rows.iter().filter(|row| row.demand.is_some());
+    assert_eq!(count("cache_demand_bytes"), with_demand().count());
+    assert_eq!(
+        count("cache_demand_ratio"),
+        with_demand()
+            .filter(|row| row.usage.capacity_bytes > 0)
+            .count()
+    );
+    assert!(!metrics
+        .contains("cache_demand_ratio{cache=\"grib_message_cache\",collection=\"grib-default\"}"));
+
     // The log block and the endpoint list the same entries and sizes.
     assert_log_and_json_agree(&rows);
 
@@ -502,6 +572,27 @@ fn row(id: &'static str, scope: Scope, kind: Kind, source: SizeSource, capacity:
             }),
         },
         window: None,
+        demand: None,
+    }
+}
+
+/// The 0.1° source's grid cache demand: sixteen fields of 25 MiB.
+fn grid_demand() -> Demand {
+    let part = plan::CacheDemand::demand(
+        400 * MIB,
+        "16 × decoded field bytes",
+        "[grib] grid_cache_mb",
+    )
+    .input("fields", 16)
+    .input("nodes", 3601 * 1801)
+    .input("field_bytes", 25 * MIB);
+    Demand {
+        bytes: part.bytes,
+        rule: part.rule,
+        floor: false,
+        ahead: false,
+        setting: part.setting,
+        parts: vec![("ifs".into(), part)],
     }
 }
 
@@ -531,16 +622,19 @@ fn sample_rows() -> Vec<Row> {
             SizeSource::Default,
             256 * MIB,
         ),
-        row(
-            "grid_cache",
-            Scope::Source {
-                engine: "grib",
-                id: "ifs".into(),
-            },
-            Kind::Cache,
-            SizeSource::Collection("[grib] grid_cache_mb"),
-            1536 * MIB,
-        ),
+        Row {
+            demand: Some(grid_demand()),
+            ..row(
+                "grid_cache",
+                Scope::Source {
+                    engine: "grib",
+                    id: "ifs".into(),
+                },
+                Kind::Cache,
+                SizeSource::Collection("[grib] grid_cache_mb"),
+                1536 * MIB,
+            )
+        },
         row(
             "render_budget",
             Scope::Process,
@@ -552,7 +646,9 @@ fn sample_rows() -> Vec<Row> {
 }
 
 /// The document's shape: an object per cache and per budget with the
-/// fields the issue names, totals, and the memory gauges by name.
+/// fields the issue names, totals, and the memory gauges by name; a cache's
+/// demand, its rule and kind, the size it suggests and each collection's
+/// inputs (#1309), null where no engine publishes one.
 #[test]
 fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
     let rows = sample_rows();
@@ -584,8 +680,18 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
                 "prewarmed": false,
             },
             "last_hour": null,
+            "demand_bytes": 400 * MIB,
+            "demand_rule": "16 × decoded field bytes",
+            "demand_kind": "demand",
+            "suggested_bytes": 460 * MIB,
+            "demand_inputs": [{
+                "collection": "ifs",
+                "bytes": 400 * MIB,
+                "inputs": {"fields": 16, "nodes": 3601 * 1801, "field_bytes": 25 * MIB},
+            }],
         })
     );
+    assert_eq!(json["caches"][2]["demand_bytes"], Value::Null);
     assert_eq!(
         json["budgets"],
         json!([{
@@ -601,6 +707,11 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
             "misses": null,
             "churn": null,
             "last_hour": null,
+            "demand_bytes": null,
+            "demand_rule": null,
+            "demand_kind": null,
+            "suggested_bytes": null,
+            "demand_inputs": null,
         }])
     );
     let caches = (8192 + 4096 + 256 + 1536) * MIB;
@@ -686,7 +797,7 @@ Cache and memory plan at boot: 4 caches 14080 MiB (13.75 GiB), 1 budgets 4096 Mi
   caches, collection geotiff:
     tile_cache opera     256 MiB  default
   caches, source grib:
-    grid_cache ifs      1536 MiB  collection:[grib] grid_cache_mb
+    grid_cache ifs      1536 MiB  collection:[grib] grid_cache_mb, demand 400 MiB, suggested 460 MiB
   budgets, process:
     render_budget       4096 MiB  env:MC_RENDER_MEMORY_MB";
     assert_eq!(log, expected);
@@ -711,7 +822,7 @@ fn a_changed_size_shows_the_old_one() {
     let changed: Vec<&str> = log.lines().filter(|l| l.contains("(was ")).collect();
     assert_eq!(
         changed,
-        ["    grid_cache ifs       256 MiB  default (was 1536 MiB)"]
+        ["    grid_cache ifs       256 MiB  default (was 1536 MiB), demand 400 MiB, suggested 460 MiB"]
     );
 }
 

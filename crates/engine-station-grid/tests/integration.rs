@@ -704,6 +704,58 @@ fn late_observations_revise_the_grid() {
     assert_eq!(analyses(), 3);
 }
 
+/// #1309: the grid cache's demand is parameters × precompute × one grid,
+/// weighed as the cache weighs it: its cells, and a residual per station
+/// once the poll has computed an analysis. Without a pre-compute it is the
+/// one grid a request computes. The terrain and mask, which the engine
+/// holds, are an input of their own.
+#[test]
+fn the_grid_cache_demand_counts_the_grids_computed_ahead() {
+    let t = utc(10, 6, 0);
+    let source = Synthetic::new(vec![
+        (24.0, 60.0, vec![(t, 1.0)]),
+        (26.0, 60.0, vec![(t, 3.0)]),
+    ]);
+    let config = synthetic_config([22.0, 58.0, 28.0, 62.0], 0.1, 300.0);
+    assert_eq!(config.precompute, 2);
+    let engine = StationGridEngine::new("demand", "obs", source.clone(), &config).unwrap();
+    let cells: u64 = 60 * 40;
+    let empty_grid = cells * 4 + 128;
+    let before = engine.grid_demand();
+    assert_eq!(before.setting, "MC_STATION_GRID_CACHE_MB");
+    assert_eq!(
+        before.inputs,
+        [
+            ("parameters", 1),
+            ("precompute", 2),
+            ("cells", cells),
+            ("stations", 0),
+            ("grid_bytes", empty_grid),
+            ("terrain_mask_bytes", 0),
+        ]
+    );
+    assert_eq!(before.bytes, 2 * empty_grid);
+
+    engine.poll_once();
+    let grid =
+        empty_grid + 2 * std::mem::size_of::<engine_station_grid::residuals::Residual>() as u64;
+    let after = engine.grid_demand();
+    assert_eq!(after.inputs[3..5], [("stations", 2), ("grid_bytes", grid)]);
+    assert_eq!(after.bytes, 2 * grid);
+
+    let none = StationGridEngine::new(
+        "demand-none",
+        "obs",
+        source,
+        &StationGridConfig {
+            precompute: 0,
+            ..config
+        },
+    )
+    .unwrap();
+    assert_eq!(none.grid_demand().bytes, empty_grid);
+}
+
 /// A grid that cannot be ready by the request deadline is a 503
 /// (`ResourceExhausted`), never a partial grid; its computation goes on and
 /// serves the retry.

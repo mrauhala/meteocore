@@ -186,7 +186,39 @@ pub struct Catalog {
     pub wind: Arc<WindFacts>,
 }
 
+/// How an Icechunk store's decoded-chunk cache demand is computed (#1309).
+const DECODED_DEMAND_RULE: &str = "16 × mean decoded chunk bytes";
+/// A plain store's: its decoded-chunk cache holds nothing.
+const PLAIN_DECODED_DEMAND_RULE: &str = "none: a plain store keeps no decoded chunks, its object \
+                                         cache holds the stored ones";
+
 impl Catalog {
+    /// What the store needs of its decoded-chunk cache (#1309):
+    /// [`ds_cache::plan::DEMAND_FIELDS`] chunks of the mean weight of its
+    /// variables' inner chunks the cache keeps, each weighed as the cache
+    /// weighs it. A plain store keeps none: 0.
+    pub(crate) fn decoded_demand(&self) -> ds_cache::plan::CacheDemand {
+        use ds_cache::plan::{CacheDemand, DEMAND_FIELDS};
+        const SETTING: &str = "[zarr.icechunk] decoded_cache_mb";
+        if self.revision.is_none() {
+            return CacheDemand::demand(0, PLAIN_DECODED_DEMAND_RULE, SETTING);
+        }
+        let weights: Vec<u64> = self
+            .vars
+            .iter()
+            .filter_map(|v| v.decoded.as_ref()?.chunk_weight(&v.array))
+            .collect();
+        let mean = weights
+            .iter()
+            .sum::<u64>()
+            .checked_div(weights.len() as u64)
+            .unwrap_or(0);
+        CacheDemand::demand(DEMAND_FIELDS * mean, DECODED_DEMAND_RULE, SETTING)
+            .input("fields", DEMAND_FIELDS)
+            .input("variables", weights.len() as u64)
+            .input("chunk_bytes", mean)
+    }
+
     /// Resolve a requested model run to its reference-axis index: `None` ⇒
     /// the latest run, `Some(rt)` ⇒ that exact run or `ReferenceTimeNotFound`.
     /// A non-forecast store has no runs and answers `Ok(None)` for any

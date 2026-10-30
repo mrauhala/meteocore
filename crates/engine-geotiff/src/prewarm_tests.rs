@@ -88,6 +88,41 @@ fn remote_engine(local: &TempDir, remote: &TempDir) -> GeoTiffEngine {
     engine
 }
 
+/// #1309: a remote collection's tile cache demand is every frame in its
+/// window at the mean encoded size, unknown before a frame's size is; a
+/// local collection's is none, whatever `tile_cache_mb` says, since it
+/// reads through the page cache.
+#[test]
+fn the_tile_cache_demand_is_every_frame_encoded() {
+    let local = GeoTiffEngine::new("demand-local", fixture_dir().to_str(), &config()).unwrap();
+    let demand = local.tile_cache_demand().expect("published at load");
+    assert_eq!(
+        (demand.bytes, demand.inputs.len(), demand.setting),
+        (0, 0, "[geotiff] tile_cache_mb")
+    );
+    assert!(demand.rule.contains("page cache"), "{}", demand.rule);
+
+    // A remote collection with no frame yet has no known frame size: no
+    // demand, rather than 0.
+    let (empty, remote) = (TempDir::new("demand_local"), TempDir::new("demand_remote"));
+    std::fs::create_dir_all(remote.0.join("d")).unwrap();
+    let engine = remote_engine(&empty, &remote);
+    engine.poll_once();
+    assert_eq!(engine.tile_cache_demand(), None);
+    for frame in FRAMES {
+        publish(&remote, frame);
+    }
+    engine.poll_once();
+    let sizes: Vec<u64> = FRAMES
+        .iter()
+        .map(|frame| std::fs::metadata(fixture_dir().join(frame)).unwrap().len())
+        .collect();
+    let mean = sizes.iter().sum::<u64>() / 2;
+    let demand = engine.tile_cache_demand().unwrap();
+    assert_eq!(demand.inputs, [("frames", 2), ("frame_bytes", mean)]);
+    assert_eq!(demand.bytes, 2 * mean);
+}
+
 /// Every non-empty tile of a frame, as `(ifd, layout generation, chunk)`,
 /// all levels.
 fn frame_tiles(metadata: &TiffMetadata, source: &DataSource) -> Vec<(u16, u64, u32)> {

@@ -713,6 +713,17 @@ fn single(resp: CoverageResponse) -> ds_core::model::QueryResult {
     }
 }
 
+/// #1309: a plain store's decoded-chunk cache is built empty, so it
+/// demands nothing; its object cache holds the stored chunks.
+#[test]
+fn a_plain_store_demands_no_decoded_chunks() {
+    let demand = engine().decoded_cache_demand().expect("published at load");
+    assert_eq!(demand.bytes, 0);
+    assert!(demand.inputs.is_empty());
+    assert!(demand.rule.contains("plain store"), "{}", demand.rule);
+    assert_eq!(demand.setting, "[zarr.icechunk] decoded_cache_mb");
+}
+
 /// A range's precision is its array's data type (#1341): the float32
 /// arrays' values are `f32`, unit conversion and interpolation adding no
 /// digits; the packed int16 `t2m_packed` keeps `f64`, as its unpacked type

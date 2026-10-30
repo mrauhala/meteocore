@@ -55,9 +55,12 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     the product. It does so only while every live engine's window
     (`cache::windows`) fits the capacity. Past that, each download would
     evict another in-window scan and the polls would download in a loop:
-    it fills free room only, and logs one WARN per poll with every
-    collection's window. `FRAMES` is one shard so that "fits" is exact:
-    `quick_cache` otherwise gives each shard an equal slice of the budget.
+    it fills free room only. Each poll publishes its window as the frame
+    cache's demand (`ds_cache::plan::DemandSlot`, #1309), and the plan
+    logs one WARN when the windows first exceed the cache, naming every
+    collection's window, not one per poll. `FRAMES` is one shard so that
+    "fits" is exact: `quick_cache` otherwise gives each shard an equal
+    slice of the budget.
   - The re-download claims the fill guard untracked: it counts in
     `satellite_frame_reingests_total`, and cache misses stay request-time
     downloads. `/metrics` also has `satellite_frame_window_bytes` and
@@ -79,8 +82,9 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     `ds_storage::test_util::StalledBody` on a paused clock (#1055).
   - `tests/refetch.rs` runs both call sites with zero-size caches (`0` also
     turns re-downloading off). `tests/window_capacity.rs`, on a 1 MB cache,
-    pins the thrash guard, its WARN and the recovery; `lib.rs` tests pin the
-    sweep, the re-download and instance-scoped keys.
+    pins the thrash guard, its single demand WARN, none on later polls, and
+    the recovery; `lib.rs` tests pin the sweep, the re-download and
+    instance-scoped keys.
 - **Downloads are capped per poll** (`MAX_INGEST_PER_POLL` per product: new
   scans first, newest first, then re-downloads): bootstrapping a window
   spreads over polls (Critical Rule 9). No ingest starts once the poll has

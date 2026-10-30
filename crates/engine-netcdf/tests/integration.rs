@@ -167,6 +167,28 @@ fn meps_runs_and_variables_are_advertised() {
     assert!((newest - at("2026-10-15T09:00:00Z")).num_seconds().abs() <= 1);
 }
 
+/// #1309: a collection's demand on the shared field cache is sixteen
+/// fields of its grid, each weighed as the cache weighs it, under its
+/// longest variable name; none before a file gives the grid.
+#[test]
+fn the_field_cache_demands_sixteen_fields_of_the_grid() {
+    let engine = meps();
+    let [width, height] = engine.raster_info().grid_size.unwrap();
+    let cells = u64::from(width) * u64::from(height);
+    let demand = engine.field_cache_demand().expect("published by the scan");
+    assert_eq!(demand.setting, "MC_NETCDF_FIELD_CACHE_MB");
+    assert_eq!(demand.inputs[..2], [("fields", 16), ("cells", cells)]);
+    // The values, the longest name ("air_pressure_at_sea_level") and 96
+    // bytes of overhead.
+    let field = cells * 4 + 25 + 96;
+    assert_eq!(demand.inputs[2], ("field_bytes", field));
+    assert_eq!(demand.bytes, 16 * field);
+
+    let dir = tempfile::tempdir().unwrap();
+    let empty = NetcdfEngine::new("empty", &meps_config(dir.path())).unwrap();
+    assert_eq!(empty.field_cache_demand(), None);
+}
+
 /// `new` scans the directory once, so the layers exist when the collection
 /// is registered; a later poll picks up new files. A directory that cannot
 /// be listed is a WARN, retried by the poll.

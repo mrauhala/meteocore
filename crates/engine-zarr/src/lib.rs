@@ -74,6 +74,9 @@ pub struct ZarrEngine {
     /// Variable filter from config (`None` = expose all).
     param_filter: Option<Vec<String>>,
     poll_interval: Duration,
+    /// What the collection needs of its decoded-chunk cache (#1309),
+    /// published with each catalog.
+    demand: ds_cache::plan::DemandSlot,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
 }
@@ -114,15 +117,39 @@ impl ZarrEngine {
 
         log_loaded(collection_id, &catalog);
 
-        Ok(Self {
+        let engine = Self {
             collection_id: collection_id.to_string(),
             source,
             decoded_cache,
             catalog: ArcSwap::from_pointee(catalog),
             param_filter,
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
+            demand: ds_cache::plan::DemandSlot::new(
+                "zarr_decoded_cache",
+                ds_cache::plan::Scope::Collection {
+                    engine: "zarr",
+                    id: collection_id.to_string(),
+                },
+                collection_id,
+            ),
             shutdown: Shutdown::new(),
-        })
+        };
+        engine.publish_demand();
+        Ok(engine)
+    }
+
+    /// Publish the catalog's demand on the decoded-chunk cache (#1309),
+    /// and log the plan's WARN when the cache has just fallen below it.
+    fn publish_demand(&self) {
+        if let Some(short) = self.demand.publish(self.catalog.load().decoded_demand()) {
+            tracing::warn!("{short}");
+        }
+    }
+
+    /// What the collection last published as its decoded-chunk cache's
+    /// demand (#1309).
+    pub fn decoded_cache_demand(&self) -> Option<ds_cache::plan::CacheDemand> {
+        self.demand.get()
     }
 
     /// Run the poll loop: periodically rebuild the catalog so appended time
@@ -205,6 +232,7 @@ impl ZarrEngine {
                 // Make the replacement visible before retiring the old
                 // generation, so new requests never load a retired catalog.
                 self.source.publish(&store);
+                self.publish_demand();
             }
             Ok(None) => {}
             Err(e) => {

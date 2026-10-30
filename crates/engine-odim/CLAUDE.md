@@ -111,7 +111,13 @@ around `ds-storage` calls (Critical Rules 6–7).
   additive (never marks known-bad; `PixelCache::contains` skips
   already-resident moments); bounded by the pixel-cache byte budget
   (`MC_PVOL_PIXEL_CACHE_MB`). `0` disables; default `1` warms the base tilt
-  (the standard reflectivity animation view).
+  (the standard reflectivity animation view). Each scan publishes the
+  source's floor on the cache (`prewarm_floor`, #1309): 2 × the entries
+  `prewarm_moments` names for every retained volume, weighed by
+  `pixel_cache::entry_weight` from the sweep's shape and
+  `PolarMoment::cell_bytes`, the decoded cell size read from the HDF5 type
+  at parse, never a decode. A new `RawPixels` variant updates
+  `reader::cell_bytes` too.
 - **Pixel cache policy (#992).** `PIXEL_CACHE` is filled ahead of reads, so
   it is built with `ByteBoundedCache::new_with_hot_allocation(…, 0.5)`
   (`PIXEL_CACHE_HOT_ALLOCATION`), not quick_cache's default 0.97. Under the

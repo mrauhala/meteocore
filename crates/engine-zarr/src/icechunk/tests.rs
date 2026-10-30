@@ -842,6 +842,27 @@ async fn concurrent_maps_read_icechunk_through_render_executor() {
     }
 }
 
+/// #1309: an Icechunk store's decoded-chunk cache demands sixteen of its
+/// inner chunks, each weighed as the cache weighs it: the fixture's are
+/// 2 × 1 × 1 f32 values under a key of the snapshot id, the array's name
+/// and three indices.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_decoded_cache_demands_sixteen_inner_chunks() {
+    let dir = tempfile::tempdir().unwrap();
+    fixture(dir.path()).await;
+    let engine = ZarrEngine::new("demand", &config(dir.path())).unwrap();
+    let demand = engine.decoded_cache_demand().expect("published at load");
+    assert_eq!(demand.setting, "[zarr.icechunk] decoded_cache_mb");
+    assert_eq!(demand.inputs[..2], [("fields", 16), ("variables", 1)]);
+    let (name, chunk) = demand.inputs[2];
+    assert_eq!(name, "chunk_bytes");
+    // 8 bytes of values, "temp", three u64 indices and 160 of overhead,
+    // plus the snapshot id.
+    let known = 8 + 4 + 3 * 8 + 160;
+    assert!((known + 1..known + 64).contains(&chunk), "{chunk}");
+    assert_eq!(demand.bytes, 16 * chunk);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn decoded_inner_chunks_reuse_other_leads_and_preserve_deadlines_without_payload_cache() {
     let dir = tempfile::tempdir().unwrap();

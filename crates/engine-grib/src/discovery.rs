@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::catalog::MessageEntry;
+use ds_cache::plan::{CacheDemand, DemandSlot, Scope, DEMAND_FIELDS};
 use ds_core::wind::{GridAxes, ParameterFacts, WindFacts};
 use metadata::GridGeometry;
 
@@ -71,8 +72,70 @@ fn catalogs(catalog: &Catalog) -> impl Iterator<Item = (Option<GribLevelType>, &
     )
 }
 
+/// How the decoded-grid cache's demand is computed (#1309).
+const GRID_DEMAND_RULE: &str = "16 × decoded field bytes";
+/// How the compressed-message cache's demand is computed (#1309).
+const MESSAGE_DEMAND_RULE: &str = "16 × mean message bytes of the latest run";
+
+/// A slot for a source's demand on its cache `cache`, as the server's
+/// memory plan lists it: scoped to the source's collection.
+pub(super) fn demand_slot(cache: &'static str, collection_id: &str) -> DemandSlot {
+    DemandSlot::new(
+        cache,
+        Scope::Source {
+            engine: "grib",
+            id: collection_id.to_string(),
+        },
+        collection_id,
+    )
+}
+
+/// The decoded-grid cache's demand for fields of `nodes` values (#1309):
+/// [`DEMAND_FIELDS`] of them, each weighed as the cache weighs it.
+pub(super) fn grid_demand(nodes: u64) -> CacheDemand {
+    let field = GridCache::estimated_weight(nodes);
+    CacheDemand::demand(
+        DEMAND_FIELDS.saturating_mul(field),
+        GRID_DEMAND_RULE,
+        "[grib] grid_cache_mb",
+    )
+    .input("fields", DEMAND_FIELDS)
+    .input("nodes", nodes)
+    .input("field_bytes", field)
+}
+
+/// The compressed-message cache's demand from `catalog` (#1309):
+/// [`DEMAND_FIELDS`] messages of the mean weight of the latest run's, each
+/// weighed as the cache weighs it. `None` before a run with a known message
+/// length.
+pub(super) fn message_demand(catalog: &Catalog) -> Option<CacheDemand> {
+    let (mut bytes, mut messages) = (0u64, 0u64);
+    for file in catalog.latest_run()?.steps.values() {
+        for entry in &file.messages {
+            if let Some(length) = entry.length {
+                bytes += crate::message_cache::message_weight(file.message_url(entry), length);
+                messages += 1;
+            }
+        }
+    }
+    let mean = bytes.checked_div(messages)?;
+    Some(
+        CacheDemand::demand(
+            DEMAND_FIELDS.saturating_mul(mean),
+            MESSAGE_DEMAND_RULE,
+            "[grib] message_cache_mb",
+        )
+        .input("fields", DEMAND_FIELDS)
+        .input("messages", messages)
+        .input("message_bytes", mean),
+    )
+}
+
 impl GribEngine {
     pub(super) fn publish_catalog(&self, catalog: Catalog) {
+        if let Some(demand) = message_demand(&catalog) {
+            self.publish_demand(&self.source.message_demand, demand);
+        }
         self.source.catalog.store(Arc::new(catalog));
         // A new run may pack a parameter differently: let the CCSDS point
         // path try each parameter again (#1300).
@@ -113,6 +176,27 @@ impl GribEngine {
             })
             .collect();
         discovery.wind = wind;
+        let nodes = discovery
+            .views
+            .values()
+            .filter_map(|info| decoded_nodes(info.grid_size))
+            .max();
+        drop(discovery);
+        // A decode on a query path publishes a geometry too: only a change
+        // is published, so a query pays no plan check.
+        if let Some(demand) = nodes.map(grid_demand) {
+            if self.source.grid_demand.get().as_ref() != Some(&demand) {
+                self.publish_demand(&self.source.grid_demand, demand);
+            }
+        }
+    }
+
+    /// Publish `demand` in `slot`, and log the plan's WARN when the cache
+    /// has just fallen below it.
+    fn publish_demand(&self, slot: &DemandSlot, demand: CacheDemand) {
+        if let Some(short) = slot.publish(demand) {
+            tracing::warn!("{short}");
+        }
     }
 
     pub(super) fn geometry_probes<'a>(
@@ -298,6 +382,52 @@ mod tests {
             engine.storage_bytes_read(),
             "no duplicate geometry probe"
         );
+    }
+
+    /// #1309: the decoded-grid cache's demand is sixteen fields as the
+    /// cache weighs them. A 0.1° global grid suggests about 0.44 GiB, which
+    /// the 256 MiB default holds ten fields of; a 0.25° one 73 MiB.
+    #[test]
+    fn the_grid_cache_demands_sixteen_fields() {
+        let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+        let tenth = grid_demand(decoded_nodes(Some([3600, 1800])).unwrap());
+        assert_eq!(tenth.setting, "[grib] grid_cache_mb");
+        assert_eq!(tenth.inputs[..2], [("fields", 16), ("nodes", 3601 * 1801)]);
+        assert_eq!(tenth.bytes, 16 * tenth.inputs[2].1);
+        assert_eq!(tenth.inputs[2].1, GridCache::estimated_weight(3601 * 1801));
+        let suggested = gib(tenth.suggested_bytes());
+        assert!((0.4..0.5).contains(&suggested), "{suggested} GiB");
+        let quarter = grid_demand(decoded_nodes(Some([1440, 720])).unwrap());
+        assert_eq!(quarter.suggested_bytes(), 73 * ds_cache::MIB);
+    }
+
+    /// #1309: a source publishes its grid demand once its geometry is
+    /// known, and its message cache's from the latest run's messages of a
+    /// known length: sixteen of their mean weight.
+    #[test]
+    fn a_source_publishes_its_grid_and_message_demand() {
+        let source = TestSource::new();
+        for (name, step) in [("f000", 0), ("f003", 3)] {
+            source.write(
+                name,
+                &[
+                    ("TMP", "2 m above ground", message(0, 280.0, [0; 4], 103, 2)),
+                    // The last record's length is unknown to a wgrib2 index.
+                    ("TAIL", "surface", message(0, 0.0, [0; 4], 1, 0)),
+                ],
+                step,
+            );
+        }
+        let engine = GribEngine::new("demand", &source.config()).unwrap();
+        let grid = engine.source.grid_demand.get().expect("geometry published");
+        assert_eq!(grid, grid_demand(4));
+        let messages = engine.source.message_demand.get().expect("lengths known");
+        assert_eq!(messages.setting, "[grib] message_cache_mb");
+        assert_eq!(messages.inputs[..2], [("fields", 16), ("messages", 2)]);
+        let mean = messages.inputs[2].1;
+        let length = message(0, 280.0, [0; 4], 103, 2).len() as u64;
+        assert!((length + 1..length + 1024).contains(&mean), "{mean}");
+        assert_eq!(messages.bytes, 16 * mean);
     }
 
     #[test]

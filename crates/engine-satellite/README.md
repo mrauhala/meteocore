@@ -37,9 +37,11 @@ while the window fits in memory, no request reads the bucket.
   coordinates. A tiled scan waits until it has as many tiles as earlier
   scans, a newer scan appears, or 15 minutes after its start.
 - **Memory.** Scans live in one byte-bounded cache shared by every
-  satellite collection; each poll drops those that left the window. While
-  all windows fit, the poll downloads again any in-window scan the cache
-  evicted; otherwise only into free room, with one WARN per poll.
+  satellite collection; each poll drops those that left the window. The
+  windows together are the cache's demand in `/admin/cache-plan`. While
+  they fit, the poll downloads again any in-window scan the cache evicted;
+  otherwise only into free room, and the server logs one WARN naming each
+  window and the size to set.
 - **Rendering.** Output pixels map to source pixels through a coarse
   `ProjectionGrid`; each takes the source pixel under it. Only the blocks
   a render touches (one NetCDF chunk, or one ISatSS tile) are decoded, and

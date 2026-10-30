@@ -240,6 +240,12 @@ need no reload pruning.
   `load_collections` right after their engine is pushed, reused engines
   too; registering an owner again replaces its entry.
 - A recovery-loop reload logs the block only when the plan changed.
+- `cache_plan::snapshot` runs `plan::check_rows` and logs each new
+  `Shortfall` at WARN (#1309), so a reload that shrinks a cache below its
+  demand warns from the plan log; engines warn from their own publishes.
+  `cache_demand_bytes` and `cache_demand_ratio` have one series per plan
+  row with a demand, `collection` empty for a process-wide cache, reset
+  every scrape; the ratio has none for a disabled cache.
 - The plan test runs in a child process: the `MC_*` statics read the
   environment once.
 - Without `ADMIN_TOKEN` every admin route answers 403 (`require_admin_token`).

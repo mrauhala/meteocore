@@ -430,6 +430,23 @@ pub(crate) fn read_raw_pixels_2d(
     Ok(pixels)
 }
 
+/// Bytes per cell [`read_raw_pixels_2d`] decodes a dataset of `dtype`
+/// into, read from the type alone: 1 for `u8`, 2 for `u16` and `i16`, 4 for
+/// `f32` and the `f64` it narrows; 0 for a type it refuses. The PVOL
+/// pre-warm floor counts it before anything is decoded (#1309).
+pub(crate) fn cell_bytes(dtype: &Datatype) -> u8 {
+    match dtype {
+        Datatype::FixedPoint {
+            size: 1,
+            signed: false,
+            ..
+        } => 1,
+        Datatype::FixedPoint { size: 2, .. } => 2,
+        Datatype::FloatingPoint { size: 4 | 8, .. } => 4,
+        _ => 0,
+    }
+}
+
 /// The whole of `ds` as `T`. A chunked dataset is read as a full selection,
 /// never with `Dataset::read_array` (#1316): on a chunked dataset of up to
 /// 32 MiB, `read_array` also copies the dataset's bytes into its handle,

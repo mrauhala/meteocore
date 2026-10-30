@@ -119,6 +119,9 @@ pub struct NetcdfEngine {
     open_file_bytes: AtomicU64,
     /// What remote reads found replaced, for the poll and `content_version`.
     changes: Arc<Changes>,
+    /// What the collection needs of the field cache (#1309), published by
+    /// each scan.
+    field_demand: ds_cache::plan::DemandSlot,
     shutdown: Shutdown,
 }
 
@@ -400,6 +403,11 @@ impl NetcdfEngine {
             decodes: Arc::new(AtomicU64::new(0)),
             open_file_bytes: AtomicU64::new(0),
             changes: Arc::new(Changes::default()),
+            field_demand: ds_cache::plan::DemandSlot::new(
+                "netcdf_field_cache",
+                ds_cache::plan::Scope::Engine("netcdf"),
+                collection_id,
+            ),
             shutdown: Shutdown::new(),
         };
         if let Err(e) = engine.initial_scan() {
@@ -556,6 +564,12 @@ impl NetcdfEngine {
     pub fn grid(&self) -> Option<GeoTransform> {
         let catalog = self.catalog.load();
         catalog.layout.as_ref()?.grid.transform().cloned()
+    }
+
+    /// What the collection last published as its demand on the field cache
+    /// (#1309).
+    pub fn field_cache_demand(&self) -> Option<ds_cache::plan::CacheDemand> {
+        self.field_demand.get()
     }
 
     /// The estimated heap the catalog's open files hold (#1307): each
@@ -729,7 +743,15 @@ impl NetcdfEngine {
             catalog.runs.len(),
             catalog.info.times.len()
         );
+        let demand = field::field_demand(&catalog);
         self.catalog.store(Arc::new(catalog));
+        if let Some(demand) = demand {
+            // Entered in the plan, so the publish finds its size.
+            field::field_cache_metrics();
+            if let Some(short) = self.field_demand.publish(demand) {
+                tracing::warn!("{short}");
+            }
+        }
         let open: u64 = state
             .known
             .values()
