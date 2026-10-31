@@ -1258,7 +1258,8 @@ fetched that the message or grid cache holds, and nothing backwards or past
 the run's last step. What it has queued, in flight and fetched but not yet
 read stays within half the cache's cold ring (about 14–16 MB up to 1 GiB,
 a quarter of `message_cache_mb` at most), nearest steps first; a frame read or
-evicted gives its room back. The two GETs in flight are shared with the
+evicted gives its room back, and one nobody reads after two minutes stops
+holding it. The two GETs in flight are shared with the
 pre-warm. A fill is admitted undecoded and read once without promotion, as
 a map's own fill is, so an animation evicts nothing the hot ring keeps; a
 fill that does not decode is evicted when read. A request for a message the

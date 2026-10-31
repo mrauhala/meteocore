@@ -886,3 +886,70 @@ fn a_fetch_that_panics_gives_its_room_back() {
     assert!(state.pending.is_empty());
     assert_eq!((state.queued, state.workers), (0, 0));
 }
+
+/// The room is held against what is outstanding, not spent for the run's
+/// lifetime. A pass over a run reads ahead more than a quarter of the
+/// cache, and after its messages leave the cache and a poll publishes the
+/// catalog again, a second pass over the same run reads ahead again.
+#[test]
+fn the_room_is_not_spent_for_the_runs_lifetime() {
+    let large = large();
+    let length = large.len() as u64;
+    let source = TestSource::new();
+    for step in 0..12 {
+        write_step(&source, "", RUN, step, &[("q", &large)]);
+    }
+    let (owner, view, store) = served(&source, 64, 0, 3, TestStore::default());
+    let share = 64 * MIB / 100 * SHARE_PERCENT;
+    reads(&store);
+    animate(&owner, &view, 0..12, "q");
+    assert_eq!(reads(&store), expected(&[0, 1], 2..12, length));
+    assert!(
+        owner.read_ahead_counts().1 > share,
+        "past a quarter of the cache"
+    );
+    cache(&owner).clear();
+    owner.source.read_ahead.as_ref().unwrap().forget_plans();
+    animate(&owner, &view, 0..12, "q");
+    assert_eq!(reads(&store), expected(&[0, 1], 2..12, length));
+    assert_eq!(owner.read_ahead_counts().0, 2 * 10);
+}
+
+/// Fills nobody reads stop holding the room after `UNREAD_FOR`, though a
+/// cache under no pressure keeps them: an animation of `q` abandoned with
+/// the room's five 2.6 MB fills unread leaves an animation of `w` nothing
+/// to read ahead, until those fills are two minutes old.
+#[test]
+fn abandoned_fills_stop_holding_the_room_after_a_while() {
+    let large = large();
+    let length = large.len() as u64;
+    let source = TestSource::new();
+    for step in 0..9 {
+        write_step(&source, "", RUN, step, &[("q", &large), ("w", &large)]);
+    }
+    let (owner, view, store) = served(&source, 64, 0, 12, TestStore::default());
+    animate(&owner, &view, 0..2, "q");
+    assert_eq!(
+        owner.read_ahead_counts().0,
+        5,
+        "the room's five, then abandoned"
+    );
+    reads(&store);
+    let w = |step: u32, background: bool| Read {
+        offset: length,
+        ..whole(step, length, background)
+    };
+    animate(&owner, &view, 0..2, "w");
+    assert_eq!(
+        reads(&store),
+        [w(0, false), w(1, false)],
+        "the room is full"
+    );
+    cache(&owner).age_read_ahead(UNREAD_FOR + Duration::from_secs(1));
+    animate(&owner, &view, 2..3, "w");
+    let mut expected = vec![w(2, false)];
+    expected.extend((3..8).map(|step| w(step, true)));
+    assert_eq!(reads(&store), expected);
+    let unread = (2..7).filter(|&s| cache(&owner).is_resident(&key_of(&view, s, "q")));
+    assert_eq!(unread.count(), 5, "the abandoned fills stay cached");
+}

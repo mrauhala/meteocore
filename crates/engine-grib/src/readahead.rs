@@ -34,7 +34,9 @@
 //!   the next frame before it is drawn. Nearest steps first, stopping at
 //!   the first that does not fit. A request's first read of a fill gives
 //!   its weight back, as does its eviction unread or a failed fetch, so the
-//!   room bounds what waits, not what a run may fetch;
+//!   room bounds what waits, not what a run may fetch; a fill nobody reads
+//!   stops counting after [`UNREAD_FOR`], so an abandoned animation in a
+//!   cache that never evicts its fills does not switch the read-ahead off;
 //! - [`CONCURRENCY`] GETs in flight, shared with the pre-warm
 //!   ([`crate::prewarm::BackgroundGets`]): the bucket that answers 503
 //!   SlowDown to a third counts both;
@@ -43,10 +45,12 @@
 //! The fetches run on [`CONCURRENCY`] workers per source on the GRIB I/O
 //! runtime ([`runtime::spawn_background`]), each GET through that runtime's
 //! handle under [`FetchBudget::Background`] (root Critical Rules 6 and 7):
-//! the render that plans them returns at once. A fill holds the message's
-//! single-flight claim, so a request for it meanwhile joins the GET instead
-//! of repeating it, for at most half its remaining time
-//! ([`MessageCache::read_ahead`]).
+//! the render that plans them returns at once. A request for a message
+//! being fetched waits for the fetch instead of repeating it, for at most
+//! half its remaining time, on a signal of the read-ahead's own rather
+//! than a single-flight claim: `quick_cache` admits a claimed fill that had
+//! waiters as read, and a client catching up with its read-ahead would
+//! promote every frame ([`MessageCache::read_ahead`]).
 //!
 //! A fill is admitted once its length checks, without a decode, and not
 //! kept; a request's first read of it peeks it, so it stays in the cold
@@ -94,6 +98,12 @@ const ANIMATION_WINDOW: Duration = Duration::from_secs(60);
 /// holds of it.
 const PLANNED_FOR: Duration = Duration::from_secs(300);
 
+/// How long a fill nobody reads counts against the room: an abandoned
+/// animation's fills, which a cache under no pressure never evicts, would
+/// otherwise switch the read-ahead off for the whole source. An animation
+/// reads its fills within seconds.
+pub(crate) const UNREAD_FOR: Duration = Duration::from_secs(120);
+
 /// The most messages a source's read-ahead has waiting. A trigger plans a
 /// few per parameter; a client scrubbing through many runs or parameters at
 /// once fills it, and its later frames read what they draw.
@@ -137,6 +147,12 @@ struct Fetch {
     key: MessageKey,
     /// Its weight in the message cache ([`message_weight`]).
     weight: u64,
+}
+
+/// Fills admitted before this, unread, no longer count against the room.
+fn unread_since() -> Instant {
+    let now = Instant::now();
+    now.checked_sub(UNREAD_FOR).unwrap_or(now)
 }
 
 /// Remember `key` at `now` in `seen`, first forgetting what is older than
@@ -200,7 +216,7 @@ impl ReadAhead {
     /// The weight the read-ahead may have queued, in flight and fetched
     /// but unread in `cache`: half its cold ring, and at most
     /// [`SHARE_PERCENT`] of it.
-    fn room(cache: &MessageCache) -> u64 {
+    pub(crate) fn room(cache: &MessageCache) -> u64 {
         (cache.capacity_bytes() / 100 * SHARE_PERCENT).min(cache.cold_room() / 2)
     }
 
@@ -208,7 +224,7 @@ impl ReadAhead {
     #[cfg(test)]
     fn outstanding(&self, cache: &MessageCache) -> u64 {
         let queued = self.state.lock().unwrap().queued;
-        queued.saturating_add(cache.read_ahead_unread())
+        queued.saturating_add(cache.read_ahead_unread(unread_since()))
     }
 
     /// Queue `fetches`, nearest steps first, while what is outstanding,
@@ -435,7 +451,8 @@ impl GribEngine {
         if fetches.is_empty() {
             return;
         }
-        let start = ahead.enqueue(fetches, ReadAhead::room(cache), cache.read_ahead_unread());
+        let unread = cache.read_ahead_unread(unread_since());
+        let start = ahead.enqueue(fetches, ReadAhead::room(cache), unread);
         for _ in 0..start {
             let engine = Self {
                 collection_id: self.collection_id.clone(),

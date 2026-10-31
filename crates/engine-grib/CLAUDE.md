@@ -366,9 +366,14 @@ on the request path. Single-level and legacy views require exact metadata.
   first. Unkept fills wait in the cold ring with the maps' own; more would
   evict the next frame before it is drawn
   (`a_loop_of_large_frames_in_a_full_cache_reads_ahead_within_half_the_cold_ring`).
-  A read, an eviction unread or a failed fetch gives the weight back. The
-  room is the read-ahead's own: the pre-warm spends its share at once as a
-  poll catalogues new steps. At most 32 queued.
+  A read, an eviction unread or a failed fetch gives the weight back, and
+  a fill unread for `UNREAD_FOR` (2 min) stops counting, though it may stay
+  cached: an abandoned animation in a cache under no pressure would hold
+  the room for good
+  (`abandoned_fills_stop_holding_the_room_after_a_while`). Its later first
+  read still counts a hit: the GET was saved. The room is the
+  read-ahead's own: the pre-warm spends its share at once as a poll
+  catalogues new steps. At most 32 queued.
 - The plan runs on the render's thread with no I/O; the fetches on at most
   2 workers per source on the GRIB I/O runtime (`runtime::spawn_background`,
   `block_in_place`), so the render returns at once
@@ -378,14 +383,20 @@ on the request path. Single-level and legacy views require exact metadata.
   (`the_read_ahead_keeps_two_gets_in_flight_with_the_prewarm`), then
   `get_range_on_with_budget(.., FetchBudget::Background)`. A `Job` guard
   finishes each fetch on every path, a panic included.
-- `MessageCache::read_ahead` holds the message's single-flight claim through
-  its GET, unlike `prewarm`, so a request for the next frame joins it. It
-  marks the key (`Filling`) before claiming and unmarks after release, and
-  `get_with` probes the claim with zero wait before reading the mark, so a
-  claim the read-ahead holds is always seen marked. A request with a
-  deadline waits on a marked fill for half its remaining time, then reads
-  around the cache (a bypass); without a deadline, or on another request's
-  fill, it waits as before.
+- `MessageCache::read_ahead` holds no single-flight claim: `quick_cache`
+  admits a claimed fill that had waiters as referenced
+  (`referenced = !waiters.is_empty()`), so a client catching up with its
+  read-ahead promoted every frame
+  (`a_read_ahead_fill_a_request_joined_leaves_the_hot_ring_alone`: 3 of 36
+  hot entries left). It marks the key in `Filling` with a signal of its
+  own, probes for a request's claim (taken: it stands down), fetches,
+  admits with a plain unreferenced `insert`, and raises the signal as the
+  mark drops. `get_with` takes its claim before reading the mark, so of a
+  request and a read-ahead one always sees the other and the message is
+  fetched once. A request that finds a mark waits on the signal, for half
+  its remaining time with a deadline (then reads around the cache, a
+  bypass), as long as the fetch takes without one, then takes the first
+  read by peek.
 - Scan resistance (#1340): a request's first read of a fill is a
   `ByteBoundedCache::peek` (`first_read_ahead`), no recency, as a map's own
   fill is never looked up again; a lookup would promote every frame and
@@ -402,6 +413,10 @@ on the request path. Single-level and legacy views require exact metadata.
   `grib_read_ahead_{gets,bytes,hits}_total`, hits a fill's first request
   read, a request that joined it included; a request filling the key
   itself forgets it.
+- Known limits: a client animating every second or third step never
+  passes the previous-step gate; a frame planned within 5 min is not
+  planned again after an eviction; the unread weight is read outside the
+  queue's lock, so the room can overshoot by the at most 2 fills in flight.
 - Key by source-local path, offset and indexed length. Like the decoded cache,
   this assumes immutable files at a given path/offset; engine reconstruction
   clears both caches. Changing the cache configuration triggers reconstruction

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ds_cache::{ByteBoundedCache, CacheEntry, CacheMetrics, MIB};
@@ -151,6 +151,8 @@ struct AheadFill {
     weight: u64,
     /// Whether a request has read it.
     read: bool,
+    /// When it was admitted.
+    at: Instant,
 }
 
 impl AheadFills {
@@ -186,48 +188,103 @@ impl AheadFills {
     }
 }
 
-/// The messages whose single-flight fill a map read-ahead holds (#1335):
-/// a request that finds one in flight waits on it for at most half its
-/// remaining time ([`MessageCache::get_with`]), where it waits on another
-/// request's fill as long as that takes.
+/// The messages a map read-ahead is fetching (#1335), each with a signal
+/// its fill raises once it is admitted, or not. The read-ahead holds no
+/// single-flight claim: `quick_cache` admits a claimed fill that had
+/// waiters as read, so a request joining it would promote it to the hot
+/// ring. A request that finds a message marked waits on its signal instead
+/// ([`MessageCache::get_with`]), for at most half its remaining time, and
+/// then reads the fill as its first read, without touching its recency.
 #[derive(Default)]
 struct Filling {
-    keys: Mutex<HashSet<MessageKey>>,
+    keys: Mutex<HashMap<MessageKey, Arc<Filled>>>,
     /// `keys`' length, so a lookup skips the lock while nothing fills.
     pending: AtomicUsize,
 }
 
+/// A read-ahead fill's signal: raised when its fetch is done, admitted or
+/// not.
+#[derive(Default)]
+struct Filled {
+    done: Mutex<bool>,
+    raised: Condvar,
+}
+
+impl Filled {
+    /// Wait for the signal, at most `timeout` (`None`: as long as the fill
+    /// takes, which the background budget bounds): whether it was raised.
+    fn wait(&self, timeout: Option<Duration>) -> bool {
+        let done = self.done.lock().unwrap();
+        match timeout {
+            None => *self.raised.wait_while(done, |done| !*done).unwrap(),
+            Some(timeout) => {
+                let (done, _) = self
+                    .raised
+                    .wait_timeout_while(done, timeout, |done| !*done)
+                    .unwrap();
+                *done
+            }
+        }
+    }
+}
+
 impl Filling {
     fn contains(&self, key: &MessageKey) -> bool {
-        self.pending.load(Ordering::Relaxed) > 0 && self.keys.lock().unwrap().contains(key)
+        self.pending.load(Ordering::Relaxed) > 0 && self.keys.lock().unwrap().contains_key(key)
     }
 
-    /// Mark `key` filled ahead until the mark drops. Marked before its
-    /// claim is taken and unmarked after it is released, so a request that
-    /// finds the claim taken sees the mark. The read-ahead queues a message
-    /// once, so one mark at a time.
-    fn mark(&self, key: &MessageKey) -> FillMark<'_> {
+    /// The signal of `key`'s fill in flight, if one is.
+    fn signal(&self, key: &MessageKey) -> Option<Arc<Filled>> {
+        if self.pending.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        self.keys.lock().unwrap().get(key).cloned()
+    }
+
+    /// Mark `key` filled ahead until the mark drops, which raises its
+    /// signal; `None` when it is marked already.
+    fn mark(&self, key: &MessageKey) -> Option<FillMark<'_>> {
         let mut keys = self.keys.lock().unwrap();
-        keys.insert(key.clone());
+        if keys.contains_key(key) {
+            return None;
+        }
+        let filled = Arc::new(Filled::default());
+        keys.insert(key.clone(), filled.clone());
         self.pending.store(keys.len(), Ordering::Relaxed);
-        FillMark {
+        Some(FillMark {
             filling: self,
             key: key.clone(),
-        }
+            filled,
+        })
     }
 }
 
 struct FillMark<'a> {
     filling: &'a Filling,
     key: MessageKey,
+    filled: Arc<Filled>,
 }
 
 impl Drop for FillMark<'_> {
     fn drop(&mut self) {
-        let mut keys = self.filling.keys.lock().unwrap();
-        keys.remove(&self.key);
-        self.filling.pending.store(keys.len(), Ordering::Relaxed);
+        {
+            let mut keys = self.filling.keys.lock().unwrap();
+            keys.remove(&self.key);
+            self.filling.pending.store(keys.len(), Ordering::Relaxed);
+        }
+        *self.filled.done.lock().unwrap() = true;
+        self.filled.raised.notify_all();
     }
+}
+
+/// What a request finds of a read-ahead fetching the message it reads.
+enum Join {
+    /// None is.
+    None,
+    /// The fetch is done; its fill, if admitted, waits for its first read.
+    Done,
+    /// It did not finish within half the request's remaining time.
+    TimedOut,
 }
 
 impl MessageCache {
@@ -395,9 +452,11 @@ impl MessageCache {
         self.read_ahead.update(&fills);
     }
 
-    /// The weight of what the read-ahead admitted that no request has read
-    /// yet (#1335), its fills the cache evicted first forgotten.
-    pub(crate) fn read_ahead_unread(&self) -> u64 {
+    /// The weight of what the read-ahead admitted since `since` that no
+    /// request has read yet (#1335), its fills the cache evicted first
+    /// forgotten. Older ones may stay resident, but in a cache that has not
+    /// evicted them they do not crowd the cold ring.
+    pub(crate) fn read_ahead_unread(&self, since: Instant) -> u64 {
         if !self.read_ahead.tracking() {
             return 0;
         }
@@ -406,9 +465,18 @@ impl MessageCache {
         self.read_ahead.update(&fills);
         fills
             .values()
-            .filter(|fill| !fill.read)
+            .filter(|fill| !fill.read && fill.at >= since)
             .map(|fill| fill.weight)
             .sum()
+    }
+
+    /// Make every read-ahead fill `by` older, for tests of its accounting.
+    #[cfg(test)]
+    pub(crate) fn age_read_ahead(&self, by: Duration) {
+        let mut fills = self.read_ahead.fills.lock().unwrap();
+        for fill in fills.values_mut() {
+            fill.at = fill.at.checked_sub(by).unwrap_or(fill.at);
+        }
     }
 
     pub fn read(
@@ -465,10 +533,6 @@ impl MessageCache {
     ) -> Result<(Bytes, Option<T>), DataServerError> {
         deadline::check()?;
         let key = MessageKey::new(path.as_ref(), entry);
-        if let Some(bytes) = self.first_read_ahead(&key) {
-            deadline::check()?;
-            return Ok((bytes, None));
-        }
         let mut validated = None;
         let fill = || {
             let bytes = reader::fetch_message_bytes(store, path, entry)?;
@@ -484,36 +548,46 @@ impl MessageCache {
                 bytes
             })
         };
-        // Probed before the read-ahead's mark is read: it marks a fill
-        // before claiming it, so a claim found taken by a read-ahead is
-        // always seen marked.
-        let bytes = match self
-            .cache
-            .get_value_or_guard_untracked(&key, Duration::ZERO)
-        {
-            CacheEntry::Value(bytes) => {
-                self.cache.record_hit();
-                bytes
+        let mut joined = false;
+        let bytes = loop {
+            if let Some(bytes) = self.first_read_ahead(&key) {
+                deadline::check()?;
+                return Ok((bytes, None));
             }
-            CacheEntry::Vacant(claim) => self.fill_claimed(&key, claim, fill)?,
-            CacheEntry::Timeout => match self.read_ahead_wait(&key) {
-                None => self.cache.get_or_insert_with(&key, fill)?,
-                Some(wait) => match self.cache.get_value_or_guard_untracked(&key, wait) {
-                    CacheEntry::Value(bytes) => {
-                        self.cache.record_hit();
-                        bytes
+            if !joined {
+                match self.join_read_ahead(&key) {
+                    Join::None => {}
+                    Join::Done => {
+                        joined = true;
+                        continue;
                     }
-                    CacheEntry::Vacant(claim) => self.fill_claimed(&key, claim, fill)?,
-                    CacheEntry::Timeout => {
+                    Join::TimedOut => {
                         // Read around the stalled read-ahead, admitting
-                        // nothing: it still holds the fill.
+                        // nothing: its fill will.
                         self.cache.record_bypass();
                         let bytes = fill()?;
                         deadline::check()?;
                         return Ok((bytes, validated));
                     }
-                },
-            },
+                }
+            }
+            match self
+                .cache
+                .get_value_or_guard_untracked(&key, Duration::ZERO)
+            {
+                CacheEntry::Value(bytes) => {
+                    self.cache.record_hit();
+                    break bytes;
+                }
+                // The read-ahead marks a fetch before it looks for a claim,
+                // and this claim is taken before the mark is read: one of
+                // the two sees the other, and the message is fetched once.
+                CacheEntry::Vacant(claim) if !joined && self.filling.contains(&key) => {
+                    drop(claim);
+                }
+                CacheEntry::Vacant(claim) => break self.fill_claimed(&key, claim, fill)?,
+                CacheEntry::Timeout => break self.cache.get_or_insert_with(&key, fill)?,
+            }
         };
         if validated.is_none() {
             // A hit, or another reader's fill: the first read of a
@@ -547,22 +621,30 @@ impl MessageCache {
         Ok(bytes)
     }
 
-    /// How long a request waits on the fill of `key` a map read-ahead holds
-    /// (#1335): half its remaining time. `None` when no read-ahead fills it,
-    /// or no deadline is in scope.
-    fn read_ahead_wait(&self, key: &MessageKey) -> Option<Duration> {
-        if !self.filling.contains(key) {
-            return None;
+    /// Wait for the read-ahead fetching `key` (#1335), if one is: for half
+    /// the request's remaining time, as long as the fetch takes without a
+    /// deadline in scope.
+    fn join_read_ahead(&self, key: &MessageKey) -> Join {
+        let Some(filled) = self.filling.signal(key) else {
+            return Join::None;
+        };
+        let wait = deadline::current().map(|end| end.saturating_duration_since(Instant::now()) / 2);
+        if filled.wait(wait) {
+            Join::Done
+        } else {
+            Join::TimedOut
         }
-        deadline::current().map(|end| end.saturating_duration_since(Instant::now()) / 2)
     }
 
-    /// Fill `key` ahead of a map's read of it (#1335): claim its
-    /// single-flight fill, `fetch` the message and admit it. A request for
-    /// the message meanwhile joins the fill rather than fetch it again, for
-    /// at most half its remaining time. Not kept, and its first read peeks
-    /// it ([`Self::first_read_ahead`]), as a map's own fill is never looked
-    /// up again: in a full cache it waits in the cold ring, and leaves first
+    /// Fill `key` ahead of a map's read of it (#1335): `fetch` the message
+    /// and admit it. A request for the message meanwhile waits for the fetch
+    /// rather than fetch it again, for at most half its remaining time
+    /// ([`Self::get_with`]). The fill holds no single-flight claim and is
+    /// admitted with a plain insert, unread: `quick_cache` admits a claimed
+    /// fill that had waiters as read, and a request catching up with the
+    /// read-ahead would promote it. Not kept, and its first read peeks it
+    /// ([`Self::first_read_ahead`]), as a map's own fill is never looked up
+    /// again: in a full cache it waits in the cold ring, and leaves first
     /// unless read twice.
     ///
     /// The one fill admitted without a decode: `fetch` checks the length,
@@ -571,8 +653,8 @@ impl MessageCache {
     /// decode of any fill does.
     ///
     /// Returns the bytes fetched; `None` without a fetch for a message
-    /// resident or being filled by another reader. Counts no hit and no
-    /// miss: no request asked for it.
+    /// resident or being filled by a request. Counts no hit and no miss: no
+    /// request asked for it.
     pub(crate) fn read_ahead(
         &self,
         key: &MessageKey,
@@ -581,35 +663,38 @@ impl MessageCache {
         if self.cache.contains_key(key) {
             return Ok(None);
         }
-        // Dropped after the claim, which is declared after it.
-        let _mark = self.filling.mark(key);
-        let CacheEntry::Vacant(claim) =
-            self.cache.get_value_or_guard_untracked(key, Duration::ZERO)
-        else {
+        // Raised when this returns, the fill admitted or not.
+        let Some(_mark) = self.filling.mark(key) else {
             return Ok(None);
         };
+        // Marked before a claim is looked for, where `get_with` takes its
+        // claim before it reads the mark: of a request filling the message
+        // meanwhile, one of the two sees the other.
+        match self.cache.get_value_or_guard_untracked(key, Duration::ZERO) {
+            CacheEntry::Vacant(claim) => drop(claim),
+            CacheEntry::Value(_) | CacheEntry::Timeout => return Ok(None),
+        }
         let bytes = fetch()?;
         let fetched = bytes.len();
         let weight = weight(key, &bytes);
-        // Recorded before the fill is published, so that a request joining
-        // it counts.
+        if weight > self.cache.capacity_bytes() {
+            return Ok(Some(fetched));
+        }
+        // Recorded before the fill is admitted, so that a request waiting
+        // for it takes its first read.
         {
             let mut fills = self.read_ahead.fills.lock().unwrap();
             if fills.len() >= MAX_UNREAD {
                 fills.retain(|key, _| self.cache.contains_key(key));
             }
             if fills.len() < MAX_UNREAD {
-                let read = false;
-                fills.insert(key.clone(), AheadFill { weight, read });
+                let (read, at) = (false, Instant::now());
+                fills.insert(key.clone(), AheadFill { weight, read, at });
             }
             self.read_ahead.update(&fills);
         }
-        let bytes = if weight <= self.cache.capacity_bytes() {
-            Bytes::copy_from_slice(&bytes)
-        } else {
-            bytes
-        };
-        let _ = claim.insert(bytes);
+        self.cache
+            .insert(key.clone(), Bytes::copy_from_slice(&bytes));
         if !self.cache.contains_key(key) {
             self.read_ahead.forget(key);
         }
