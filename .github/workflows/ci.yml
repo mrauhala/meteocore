@@ -181,6 +181,62 @@ jobs:
       - name: cargo deny check licenses
         run: cargo deny --locked check licenses
 
+  # Prometheus alert rules (#1375): docker/prometheus/rules/meteocore.yml,
+  # which the compose stack loads and the Helm chart ships as a
+  # PrometheusRule. `promtool check rules` parses them, and `promtool test
+  # rules` runs their unit tests: each alert fires on a failing series and
+  # stays quiet on a healthy one. promtool comes from the Prometheus release
+  # the compose stack runs (dhi.io/prometheus:3.11), its tarball checked
+  # against the release's SHA-256, also when it comes from the cache. No
+  # compilation, so a job of its own.
+  rules:
+    name: Alert rules (promtool)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PROMETHEUS_VERSION: 3.11.3
+      PROMETHEUS_SHA256: 9479af67673316278958cda1f39b88a09f8921084e039c65acca060d0447bb38
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # The release tarball is ~110 MB, of which promtool is one file.
+      - name: Cache the Prometheus release
+        id: prometheus-cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/prometheus.tar.gz
+          key: prometheus-${{ env.PROMETHEUS_VERSION }}-linux-amd64-${{ env.PROMETHEUS_SHA256 }}
+
+      - name: Download the Prometheus release
+        if: steps.prometheus-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o "${RUNNER_TEMP}/prometheus.tar.gz" \
+            "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz"
+
+      - name: Install promtool
+        run: |
+          set -euo pipefail
+          name="prometheus-${PROMETHEUS_VERSION}.linux-amd64"
+          echo "${PROMETHEUS_SHA256}  ${RUNNER_TEMP}/prometheus.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/prometheus.tar.gz" -C "${RUNNER_TEMP}" "${name}/promtool"
+          sudo install "${RUNNER_TEMP}/${name}/promtool" /usr/local/bin/promtool
+          promtool --version
+
+      - name: promtool check rules
+        run: promtool check rules docker/prometheus/rules/meteocore.yml
+
+      - name: promtool test rules
+        run: promtool test rules docker/prometheus/rules/meteocore.test.yml
+
+      # Syntax only: rule_files names the path compose mounts the rules at.
+      - name: promtool check config
+        run: promtool check config --syntax-only docker/prometheus.yml
+
   docker-check:
     name: Docker Build (PR)
     needs: check

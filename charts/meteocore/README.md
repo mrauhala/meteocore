@@ -232,6 +232,16 @@ public.
 - `serviceMonitor.enabled` creates a Prometheus Operator ServiceMonitor for
   `/metrics` on the Service port. Add the labels your Prometheus selects on
   in `serviceMonitor.labels`.
+- `prometheusRule.enabled` creates a PrometheusRule with the repository's
+  alert rules, `docker/prometheus/rules/meteocore.yml`: a stale, empty or
+  failed collection, 5xx and WMS error-tile rates, shed requests, upstream
+  throttling and memory. The repository README's Alerting section lists
+  them and their thresholds. Their `job="meteocore"` selectors name the
+  ServiceMonitor's job, the Service's name, or `prometheusRule.job` when
+  something else scrapes the pods. Add the labels your Prometheus selects
+  rules on in `prometheusRule.labels`. To change a threshold, leave this off
+  and deploy an edited copy of the file. Routing the alerts is up to your
+  Alertmanager.
 - `grafanaDashboard.enabled` puts the repository's dashboard,
   `docker/grafana/dashboards/meteocore-overview.json`, in a ConfigMap
   labelled `grafana_dashboard: "1"` for the Grafana sidecar. It is a
@@ -318,6 +328,9 @@ against that.
 | `serviceMonitor.interval` | `30s` | |
 | `serviceMonitor.scrapeTimeout` | `""` | |
 | `serviceMonitor.relabelings`, `serviceMonitor.metricRelabelings` | `[]` | |
+| `prometheusRule.enabled` | `false` | The alert rules as a PrometheusRule |
+| `prometheusRule.labels` | `{}` | |
+| `prometheusRule.job` | `""` | The scrape job the rules match; the Service's name, the ServiceMonitor's job, when empty |
 | `grafanaDashboard.enabled` | `false` | |
 | `grafanaDashboard.namespace` | `""` | The release namespace when empty |
 | `grafanaDashboard.labels` | `grafana_dashboard: "1"` | |

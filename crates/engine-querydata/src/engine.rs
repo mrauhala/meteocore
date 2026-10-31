@@ -210,6 +210,15 @@ impl QueryDataEngine {
         Some(Utc::now() - newest)
     }
 
+    /// The spacing of the newest runs' origin times, the timeline
+    /// [`Self::data_age`] is measured on, for the
+    /// `collection_expected_interval_seconds` gauge (#1375):
+    /// [`ds_core::health::expected_interval`]. `None` below two runs
+    /// (`max_runs = 1`).
+    pub fn expected_interval(&self) -> Option<chrono::Duration> {
+        ds_core::health::expected_interval(self.runs.load().runs.keys().rev().copied())
+    }
+
     /// Time since the engine loaded or a poll last found a loadable run set,
     /// for `/health` `poll_age_secs`. It grows while the directory is
     /// unreadable, empty or holds only unloadable files (the old runs are
@@ -1985,6 +1994,33 @@ mod tests {
             "poll age {poll_age}"
         );
         assert_data_age();
+    }
+
+    /// #1375: the expected interval is the spacing of the newest runs'
+    /// origin times, the timeline `data_age` is measured on; a single run
+    /// (`max_runs = 1`) has none.
+    #[test]
+    fn expected_interval_is_the_spacing_of_the_newest_runs() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        assert_eq!(engine.expected_interval(), None, "one run");
+
+        // Four 6-hourly runs, the 12Z one missing: the same file under each
+        // origin time.
+        let set = engine.runs.load();
+        let (&origin, run) = set.runs.iter().next_back().unwrap();
+        let runs = [0, 6, 18, 24]
+            .map(|hours| {
+                let entry = RunEntry {
+                    data: run.data.clone(),
+                    path: run.path.clone(),
+                };
+                (origin + chrono::Duration::hours(hours), entry)
+            })
+            .into_iter()
+            .collect();
+        engine.runs.store(Arc::new(RunSet { runs, wind: None }));
+        assert_eq!(engine.expected_interval(), Some(chrono::Duration::hours(6)));
     }
 
     #[test]

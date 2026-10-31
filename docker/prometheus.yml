@@ -1,3 +1,10 @@
+# Alert rules (#1375), mounted from docker/prometheus/rules by compose.yaml.
+# The file by name: its directory also holds the rules' unit tests, which
+# are no rules file. The alerts show on Prometheus's Alerts page; routing
+# them to people needs an Alertmanager, which the stack does not run.
+rule_files:
+  - /etc/prometheus/rules/meteocore.yml
+
 scrape_configs:
   - job_name: meteocore
     scrape_interval: 15s

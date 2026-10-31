@@ -7,7 +7,7 @@ pub mod params;
 use axum::routing::get;
 use axum::Router;
 
-pub use handlers::{AppState, WmsState};
+pub use handlers::{AppState, ErrorTile, WmsState, ERROR_TILE_REASONS};
 
 pub fn router(state: AppState) -> Router {
     Router::new()

@@ -399,6 +399,21 @@
         }
       }
     },
+    "prometheusRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "labels": {
+          "$ref": "#/definitions/stringMap"
+        },
+        "job": {
+          "type": "string"
+        }
+      }
+    },
     "grafanaDashboard": {
       "type": "object",
       "additionalProperties": false,

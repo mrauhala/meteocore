@@ -537,7 +537,10 @@ rendered-cache lookup): `hit`, `assembled` (meta-tiles all cached) or `cold`.
 A layer list is labelled by its bottom layer's collection and is
 `assembled` only when every layer was; drawing layers over each other
 counts as `assemble`.
-An error tile carries none. Maps and Tiles report `hit`/`cold` the same way.
+An error tile carries none: it carries an `ErrorTile` (the bottom layer's
+collection and a reason from `ERROR_TILE_REASONS`), which `/metrics` counts
+as `wms_error_tiles_total` (#1375), since no status code sees a 200. A 304
+revalidating one carries it too. Maps and Tiles report `hit`/`cold` the same way.
 Its render phases (#147) reuse the slow-render log's measurements, never a
 second timer: `sem_wait` is `queue`; a meta-tiled view reports
 `MetaTileStats.engine` (uncached tiles only) as `engine`, `assemble`, and

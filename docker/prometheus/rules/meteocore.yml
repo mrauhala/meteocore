@@ -1,0 +1,184 @@
+# MeteoCore alert rules (#1375): stale or empty collections, failed
+# collections, error rates, shed requests, upstream throttling and memory.
+#
+# Loaded by docker/prometheus.yml (rule_files) and shipped by the Helm chart
+# as a PrometheusRule (prometheusRule.enabled), which reads this file through
+# its rules/ symlink and replaces job="meteocore" with its ServiceMonitor's
+# job. Every selector names job="meteocore", so the rules see only the
+# MeteoCore scrape job: keep it in each new selector.
+#
+# The thresholds are starting points; the README's Alerting section lists
+# them and how to change them. Each alert has a rule unit test that fires and
+# one that stays quiet in meteocore.test.yml:
+#
+#   promtool check rules docker/prometheus/rules/meteocore.yml
+#   promtool test rules docker/prometheus/rules/meteocore.test.yml
+#
+# Routing (who is told, and how) belongs to the deployment's Alertmanager.
+
+groups:
+  - name: meteocore.availability
+    rules:
+      - alert: MeteoCoreDown
+        expr: up{job="meteocore"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "MeteoCore {{ $labels.instance }} is down"
+          description: "Prometheus has not scraped {{ $labels.instance }} for 2 minutes."
+
+      - alert: CollectionsFailed
+        expr: collections_failed{job="meteocore"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} collection(s) failed on {{ $labels.instance }}"
+          description: "Collections failed to load or lost their source. /health names them and their errors."
+
+  - name: meteocore.freshness
+    rules:
+      # The data age is now minus the newest data a collection serves; the
+      # expected interval is the spacing of its newest timesteps or runs, or
+      # its expected_interval. Stale: 3 intervals old, and at least 15
+      # minutes past one interval, so a feed every minute is not stale after
+      # three. A collection with no interval series (a single timestep and
+      # no expected_interval) never matches.
+      - alert: CollectionStale
+        expr: |
+          collection_data_age_seconds{job="meteocore"}
+            >= 3 * collection_expected_interval_seconds{job="meteocore"}
+          and
+          collection_data_age_seconds{job="meteocore"}
+            >= collection_expected_interval_seconds{job="meteocore"} + 900
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collection {{ $labels.collection }} is stale"
+          description: "The newest data {{ $labels.collection }} serves is {{ $value | humanizeDuration }} old, over 3 times the interval its data arrives at."
+
+      # A collection that never loaded data, or whose data all aged out of
+      # its window, has no data age series: collection_has_data says so.
+      - alert: CollectionEmpty
+        expr: collection_has_data{job="meteocore"} == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collection {{ $labels.collection }} holds no data"
+          description: "{{ $labels.collection }} has held no data for 15 minutes: it never loaded any, or all of it aged out."
+
+  - name: meteocore.errors
+    rules:
+      # Per API; operational routes (/health, /metrics, /admin) have no api
+      # label and are left out.
+      - alert: HighServerErrorRate
+        expr: |
+          sum by (job, instance, api) (
+            rate(http_requests_total{job="meteocore", api!="", status=~"5.."}[5m])
+          )
+          /
+          sum by (job, instance, api) (
+            rate(http_requests_total{job="meteocore", api!=""}[5m])
+          )
+          > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.api }} answers {{ $value | humanizePercentage }} of requests with 5xx"
+          description: "More than 5 % of {{ $labels.api }} requests on {{ $labels.instance }} failed with a 5xx status for 10 minutes."
+
+      # GetMap answers a failed render with a red tile and HTTP 200, so the
+      # 5xx rule never sees it. Served GetMaps are the error tiles plus the
+      # renders in render_duration_seconds; a collection that serves only
+      # error tiles has no render series, hence the `or`.
+      - alert: WmsErrorTiles
+        expr: |
+          sum by (job, instance, collection) (rate(wms_error_tiles_total{job="meteocore"}[5m]))
+          /
+          (
+              sum by (job, instance, collection) (rate(wms_error_tiles_total{job="meteocore"}[5m]))
+            +
+              (
+                  sum by (job, instance, collection) (
+                    rate(render_duration_seconds_count{job="meteocore", api="wms"}[5m])
+                  )
+                or
+                  sum by (job, instance, collection) (rate(wms_error_tiles_total{job="meteocore"}[5m])) * 0
+              )
+          )
+          > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "WMS serves error tiles for {{ $labels.collection }}"
+          description: "{{ $value | humanizePercentage }} of GetMap responses for {{ $labels.collection }} on {{ $labels.instance }} are the red error tile; the server log has the render errors."
+
+      # Requests answered 503 by admission: a full render queue, a render too
+      # large for memory, an expired render deadline, and each read budget.
+      # render_budget_rejected_total{reason="deadline"} is left out: it is
+      # also a render_deadline_exceeded_total. Each counter gets its own
+      # `counter` label, as series of different names that rate() strips to
+      # the same labels would collide; a budget whose engine is not loaded
+      # has no series and adds nothing.
+      - alert: RequestsShed
+        expr: |
+          sum by (job, instance) (
+              label_replace(rate(render_queue_rejected_total{job="meteocore"}[5m]), "counter", "render_queue", "", "")
+            or
+              label_replace(rate(render_budget_rejected_total{job="meteocore", reason="oversize"}[5m]), "counter", "render_budget", "", "")
+            or
+              label_replace(rate(render_deadline_exceeded_total{job="meteocore"}[5m]), "counter", "render_deadline", "", "")
+            or
+              label_replace(rate(edr_response_rejected_total{job="meteocore"}[5m]), "counter", "edr_response", "", "")
+            or
+              label_replace(rate(geotiff_decode_rejected_total{job="meteocore"}[5m]), "counter", "geotiff_decode", "", "")
+            or
+              label_replace(rate(netcdf_read_rejected_total{job="meteocore"}[5m]), "counter", "netcdf_read", "", "")
+            or
+              label_replace(rate(pvol_read_rejected_total{job="meteocore"}[5m]), "counter", "pvol_read", "", "")
+            or
+              label_replace(rate(zarr_read_rejected_total{job="meteocore"}[5m]), "counter", "zarr_read", "", "")
+            or
+              label_replace(rate(station_grid_compute_rejected_total{job="meteocore"}[5m]), "counter", "station_grid_compute", "", "")
+          )
+          /
+          sum by (job, instance) (rate(http_requests_total{job="meteocore"}[5m]))
+          > 0.01
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MeteoCore {{ $labels.instance }} sheds {{ $value | humanizePercentage }} of requests"
+          description: "Admission rejections and deadline expiries are above 1 % of requests for 10 minutes. The Rendering & caches and Memory & admission tabs of the dashboard show which queue or budget."
+
+  - name: meteocore.resources
+    rules:
+      - alert: UpstreamThrottled
+        expr: rate(storage_host_throttled_total{job="meteocore"}[5m]) > 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.host }} throttles MeteoCore"
+          description: "{{ $labels.host }} has answered 429 Too Many Requests for 15 minutes; collections it serves may fall behind."
+
+      # Resident memory over the memory plan's total, memory_plan_total_bytes
+      # (#1312): the memory the server sizes its caches and budgets to fit.
+      # A server without that gauge has no series here, so the alert stays
+      # quiet rather than guessing a threshold.
+      - alert: MemoryHigh
+        expr: |
+          process_resident_memory_bytes{job="meteocore"}
+            > on (job, instance) group_left ()
+          memory_plan_total_bytes{job="meteocore"}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MeteoCore {{ $labels.instance }} uses {{ $value | humanize1024 }}B of memory"
+          description: "Resident memory has been above the memory plan's total for 15 minutes. GET /admin/cache-plan lists the caches and budgets that hold it."

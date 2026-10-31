@@ -108,6 +108,7 @@ fn build_empty_router() -> axum::Router {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -335,6 +336,7 @@ fn build_failing_router() -> axum::Router {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -425,6 +427,48 @@ async fn error_tile_is_encoded_in_the_requested_format() {
         assert_magic(requested, &reply.body, extra);
         assert_eq!(reply.body, expected.unwrap(), "{extra}");
     }
+}
+
+/// #1375: an error tile is a 200, so its response carries what `/metrics`
+/// counts it by (`wms_error_tiles_total`): the collection and the reason,
+/// also on a 304 revalidation. A served render carries none.
+#[tokio::test]
+async fn error_tile_carries_its_metrics_label() {
+    let uri = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=broken&STYLES=\
+               &CRS=CRS:84&BBOX=10,55,30,70&WIDTH=64&HEIGHT=64&FORMAT=image/png";
+    let expected = api_wms::ErrorTile {
+        collection: "broken".into(),
+        reason: "internal",
+    };
+    let app = build_failing_router();
+    let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-cache"], "ERROR");
+    assert_eq!(
+        resp.extensions().get::<api_wms::ErrorTile>(),
+        Some(&expected)
+    );
+    let etag = resp.headers()["etag"].clone();
+    let request = Request::builder()
+        .uri(uri)
+        .header("if-none-match", etag)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        resp.extensions().get::<api_wms::ErrorTile>(),
+        Some(&expected)
+    );
+
+    let request = Request::builder()
+        .uri(uri.replace("LAYERS=broken", "LAYERS=radar"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = build_populated_router().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.extensions().get::<api_wms::ErrorTile>(), None);
 }
 
 /// A failed render is transient: its error tile under an explicit TIME must
@@ -553,6 +597,7 @@ fn build_populated_state_with_wms(
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -953,6 +998,7 @@ fn build_counting_router_versioned(
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -1232,6 +1278,7 @@ fn build_snapping_router_with(
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -1696,6 +1743,7 @@ fn site_collection_config(id: &str) -> CollectionConfig {
         derive_geopotential_height: None,
         discovery: None,
         derive_humidity: None,
+        expected_interval: None,
     }
 }
 
@@ -1996,6 +2044,7 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -2356,6 +2405,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -2441,6 +2491,7 @@ fn capabilities_emit_reference_time_dimension_for_forecast() {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -2519,6 +2570,7 @@ fn capabilities_omit_reference_time_dimension_for_non_forecast() {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -2858,6 +2910,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
     let cmap = Arc::new(LutColorMap::from_builtin(
@@ -3053,6 +3106,7 @@ fn build_advancing_router() -> AdvancingFixture {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -4574,6 +4628,7 @@ mod per_parameter_times {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -5479,6 +5534,7 @@ mod composites {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         };
         let style = StyleInfo {
             name: "default".to_string(),
@@ -6250,6 +6306,7 @@ fn archive_capabilities() -> String {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
     let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
