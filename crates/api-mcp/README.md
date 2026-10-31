@@ -81,7 +81,12 @@ Errors:
   or non-nowcast collection lists the storm-cell collections, and an unknown
   `sort_by` lists the sortable properties. Out-of-range values are rejected,
   never clamped. Unknown argument names (`count` for `limit`) are rejected.
-- Engine failures return a generic `Query failed` error. The detail goes to
+- An engine failure answers by its class, as in every API
+  (`ds_core::error::ErrorClass`): a request the engine turns down or a
+  resource it does not have is `invalid_params` with the engine's message; a
+  busy engine or the deadline an internal error "Server busy, try again
+  later"; a data source that keeps refusing reads one naming no upstream;
+  anything else a generic `Query failed`. The detail of the last two goes to
   the server log only.
 
 ## Endpoint and authentication

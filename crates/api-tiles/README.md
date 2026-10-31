@@ -115,13 +115,16 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
   everything else is `public, max-age=60, must-revalidate`.
 - Vector tiles carry `ETag`, `x-cache` and `Cache-Control: public, max-age=300`.
 - Errors are JSON `{"code", "description"}`. 400: a bad parameter, an
-  engine's parameter error, zoom above 24, or an unknown tile matrix set on a
-  tile route. 404: unknown collection, style or tile matrix set, or a tile
-  outside the matrix. 422: a vector tile over 50 000 features. 500: generic
-  message. 503 + `Retry-After: 1`: render slots, deadline or memory exhausted.
-  503 `SourceUnavailable` + `Retry-After: 10`: the data's object store kept
+  engine's request error, zoom above 24, or an unknown tile matrix set on a
+  tile route. 404: unknown collection, style or tile matrix set, a tile
+  outside the matrix, or what the engine reports absent. 422: a vector tile
+  over 50 000 features. 500: generic message. 503 + `Retry-After: 1`: render
+  slots, deadline or memory exhausted, or a busy engine. 503
+  `SourceUnavailable` + `Retry-After: 10`: the data's object store kept
   answering 429, 502, 503 or 504 through all of its retries. Its
-  description names no upstream; the server logs the error at WARN.
+  description names no upstream; the server logs the error at WARN. Map and
+  vector tiles answer an engine's error alike, by its class
+  (`ds_core::error::ErrorClass`), as every API does.
 
 ## Conformance
 

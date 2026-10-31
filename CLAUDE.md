@@ -808,8 +808,8 @@ one never implies the other.
 - A new source cap must name the pixel space it counts and fail with
   `InvalidParameter`/`QueryTooLarge` (400 with its message in Maps/Tiles/EDR).
   `Engine(..)` is an opaque 500 there, and WMS GetMap turns every engine
-  error except `ResourceExhausted`/`DeadlineExceeded`/`Unavailable` (503)
-  into the red tile.
+  error whose class is not transient (`ErrorClass::is_transient`: busy,
+  deadline, unavailable source, each a 503) into the red tile.
 
 ## Shared Domain Machinery (ds-core, `crates/core/`)
 
@@ -1123,6 +1123,17 @@ one never implies the other.
   - GRIB position and trajectory queries fail with it, instead of sampling
     the field as null.
   - S3 stores retry per `S3_RETRY` in `crates/storage/src/lib.rs`.
+- **`DataServerError::class()`** (#17) is the one map from a variant to how
+  every API answers it (`ds_core::error::ErrorClass`): `BadRequest` 400 with
+  its message, `NotFound` 404, `Busy` 503 + `Retry-After: 1`,
+  `DeadlineExceeded` 503 + `Retry-After: 1` (EDR: 504), `SourceUnavailable`
+  503 + `Retry-After: 10`, `Internal` 500. API crates match on the class,
+  never on the variants, so a new variant needs only its class in ds-core.
+  `Storage` is `Internal`: a store failure worth a retry is `Unavailable`.
+  Each API keeps its own body (WMS XML, OGC JSON, 3D Tiles `{"error"}`,
+  MCP JSON-RPC). The per-API suites run every variant through a real
+  handler (`crates/api-common/tests/support/engine_errors.rs`); add a new
+  variant there too.
 
 ## Engine Capabilities
 
@@ -1635,8 +1646,8 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
 
 - Use `thiserror` for error types, not manual `impl Display`.
 - Engine methods return `Result<T, DataServerError>`.
-- Keep handlers thin — delegate logic to the engine, map errors to HTTP
-  status codes.
+- Keep handlers thin — delegate logic to the engine, map engine errors to
+  HTTP status codes by `DataServerError::class()`, never by variant (#17).
 - Use `serde_json::json!` for building JSON responses.
 - Do not leak internal error details to clients — generic messages for 500s.
 - Public ds-core domain structs (`RasterInfo`, `CollectionConfig`, …) are

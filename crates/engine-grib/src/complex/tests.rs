@@ -571,11 +571,184 @@ fn a_prefix_parses_as_the_whole_message() {
     }
 }
 
+/// Each section of `message` from Section 1 on: its number, where it starts
+/// and its length.
+fn sections(message: &[u8]) -> Vec<(u8, usize, usize)> {
+    let mut found = Vec::new();
+    let mut at = 16;
+    while &message[at..at + 4] != b"7777" {
+        let len = u32::from_be_bytes(message[at..at + 4].try_into().unwrap()) as usize;
+        found.push((message[at + 4], at, len));
+        at += len;
+    }
+    found
+}
+
+/// `message` with its Section 7 `less` bytes shorter, the section's and the
+/// message's lengths restated: a whole message to `grib`, whose groups say
+/// there is more data.
+fn shorter_section7(message: &[u8], less: usize) -> Vec<u8> {
+    let (_, s7, s7_len) = *sections(message).last().unwrap();
+    let mut cut = message[..s7 + s7_len - less].to_vec();
+    cut.extend(b"7777");
+    cut[s7..s7 + 4].copy_from_slice(&((s7_len - less) as u32).to_be_bytes());
+    let total = cut.len() as u64;
+    cut[8..16].copy_from_slice(&total.to_be_bytes());
+    cut
+}
+
+/// `message`, in template 5.3, recoded as template 5.2: the same groups,
+/// without the spatial differencing's two octets in Section 5 and its extra
+/// descriptors in Section 7. It decodes, to other values.
+fn without_differencing(message: &[u8]) -> Vec<u8> {
+    let mut recoded = message[..16].to_vec();
+    let mut extra = 0;
+    for (number, start, len) in sections(message) {
+        let section = &message[start..start + len];
+        match number {
+            5 => {
+                extra = (usize::from(section[47]) + 1) * usize::from(section[48]);
+                recoded.extend(((len - 2) as u32).to_be_bytes());
+                recoded.push(5);
+                recoded.extend(&section[5..9]);
+                recoded.extend(2u16.to_be_bytes());
+                recoded.extend(&section[11..47]);
+            }
+            7 => {
+                recoded.extend(((len - extra) as u32).to_be_bytes());
+                recoded.push(7);
+                recoded.extend(&section[5 + extra..]);
+            }
+            _ => recoded.extend(section),
+        }
+    }
+    recoded.extend(b"7777");
+    let total = recoded.len() as u64;
+    recoded[8..16].copy_from_slice(&total.to_be_bytes());
+    recoded
+}
+
+/// The full decode's error on `message`: the Section 7 check's (#1325),
+/// never the panic backstop's.
+fn section7_error(message: &[u8]) -> String {
+    let error = decode_message(message, "x")
+        .map(drop)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Invalid GRIB2 data section"), "{error}");
+    error
+}
+
+/// #1325: `grib`'s complex packing decoder slices Section 7 without a bounds
+/// check, and panics on a section shorter than its groups. The full decode
+/// checks the groups first: a clean error for templates 5.3 and 5.2, cut
+/// inside the data or the descriptors, with or without a bitmap.
+#[test]
+fn a_section_7_shorter_than_its_groups_fails_the_full_decode() {
+    for message in [temperature(), soil()] {
+        let header = Header::parse(&message).unwrap();
+        let data = header.payload_len - header.layout.data;
+        let recoded = without_differencing(&message);
+        assert!(decode_message(&recoded, "x").is_ok());
+        for less in [1, data / 2, data] {
+            let error = section7_error(&shorter_section7(&message, less));
+            assert!(error.contains("data"), "less {less}: {error}");
+            let error = section7_error(&shorter_section7(&recoded, less));
+            assert!(error.contains("data"), "5.2, less {less}: {error}");
+        }
+        let into_descriptors = shorter_section7(&message, data + 1);
+        let error = section7_error(&into_descriptors);
+        assert!(
+            error.contains("group descriptors past Section 7"),
+            "{error}"
+        );
+    }
+
+    // What else `grib` panics on there: the missing order of spatial
+    // differencing, and a 32-bit group reference it unwraps as an `i32`.
+    let values: Vec<_> = smooth(360 * 181, 3)
+        .into_iter()
+        .map(Value::Present)
+        .collect();
+    let message = Complex::global().message(&values);
+    assert!(decode_message(&message, "x").is_ok());
+    let mut missing_order = message.clone();
+    missing_order[S5 + 47] = 255;
+    let error = section7_error(&missing_order);
+    assert!(error.contains("order of spatial differencing"), "{error}");
+    let mut wide_reference = message.clone();
+    wide_reference[S5 + 19] = 32;
+    let (_, s7, _) = *sections(&message).last().unwrap();
+    let refs = s7 + 5 + 3 * 2;
+    wide_reference[refs..refs + 4].fill(0xff);
+    let error = section7_error(&wide_reference);
+    assert!(error.contains("group reference over 31 bits"), "{error}");
+
+    // A group longer than the field, which `grib` would allocate whole: on
+    // a straight ramp every group is constant, of width 0, so no data
+    // bounds the last one's length (Section 5 octets 43 to 46).
+    let nodes = 360 * 181;
+    let ramp: Vec<_> = (0..nodes).map(|k| Value::Present(100 + 3 * k)).collect();
+    let message = Complex::global().message(&ramp);
+    assert!(decode_message(&message, "x").is_ok());
+    for length in [nodes + 1, 16 * nodes] {
+        let mut long_last = message.clone();
+        long_last[S5 + 42..S5 + 46].copy_from_slice(&(length as u32).to_be_bytes());
+        let error = section7_error(&long_last);
+        assert!(error.contains("a group longer than the field"), "{error}");
+    }
+}
+
+/// #1325: `grib` subtracts a section's header, and Section 6's bitmap
+/// indicator, from the section's stated length unchecked, and panics on a
+/// shorter section. Both point readers, a prefix read and the full decode
+/// check the sections first: `Invalid` or an error, never a panic.
+#[test]
+fn sections_shorter_than_grib_parses_are_invalid() {
+    let message = temperature();
+    for (number, start, len) in sections(&message) {
+        let shortest = if number == 6 { 6 } else { 5 };
+        for short in 0..shortest {
+            let mut bytes = message[..start].to_vec();
+            bytes.extend((short as u32).to_be_bytes());
+            bytes.push(number);
+            bytes.extend(&message[start + len..]);
+            let total = bytes.len() as u64;
+            bytes[8..16].copy_from_slice(&total.to_be_bytes());
+            let case = format!("section {number} of {short} octets");
+            assert!(
+                matches!(Header::parse(&bytes), Err(PointError::Invalid(_))),
+                "{case}"
+            );
+            assert!(
+                matches!(
+                    crate::ccsds::Header::parse(&bytes),
+                    Err(PointError::Invalid(_))
+                ),
+                "{case}"
+            );
+            assert!(
+                matches!(
+                    Header::parse_prefix(&bytes, bytes.len()),
+                    Err(PointError::Invalid(_))
+                ),
+                "{case}"
+            );
+            let error = decode_message(&bytes, "x").map(drop).unwrap_err();
+            assert!(
+                error.to_string().contains("shorter than grib parses"),
+                "{case}: {error}"
+            );
+        }
+    }
+}
+
 /// A message cut short, Section 7 declared shorter, corrupt descriptors and
 /// data, and parts that do not hold what a read needs: errors or exactly
 /// the full decode's values, never a panic. `grib` panics on some of these
-/// (slices past Section 7, or integer overflow in a debug build); this
-/// reader must not.
+/// (slices past Section 7, or integer overflow in a debug build); the full
+/// decode checks Section 7 first and catches the rest (#1325), and this
+/// reader must not panic either.
 #[test]
 fn malformed_messages_fail_or_agree_with_the_full_decode() {
     let coords = edge_points();
@@ -588,6 +761,7 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
         for cut in (1..len).step_by(len / 97).chain([len - 5, len - 1]) {
             let short = &message[..cut];
             assert!(Header::parse(short).is_err(), "cut {cut}");
+            assert!(decode_message(short, "x").is_err(), "cut {cut}");
             let Ok(Some(prefix)) = Header::parse_prefix(short, len) else {
                 continue;
             };
@@ -608,15 +782,10 @@ fn malformed_messages_fail_or_agree_with_the_full_decode() {
             }
         }
 
-        // Section 7 declaring fewer bytes.
+        // Section 7 declaring fewer bytes: the full decode fails too.
         for less in [1, 100, len / 2] {
-            let mut cut = message[..len - 4 - less].to_vec();
-            cut.extend(b"7777");
-            let s7 = header.payload_start - 5;
-            let s7_len = u32::from_be_bytes(cut[s7..s7 + 4].try_into().unwrap()) - less as u32;
-            cut[s7..s7 + 4].copy_from_slice(&s7_len.to_be_bytes());
-            let total = cut.len() as u64;
-            cut[8..16].copy_from_slice(&total.to_be_bytes());
+            let cut = shorter_section7(&message, less);
+            section7_error(&cut);
             let ours = catch_unwind(|| Header::parse(&cut).and_then(|h| h.index(&cut, &coords)));
             assert!(
                 matches!(ours, Ok(Err(PointError::Invalid(_)))),

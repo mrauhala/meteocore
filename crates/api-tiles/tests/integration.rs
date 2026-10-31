@@ -15,6 +15,9 @@ use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_mvt::VectorTileCache;
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 
+#[path = "../../api-common/tests/support/engine_errors.rs"]
+mod engine_errors;
+
 // ---------------------------------------------------------------------------
 // Mock engine
 // ---------------------------------------------------------------------------
@@ -751,6 +754,61 @@ mod get_tile {
                 "description": "Data source temporarily unavailable, try again later",
             })
         );
+    }
+
+    /// A `MapEngine` whose every render fails with
+    /// `engine_errors::every_error()` at this index.
+    struct Failing(usize);
+
+    impl MapEngine for Failing {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            _width: u32,
+            _height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Err(engine_errors::every_error().swap_remove(self.0))
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            MockMapEngine::make_info()
+        }
+    }
+
+    /// Every engine error answers its class's status (#17): an absent
+    /// feature is the 404 every API answers, no longer a 500. A 4xx carries
+    /// the engine's message, a 5xx never.
+    #[tokio::test]
+    async fn every_engine_error_answers_its_class_status() {
+        for (i, error) in engine_errors::every_error().iter().enumerate() {
+            let app = build_router_with_engine(Arc::new(Failing(i)));
+            let req = Request::builder()
+                .uri("/collections/radar/tiles/WebMercatorQuad/0/0/0")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            assert_eq!(status.as_u16(), error.class().status_code(), "{error:?}");
+            assert_eq!(
+                resp.headers()
+                    .get("retry-after")
+                    .map(|v| v.to_str().unwrap()),
+                engine_errors::retry_after(error),
+                "{error:?}"
+            );
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(
+                body.contains(engine_errors::SECRET),
+                status.is_client_error(),
+                "{error:?}: {body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1991,7 +2049,11 @@ mod mvt {
     }
 
     fn build_dense_router(emit: usize) -> axum::Router {
-        let engine: Arc<dyn FeatureEngine> = Arc::new(OverflowingFeatureEngine { emit });
+        build_vector_router(Arc::new(OverflowingFeatureEngine { emit }))
+    }
+
+    /// A vector-only collection `dense` served from `engine`.
+    fn build_vector_router(engine: Arc<dyn FeatureEngine>) -> axum::Router {
         let mut feature_engines = HashMap::new();
         let mut feature_collections = HashMap::new();
         feature_engines.insert("dense".to_string(), engine);
@@ -2275,6 +2337,60 @@ mod mvt {
             body_str.contains("tile-too-dense"),
             "422 body should mention the density guard, got: {body_str}"
         );
+    }
+
+    /// A `FeatureEngine` whose every query fails with
+    /// `engine_errors::every_error()` at this index.
+    struct FailingFeatureEngine(usize);
+
+    impl FeatureEngine for FailingFeatureEngine {
+        fn get_features(&self, _: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+            Err(engine_errors::every_error().swap_remove(self.0))
+        }
+
+        fn get_feature(&self, _id: &str) -> Result<Feature, DataServerError> {
+            Err(engine_errors::every_error().swap_remove(self.0))
+        }
+
+        fn feature_count(&self) -> usize {
+            0
+        }
+
+        fn spatial_extent(&self) -> Option<[f64; 4]> {
+            Some([-180.0, -85.0, 180.0, 85.0])
+        }
+    }
+
+    /// A vector tile's engine error answers its class's status (#17), as a
+    /// map tile's does: a busy engine is a 503 to retry and a request the
+    /// engine turns down a 400 with its message, where every error but an
+    /// unavailable source used to be a 500. A 5xx never names the detail.
+    #[tokio::test]
+    async fn every_vector_tile_engine_error_answers_its_class_status() {
+        for (i, error) in engine_errors::every_error().iter().enumerate() {
+            let app = build_vector_router(Arc::new(FailingFeatureEngine(i)));
+            let req = Request::builder()
+                .uri("/collections/dense/tiles/WebMercatorQuad/0/0/0?f=mvt")
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            let status = resp.status();
+            assert_eq!(status.as_u16(), error.class().status_code(), "{error:?}");
+            assert_eq!(
+                resp.headers()
+                    .get("retry-after")
+                    .map(|v| v.to_str().unwrap()),
+                engine_errors::retry_after(error),
+                "{error:?}"
+            );
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(
+                body.contains(engine_errors::SECRET),
+                status.is_client_error(),
+                "{error:?}: {body}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use ds_core::error::{DataServerError, ErrorClass};
 use serde_json::json;
 
 /// axum's [`Query`] whose rejection is this API's JSON 400, not axum's
@@ -38,8 +39,11 @@ pub enum Tiles3dError {
     NotFound(String),
     /// Bad request (e.g. unknown quantity, unparseable datetime) → 400.
     BadRequest(String),
-    /// Server temporarily overloaded → 503.
-    ServiceUnavailable(String),
+    /// Server busy: the request was not admitted or ran out of time, or the
+    /// engine was busy (`ErrorClass::Busy`, `ErrorClass::DeadlineExceeded`)
+    /// → 503 with `Retry-After: 1` and a fixed message, which nothing can
+    /// fill with internal state (#122).
+    ServiceUnavailable,
     /// A data source that kept refusing the reads
     /// (`DataServerError::Unavailable`, #1355) → 503 with `Retry-After: 10`
     /// and a message naming no upstream.
@@ -51,19 +55,20 @@ pub enum Tiles3dError {
 impl IntoResponse for Tiles3dError {
     fn into_response(self) -> Response {
         let retry_after = match self {
-            Tiles3dError::ServiceUnavailable(_) => Some(1),
-            Tiles3dError::SourceUnavailable => {
-                Some(ds_core::error::DataServerError::UNAVAILABLE_RETRY_AFTER_SECS)
-            }
+            Tiles3dError::ServiceUnavailable => Some(1),
+            Tiles3dError::SourceUnavailable => Some(DataServerError::UNAVAILABLE_RETRY_AFTER_SECS),
             _ => None,
         };
         let (status, message) = match self {
             Tiles3dError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             Tiles3dError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
-            Tiles3dError::ServiceUnavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+            Tiles3dError::ServiceUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server busy, try again later".to_string(),
+            ),
             Tiles3dError::SourceUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                ds_core::error::DataServerError::UNAVAILABLE_DESCRIPTION.to_string(),
+                DataServerError::UNAVAILABLE_DESCRIPTION.to_string(),
             ),
             // Don't leak internal detail to the client (CLAUDE.md code style).
             Tiles3dError::Internal(_) => (
@@ -82,26 +87,19 @@ impl IntoResponse for Tiles3dError {
     }
 }
 
-impl From<ds_core::error::DataServerError> for Tiles3dError {
-    fn from(e: ds_core::error::DataServerError) -> Self {
-        use ds_core::error::DataServerError as E;
-        match e {
-            E::ResourceExhausted | E::DeadlineExceeded => {
-                Tiles3dError::ServiceUnavailable(e.to_string())
-            }
+/// An engine's error answers by its class, as in every API (#17).
+impl From<DataServerError> for Tiles3dError {
+    fn from(e: DataServerError) -> Self {
+        match e.class() {
+            ErrorClass::Busy | ErrorClass::DeadlineExceeded => Tiles3dError::ServiceUnavailable,
             // Logged at WARN: an upstream's throttling is no server fault.
-            E::Unavailable(_) => {
+            ErrorClass::SourceUnavailable => {
                 tracing::warn!("3D Tiles content error: {e}");
                 Tiles3dError::SourceUnavailable
             }
-            E::InvalidParameter(m)
-            | E::InvalidBbox(m)
-            | E::InvalidDatetime(m)
-            | E::QueryTooLarge(m) => Tiles3dError::BadRequest(m),
-            E::CollectionNotFound(m) | E::LocationNotFound(m) | E::FeatureNotFound(m) => {
-                Tiles3dError::NotFound(m)
-            }
-            other => Tiles3dError::Internal(other.to_string()),
+            ErrorClass::BadRequest => Tiles3dError::BadRequest(e.to_string()),
+            ErrorClass::NotFound => Tiles3dError::NotFound(e.to_string()),
+            ErrorClass::Internal => Tiles3dError::Internal(e.to_string()),
         }
     }
 }
@@ -110,7 +108,7 @@ impl From<ds_executor::ExecutionError> for Tiles3dError {
     fn from(error: ds_executor::ExecutionError) -> Self {
         match error {
             ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
-            other => Self::ServiceUnavailable(other.to_string()),
+            _ => Self::ServiceUnavailable,
         }
     }
 }
@@ -118,7 +116,6 @@ impl From<ds_executor::ExecutionError> for Tiles3dError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ds_core::error::DataServerError;
 
     /// A data source that keeps refusing reads (#1355) is a 503 with a
     /// longer `Retry-After` than the busy answer, naming no upstream.
