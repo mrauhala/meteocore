@@ -367,6 +367,58 @@ async fn staged_ranges_are_metered_until_their_decodes_take_them() {
     assert_eq!(read_ahead(&engine).used, NINE.len() as u64);
 }
 
+/// A prefetch that panics, a request the executor survives as a 500, still
+/// counts each planned range once and gives back all its staging room: the
+/// next queries' plans fit as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicking_prefetch_gives_back_its_staging_room() {
+    let dir = tempfile::tempdir().unwrap();
+    forecast_repository_with(dir.path(), &NINE, &LONS[..4], blosc()).await;
+    let (engine, _) = engine("panic", &config(dir.path()));
+    let catalog = engine.catalog.load();
+    let run = catalog.resolve_run(None).unwrap();
+    let steps: Vec<usize> = (0..3).collect();
+    let reads: Vec<_> = catalog
+        .vars
+        .iter()
+        .map(|var| {
+            let read = catalog.position_read(var, run, 10.5, 59.5, &steps).unwrap();
+            (var, read.unwrap().subset)
+        })
+        .collect();
+    super::PANIC_IN_FETCH.set(true);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        catalog.prefetch(&reads);
+    }));
+    super::PANIC_IN_FETCH.set(false);
+    assert!(panicked.is_err());
+    let meter = meter(&engine);
+    assert_eq!(meter.staging_reserved(), 0, "no room left reserved");
+    assert_eq!(engine.icechunk_staged_bytes(), Some(0));
+    assert_eq!(
+        read_ahead(&engine),
+        ReadAhead {
+            failed: NINE.len() as u64,
+            ..Default::default()
+        }
+    );
+    // The whole room is free: one plan can take all of it.
+    let room = meter.prefetch_room();
+    let shared = match &engine.source {
+        crate::source::Source::Icechunk(source) => source.meter.clone(),
+        crate::source::Source::Plain(_) => unreachable!("an Icechunk engine"),
+    };
+    let whole = shared.plan_ahead(room - super::metered::staging_weight(0));
+    assert!(whole.is_some());
+    drop(whole);
+    assert_eq!(meter.staging_reserved(), 0);
+    let names: Vec<String> = NINE.iter().map(|(name, _)| name.to_string()).collect();
+    engine
+        .query_position("POINT(10.5 59.5)", None, Some(&names), None, None)
+        .unwrap();
+    assert_eq!(read_ahead(&engine).used, NINE.len() as u64);
+}
+
 /// Fetched ahead or read one variable at a time, the payload cache ends up
 /// the same: the same misses, entries and churn, and no hits. Asked again,
 /// with no decoded cache in front, both answer from it.

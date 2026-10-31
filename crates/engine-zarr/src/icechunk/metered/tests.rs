@@ -152,9 +152,9 @@ async fn ahead(storage: &MeteredStorage, ctx: &StorageContext<'_>, range: Range<
             .unwrap();
         read_all(reader).await;
     };
+    let ahead = Arc::new(ahead);
     PREFETCH.scope(ahead.clone(), read).await;
     ahead.end(Prefetched::Skipped);
-    storage.meter.finish_ahead(&ahead);
     true
 }
 

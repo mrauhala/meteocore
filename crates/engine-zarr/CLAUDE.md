@@ -326,9 +326,10 @@ errors clearly if the table is set without the feature.
   drop another query's staged range to make room. Its read-budget permit is
   `Budget::try_reserve_spare` (half the budget stays free for requests),
   never waited for. A refusal or failed fetch leaves the range to the
-  decode's serial read, as before. `Meter::finish_ahead` counts every
-  planned range exactly once: used, unused, skipped, serial, failed,
-  expired. A MULTIPOINT past `ds_core::feature::MAX_POSITION_VALUES`
+  decode's serial read, as before. Dropping a planned range's
+  `metered::Ahead` counts it exactly once (used, unused, skipped, serial,
+  failed, expired) and gives back the room it did not stage into: keep
+  that in `Drop`, so a panic out of the fetches cannot leak room. A MULTIPOINT past `ds_core::feature::MAX_POSITION_VALUES`
   plans nothing. Reads inside `metered::PREFETCH` go to
   `metered::staging`, never the payload cache: the decode's read misses
   the cache, takes the staged range, and inserts it exactly as a storage

@@ -59,6 +59,12 @@ tokio::task_local! {
 
 mod staging;
 
+/// What staging charges a range of `length` bytes.
+#[cfg(test)]
+pub(crate) fn staging_weight(length: u64) -> u64 {
+    staging::weight(length)
+}
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct PayloadKey {
     path: Arc<str>,
@@ -110,8 +116,11 @@ pub(crate) enum Prefetched {
 }
 
 /// One range a query fetches ahead (#1353): the staging room reserved for
-/// it, what its read found and how its fetch ended.
+/// it, what its read found and how its fetch ended. Dropping it, however
+/// the fetch ended, a panic included, counts the range and gives back the
+/// room it did not stage into, exactly once.
 pub(crate) struct Ahead {
+    meter: Arc<Meter>,
     weight: u64,
     /// [`Self::NOT_READ`], [`Self::STAGED`] or [`Self::ON_HAND`].
     found: AtomicU8,
@@ -132,6 +141,24 @@ impl Ahead {
 
     fn found(&self, found: u8) {
         self.found.store(found, Ordering::Relaxed);
+    }
+}
+
+/// A staged range is counted when a decode takes it, or it is dropped
+/// unread; any other ends here.
+impl Drop for Ahead {
+    fn drop(&mut self) {
+        if self.found.load(Ordering::Relaxed) == Ahead::STAGED {
+            return;
+        }
+        self.meter.staging.release(self.weight);
+        let ended = *self.ended.get_mut().unwrap_or_else(|e| e.into_inner());
+        let unfinished = if std::thread::panicking() {
+            Prefetched::Failed
+        } else {
+            Prefetched::Expired
+        };
+        self.meter.count(ended.unwrap_or(unfinished), 1);
     }
 }
 
@@ -172,31 +199,27 @@ impl Meter {
     }
 
     /// Plan to fetch a range of `length` bytes ahead: reserve its room in
-    /// staging, beside what other queries staged and reserved. `None`,
-    /// counted `Serial`, when it does not fit.
-    pub(crate) fn plan_ahead(&self, length: u64) -> Option<Arc<Ahead>> {
+    /// staging, beside what other queries staged and reserved, until the
+    /// returned [`Ahead`] is dropped. `None`, counted `Serial`, when it does
+    /// not fit.
+    pub(crate) fn plan_ahead(self: &Arc<Self>, length: u64) -> Option<Ahead> {
         let weight = staging::weight(length);
         if !self.staging.reserve(weight, self.prefetch_room()) {
             self.count(Prefetched::Serial, 1);
             return None;
         }
-        Some(Arc::new(Ahead {
+        Some(Ahead {
+            meter: self.clone(),
             weight,
             found: AtomicU8::new(Ahead::NOT_READ),
             ended: Default::default(),
-        }))
+        })
     }
 
-    /// Count a planned range once its fetch has ended or been cut off, and
-    /// give back the room it did not stage into. A staged range is counted
-    /// when a decode takes it, or it is dropped unread.
-    pub(crate) fn finish_ahead(&self, ahead: &Ahead) {
-        if ahead.found.load(Ordering::Relaxed) == Ahead::STAGED {
-            return;
-        }
-        self.staging.release(ahead.weight);
-        let ended = *ahead.ended.lock().unwrap_or_else(|e| e.into_inner());
-        self.count(ended.unwrap_or(Prefetched::Expired), 1);
+    /// Staging room reserved for ranges being fetched.
+    #[cfg(test)]
+    pub(crate) fn staging_reserved(&self) -> u64 {
+        self.staging.reserved()
     }
 
     /// Bytes of ranges fetched ahead and not yet taken: held memory outside

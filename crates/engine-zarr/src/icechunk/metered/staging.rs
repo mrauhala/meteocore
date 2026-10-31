@@ -108,6 +108,12 @@ impl Staging {
         self.lock().expire(now)
     }
 
+    /// Weight of the room reserved for ranges being fetched.
+    #[cfg(test)]
+    pub(super) fn reserved(&self) -> u64 {
+        self.lock().reserved
+    }
+
     /// Weight of the staged ranges, reservations aside.
     pub(super) fn weight(&self) -> u64 {
         self.lock().weight

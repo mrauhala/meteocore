@@ -144,6 +144,14 @@ pub(crate) struct Store(AsyncIcechunkStore, Arc<Meter>);
 /// Most ranges one query fetches ahead at once (#1353).
 const PREFETCH_CONCURRENCY: usize = 8;
 
+#[cfg(test)]
+thread_local! {
+    /// Makes the fetches ahead of a query on this thread panic, for tests
+    /// of what a panic leaves behind.
+    pub(crate) static PANIC_IN_FETCH: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 impl Store {
     /// Fetch `ranges` of chunk objects together, at most
     /// [`PREFETCH_CONCURRENCY`] at once on the I/O runtime within the
@@ -159,7 +167,9 @@ impl Store {
     /// Icechunk's, from the read budget, only while half the budget stays
     /// free ([`Budget::try_reserve_spare`]). A range refused either, or whose
     /// fetch fails, is left to its decode's serial read, as every range was
-    /// before. Every planned range is counted once ([`Meter::finish_ahead`]).
+    /// before. Every planned range is counted once, and gives back the room
+    /// it did not stage into, when its [`metered::Ahead`] drops: after the
+    /// fetches, or while a panic unwinds out of them.
     pub(crate) fn prefetch(&self, budget: &Arc<Budget>, ranges: Vec<ColdRange>) {
         let meter = &self.1;
         if meter.prefetch_room() == 0 {
@@ -167,7 +177,10 @@ impl Store {
         }
         let planned: Vec<(ColdRange, Arc<metered::Ahead>)> = ranges
             .into_iter()
-            .filter_map(|range| meter.plan_ahead(range.length).map(|ahead| (range, ahead)))
+            .filter_map(|range| {
+                let ahead = meter.plan_ahead(range.length)?;
+                Some((range, Arc::new(ahead)))
+            })
             .collect();
         let fetches = futures::stream::iter(planned.clone())
             .map(|(range, ahead)| {
@@ -189,19 +202,20 @@ impl Store {
             .buffer_unordered(PREFETCH_CONCURRENCY)
             .collect::<()>();
         // A deadline that expires here fails the decodes that follow; the
-        // fetches it cut off are counted `Expired`.
+        // fetches it cut off are counted `Expired` as `planned` drops.
         let _ = runtime::run(async {
             fetches.await;
             Ok(())
         });
-        for (_, ahead) in &planned {
-            meter.finish_ahead(ahead);
-        }
     }
 
     /// Read one range through Icechunk, which stages it, and drop the
     /// bytes.
     async fn fetch(&self, range: &ColdRange) -> Result<(), DataServerError> {
+        #[cfg(test)]
+        if PANIC_IN_FETCH.get() {
+            panic!("a fetch ahead panicked");
+        }
         let ranges = std::iter::once(ByteRange::FromStart(range.offset, Some(range.length)));
         let stream =
             AsyncReadableStorageTraits::get_partial_many(&self.0, &range.key, Box::new(ranges))
