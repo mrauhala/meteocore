@@ -23,6 +23,10 @@
 //! Engines publish what each cache must hold for their data ([`demand`],
 //! #1309): a row carries its cache's [`Demand`], from which the plan
 //! suggests a size and says when the configured one is short.
+//!
+//! [`grant::plan`] fits every cache and budget to the memory the process
+//! may use (#1312): a pure function of a snapshot's rows and that total,
+//! which applies nothing.
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -34,6 +38,7 @@ use std::time::{Duration, Instant};
 use crate::{CacheMetrics, Churn, MIB};
 
 pub mod demand;
+pub mod grant;
 pub use demand::{check_rows, CacheDemand, Demand, DemandSlot, Shortfall, DEMAND_FIELDS};
 
 /// A cache holds entries for reuse; a budget admits transient work.

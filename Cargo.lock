@@ -4797,6 +4797,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "jsonschema",
+ "libc",
  "notify",
  "prometheus",
  "quick-xml 0.42.0",
@@ -4814,6 +4815,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
