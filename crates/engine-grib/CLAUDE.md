@@ -329,7 +329,8 @@ on the request path. Single-level and legacy views require exact metadata.
   planned. Checking all keys together would switch the pre-warm off where
   it matters: five keys × 85 steps of 0.25° IFS is about 640 MB against a
   512 MiB cache. Fetches run as `run_field_jobs` at 2 in flight on the
-  scan's runtime (the poll runtime), each a
+  scan's runtime (the poll runtime), under `BackgroundGets` permits
+  shared with the map read-ahead (below), each a
   `get_range_on_with_budget(.., FetchBudget::Background)`, under a 120 s
   deadline per poll, which the poll loop waits for. Before admission,
   `index_message` builds the complete point index (`Reach::Full`, #1337),
@@ -345,8 +346,77 @@ on the request path. Single-level and legacy views require exact metadata.
   hit or miss. With `prewarm` on, the cache is built `prewarmed()` (the
   cache-plan caveat). `/metrics`: `grib_prewarm_{gets,bytes,hits}_total`;
   hits counts a pre-warmed message's first request read, from an unread set
-  of at most 4096 keys pruned to resident ones before each pre-warm.
+  of at most 4096 keys pruned to resident ones before each pre-warm, and
+  forgotten when a request fills the key itself.
   `[grib] prewarm = false` turns it off.
+- Map read-ahead (#1335, `readahead.rs`): after `get_raster_tile(s)` draws
+  step k, `read_ahead_after` plans the messages `map_message` would draw at
+  the run's next `[grib] read_ahead` steps carrying the parameters
+  (`CarriedSteps::after`; default 3, at most 12, `0` off): forward and
+  within the run only. Gated on animation: the view (`view_id`: view,
+  parameters, z, run, bbox, size, CRS kind) must have drawn the carried
+  step before k (`CarriedSteps::before`) within 60 s, so a static view
+  costs no speculative GET. Once per frame (`frame_id`) for 5 min, so a
+  loop's later passes plan again; `publish_catalog` clears the plans.
+  Skipped: a message resident in the message cache, one whose grid the grid
+  cache holds (`GridCache::contains`), one queued or in flight.
+- Room, not a per-run share: what is queued, in flight and fetched unread
+  (`MessageCache::read_ahead_unread`, evicted fills pruned) stays within
+  half `MessageCache::cold_room` and 25 % of the cache, nearest steps
+  first. Unkept fills wait in the cold ring with the maps' own; more would
+  evict the next frame before it is drawn
+  (`a_loop_of_large_frames_in_a_full_cache_reads_ahead_within_half_the_cold_ring`).
+  A read, an eviction unread or a failed fetch gives the weight back, and
+  a fill unread for `UNREAD_FOR` (2 min) stops counting, though it may stay
+  cached: an abandoned animation in a cache under no pressure would hold
+  the room for good
+  (`abandoned_fills_stop_holding_the_room_after_a_while`). Its later first
+  read still counts a hit: the GET was saved. The room is the
+  read-ahead's own: the pre-warm spends its share at once as a poll
+  catalogues new steps. At most 32 queued.
+- The plan runs on the render's thread with no I/O; the fetches on at most
+  2 workers per source on the GRIB I/O runtime (`runtime::spawn_background`,
+  `block_in_place`), so the render returns at once
+  (`the_triggering_render_does_not_wait_for_the_read_ahead`). Each GET takes
+  a `BackgroundGets` permit before claiming the fill, shared with the
+  pre-warm, so the two keep 2 GETs in flight together, never 4
+  (`the_read_ahead_keeps_two_gets_in_flight_with_the_prewarm`), then
+  `get_range_on_with_budget(.., FetchBudget::Background)`. A `Job` guard
+  finishes each fetch on every path, a panic included.
+- `MessageCache::read_ahead` holds no single-flight claim: `quick_cache`
+  admits a claimed fill that had waiters as referenced
+  (`referenced = !waiters.is_empty()`), so a client catching up with its
+  read-ahead promoted every frame
+  (`a_read_ahead_fill_a_request_joined_leaves_the_hot_ring_alone`: 3 of 36
+  hot entries left). It marks the key in `Filling` with a signal of its
+  own, probes for a request's claim (taken: it stands down), fetches,
+  admits with a plain unreferenced `insert`, and raises the signal as the
+  mark drops. `get_with` takes its claim before reading the mark, so of a
+  request and a read-ahead one always sees the other and the message is
+  fetched once. A request that finds a mark waits on the signal, for half
+  its remaining time with a deadline (then reads around the cache, a
+  bypass), as long as the fetch takes without one, then takes the first
+  read by peek.
+- Scan resistance (#1340): a request's first read of a fill is a
+  `ByteBoundedCache::peek` (`first_read_ahead`), no recency, as a map's own
+  fill is never looked up again; a lookup would promote every frame and
+  evict the hot ring
+  (`an_animation_read_ahead_keeps_what_the_hot_ring_holds`). Fills are
+  admitted undecoded, the one exception to admitting bytes only after a
+  decode, and not kept. `MessageCache::decoded` accepts a fill once a
+  reader decodes or indexes it, and evicts one a reader cannot, map or
+  point path, never a message a reader admitted itself
+  (`only_an_unchecked_read_ahead_fill_leaves_when_a_reader_cannot_parse_it`).
+  Decoding in the worker would only validate: its grid would save a 0.25°
+  frame only its decode, and a 0.1° source's grids ahead cannot share a
+  cold ring sized for one (#1332). `/metrics`:
+  `grib_read_ahead_{gets,bytes,hits}_total`, hits a fill's first request
+  read, a request that joined it included; a request filling the key
+  itself forgets it.
+- Known limits: a client animating every second or third step never
+  passes the previous-step gate; a frame planned within 5 min is not
+  planned again after an eviction; the unread weight is read outside the
+  queue's lock, so the room can overshoot by the at most 2 fills in flight.
 - Key by source-local path, offset and indexed length. Like the decoded cache,
   this assumes immutable files at a given path/offset; engine reconstruction
   clears both caches. Changing the cache configuration triggers reconstruction

@@ -542,8 +542,15 @@ impl GribEngine {
             match on_fill {
                 Some(read) => read,
                 // The cached message: an index short of the points extends
-                // from its bytes (#1337).
-                None => sample(&bytes, Reach::Points)?,
+                // from its bytes (#1337). A read-ahead fill, admitted
+                // undecoded, leaves when they do not parse (#1335).
+                None => {
+                    let read = sample(&bytes, Reach::Points);
+                    if let Some(cache) = &self.source.message_cache {
+                        cache.decoded(&key, &read);
+                    }
+                    read?
+                }
             }
         };
         match &read {
@@ -587,15 +594,12 @@ impl GribEngine {
         let Some(len) = entry.length.and_then(|len| usize::try_from(len).ok()) else {
             return Ok(None);
         };
-        if let Some(bytes) = self
-            .source
-            .message_cache
-            .as_ref()
-            .and_then(|cache| cache.get_resident(key))
-        {
-            return self
-                .points_from(index, key, field, &bytes, Reach::Points)
-                .map(Some);
+        if let Some(cache) = &self.source.message_cache {
+            if let Some(bytes) = cache.get_resident(key) {
+                let read = self.points_from(index, key, field, &bytes, Reach::Points);
+                cache.decoded(key, &read);
+                return read.map(Some);
+            }
         }
         let unexpected = |error: PointError| match error {
             PointError::Fatal(error) => Err(error),

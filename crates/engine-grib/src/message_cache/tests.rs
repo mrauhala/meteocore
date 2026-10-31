@@ -543,3 +543,210 @@ fn repeated_forecast_latency_replay() {
         }
     }
 }
+
+/// A message of `length` bytes at offset 0 of `name`.
+fn named(name: &str, length: u64) -> MessageKey {
+    MessageKey {
+        path: Arc::from(name),
+        offset: 0,
+        length: Some(length),
+    }
+}
+
+/// A 64 MiB cache whose hot ring is at its target, as a production cache's
+/// is, with one more entry in its cold ring.
+fn hot_at_target() -> (MessageCache, Vec<MessageKey>) {
+    let cache = MessageCache::new(64).unwrap();
+    let hot = (cache.cache.hot_allocation() * cache.capacity_bytes() as f64) as u64;
+    let keys: Vec<_> = (0..hot / MIB + 1)
+        .map(|i| named(&format!("hot{i}"), MIB))
+        .collect();
+    for key in &keys {
+        cache
+            .cache
+            .insert(key.clone(), Bytes::from(vec![0u8; MIB as usize]));
+    }
+    (cache, keys)
+}
+
+/// #1335: map read-ahead fills are not kept, so they share the cold ring
+/// with the maps' own fills. In a cache whose hot ring is at its target,
+/// twelve steps of 2.5 MiB, which the whole cache would hold, evict the
+/// step a client asks for next before it is read; the five the read-ahead
+/// takes, half the cold ring, all wait for their read.
+#[test]
+fn the_read_ahead_room_keeps_its_fills_in_a_cache_with_a_full_hot_ring() {
+    let length = 5 * MIB / 2;
+    let fill = |cache: &MessageCache, steps: u64| {
+        let keys: Vec<_> = (0..steps)
+            .map(|s| named(&format!("step{s:02}"), length))
+            .collect();
+        for key in &keys {
+            let bytes = Bytes::from(vec![1u8; length as usize]);
+            assert!(cache.read_ahead(key, || Ok(bytes)).unwrap().is_some());
+        }
+        keys.iter()
+            .map(|key| cache.is_resident(key))
+            .collect::<Vec<_>>()
+    };
+    let (cache, _) = hot_at_target();
+    assert!(cache.holds(12, 12 * length), "the whole cache holds them");
+    assert!(!fill(&cache, 12)[0], "twelve evict the next step");
+
+    let (cache, _) = hot_at_target();
+    let room = crate::readahead::ReadAhead::room(&cache);
+    let admitted = room / message_weight("step00", length);
+    assert_eq!(admitted, 5);
+    assert!(room <= cache.cold_room() / 2);
+    assert_eq!(fill(&cache, admitted), [true; 5]);
+}
+
+/// #1335: a read-ahead fill the cache evicted unread, which the map then
+/// reads itself, is no read-ahead hit, nor is a later hit on the map's own
+/// copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_the_request_fetched_itself_is_no_read_ahead_hit() {
+    let cache = MessageCache::new(1).unwrap();
+    let observed = instrumented(Duration::ZERO);
+    let store = DataStore::new(observed.clone());
+    let path = Path::from("fields.grib2");
+    let first = message(0, 280.0, [0; 4], 1, 0);
+    put(&observed, &path, &first).await;
+    let e = entry(Some(first.len()));
+    let key = MessageKey::new(path.as_ref(), &e);
+    let copy = first.clone();
+    tokio::task::block_in_place(|| {
+        cache
+            .read_ahead(&key, move || Ok(Bytes::from(copy)))
+            .unwrap();
+        let mut i = 0;
+        while cache.is_resident(&key) {
+            let filler = named(&format!("filler{i}"), 64 * 1024);
+            cache
+                .cache
+                .insert(filler, Bytes::from(vec![0u8; 64 * 1024]));
+            i += 1;
+        }
+        for _ in 0..2 {
+            cache.read(&store, &path, &e).unwrap();
+        }
+    });
+    assert_eq!(observed.reads.lock().unwrap().attempts[path.as_ref()], 1);
+    assert_eq!(cache.read_ahead_hits(), 0);
+}
+
+/// #1335 against #1340's scan resistance: a map's own one-off fill leaves
+/// from the cold ring without touching the hot ring, and so does a
+/// read-ahead fill the map reads once. An animation pass of 60 frames of
+/// 1 MiB over a cache whose hot ring is at its target keeps as many hot
+/// entries either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_ahead_fill_read_once_leaves_the_hot_ring_alone() {
+    let observed = instrumented(Duration::ZERO);
+    let store = DataStore::new(observed.clone());
+    let path = Path::from("frames.grib2");
+    let accept = |_: &[u8]| Ok::<_, DataServerError>(());
+    let mut survivors = Vec::new();
+    for read_ahead in [false, true] {
+        let (cache, hot) = hot_at_target();
+        tokio::task::block_in_place(|| {
+            for frame in 0..60u64 {
+                let mut e = entry(Some(MIB as usize));
+                e.offset = frame * MIB;
+                let key = MessageKey::new(path.as_ref(), &e);
+                let bytes = || Bytes::from(vec![1u8; MIB as usize]);
+                if read_ahead {
+                    cache.read_ahead(&key, || Ok(bytes())).unwrap();
+                    let (_, validated) = cache.get_with(&store, &path, &e, false, accept).unwrap();
+                    assert!(validated.is_none(), "the read-ahead's copy");
+                } else {
+                    cache
+                        .cache
+                        .get_or_insert_with(&key, || Ok::<_, DataServerError>(bytes()))
+                        .unwrap();
+                }
+            }
+        });
+        survivors.push(hot.iter().filter(|key| cache.is_resident(key)).count());
+    }
+    assert_eq!(survivors[1], survivors[0], "{survivors:?}");
+}
+
+/// #1335: a request catching up with the read-ahead waits for its fetch,
+/// and the fill it joined stays as cold as a map's own. `quick_cache`
+/// admits a claimed fill that had waiters as read: held under a claim, the
+/// fills of 60 frames each joined by its request left 3 of 36 hot entries
+/// of a cache whose hot ring is at its target. Each request joins, with a
+/// deadline and without one, fetches nothing, and every hot entry stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_ahead_fill_a_request_joined_leaves_the_hot_ring_alone() {
+    let observed = instrumented(Duration::ZERO);
+    let store = DataStore::new(observed.clone());
+    let path = Path::from("frames.grib2");
+    let accept = |_: &[u8]| Ok::<_, DataServerError>(());
+    // The deadline bounds only how long a request may wait: the fetch ends
+    // as soon as it waits.
+    for deadline in [Some(Duration::from_secs(60)), None] {
+        let cache = Arc::new(MessageCache::new(64).unwrap());
+        let hot = (cache.cache.hot_allocation() * cache.capacity_bytes() as f64) as u64;
+        let hot_keys: Vec<_> = (0..hot / MIB)
+            .map(|i| named(&format!("hot{i}"), MIB))
+            .collect();
+        for key in &hot_keys {
+            cache
+                .cache
+                .insert(key.clone(), Bytes::from(vec![0u8; MIB as usize]));
+        }
+        let mut joined = 0;
+        for frame in 0..60u64 {
+            let mut e = entry(Some(MIB as usize));
+            e.offset = frame * MIB;
+            let key = MessageKey::new(path.as_ref(), &e);
+            let (claimed, started) = std::sync::mpsc::channel();
+            let fill = std::thread::spawn({
+                let cache = cache.clone();
+                move || {
+                    let fetch = || {
+                        claimed.send(()).unwrap();
+                        // Finished only once the frame's request waits.
+                        until(|| cache.read_ahead_waiters(&key) > 0);
+                        Ok(Bytes::from(vec![1u8; MIB as usize]))
+                    };
+                    cache.read_ahead(&key, fetch).unwrap()
+                }
+            });
+            started.recv().unwrap();
+            let (_, validated) = tokio::task::block_in_place(|| {
+                let _deadline = deadline::enter(deadline.map(|wait| Instant::now() + wait));
+                cache.get_with(&store, &path, &e, false, accept).unwrap()
+            });
+            if validated.is_none() {
+                joined += 1;
+            }
+            assert!(fill.join().unwrap().is_some());
+        }
+        let kept = hot_keys.iter().filter(|k| cache.is_resident(k)).count();
+        assert_eq!(
+            (joined, kept),
+            (60, hot_keys.len()),
+            "deadline {deadline:?}"
+        );
+    }
+    let attempts = observed.reads.lock().unwrap().attempts.clone();
+    assert!(
+        attempts.is_empty(),
+        "no request fetched a frame: {attempts:?}"
+    );
+}
+
+/// Wait until `done`, polling; a test that waits a minute has hung.
+fn until(done: impl Fn() -> bool) {
+    let started = Instant::now();
+    while !done() {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "never happened"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}

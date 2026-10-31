@@ -45,6 +45,15 @@ static IO_RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("GRIB I/O runtime")
 });
 
+/// Run `work` in the background on the GRIB I/O runtime, inside
+/// `block_in_place` on one of its workers, so its storage calls take that
+/// runtime's handle (root Critical Rule 7). Never on the caller's thread:
+/// the map read-ahead (#1335) starts from a render, which does not wait
+/// for it.
+pub(crate) fn spawn_background(work: impl FnOnce() + Send + 'static) {
+    drop(IO_RUNTIME.spawn(async move { tokio::task::block_in_place(work) }));
+}
+
 pub(crate) fn run_fetches<F>(future: F) -> F::Output
 where
     F: std::future::Future + Send,

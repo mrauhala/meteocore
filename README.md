@@ -1246,6 +1246,28 @@ clients read again. `grib_prewarm_gets_total` and `grib_prewarm_bytes_total`
 count its storage reads per source, `grib_prewarm_hits_total` the pre-warmed
 messages a request then read. `prewarm = false` turns it off.
 
+Map animations read ahead the same way (#1335). When a WMS, Maps or Tiles
+view (a tile or an image) draws a step of a parameter less than a minute
+after it drew the step before, the source fetches the messages it would
+draw at that run's next `read_ahead` steps (default 3) carrying the
+parameter into the message cache, on the GRIB I/O runtime, so a client
+stepping forward through a cold run waits on storage for its first two
+frames only. A view that draws one step, however often, reads nothing
+ahead. A frame plans once in five minutes, whatever its tiles; nothing is
+fetched that the message or grid cache holds, and nothing backwards or past
+the run's last step. What it has queued, in flight and fetched but not yet
+read stays within half the cache's cold ring (about 14–16 MB up to 1 GiB,
+a quarter of `message_cache_mb` at most), nearest steps first; a frame read or
+evicted gives its room back, and one nobody reads after two minutes stops
+holding it. The two GETs in flight are shared with the
+pre-warm. A fill is admitted undecoded and read once without promotion, as
+a map's own fill is, so an animation evicts nothing the hot ring keeps; a
+fill that does not decode is evicted when read. A request for a message the
+read-ahead is fetching joins that GET, for at most half its remaining time,
+then reads the message itself. `grib_read_ahead_gets_total`,
+`grib_read_ahead_bytes_total` and `grib_read_ahead_hits_total` count it per
+source; `read_ahead = 0` turns it off.
+
 Area and radius queries also load up to four parameter/level fields concurrently.
 The first field determines the grid and supplies its own output values; it is
 not fetched twice when the cache is disabled. The combined output and polygon
@@ -1301,6 +1323,7 @@ Either `data_path` **or** `endpoint`+`bucket` must be set (mutually exclusive).
 | `message_cache_mb` | no | `0` | Optional compressed GRIB message cache in MiB; additional to `grid_cache_mb`, shared by the source's level collections. `0` disables it. |
 | `point_index_cache_mb` | no | 25 % of `message_cache_mb`, at least `16` | Point-index cache in MiB, per source, one shard: position queries on CCSDS (5.42) and complex-packed (5.3) fields decode only the blocks or rows their points need. An index is 1–6 KB for CCSDS and 100–140 KB for GFS 0.25°: 13–20 % of a temperature message, up to 23 % of a precipitation one. Unset, it is 25 % of `message_cache_mb`, room for the index of every GFS message that cache keeps: 256 MiB for `1024`; 16 MiB without a message cache. A CCSDS source fills only a small part of it. A value set, `0` included, is the size. `0` disables that path. |
 | `prewarm` | no | `true` | As the poll catalogues new steps of the newest run, fetch their messages of the parameters and levels EDR position queries read in the last 24 hours into the message cache, and index them, so the first query of the new run reads nothing from storage. At most 25 % of `message_cache_mb` per run, earliest steps first, two GETs at a time; nothing without a message cache or a recent read, and nothing of a parameter level whose messages of the run the cache cannot hold. What was read is kept in memory only: after a restart nothing is pre-warmed until clients read again. `false` turns it off. |
+| `read_ahead` | no | `3` | Steps a map animation reads ahead: when a WMS, Maps or Tiles view draws a step within a minute of the step before, fetch the messages it would draw at that run's next `read_ahead` steps into the message cache, in the background. What is queued, in flight and unread stays within half the cache's cold ring and a quarter of `message_cache_mb`; two GETs at a time together with the pre-warm; nothing without a message cache, nothing the message or grid cache holds. At most `12`; `0` turns it off. |
 | `run_hours` | no | `[0, 6, 12, 18]` | Model run hours to poll, 0–23, substituted into `{run}`. Must not be empty when `prefix_pattern` uses `{run}`; unused without it. |
 
 #### GRIB Config Example

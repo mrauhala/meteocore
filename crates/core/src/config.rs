@@ -3169,6 +3169,24 @@ fn default_grid_cache_mb() -> u64 {
     DEFAULT_GRID_CACHE_MB
 }
 
+/// Default `[grib] read_ahead`: the steps a map render reads ahead (#1335).
+/// A client waiting on each frame asks for the next once this one is drawn,
+/// while that step's GET, started when this frame's message was read, may
+/// still be in flight: the render is only a part of a GET (0.25–1 s, more
+/// with a bucket's 503 retries). Three steps give the step after it two
+/// frames' head start; a client keeping four requests in flight hides the
+/// rest itself.
+pub const DEFAULT_GRIB_READ_AHEAD: usize = 3;
+
+/// The deepest `[grib] read_ahead`. Past a dozen steps a frame reads much
+/// of its run ahead, the pre-warm's job: every frame then spends its share
+/// on steps a client may never draw.
+pub const MAX_GRIB_READ_AHEAD: usize = 12;
+
+fn default_grib_read_ahead() -> usize {
+    DEFAULT_GRIB_READ_AHEAD
+}
+
 /// Mutually exclusive GRIB collection families. A single-level collection
 /// carries fixed-height products as parameters, without a vertical axis.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -3256,6 +3274,15 @@ pub struct GribConfig {
     /// a recent read. `false` turns it off for this source.
     #[serde(default = "default_true")]
     pub prewarm: bool,
+    /// Read ahead of map animations (#1335): after a WMS, Maps or Tiles
+    /// render draws a step of a parameter, fetch the messages it would draw
+    /// at that run's next `read_ahead` steps into the message cache, within
+    /// a quarter of `message_cache_mb` per run, two GETs at a time together
+    /// with the pre-warm. Default: [`DEFAULT_GRIB_READ_AHEAD`], at most
+    /// [`MAX_GRIB_READ_AHEAD`]; nothing without a message cache. `0` turns
+    /// it off for this source.
+    #[serde(default = "default_grib_read_ahead")]
+    pub read_ahead: usize,
     /// Model run hours to poll. Default: all (00, 06, 12, 18)
     pub run_hours: Option<Vec<u32>>,
     /// Index file format: "ecmwf-json" (default) or "wgrib2".
@@ -3297,6 +3324,7 @@ impl GribConfig {
             message_cache_mb: 0,
             point_index_cache_mb: None,
             prewarm: true,
+            read_ahead: DEFAULT_GRIB_READ_AHEAD,
             run_hours: None,
             index_format,
             filename_contains: None,
@@ -4984,6 +5012,12 @@ impl ServerConfig {
                         "Collection '{id}': grib poll_interval_secs must be > 0"
                     )));
                 }
+                if grib.read_ahead > MAX_GRIB_READ_AHEAD {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': grib read_ahead must be at most \
+                         {MAX_GRIB_READ_AHEAD} steps (0 turns it off)"
+                    )));
+                }
 
                 // Data source: exactly one of local `data_path` or S3
                 // `endpoint`+`bucket`. The remote source needs *both* S3 fields
@@ -6218,6 +6252,38 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         let updated = off.collections[0].grib.as_ref().unwrap();
         assert!(!updated.prewarm);
         assert_ne!(updated, original, "turning it off must rebuild the engine");
+    }
+
+    /// #1335: the map read-ahead reads three steps ahead unless a source
+    /// sets its depth, an auto-discovered source included; `0` turns it
+    /// off, past the deepest is a load error, and a change rebuilds the
+    /// engine.
+    #[test]
+    fn grib_read_ahead_defaults_to_three_steps_and_is_bounded() {
+        let cfg = grib_collection("data_path = \"testdata/grib-local\"\n");
+        let original = cfg.collections[0].grib.as_ref().unwrap();
+        assert_eq!(original.read_ahead, 3);
+        let local = GribConfig::auto_local(
+            "x".into(),
+            ".idx".into(),
+            ".grib2".into(),
+            Some("wgrib2".into()),
+        );
+        assert_eq!(local.read_ahead, DEFAULT_GRIB_READ_AHEAD);
+        for depth in [0, MAX_GRIB_READ_AHEAD] {
+            let body = format!("data_path = \"testdata/grib-local\"\nread_ahead = {depth}\n");
+            let cfg = grib_collection(&body);
+            cfg.validate().unwrap();
+            let updated = cfg.collections[0].grib.as_ref().unwrap();
+            assert_eq!(updated.read_ahead, depth);
+            assert_ne!(updated, original, "a change rebuilds the engine");
+        }
+        let deep = grib_collection(&format!(
+            "data_path = \"testdata/grib-local\"\nread_ahead = {}\n",
+            MAX_GRIB_READ_AHEAD + 1
+        ));
+        let error = deep.validate().unwrap_err().to_string();
+        assert!(error.contains("read_ahead must be at most 12"), "{error}");
     }
 
     #[test]

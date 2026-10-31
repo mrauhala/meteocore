@@ -47,6 +47,7 @@ fn grib_config() -> GribConfig {
         message_cache_mb: 0,
         point_index_cache_mb: None,
         prewarm: true,
+        read_ahead: ds_core::config::DEFAULT_GRIB_READ_AHEAD,
         run_hours: None,
         index_format: Some("ecmwf-json".to_string()),
         filename_contains: None,
