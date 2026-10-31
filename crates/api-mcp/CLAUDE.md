@@ -31,12 +31,17 @@ to anyone who finds the URL. Rules, all tested:
   credential"). A server that booted *without* MCP cannot gain it by reload —
   `do_reload` logs a warning saying so rather than reporting success and
   changing nothing. Token and rate limit are fixed at boot too.
-- **Engine errors never reach the client** (Critical Rule 11).
-  `DataServerError`'s Display carries `Storage`/`Io` detail — filesystem
-  paths, backend messages — so `query_failed()` logs it and returns a fixed
-  string, exactly as api-features does at the equivalent site. *Parameter*
-  errors are different and deliberately verbose: they describe the caller's
-  own input and are what lets a model self-correct.
+- **An engine error answers by its class** (`query_failed()`, by
+  `DataServerError::class()`, #17), as in every API. `BadRequest` and
+  `NotFound` are `invalid_params` with the engine's message, which every
+  HTTP API returns too and which lets a model self-correct. `Busy` /
+  `DeadlineExceeded` are `internal_error("Server busy, try again later")`,
+  `SourceUnavailable` the generic `UNAVAILABLE_DESCRIPTION`. `Internal` never
+  reaches the client (Critical Rule 11): its Display carries `Storage`/`Io`
+  detail — filesystem paths, backend messages — so it is logged and answered
+  with the fixed "Query failed", exactly as api-features does at the
+  equivalent site. *Parameter* errors are deliberately verbose: they describe
+  the caller's own input.
 - **The configured token is trimmed**, matching the presented one. An env var
   set from a file or a here-doc carries a trailing newline, and without this
   the two never compare equal and every request 401s with no clue why.

@@ -1,6 +1,7 @@
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use ds_core::error::{DataServerError, ErrorClass};
 use serde_json::json;
 
 /// Error type for OGC API Tiles endpoints.
@@ -18,20 +19,55 @@ pub enum TilesError {
     Unprocessable(String),
     /// Internal server error.
     Internal(String),
-    /// Server too busy (render semaphore exhausted).
-    ServiceUnavailable(String),
+    /// Server busy: the render was not admitted or ran out of time, or the
+    /// engine was busy (`ErrorClass::Busy`, `ErrorClass::DeadlineExceeded`).
+    /// A 503 with `Retry-After: 1` and a fixed message: it carries nothing a
+    /// caller could fill with internal state (#122).
+    ServiceUnavailable,
     /// A data source that kept refusing the tile's reads
     /// (`DataServerError::Unavailable`, #1355): a 503 with `Retry-After: 10`.
     SourceUnavailable,
 }
 
+impl TilesError {
+    /// The answer to the engine's `error` serving a `what` tile ("render"
+    /// for a map tile, "vector tile" for a feature query) of `collection`:
+    /// its [`ErrorClass`], as every API answers it (#17). A client mistake
+    /// (a multi-parameter collection rendered without a parameter, a bad
+    /// bbox or datetime) is a 400 with the engine's message, and an absent
+    /// resource a 404 (a pinned run pruned between resolution and render,
+    /// routine for nowcast generations, #522): both traced at DEBUG, so a
+    /// misconfigured client stays diagnosable without flooding the WARN
+    /// stream. A data source's refusal and an internal failure are logged
+    /// at WARN, the detail never in the body.
+    pub(crate) fn from_engine(e: DataServerError, what: &str, collection: &str) -> Self {
+        match e.class() {
+            ErrorClass::Busy | ErrorClass::DeadlineExceeded => TilesError::ServiceUnavailable,
+            ErrorClass::SourceUnavailable => {
+                tracing::warn!("Tiles {what} error for collection '{collection}': {e}");
+                TilesError::SourceUnavailable
+            }
+            ErrorClass::BadRequest => {
+                tracing::debug!("Tiles {what} bad-request for collection '{collection}': {e}");
+                TilesError::BadRequest(e.to_string())
+            }
+            ErrorClass::NotFound => {
+                tracing::debug!("Tiles {what} not-found for collection '{collection}': {e}");
+                TilesError::NotFound(e.to_string())
+            }
+            ErrorClass::Internal => {
+                tracing::warn!("Tiles {what} error for collection '{collection}': {e}");
+                TilesError::Internal(format!("{what} failed: {e}"))
+            }
+        }
+    }
+}
+
 impl IntoResponse for TilesError {
     fn into_response(self) -> axum::response::Response {
         let retry_after = match &self {
-            TilesError::ServiceUnavailable(_) => Some(1),
-            TilesError::SourceUnavailable => {
-                Some(ds_core::error::DataServerError::UNAVAILABLE_RETRY_AFTER_SECS)
-            }
+            TilesError::ServiceUnavailable => Some(1),
+            TilesError::SourceUnavailable => Some(DataServerError::UNAVAILABLE_RETRY_AFTER_SECS),
             _ => None,
         };
         let (status, code, description) = match &self {
@@ -47,11 +83,7 @@ impl IntoResponse for TilesError {
                 "ServerError",
                 "Internal server error",
             ),
-            // Like Internal, drop the inner string structurally — the only
-            // current call site is render_semaphore-exhausted with a fixed
-            // string, but ignoring the payload here means a future caller
-            // can't accidentally leak internal state via this variant.
-            TilesError::ServiceUnavailable(_) => (
+            TilesError::ServiceUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "ServerBusy",
                 "Server busy, try again later",
@@ -60,7 +92,7 @@ impl IntoResponse for TilesError {
             TilesError::SourceUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 api_common::SOURCE_UNAVAILABLE,
-                ds_core::error::DataServerError::UNAVAILABLE_DESCRIPTION,
+                DataServerError::UNAVAILABLE_DESCRIPTION,
             ),
         };
 
@@ -121,12 +153,8 @@ mod tests {
     }
 
     #[test]
-    fn into_response_redacts_service_unavailable_message() {
-        // The only current call site passes a safe fixed string, but the
-        // variant must structurally drop its payload — defence-in-depth
-        // against a future caller passing internal state.
-        let err = TilesError::ServiceUnavailable("semaphore poisoned: secret".to_string());
-        let response = err.into_response();
+    fn service_unavailable_is_a_fixed_busy_answer() {
+        let response = TilesError::ServiceUnavailable.into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let reason = response
@@ -134,11 +162,6 @@ mod tests {
             .get::<ErrorReason>()
             .expect("attached");
         assert_eq!(reason.0, "ServerBusy: Server busy, try again later");
-        assert!(
-            !reason.0.contains("secret"),
-            "inner detail must not leak via ErrorReason, got {:?}",
-            reason.0
-        );
         assert_eq!(response.headers()[header::RETRY_AFTER], "1");
     }
 

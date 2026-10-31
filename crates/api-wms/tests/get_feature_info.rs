@@ -34,6 +34,9 @@ use ds_core::model::{
 use ds_core::vertical::{VerticalDimension, VerticalKind};
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 
+#[path = "../../api-common/tests/support/engine_errors.rs"]
+mod engine_errors;
+
 fn at(time: &str) -> DateTime<Utc> {
     time.parse().unwrap()
 }
@@ -66,6 +69,8 @@ enum Answer {
     Throttled,
     /// An internal failure whose message must not reach the client.
     Fails,
+    /// The `engine_errors::every_error()` at this index.
+    Error(usize),
 }
 
 /// One position query the engine received.
@@ -293,6 +298,7 @@ impl EdrEngine for Nwp {
                     "connection refused at 10.0.0.5:9000/secret-bucket".into(),
                 ));
             }
+            Answer::Error(i) => return Err(engine_errors::every_error().swap_remove(i)),
         };
         let (lat, lon) = ds_core::feature::parse_point_coords(coords)?;
         let level = z.map_or(LEVELS[0], |z| z[0]);
@@ -1019,6 +1025,42 @@ async fn an_overloaded_engine_is_503_and_a_failing_one_leaks_nothing() {
     );
     assert!(!reply.body.contains("secret"), "{}", reply.body);
     assert!(!reply.body.contains("10.0.0.5"), "{}", reply.body);
+}
+
+/// Every engine error answers by its class (#17): an absent resource is the
+/// empty answer, a request the engine turns down the 400 naming the layer,
+/// and every other class the status every API answers it with. No error
+/// names the engine's detail.
+#[tokio::test]
+async fn every_engine_error_answers_its_class_status() {
+    for (i, error) in engine_errors::every_error().iter().enumerate() {
+        let query = gfi("nwp/t2m", 0, 0, "&INFO_FORMAT=application/json");
+        let reply = get(&router(Nwp::new(Answer::Error(i))), &query).await;
+        let expected = match error.class() {
+            ds_core::error::ErrorClass::NotFound => 200,
+            class => class.status_code(),
+        };
+        assert_eq!(reply.status.as_u16(), expected, "{error:?}: {}", reply.body);
+        assert_eq!(
+            reply.retry_after.as_deref(),
+            engine_errors::retry_after(error),
+            "{error:?}"
+        );
+        assert!(
+            !reply.body.contains(engine_errors::SECRET),
+            "{error:?}: {}",
+            reply.body
+        );
+        if expected == 200 {
+            let feature = &json(&reply)["features"][0];
+            assert_eq!(feature["properties"]["value"], serde_json::Value::Null);
+        } else if expected == 400 {
+            assert_eq!(
+                exception_code(&reply.body).as_deref(),
+                Some("InvalidParameterValue")
+            );
+        }
+    }
 }
 
 /// GetFeatureInfo's deadline is its own (#1103): `MC_FEATURE_INFO_TIMEOUT_MS`,

@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use ds_core::config::CollectionConfig;
-use ds_core::error::DataServerError;
+use ds_core::error::{DataServerError, ErrorClass};
 use ds_core::feature::{DatetimeInterval, Feature, FeatureQuery, PropertyValue, SortKey};
 use ds_core::feature_engine::FeatureEngine;
 
@@ -633,15 +633,34 @@ impl ServerHandler for MeteoCoreMcp {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Generic client-facing error for an engine query failure.
+/// The client-facing error of an engine query failure, by its class, as
+/// every API answers it (#17). A request the engine turns down or a resource
+/// it does not have is about the caller's own input: `invalid_params` with
+/// the engine's message, which every HTTP API returns too and which lets a
+/// model self-correct. A busy engine, a deadline and a data source that keeps
+/// refusing reads say to try again, naming no upstream.
 ///
-/// Critical Rule 11: `DataServerError`'s Display carries `Storage(String)` and
+/// Critical Rule 11: an internal error's Display carries `Storage(String)` and
 /// `Io` detail — filesystem paths, backend messages — which must not reach a
 /// client. api-features discards it the same way at the equivalent site; the
 /// detail goes to the log instead, where it is actually useful.
-fn query_failed(e: ds_core::error::DataServerError) -> ErrorData {
-    tracing::error!("MCP feature query failed: {e}");
-    ErrorData::internal_error("Query failed", None)
+fn query_failed(e: DataServerError) -> ErrorData {
+    match e.class() {
+        ErrorClass::BadRequest | ErrorClass::NotFound => {
+            ErrorData::invalid_params(e.to_string(), None)
+        }
+        ErrorClass::Busy | ErrorClass::DeadlineExceeded => {
+            ErrorData::internal_error("Server busy, try again later", None)
+        }
+        ErrorClass::SourceUnavailable => {
+            tracing::warn!("MCP feature query failed: {e}");
+            ErrorData::internal_error(DataServerError::UNAVAILABLE_DESCRIPTION, None)
+        }
+        ErrorClass::Internal => {
+            tracing::error!("MCP feature query failed: {e}");
+            ErrorData::internal_error("Query failed", None)
+        }
+    }
 }
 
 fn rfc3339(t: DateTime<Utc>) -> String {

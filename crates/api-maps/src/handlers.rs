@@ -1782,54 +1782,7 @@ async fn render_map(
                 tile.map_err(|e| MapsError::Internal(format!("Failed to encode empty tile: {e}")))?;
             (cached, "EMPTY")
         }
-        Err(e) => {
-            use ds_core::error::DataServerError as DSE;
-            // A client mistake (e.g. a multi-parameter PVOL collection
-            // rendered without a `<site>:<quantity>` parameter, or a bad
-            // bbox/datetime) is a 400 with the engine's helpful message —
-            // not a 500 that hides it behind "Internal server error".
-            return Err(match e {
-                DSE::ResourceExhausted | DSE::DeadlineExceeded => {
-                    MapsError::ServiceUnavailable(e.to_string())
-                }
-                // A data source that kept refusing the reads (#1355): WARN,
-                // not a server fault, and a 503 naming no upstream.
-                DSE::Unavailable(_) => {
-                    tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
-                    MapsError::SourceUnavailable
-                }
-                DSE::InvalidParameter(_)
-                | DSE::InvalidBbox(_)
-                | DSE::InvalidDatetime(_)
-                | DSE::QueryTooLarge(_) => {
-                    // 4xx-class: traced at DEBUG (not WARN) so a misconfigured
-                    // client is still diagnosable server-side without inflating
-                    // the warn stream with routine bad requests.
-                    tracing::debug!(
-                        "Maps render bad-request for collection '{}': {e}",
-                        collection_id
-                    );
-                    MapsError::BadRequest(e.to_string())
-                }
-                // ReferenceTimeNotFound is documented to map to 404 (EDR
-                // already does); reachable here when a pinned run is pruned
-                // between resolution and render — routine for nowcast
-                // generations (#522), not an internal error.
-                DSE::CollectionNotFound(_)
-                | DSE::LocationNotFound(_)
-                | DSE::ReferenceTimeNotFound(_) => {
-                    tracing::debug!(
-                        "Maps render not-found for collection '{}': {e}",
-                        collection_id
-                    );
-                    MapsError::NotFound(e.to_string())
-                }
-                _ => {
-                    tracing::warn!("Maps render error for collection '{}': {e}", collection_id);
-                    MapsError::Internal(format!("Render failed: {e}"))
-                }
-            });
-        }
+        Err(e) => return Err(MapsError::from_engine(e, collection_id)),
     };
 
     // Content-derived ETag now available — do the `If-None-Match`
@@ -1907,7 +1860,7 @@ impl From<ds_executor::ExecutionError> for MapsError {
     fn from(error: ds_executor::ExecutionError) -> Self {
         match error {
             ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
-            other => Self::ServiceUnavailable(other.to_string()),
+            _ => Self::ServiceUnavailable,
         }
     }
 }
