@@ -594,6 +594,10 @@ impl MessageCache {
                     drop(claim);
                 }
                 CacheEntry::Vacant(claim) => break self.fill_claimed(&key, claim, fill)?,
+                // The read-ahead's own probe holds the claim for an instant;
+                // waiting on that claim would hand this request the abandoned
+                // claim, and both would fetch. Join the read-ahead instead.
+                CacheEntry::Timeout if !joined && self.filling.contains(&key) => {}
                 CacheEntry::Timeout => break self.cache.get_or_insert_with(&key, fill)?,
             }
         };
