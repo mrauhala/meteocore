@@ -733,6 +733,24 @@ fn f32_source_keeps_nodata_and_values() {
     }
 }
 
+/// #1375: the expected interval is the spacing of the newest generations'
+/// anchor frames, the timeline `catalog_age` is measured on: none for one
+/// generation, the source's cadence once more follow.
+#[test]
+fn expected_interval_is_the_spacing_of_the_generation_anchors() {
+    let anchor = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT1H", &[t0(), anchor]);
+    engine.poll_once();
+    assert!(engine.has_data());
+    assert_eq!(engine.expected_interval(), None, "one generation");
+    for minutes in [10, 15] {
+        let next = t0() + Duration::minutes(minutes);
+        source.times.write().unwrap().push(next);
+        engine.poll_once();
+    }
+    assert_eq!(engine.expected_interval(), Some(Duration::minutes(5)));
+}
+
 #[test]
 fn generation_produces_future_frames_and_instances_contract() {
     let anchor = t0() + Duration::minutes(5);

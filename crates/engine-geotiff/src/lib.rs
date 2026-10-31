@@ -775,6 +775,15 @@ impl GeoTiffEngine {
         Some(Utc::now() - newest)
     }
 
+    /// The spacing of the newest timesteps [`Self::data_age`] is measured
+    /// on, for the `collection_expected_interval_seconds` gauge (#1375):
+    /// [`ds_core::health::expected_interval`] over the catalog's live
+    /// timesteps. `None` below two.
+    pub fn expected_interval(&self) -> Option<chrono::Duration> {
+        let catalog = self.catalog.load();
+        ds_core::health::expected_interval(catalog.live().rev().map(|(time, _)| *time))
+    }
+
     /// Time since the engine loaded or a poll last found files, for
     /// `/health` `poll_age_secs`. It grows while the scan fails or comes back
     /// empty (the old catalog is kept), not while the files merely stop
@@ -3844,6 +3853,42 @@ mod tests {
             engine.poll_once();
         }
         assert_data_age("2026-04-06T06:45:00Z");
+    }
+
+    /// #1375: the expected interval is the spacing of the newest timesteps,
+    /// the timeline `data_age` is measured on, from the newest six: a
+    /// missing frame does not move it, an older hourly past is not read.
+    #[test]
+    fn expected_interval_is_the_spacing_of_the_newest_timesteps() {
+        let src = ["testdata/radar-tm35fin", "../../testdata/radar-tm35fin"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_dir())
+            .expect("testdata/radar-tm35fin fixture")
+            .join("radar_tm35_20260406T0640Z.tif");
+        let dir = TempDir::new("expected_interval_test");
+        let copy = |stamp: &str| {
+            std::fs::copy(
+                &src,
+                dir.0.join(format!("radar_tm35_20260406T{stamp}Z.tif")),
+            )
+            .unwrap();
+        };
+        copy("0640");
+        let engine = GeoTiffEngine::new("radar", dir.0.to_str(), &tm35fin_test_config()).unwrap();
+        assert_eq!(engine.expected_interval(), None, "one timestep");
+
+        for stamp in [
+            "0300", "0400", "0500", "0610", "0615", "0620", "0630", "0635",
+        ] {
+            copy(stamp);
+        }
+        let engine = GeoTiffEngine::new("radar", dir.0.to_str(), &tm35fin_test_config()).unwrap();
+        // 06:40 back to 06:10: 5, 5, 10 (06:25 missing), 5 and 5 minutes.
+        assert_eq!(
+            engine.expected_interval(),
+            Some(chrono::Duration::minutes(5))
+        );
     }
 
     /// #1007: a poll that finds no files leaves `poll_age` growing, also

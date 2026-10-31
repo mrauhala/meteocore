@@ -188,6 +188,17 @@ serviceMonitor:
   relabelings: []
   metricRelabelings: []
 
+# The repository's Prometheus alert rules as a Prometheus Operator
+# PrometheusRule: stale or empty collections, error rates, shed requests,
+# throttling and memory. README.md lists them.
+prometheusRule:
+  enabled: false
+  # Labels your Prometheus selects rules on (ruleSelector).
+  labels: {}
+  # The scrape job the rules match: the ServiceMonitor's, named after the
+  # Service, when empty.
+  job: ""
+
 # The repository's Grafana dashboard as a ConfigMap for the Grafana sidecar.
 # It is a dashboard.grafana.app/v2 resource: Grafana 13 or later.
 grafanaDashboard:

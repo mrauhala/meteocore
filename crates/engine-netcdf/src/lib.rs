@@ -555,6 +555,24 @@ impl NetcdfEngine {
         Some(Utc::now() - newest)
     }
 
+    /// The spacing of the timeline [`Self::data_age`] is measured on, for
+    /// the `collection_expected_interval_seconds` gauge (#1375):
+    /// [`ds_core::health::expected_interval`] over the newest runs'
+    /// reference times, or the valid times without runs. `None` below two.
+    pub fn expected_interval(&self) -> Option<chrono::Duration> {
+        let catalog = self.catalog.load();
+        match catalog.runs.last_key_value()? {
+            (Some(_), _) => ds_core::health::expected_interval(
+                catalog
+                    .runs
+                    .keys()
+                    .rev()
+                    .map_while(|reference_time| *reference_time),
+            ),
+            (None, run) => ds_core::health::expected_interval(run.steps.keys().rev().copied()),
+        }
+    }
+
     /// Every served valid time, ascending.
     pub fn times(&self) -> Vec<DateTime<Utc>> {
         self.catalog.load().info.times.clone()

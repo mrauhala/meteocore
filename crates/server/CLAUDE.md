@@ -330,7 +330,10 @@ need no reload pruning.
 - Never the time since a poll. A stalled feeder leaves its files in place,
   every poll still finds them, and a poll-stamped age stayed near the poll
   interval while the served latest got minutes older. An engine gaining a
-  data age adds it to `collection_data_ages`; `/health` and the gauge follow.
+  data age adds it to `collection_data_ages` with an `expected_interval()`
+  over the same timeline (`ds_core::health::expected_interval`), and its
+  type to `ds_core::config::DATA_AGE_ENGINES`; `/health` and the gauges
+  follow.
 - `poll_age_secs` (GeoTIFF, QueryData): time since the engine loaded or a
   poll last found data. It grows while the source is unreachable, empty or
   unloadable, the old data kept. Both growing: the source fails. Only
@@ -340,8 +343,23 @@ need no reload pruning.
   while it holds none: never loaded, or all of it aged out. Such a collection
   has no `collection_data_age_seconds` series and `collection_has_data` 0;
   the others have 1 (#1055). A reloaded-away collection loses both series;
-  only those are removed, never the family. Alert per collection on the age,
-  thresholds per feed, and on `collection_has_data == 0`.
+  only those are removed, never the family.
+- `collection_expected_interval_seconds` (#1375) is the spacing of the
+  timeline the age is measured on: `ds_core::health::expected_interval`,
+  the median of the newest five gaps (the larger middle one of an even
+  count), or the collection's `expected_interval` (`DATA_AGE_ENGINES` only).
+  Below two timesteps without one it has no series, and `CollectionStale`
+  never fires for the collection. Same lifecycle as the age series, in the
+  same `REPORTED` lock.
+- Alert rules live in `docker/prometheus/rules/meteocore.yml`, with a
+  promtool unit test per alert in `meteocore.test.yml` (CI job `rules`).
+  The chart ships the same file through its `rules/` symlink as a
+  PrometheusRule, replacing `job="meteocore"`: every selector names that
+  job. Renaming or relabelling a family a rule reads needs the rule and its
+  test changed in the same PR.
+- WMS GetMap's red error tile (HTTP 200, #280) carries an `api_wms::ErrorTile`;
+  `metrics_middleware` counts it as `wms_error_tiles_total{collection,reason}`
+  and `prune_render_duration` drops a removed WMS collection's series.
 
 ## Operational notes
 
