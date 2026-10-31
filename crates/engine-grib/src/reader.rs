@@ -86,7 +86,34 @@ pub(crate) fn fetch_message_bytes(
 }
 
 /// Decode a GRIB2 message from raw bytes.
+///
+/// A panic in the `grib` crate, which decodes bytes from the source, is an
+/// error for this field, never a failed worker that fails the whole query
+/// (#1325). The decode reads only `bytes` and drops all it builds, so
+/// nothing a panic interrupts is observed again; the workspace unwinds on
+/// panic (no `panic = "abort"` profile). Known panics are checked before
+/// the decode runs ([`crate::ccsds::check_sections`], [`check_data_section`]).
 pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServerError> {
+    catching_panics(param, || decode(bytes, param))
+}
+
+/// `decode`'s result, or an error naming `param` if it panicked.
+fn catching_panics<T>(
+    param: &str,
+    decode: impl FnOnce() -> Result<T, DataServerError> + std::panic::UnwindSafe,
+) -> Result<T, DataServerError> {
+    std::panic::catch_unwind(decode).unwrap_or_else(|_| {
+        tracing::warn!(parameter = %param, "GRIB2 decoder panicked; the message is unreadable");
+        Err(DataServerError::Engine(format!(
+            "GRIB2 decoder panicked on the message for {param}"
+        )))
+    })
+}
+
+fn decode(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServerError> {
+    crate::ccsds::check_sections(bytes).map_err(|reason| {
+        DataServerError::Engine(format!("Invalid GRIB2 message for {param}: {reason}"))
+    })?;
     let grib2 = grib::from_reader(std::io::Cursor::new(bytes)).map_err(|e| {
         DataServerError::Engine(format!("Failed to parse GRIB2 message for {param}: {e}"))
     })?;
@@ -121,6 +148,9 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
     let metadata =
         crate::metadata::MessageMetadata::from_product(discipline, centre, submessage.prod_def())?;
     let uv_frame = layout.uv_frame;
+    check_data_section(&submessage, bytes).map_err(|reason| {
+        DataServerError::Engine(format!("Invalid GRIB2 data section for {param}: {reason}"))
+    })?;
 
     // Decode values using Grib2SubmessageDecoder
     let decoder = Grib2SubmessageDecoder::from(submessage).map_err(|e| {
@@ -182,6 +212,27 @@ pub fn decode_message(bytes: &[u8], param: &str) -> Result<DecodedGrid, DataServ
         statistic: metadata.statistic,
         uv_frame,
     })
+}
+
+/// What `grib`'s decoder takes on trust in Section 7, checked before it
+/// runs: complex packing (templates 5.2 and 5.3) slices its groups without a
+/// bounds check and panics on a section shorter than they say (#1325).
+/// Simple packing and CCSDS read through bounded iterators, and JPEG 2000
+/// and PNG are not built in.
+fn check_data_section<R>(submessage: &grib::SubMessage<'_, R>, bytes: &[u8]) -> Result<(), String> {
+    let section5 = submessage.section5().map_err(|e| e.to_string())?;
+    let section7 = submessage.7.body;
+    let payload = section7
+        .offset
+        .checked_add(5)
+        .zip(section7.offset.checked_add(section7.size))
+        .and_then(|(start, end)| bytes.get(start..end))
+        .ok_or("Section 7 outside the message")?;
+    crate::complex::check_section7(
+        &section5.payload.template,
+        section5.payload.num_encoded_points as usize,
+        payload,
+    )
 }
 
 struct GridLayout {
@@ -357,6 +408,19 @@ mod tests {
             );
             assert_eq!(grid.bilinear_value(0.5, 0.5), Some(25.0));
         }
+    }
+
+    /// #1325: a panic in the decoder fails its field, not the worker that
+    /// runs the whole query.
+    #[test]
+    fn a_decoder_panic_is_an_error_for_its_field() {
+        let error =
+            catching_panics("TMP", || -> Result<(), _> { panic!("a decoder bug") }).unwrap_err();
+        assert!(matches!(error, DataServerError::Engine(_)));
+        assert!(error
+            .to_string()
+            .contains("panicked on the message for TMP"));
+        assert_eq!(catching_panics("TMP", || Ok(7)).unwrap(), 7);
     }
 
     #[test]

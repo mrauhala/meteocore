@@ -135,6 +135,7 @@ impl Header {
     /// readable; another layout is [`PointError::Unsupported`], and what
     /// the full decode would reject is [`PointError::Invalid`].
     pub(crate) fn parse(message: &[u8]) -> Result<Self, PointError> {
+        check_sections(message).map_err(invalid)?;
         let grib2 = grib::from_reader(Cursor::new(message)).map_err(invalid)?;
         let (_, submessage) = grib2
             .iter()
@@ -631,9 +632,12 @@ fn find_section7(prefix: &[u8]) -> Result<Option<(usize, usize)>, PointError> {
             return Ok(None);
         };
         let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        if len < shortest_section(header[4]) {
+            return Err(invalid(SHORT_SECTION));
+        }
         match header[4] {
-            7 if len >= 5 => return Ok(Some((at, len))),
-            1..=6 if len >= 5 => {
+            7 => return Ok(Some((at, len))),
+            1..=6 => {
                 at = at
                     .checked_add(len)
                     .ok_or_else(|| invalid("section length overflows"))?
@@ -641,6 +645,51 @@ fn find_section7(prefix: &[u8]) -> Result<Option<(usize, usize)>, PointError> {
             _ => return Err(invalid("unexpected section before Section 7")),
         }
     }
+}
+
+/// The error for a section shorter than [`shortest_section`].
+const SHORT_SECTION: &str = "a section shorter than grib parses";
+
+/// The shortest section `grib` parses: its 5-octet header, and Section 6's
+/// bitmap indicator. It subtracts these from a section's stated length
+/// unchecked, and panics on a shorter one (#1325).
+fn shortest_section(number: u8) -> usize {
+    if number == 6 {
+        6
+    } else {
+        5
+    }
+}
+
+/// Check the sections of `message`, a whole message, before `grib` parses
+/// it (#1325): from Section 1 on they must tile the message up to Section
+/// 8, as Section 0's total length places it, each at least
+/// [`shortest_section`] long. `grib` walks them by that total length with
+/// unchecked subtractions and panics on a shorter section.
+pub(crate) fn check_sections(message: &[u8]) -> Result<(), &'static str> {
+    let indicator = message.get(..16).ok_or("shorter than Section 0")?;
+    if &indicator[..4] != b"GRIB" || indicator[7] != 2 {
+        return Err("not a GRIB edition 2 message");
+    }
+    let total = u64::from_be_bytes(indicator[8..16].try_into().unwrap());
+    let end = usize::try_from(total)
+        .ok()
+        .filter(|&total| (20..=message.len()).contains(&total))
+        .ok_or("total length outside the message")?
+        - 4;
+    let mut at = 16;
+    while at < end {
+        let header = message.get(at..at + 5).ok_or("a section past Section 8")?;
+        let len = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        if len < shortest_section(header[4]) {
+            return Err(SHORT_SECTION);
+        }
+        at += len;
+        if at > end {
+            return Err("a section past Section 8");
+        }
+    }
+    Ok(())
 }
 
 impl CcsdsIndex {
