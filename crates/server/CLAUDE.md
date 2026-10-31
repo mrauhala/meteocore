@@ -270,6 +270,25 @@ need no reload pruning.
   every scrape; the ratio has none for a disabled cache.
 - The plan test runs in a child process: the `MC_*` statics read the
   environment once.
+- `memory_plan.rs` (#1312) fits every row to the memory total in
+  `cache_plan::log`, so at boot, after every accepted reload and on a
+  recovery reload: `ds_cache::plan::grant::plan` over the snapshot rows,
+  the accepted `[memory] total_mb` (`AcceptedLoad::memory_total_mb`) and
+  the facts `memory_plan::read_at_boot` reads once (`main` calls it before
+  the first load, so `MemAvailable` is what boot leaves). The last report
+  is a process-wide static that `/admin/cache-plan` (`planned_bytes`,
+  `plan`) and the `/metrics` plan gauges read. It applies nothing: the
+  plan is a report until `[memory] mode = "auto"` (#1312 part 2).
+- Detection (`memory_plan/detect.rs`) reads `/proc` and `/sys` under a
+  root, so its tests build fixture trees and run on any OS; without
+  `<root>/proc/meminfo`, macOS asks `sysctlbyname` and Windows
+  `GlobalMemoryStatusEx`.
+- `memory_plan::unreachable` decides rule 2 (0 for a cache no collection
+  can reach) from the accepted collections: a new cache or budget that some
+  configs cannot reach needs an arm there, and a class in
+  `ds_cache::plan::grant::class`, or it plans as `fixed`.
+  `STORE_FAMILIES` is the dashboard's "stores" list (Memory outside
+  caches): change both together.
 - Without `ADMIN_TOKEN` every admin route answers 403 (`require_admin_token`).
 - `metrics_handler` takes the budgets' high-water marks after
   `refresh_metrics` (`update_budget_peaks`); the plan endpoint and log block

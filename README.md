@@ -535,6 +535,9 @@ port = 8000
 # [discovery]                                   # optional, top-level config.toml only
 # catalogue = "https://wis2-gdc.weather.gc.ca"  # WIS2 Global Discovery Catalogue of WCMP2 records (default)
 
+# [memory]                                      # optional, top-level config.toml only
+# total_mb = 28672                              # the memory this server may use (MiB); detected when unset
+
 [[collections]]
 id = "weather"
 title = "Finnish Weather Observations"
@@ -597,6 +600,109 @@ wis2_topic = "weather/surface-based-observations/weather-radar"
 | `rendered_cache_mb` | no | `256` | Size (MB) of the rendered-image cache: encoded images WMS, Maps and Tiles serve again on a repeated request. Server-wide, not per-collection. `0` disables it. Unset, the deprecated per-collection `[wms] rendered_cache_mb` still sizes it: the largest value among the WMS, Maps and Tiles collections, with a warning. When both are set, this key wins and the collection keys are ignored with a warning. A reload re-reads it and resizes the warm cache in place, keeping the images that fit; a size at which a new cache would have fewer shards, or over four times as many, starts an empty one. |
 | `state_dir` | no | — | Writable directory for engine state snapshots. A WIS2-fed CAP collection keeps its alert set (alerts, zone polygons, withdrawals) in `<state_dir>/<collection id>.cap.state`: written atomically at most every five minutes when it changed, at least hourly when it did not, and on graceful shutdown; restored when the collection is built (alerts that expired meanwhile are dropped). Without it, every restart starts the alert set empty and the collection reports `degraded` ("warming up after cold start: N alerts received") for `[cap.wis2] warmup` (default `PT24H`). A snapshot older than `warmup` (the server was down that long) keeps its alerts but restarts the warm-up ("warming up after a long outage"). A WIS2-fed BUFR collection likewise keeps its report store in `<state_dir>/<collection id>.bufr.state` (gzip-compressed JSON, about 8 MB for a global SYNOP store of 270k reports), on the same schedule; restore drops reports older than `retention`. The shutdown flush encodes the whole store, about 0.25 s per 270k reports: a 7-day `retention` over the default `max_stations` of 50 000 hourly stations is about 8.4M reports, roughly 8 s and 235 MB. Docker kills a container 10 s after asking it to stop, and the server drains its open requests before it flushes, so give a large store a longer stop timeout (`stop_grace_period` in Compose, `docker stop -t <seconds>`). The collections flush side by side, so the largest store sets the time; each flush logs its duration and size at INFO (`state snapshot flushed in …`). A flush cut short keeps the previous snapshot, losing at most the last five minutes of reports. Without `state_dir`, a restart empties the store and the collection reports "warming up after cold start: N reports received" for `[bufr.wis2] warmup`, which defaults to the shorter of the collection's `retention` and `PT24H` (with a longer retention, the older part of the window is still filling when the warm-up ends; set `warmup` to the retention to wait for a full window). A reload that rebuilds either kind of collection does not go through the snapshot: the new engine takes over the replaced one's set in memory. A `data_path` BUFR source re-reads its files and needs no snapshot. Resolved relative to the config file's directory; created at boot. The Docker image provides `/var/lib/meteocore` owned by its non-root user, so a named volume mounted there is writable. A failed write is a rate-limited warning, never a load error; a corrupt snapshot is a cold start. Fixed at boot: restart to change. |
 | `render_concurrency` | no | 2× CPUs, min 8 | Render CPU slots shared by WMS, Maps, Tiles and 3D Tiles; `MC_RENDER_QUEUE_CAPACITY` defaults to 3× this. Lower it for CPU-bound deployments, raise it when renders mostly wait on remote reads. Must be 1–512. Fixed at boot: a reload cannot resize the slots and logs a warning instead; restart to change. The effective value is logged at startup and exported as `render_semaphore_total`. |
+
+### Memory (`[memory]`)
+
+The memory plan fits every cache and admission budget into the memory the
+server may use. For now it is a report: [`/admin/cache-plan`](#memory-and-caches),
+the boot and reload log and `/metrics` show the size it would give each one
+next to the configured size, and nothing is resized.
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `total_mb` | no | detected | The memory this server may use, in MiB. At least 256. Top-level `config.toml` only; a reload re-reads it. |
+
+Without `total_mb` the total is detected, the first of:
+
+1. **A cgroup limit, × 0.8.** cgroup v2: the smallest finite `memory.max` or
+   `memory.high` of the server's cgroup and every ancestor (`max` is none).
+   cgroup v1: `memory.limit_in_bytes` or `hierarchical_memory_limit`, any
+   value at or above `MemTotal` being none (v1 reads "unlimited" as
+   9 223 372 036 854 771 712). A hybrid host reads v2 first. Docker's
+   `mem_limit`, Kubernetes `limits.memory` and systemd's `MemoryMax=` set
+   one. The 20 % kept back is for the page cache of mapped local data
+   (GeoTIFF, QueryData), which the cgroup also counts, and for spikes:
+   crossing the limit is an OOM kill. `memory.low`, which Docker's
+   `mem_reservation` and Kubernetes requests set, protects memory and does
+   not limit it: the log reports it, the plan does not use it. A pod with
+   requests but no limit is a host without a limit.
+2. **No limit:** the smaller of half of `MemTotal` and 80 % of `MemAvailable`
+   at boot, with one WARN asking for `total_mb`. macOS and Windows ask the
+   system for both.
+
+`total_mb` above a detected cgroup limit is used, with a WARN. Under
+512 MiB the plan puts every cache and budget at its floor, with a WARN. The
+log names the input that set the total, e.g.
+`memory total 3.20 GiB (cgroup v2 memory.max 4.00 GiB × 0.8)`.
+
+Reserves come first:
+
+- the memory outside jemalloc (RSS less `jemalloc_resident_bytes`, at least
+  512 MiB) and the heap outside the caches (the store gauges, plus 32 MiB
+  per collection for what has none), measured where RSS is read (Linux);
+  elsewhere 256 MiB plus 16 MiB per collection;
+- the render budget, 10 % of the total between 128 MiB and 4 GiB, and the
+  largest read budget (every other budget), 5 % of the total between 64 MiB
+  and 1 GiB but never above its default: reads of different engines rarely
+  peak together, and the budgets' `*_reserved_peak_bytes` will tell whether
+  a larger one is used. A budget set by its variable keeps its size;
+- allocator slack: the caches share what is left, divided by 1.1, the pool.
+
+The caches share the pool:
+
+1. A cache sized by a setting (an `MC_…` variable, a `[server]` key, a
+   collection key, or a key it follows) keeps its size.
+2. A cache no collection can reach gets 0: the 3D Tiles content and voxel
+   caches without a `3dtiles` collection, the composite cache without an
+   `odim` collection, an engine's caches without a collection of it, the MVT
+   cache without a Features collection with `tiles`, a local GeoTIFF's tile
+   cache and a local GRIB source's message cache.
+3. The satellite scan and station-grid caches get their demand plus 15 %.
+4. The working-set caches (GRIB grid and message, remote GeoTIFF tiles,
+   Zarr, NetCDF) get their demand plus 15 %, else their configured size,
+   between 64 MiB and 2 GiB, all of them together at most 35 % of what the
+   first three leave.
+5. The traffic-driven caches share what is left by weight, each between an
+   eighth of its configured size and eight times it: meta-tiles 45, PVOL
+   pixels 25 (on top of its pre-warm floor), GeoTIFF decoded chunks 15,
+   ODIM composites 10, rendered images, MVT, 3D Tiles content and voxel
+   grids 5 each. The other caches keep their size.
+6. While the total allows, no cache gets less than its configured size.
+7. When it does not, caches are cut toward their floors in this order until
+   they fit: those idle over the last hour, the traffic-driven ones (the
+   lowest weight first), the working sets (one cut below 64 MiB or four of
+   its fields goes to its floor, 0 for one that is off today), the budgets
+   (to 128 and 64 MiB), and the demand caches last, below which an engine
+   degrades. What still does not
+   fit is the shortfall, never a load error. One WARN block per boot or
+   reload gives the total and its source, the demand, floors and pins, each
+   cut (configured → planned) and the collections with the largest demand;
+   on a host without a limit it asks for `total_mb`.
+
+The plan fits each cache's expected use into the pool: its demand, or what
+it holds when that is more, for a cache whose demand is known, else its
+planned size. The planned sizes can sum to more, as configured sizes do
+today: a cache allocates only as it fills.
+
+| Where it runs | Total with nothing set | Pool |
+|---------------|------------------------|------|
+| Container with a 4 GiB limit, 10 collections | 3.20 GiB (cgroup × 0.8) | 2.10 GiB: render budget 327 MiB, read budget 163 MiB |
+| Laptop, 16 GiB with 6 GiB available, 5 collections | min(8, 4.8) = 4.80 GiB | 3.41 GiB |
+| Small VM, 2 GiB, one local radar | 1.00 GiB | 509 MiB: render 128 MiB, read 64 MiB, caches at their floors plus a share |
+| Shared 62 GiB host, ~48 GiB available, 79 collections | min(31, 38) = 31 GiB, with the WARN | ~21.5 GiB |
+| Dedicated 128 GiB server, 40 collections | 64 GiB until `total_mb` is set | ~53 GiB: budgets at their 4 GiB and 1 GiB ceilings |
+
+Worked example: the container, with two GRIB sources, a satellite
+collection, a PVOL site, NetCDF and local GeoTIFF radars. 256 MiB plus
+16 MiB for each of its ten collections is 0.41 GiB outside the caches; with
+the 327 MiB render budget, a 163 MiB read budget and 0.21 GiB of slack, the
+caches share 2.10 GiB. The 3D Tiles, composite, MVT and station-frame
+caches and the Zarr read budget plan 0: no collection reaches them. The
+satellite scans keep their 1 GiB, 650 MiB of it expected. The rest do not
+fit at their configured sizes, so the plan cuts: the meta-tile and PVOL
+pixel caches to 128 MiB, rendered images to 32 MiB and decoded GeoTIFF
+chunks to 64 MiB, then the GRIB grid and NetCDF caches to 102–153 MiB. The
+WARN block lists each cut; `total_mb`, or a larger limit, gives them back.
 
 ### Collection Config Fields
 
@@ -2641,6 +2747,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/admin/cach
 - `memory` repeats the process and allocator gauges of `/metrics` (`process_resident_memory_bytes`, `jemalloc_*_bytes`), `null` where they cannot be read: RSS and swap off Linux.
 - A cache's `churn` counts, since it was built, the bytes it admitted for keys not resident (`inserted_bytes`), the inserts it refused because the entry outweighs its shard's hot target (`refused`), the entries it evicted from the cold and hot rings (`evictions`) and their bytes (`evicted_bytes`), the reads that went around it (`bypasses`: a GRIB window larger than the grid cache), and, for a cache that keeps a ghost ring, `ghost_hits`: misses whose key it evicted within 0.5, 1 or 2 times its capacity of evictions, cumulative. `prewarmed` marks a cache filled ahead of its reads (PVOL pixels, GeoTIFF tiles, a GRIB message cache with `prewarm` on).
 - A cache whose engines know what it must hold for their data has its demand: `demand_bytes`, `demand_rule` (how it is computed), `demand_kind` (`floor` for the PVOL pixel cache, whose pre-warm is only part of what it holds, else `demand`), `suggested_bytes` (the demand plus 15 %, or the floor, in whole MiB) and `demand_inputs`, each collection's part with the facts it comes from. The engines compute it from what their polls load, never per request: the satellite scans in each time window, the PVOL pre-warm set (twice it), the station grids computed ahead, 16 fields of a GRIB source's grid and 16 of its messages, 16 fields of a NetCDF grid, 16 inner chunks of an Icechunk store, and every frame of a remote GeoTIFF collection at its mean encoded size. A local GeoTIFF collection and a plain Zarr store demand nothing: their tile and decoded caches stay empty. Caches that hold what requests ask for (meta-tiles, rendered images, decoded chunks) have none: `last_hour` says whether they need more. The fields are `null` where there is no demand. Nothing applies a suggestion.
+- `planned_bytes` is the size the [memory plan](#memory-memory) gives the cache or budget, `planned_reason` why (`pinned`, `unreachable: …`, `demand + 15 %`, `working set`, `share by weight 45`, `size today`, `scaled to the total`, `cut: …`, `fixed`, `floor: …`), and `expected_bytes` what the plan counts it at. The plan is computed at boot and after every accepted reload: an entry entered since has `null`. `plan` holds its `total_bytes` and `total_source`, `cgroup_low_bytes`, the `reserves` (`outside_bytes`, `heap_bytes`, `baseline` `measured` or `estimated`, `render_budget_bytes`, `read_budget_bytes` and the `read_budget` reserved, `slack_bytes`), `pool_bytes`, `expected_bytes`, `demand_bytes`, `floor_bytes`, `pinned_bytes`, `shortfall_bytes` and `cut`; `null` when no total is known. A report: no size is changed.
 - When a cache is configured below its demand, the server logs one WARN naming the cache, its size and where it came from, the rule, each collection's inputs, what the shortfall costs and the size to set. It warns again only when the size changes or the demand grows 15 % past the one it reported, so a demand that grows a little each poll, or hovers around the size, warns once; after the demand has dropped under 90 % of the size, a new shortfall warns afresh. A disabled cache (`0`) is never short.
 - A cache's `last_hour` says whether it needs memory, from the counters `/metrics` scrapes sample every five minutes (without a scraper, since the previous plan read; `null` until a cache has five minutes of samples): `lookups` and `lookups_per_hour`, `hit_ratio`, `turnover_per_hour` (capacities admitted per hour), `cold_eviction_share` (evicted before a second use), `ghost_hit_share` by depth, `estimated_hit_ratio` of a cache 1.5, 2 or 3 times as large, a `caveat` for a pre-warmed cache, and its `label`:
 
@@ -2654,7 +2761,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/admin/cach
 
   The ghost ring costs a hash and a lock on every miss, so it is kept only by the meta-tile, rendered-image, GeoTIFF decoded-chunk, PVOL pixel and GRIB grid and message caches. The thresholds are starting points.
 
-The server logs the same list at INFO at boot and after every accepted reload: one line per cache and budget, grouped by scope, with its size in MiB and its source, a cache's demand and suggested size, the totals, and after a reload the old size of each one that changed. On `/metrics`, `cache_size_source{cache,collection,source}` is 1 for each entry, `memory_capacity_total_bytes{kind}` sums the capacities of the caches and of the budgets, `cache_demand_bytes{cache,collection}` is each cache's demand and `cache_demand_ratio{cache,collection}` that over its size. The Grafana dashboard's Memory & admission tab shows them in its Cache plan row: the table's Demand column, and the Demand by cache panel. Its Rendering & caches tab shows each cache's churn and label in the Cache churn row.
+The server logs the same list at INFO at boot and after every accepted reload: one line per cache and budget, grouped by scope, with its size in MiB and its source, a cache's demand and suggested size, its planned size and why, the totals and the memory plan's total and reserves, and after a reload the old size of each one that changed. A plan that cuts caches, or falls short, adds one WARN block. On `/metrics`, `cache_size_source{cache,collection,source}` is 1 for each entry, `memory_capacity_total_bytes{kind}` sums the capacities of the caches and of the budgets, `cache_demand_bytes{cache,collection}` is each cache's demand and `cache_demand_ratio{cache,collection}` that over its size, `cache_planned_bytes{cache,collection}` each entry's planned size, and `memory_plan_total_bytes`, `memory_plan_pool_bytes` and `memory_plan_shortfall_bytes` the plan's total, pool and shortfall. The Grafana dashboard's Memory & admission tab shows them in its Cache plan row: the table's Planned and Demand columns, the Demand by cache panel, Memory plan, and Plan against memory, the planned and configured sums against the total and RSS. Its Rendering & caches tab shows each cache's churn and label in the Cache churn row.
 
 Memory outside the caches has gauges too ([Memory outside caches](#prometheus-metrics)):
 
@@ -2810,6 +2917,10 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `memory_capacity_total_bytes` | gauge | kind | Configured capacity of every cache (`cache`) or admission budget (`budget`), summed |
 | `cache_demand_bytes` | gauge | cache, collection | What a cache must hold for its collections' data, as their engines compute it; `collection` empty for a process-wide cache, whose demand sums its collections'. The PVOL pixel cache's is a floor |
 | `cache_demand_ratio` | gauge | cache, collection | `cache_demand_bytes` over the cache's configured capacity: above 1 the cache is below its demand. No series for a disabled cache |
+| `cache_planned_bytes` | gauge | cache, collection | The size the [memory plan](#memory-memory) gives each cache and admission budget, labelled as `cache_size_source` is. A report: the configured size is unchanged |
+| `memory_plan_total_bytes` | gauge | — | The memory the plan fits every cache and budget into: `[memory] total_mb`, else 80 % of a cgroup limit, else the smaller of half of `MemTotal` and 80 % of `MemAvailable` at boot; 0 when unknown |
+| `memory_plan_pool_bytes` | gauge | — | What the caches share of the total after the reserves |
+| `memory_plan_shortfall_bytes` | gauge | — | How much more memory the plan needs with its pins kept and every other cache and budget at its floor; 0 when it fits |
 
 **Render & storage:**
 

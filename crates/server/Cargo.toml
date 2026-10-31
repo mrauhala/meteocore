@@ -77,3 +77,11 @@ tower = { version = "0.5", features = ["util"] }
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
 tikv-jemallocator = { version = "0.7", features = ["stats"] }
+
+# The host's memory for the memory plan (#1312): `sysctlbyname`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+# The host's memory for the memory plan (#1312): `GlobalMemoryStatusEx`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }

@@ -363,6 +363,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   hot_allocation_holding(capacity, largest))` (the GRIB caches, #1332). A
   caller that will read a fill again but samples its own copy now `keep`s
   it, or the fills after it push it out of the cold ring (#1340).
+  The memory plan sizes a cache by its class (`ds_cache::plan::grant::class`,
+  #1312: demand, working set, traffic-driven with a weight, else fixed):
+  a new cache gets one there.
   Every cache and admission budget is entered in the memory plan,
   `ds_cache::plan` (#1306), under its `/metrics` family as id
   (`metatile_cache`, `geotiff_decode`), a scope and its size source. A
@@ -1201,6 +1204,14 @@ rate_limit_per_min = 60     # PER BUCKET — authenticated requests and failed
 # cannot introduce it on a server that started without it — the route is built
 # at boot. Enabling for the first time, and changing token_env or
 # rate_limit_per_min, all need a restart.
+
+# Optional: the memory this server may use, in MiB (at least 256), which the
+# memory plan fits every cache and budget into (#1312). Top-level config.toml
+# only. Unset: 80 % of a cgroup limit, else min(50 % of MemTotal, 80 % of
+# MemAvailable at boot), with a WARN. For now a report (/admin/cache-plan
+# planned_bytes, cache_planned_bytes): nothing is resized.
+[memory]
+total_mb = 28672
 
 # Optional named colormaps. Like [[style_bundles]], MUST live in top-level
 # config.toml (rejected in per-collection files). Registered next to the
