@@ -138,3 +138,65 @@ async fn a_zero_payload_budget_keeps_nothing() {
     assert_eq!((cache.hits, cache.misses, cache.bytes), (0, 2, 0));
     assert_eq!(cache.capacity_bytes, 0);
 }
+
+/// A range fetched ahead waits outside the payload cache and touches it
+/// only as its decode's read does: that read misses, takes the range, and
+/// fills the cache as a read from storage would (#1353).
+#[tokio::test]
+async fn a_range_fetched_ahead_reaches_the_payload_cache_as_its_decodes_miss() {
+    let (storage, meter, settings) = storage(1024 * 1024).await;
+    let ctx = StorageContext::unattributed(&settings);
+    let path = "chunks/0123456789ABCDEF";
+    let read = |range: Range<u64>| {
+        let storage = &storage;
+        let ctx = &ctx;
+        async move {
+            let (reader, _) = storage.get_object(ctx, path, Some(&range)).await.unwrap();
+            read_all(reader).await
+        }
+    };
+    let cache = |meter: &Meter| {
+        let cache = meter.payload_metrics();
+        (cache.hits, cache.misses, cache.bytes)
+    };
+
+    let ahead = PREFETCH.scope((), read(0..40)).await;
+    assert_eq!(ahead, (0..40).collect::<Vec<u8>>());
+    let requests = meter.counts().0;
+    assert!(requests > 0);
+    assert_eq!(cache(&meter), (0, 0, 0), "staged, not cached");
+    assert_eq!(PREFETCH.scope((), read(0..40)).await, ahead, "staged once");
+    assert_eq!(meter.counts().0, requests);
+
+    // The decode: a miss, served from staging, filling the cache.
+    assert_eq!(read(0..40).await, ahead);
+    assert_eq!(meter.counts().0, requests, "no request");
+    let (hits, misses, bytes) = cache(&meter);
+    assert_eq!((hits, misses), (0, 1));
+    assert!(bytes >= 40);
+    assert_eq!(meter.prefetched(), [1, 0, 0, 0], "used");
+    // Taken: the next read hits the cache, and a fetch ahead of a cached
+    // range changes nothing.
+    assert_eq!(read(0..40).await, ahead);
+    assert_eq!(PREFETCH.scope((), read(0..40)).await, ahead);
+    assert_eq!(cache(&meter), (1, 1, bytes));
+    assert_eq!(meter.counts().0, requests);
+    assert_eq!(meter.prefetched(), [1, 0, 0, 0]);
+}
+
+/// Without a payload cache there is no room to stage in: a fetch ahead of
+/// a range is dropped unread at once.
+#[tokio::test]
+async fn without_a_payload_cache_nothing_waits_in_staging() {
+    let (storage, meter, settings) = storage(0).await;
+    let ctx = StorageContext::unattributed(&settings);
+    let (reader, _) = PREFETCH
+        .scope(
+            (),
+            storage.get_object(&ctx, "chunks/0123456789ABCDEF", Some(&(0..40))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read_all(reader).await.len(), 40);
+    assert_eq!(meter.prefetched(), [0, 1, 0, 0]);
+}

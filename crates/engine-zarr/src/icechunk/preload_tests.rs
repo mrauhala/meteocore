@@ -13,24 +13,24 @@ use zarrs::{
     group::GroupBuilder,
 };
 
-const VARIABLES: [(&str, f32); 2] = [("msl", 1000.0), ("t2m", 250.0)];
-const LATS: [f64; 4] = [60.0, 59.0, 58.0, 57.0];
+pub(super) const VARIABLES: [(&str, f32); 2] = [("msl", 1000.0), ("t2m", 250.0)];
+pub(super) const LATS: [f64; 4] = [60.0, 59.0, 58.0, 57.0];
 const LONS: [f64; 4] = [10.0, 11.0, 12.0, 13.0];
 /// Every request pays this, as a remote repository's round trip does.
-const LATENCY_MS: u64 = 100;
+pub(super) const LATENCY_MS: u64 = 100;
 
 /// `base + 1000·run + lead + 0.1·row + 0.01·col`, plus `shift` after a
 /// correction commit.
-fn value(base: f32, run: u64, lead: u64, row: u64, col: u64, shift: f32) -> f32 {
+pub(super) fn value(base: f32, run: u64, lead: u64, row: u64, col: u64, shift: f32) -> f32 {
     base + 1000.0 * run as f32 + lead as f32 + 0.1 * row as f32 + 0.01 * col as f32 + shift
 }
 
-fn field(base: f32, runs: std::ops::Range<u64>, shift: f32) -> Vec<f32> {
+fn field(base: f32, runs: std::ops::Range<u64>, cols: u64, shift: f32) -> Vec<f32> {
     let mut values = Vec::new();
     for run in runs {
         for lead in 0..3 {
             for row in 0..LATS.len() as u64 {
-                for col in 0..LONS.len() as u64 {
+                for col in 0..cols {
                     values.push(value(base, run, lead, row, col, shift));
                 }
             }
@@ -41,7 +41,19 @@ fn field(base: f32, runs: std::ops::Range<u64>, shift: f32) -> Vec<f32> {
 
 /// A forecast repository laid out like the GFS store: one shard per run and
 /// longitude half, each holding two inner chunks of every lead.
-async fn forecast_repository(dir: &std::path::Path) -> Repository {
+pub(super) async fn forecast_repository(dir: &std::path::Path) -> Repository {
+    forecast_repository_with(dir, &VARIABLES, &LONS, Arc::new(GzipCodec::new(1).unwrap())).await
+}
+
+/// [`forecast_repository`] with other variables, longitudes and inner-chunk
+/// compression: shards stay two columns wide, so an odd count of
+/// longitudes leaves an edge shard reaching past the grid.
+pub(super) async fn forecast_repository_with(
+    dir: &std::path::Path,
+    variables: &[(&str, f32)],
+    lons: &[f64],
+    codec: Arc<dyn zarrs::array::codec::api::BytesToBytesCodecTraits>,
+) -> Repository {
     let storage = icechunk::new_local_filesystem_storage(dir).await.unwrap();
     let repo = Repository::create(storage)
         .config(RepositoryConfig {
@@ -82,7 +94,7 @@ async fn forecast_repository(dir: &std::path::Path) -> Repository {
         ),
         (
             "longitude",
-            LONS.to_vec(),
+            lons.to_vec(),
             serde_json::json!({"units": "degrees_east", "standard_name": "longitude"}),
         ),
     ] {
@@ -99,15 +111,16 @@ async fn forecast_repository(dir: &std::path::Path) -> Repository {
         array.async_store_metadata().await.unwrap();
         array.async_store_chunk(&[0], values).await.unwrap();
     }
-    for (name, base) in VARIABLES {
+    let cols = lons.len() as u64;
+    for &(name, base) in variables {
         let shard = ShardingCodecBuilder::new(
             [1, 3, 2, 2].map(|n: u64| n.try_into().unwrap()).to_vec(),
             &data_type::float32(),
         )
-        .bytes_to_bytes_codecs(vec![Arc::new(GzipCodec::new(1).unwrap())])
+        .bytes_to_bytes_codecs(vec![codec.clone()])
         .build();
         let array = ArrayBuilder::new(
-            vec![2, 3, 4, 4],
+            vec![2, 3, 4, cols],
             vec![1, 3, 4, 2],
             data_type::float32(),
             f32::NAN,
@@ -120,8 +133,8 @@ async fn forecast_repository(dir: &std::path::Path) -> Repository {
         array.async_store_metadata().await.unwrap();
         array
             .async_store_array_subset(
-                &ArraySubset::new_with_shape(vec![2, 3, 4, 4]),
-                field(base, 0..2, 0.0),
+                &ArraySubset::new_with_shape(vec![2, 3, 4, cols]),
+                field(base, 0..2, cols, 0.0),
             )
             .await
             .unwrap();
@@ -130,7 +143,7 @@ async fn forecast_repository(dir: &std::path::Path) -> Repository {
     repo
 }
 
-async fn commit(store: &AsyncIcechunkStore, message: &str) {
+pub(super) async fn commit(store: &AsyncIcechunkStore, message: &str) {
     store
         .session()
         .write()
@@ -142,7 +155,7 @@ async fn commit(store: &AsyncIcechunkStore, message: &str) {
 }
 
 /// Rewrite the latest run of every variable, so its chunks are new objects.
-async fn correct_latest_run(repo: &Repository, shift: f32) {
+pub(super) async fn correct_latest_run(repo: &Repository, shift: f32) {
     let store = Arc::new(AsyncIcechunkStore::new(
         repo.writable_session("main").await.unwrap(),
     ));
@@ -153,7 +166,7 @@ async fn correct_latest_run(repo: &Repository, shift: f32) {
         array
             .async_store_array_subset(
                 &ArraySubset::new_with_ranges(&[1..2, 0..3, 0..4, 0..4]),
-                field(base, 1..2, shift),
+                field(base, 1..2, LONS.len() as u64, shift),
             )
             .await
             .unwrap();
@@ -161,7 +174,7 @@ async fn correct_latest_run(repo: &Repository, shift: f32) {
     commit(&store, "correct the latest run").await;
 }
 
-fn config(dir: &std::path::Path) -> ZarrConfig {
+pub(super) fn config(dir: &std::path::Path) -> ZarrConfig {
     let mut config = ZarrConfig::auto_local(dir.to_string_lossy().into_owned());
     config.cache_mb = 4;
     config.icechunk = Some(IcechunkConfig {
@@ -188,7 +201,7 @@ fn slow_engine(id: &str, config: &ZarrConfig) -> ZarrEngine {
     .unwrap()
 }
 
-fn meter(engine: &ZarrEngine) -> &Meter {
+pub(super) fn meter(engine: &ZarrEngine) -> &Meter {
     match &engine.source {
         crate::source::Source::Icechunk(source) => source.meter(),
         crate::source::Source::Plain(_) => unreachable!("an Icechunk engine"),
@@ -197,7 +210,7 @@ fn meter(engine: &ZarrEngine) -> &Meter {
 
 /// The values a position between the first two latitudes and longitudes
 /// reads: the mean of its four cells, all in inner chunk (run, 0, 0, 0).
-fn expected_series(base: f32, shift: f32) -> Vec<f64> {
+pub(super) fn expected_series(base: f32, shift: f32) -> Vec<f64> {
     (0..3)
         .map(|lead| {
             [(0, 0), (0, 1), (1, 0), (1, 1)]

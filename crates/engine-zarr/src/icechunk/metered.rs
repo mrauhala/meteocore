@@ -14,6 +14,11 @@
 //! rewritten, so a range keyed by path stays valid across snapshots, as
 //! Icechunk's own key (chunk id, range) did. Icechunk still coalesces
 //! concurrent reads of one range before they reach this cache.
+//!
+//! A range a query fetches ahead of its decode ([`PREFETCH`]) waits in
+//! [`staging`], outside the payload cache, and touches the cache only as
+//! the decode's read of it does: that read misses, takes the staged range,
+//! and fills the cache as if it had just read it from storage.
 
 use std::{
     fmt,
@@ -43,6 +48,14 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt as _, ReadBuf};
 /// Object paths of chunk payloads, below the repository root.
 const CHUNKS: &str = icechunk::format::CHUNKS_FILE_PATH;
 
+tokio::task_local! {
+    /// Set around a query's fetches ahead of its decodes (#1353): each
+    /// range read is staged for its decode, not put in the payload cache.
+    pub(super) static PREFETCH: ();
+}
+
+mod staging;
+
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct PayloadKey {
     path: Arc<str>,
@@ -59,10 +72,31 @@ pub(crate) struct Meter {
     requests: AtomicU64,
     read_bytes: AtomicU64,
     payload: ByteBoundedCache<PayloadKey, Bytes>,
+    /// Ranges fetched ahead, until their decodes take them.
+    staging: staging::Staging,
+    /// Ranges fetched ahead, by [`Prefetched`].
+    prefetched: [AtomicU64; 4],
     /// Every request in order: `(path, range)`, for tests that assert which
     /// objects a read touched.
     #[cfg(test)]
     log: std::sync::Mutex<Vec<(String, Option<Range<u64>>)>>,
+    /// When each request was issued, in the same order.
+    #[cfg(test)]
+    issued: std::sync::Mutex<Vec<std::time::Instant>>,
+}
+
+/// What became of one range a query planned to fetch ahead (#1353).
+#[derive(Clone, Copy)]
+pub(crate) enum Prefetched {
+    /// Fetched, then taken by a decode.
+    Used = 0,
+    /// Fetched, then dropped before any decode asked for it.
+    Unused = 1,
+    /// Left to its decode's own read: no room in staging or the read
+    /// budget.
+    Serial = 2,
+    /// The fetch failed; the decode reads it again.
+    Failed = 3,
 }
 
 impl Meter {
@@ -73,9 +107,59 @@ impl Meter {
             requests: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
             payload: ByteBoundedCache::new(payload_bytes, ds_cache::MIB, weigh_payload),
+            staging: Default::default(),
+            prefetched: Default::default(),
             #[cfg(test)]
             log: Default::default(),
+            #[cfg(test)]
+            issued: Default::default(),
         }
+    }
+
+    /// The most bytes staged at once, and so the most one query fetches
+    /// ahead: what one shard of the payload cache holds. Zero, so nothing
+    /// fetched ahead, when the cache keeps nothing.
+    pub(crate) fn prefetch_room(&self) -> u64 {
+        self.payload.shard_capacity_bytes()
+    }
+
+    pub(crate) fn count_prefetched(&self, outcome: Prefetched) {
+        self.count_many(outcome, 1);
+    }
+
+    fn count_many(&self, outcome: Prefetched, ranges: u64) {
+        self.prefetched[outcome as usize].fetch_add(ranges, Ordering::Relaxed);
+    }
+
+    /// Ranges fetched ahead and used, unused, left serial, and failed,
+    /// cumulative. A range still staged is in none yet.
+    pub(crate) fn prefetched(&self) -> [u64; 4] {
+        self.prefetched
+            .each_ref()
+            .map(|count| count.load(Ordering::Relaxed))
+    }
+
+    /// Bytes of ranges fetched ahead and not yet taken: held memory outside
+    /// the payload cache, at most [`Self::prefetch_room`].
+    pub(crate) fn staged_bytes(&self) -> u64 {
+        self.staging.weight()
+    }
+
+    /// A range a decode wants, taken from staging if fetched ahead.
+    fn take_staged(&self, key: &PayloadKey) -> Option<Bytes> {
+        let (bytes, dropped) = self.staging.take(key, std::time::Instant::now());
+        self.count_many(Prefetched::Unused, dropped);
+        if bytes.is_some() {
+            self.count_prefetched(Prefetched::Used);
+        }
+        bytes
+    }
+
+    fn stage(&self, key: PayloadKey, bytes: Bytes) {
+        let dropped =
+            self.staging
+                .stage(key, bytes, self.prefetch_room(), std::time::Instant::now());
+        self.count_many(Prefetched::Unused, dropped);
     }
 
     /// Storage requests issued and object-body bytes received, cumulative.
@@ -92,16 +176,24 @@ impl Meter {
 
     #[cfg(test)]
     pub(crate) fn take_log(&self) -> Vec<(String, Option<Range<u64>>)> {
+        self.issued.lock().unwrap().clear();
         std::mem::take(&mut self.log.lock().unwrap())
+    }
+
+    /// When each request since the last [`Self::take_log`] was issued.
+    #[cfg(test)]
+    pub(crate) fn issued(&self) -> Vec<std::time::Instant> {
+        self.issued.lock().unwrap().clone()
     }
 
     fn request(&self, _path: &str, _range: Option<&Range<u64>>) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
-        self.log
-            .lock()
-            .unwrap()
-            .push((_path.to_owned(), _range.cloned()));
+        {
+            let mut log = self.log.lock().unwrap();
+            log.push((_path.to_owned(), _range.cloned()));
+            self.issued.lock().unwrap().push(std::time::Instant::now());
+        }
     }
 
     fn read(&self, bytes: usize) {
@@ -137,6 +229,23 @@ pub(crate) struct MeteredStorage {
 impl MeteredStorage {
     pub(crate) fn new(backend: Arc<dyn Storage + Send + Sync>, meter: Arc<Meter>) -> Self {
         Self { backend, meter }
+    }
+
+    /// Read a chunk payload range whole from storage.
+    async fn read_payload(
+        &self,
+        ctx: &StorageContext<'_>,
+        path: &str,
+        range: &Range<u64>,
+    ) -> StorageResult<(Bytes, VersionInfo)> {
+        let (mut reader, version) = self.get_object_concurrently(ctx, path, range).await?;
+        let length = range.end.saturating_sub(range.start);
+        let mut body = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+        reader
+            .read_to_end(&mut body)
+            .await
+            .map_err(|e| StorageError::capture(StorageErrorKind::IOError(e)))?;
+        Ok((Bytes::from(body), version))
     }
 }
 
@@ -195,19 +304,35 @@ impl Storage for MeteredStorage {
             start: range.start,
             end: range.end,
         };
-        if let Some(bytes) = self.meter.payload.get(&key) {
-            // Icechunk ignores a chunk read's version: chunks are immutable.
-            return Ok((Box::pin(Cursor::new(bytes)), VersionInfo::for_creation()));
+        let meter = &self.meter;
+        // Icechunk ignores a chunk read's version: chunks are immutable.
+        let cached = |bytes: Bytes| -> (Pin<Box<dyn AsyncBufRead + Send>>, VersionInfo) {
+            (Box::pin(Cursor::new(bytes)), VersionInfo::for_creation())
+        };
+        if PREFETCH.try_with(|_| ()).is_ok() {
+            // Already at hand: the decode finds it, and counts it, itself.
+            if let Some(bytes) = meter
+                .payload
+                .peek(&key)
+                .or_else(|| meter.staging.peek(&key))
+            {
+                return Ok(cached(bytes));
+            }
+            let (bytes, version) = self.read_payload(ctx, path, range).await?;
+            meter.stage(key, bytes.clone());
+            return Ok((Box::pin(Cursor::new(bytes)), version));
         }
-        let (mut reader, version) = self.get_object_concurrently(ctx, path, range).await?;
-        let length = range.end.saturating_sub(range.start);
-        let mut body = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
-        reader
-            .read_to_end(&mut body)
-            .await
-            .map_err(|e| StorageError::capture(StorageErrorKind::IOError(e)))?;
-        let bytes = Bytes::from(body);
-        self.meter.payload.insert(key, bytes.clone());
+        if let Some(bytes) = meter.payload.get(&key) {
+            return Ok(cached(bytes));
+        }
+        // A miss either way; a range fetched ahead fills the cache as one
+        // read now does.
+        if let Some(bytes) = meter.take_staged(&key) {
+            meter.payload.insert(key, bytes.clone());
+            return Ok(cached(bytes));
+        }
+        let (bytes, version) = self.read_payload(ctx, path, range).await?;
+        meter.payload.insert(key, bytes.clone());
         Ok((Box::pin(Cursor::new(bytes)), version))
     }
 

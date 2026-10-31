@@ -12,13 +12,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures::TryStreamExt;
+use futures::{StreamExt as _, TryStreamExt};
 use icechunk::repository::VersionInfo;
 use icechunk::{Repository, RepositoryConfig, Storage};
 use zarrs::storage::{
-    byte_range::ByteRangeIterator, AsyncListableStorageTraits, AsyncReadableStorageTraits,
-    ListableStorageTraits, MaybeBytes, MaybeBytesIterator, ReadableStorageTraits, StorageError,
-    StoreKey, StoreKeys, StoreKeysPrefixes, StorePrefix,
+    byte_range::{ByteRange, ByteRangeIterator},
+    AsyncListableStorageTraits, AsyncReadableStorageTraits, ListableStorageTraits, MaybeBytes,
+    MaybeBytesIterator, ReadableStorageTraits, StorageError, StoreKey, StoreKeys,
+    StoreKeysPrefixes, StorePrefix,
 };
 use zarrs_icechunk::AsyncIcechunkStore;
 
@@ -26,13 +27,15 @@ use ds_core::config::{IcechunkConfig, ZarrConfig};
 use ds_core::error::DataServerError;
 
 use crate::{
+    decoded::ColdRange,
+    read_budget::Budget,
     runtime,
     store::{io_err, EngineStore},
 };
 
 mod metered;
 pub(crate) use metered::Meter;
-use metered::MeteredStorage;
+use metered::{MeteredStorage, Prefetched};
 
 /// Repository clients and immutable object caches survive snapshot refreshes.
 pub(crate) struct Source {
@@ -125,16 +128,100 @@ impl Source {
                 .readonly_session(&VersionInfo::SnapshotId(snapshot))
                 .await
                 .map_err(|e| DataServerError::Storage(format!("open Icechunk snapshot: {e}")))?;
-            Ok(Some(Arc::new(
-                EngineStore::new(Store(AsyncIcechunkStore::new(session))).with_revision(revision),
-            )))
+            Ok(Some(Arc::new(EngineStore::icechunk(
+                Store(AsyncIcechunkStore::new(session), self.meter.clone()),
+                revision,
+            ))))
         })
     }
 }
 
 /// Unlike AsyncToSyncBlockOn (whose output type is unconstrained), this bridge
 /// can return a timeout error without panicking or leaving a running I/O task.
-struct Store(AsyncIcechunkStore);
+/// It keeps its repository's meter, whose payload cache a prefetch fills.
+pub(crate) struct Store(AsyncIcechunkStore, Arc<Meter>);
+
+/// Most ranges one query fetches ahead at once (#1353).
+const PREFETCH_CONCURRENCY: usize = 8;
+
+impl Store {
+    /// Fetch `ranges` of chunk objects together, at most
+    /// [`PREFETCH_CONCURRENCY`] at once on the I/O runtime within the
+    /// request's deadline (#1353). Each waits, staged under the payload
+    /// cache's key for it, until the query's decode of it asks for that key
+    /// ([`metered::PREFETCH`]); the decode then fills the payload cache as
+    /// a serial read would.
+    ///
+    /// Nothing here fails the query, or makes it wait for memory. Only ranges
+    /// that fit [`Meter::prefetch_room`] together are fetched; each reserves
+    /// two copies of its bytes, the body read and Icechunk's, from the read
+    /// budget with `try_reserve` while in flight. A range that does not fit,
+    /// and one whose fetch fails, is left to its decode's serial read, as
+    /// every range was before. Staged bytes are bounded by that room, apart
+    /// from the read budget, as cached bytes are.
+    pub(crate) fn prefetch(&self, budget: &Arc<Budget>, ranges: Vec<ColdRange>) {
+        let meter = &self.1;
+        let mut room = meter.prefetch_room();
+        if room == 0 {
+            return;
+        }
+        let ranges: Vec<ColdRange> = ranges
+            .into_iter()
+            .filter(|range| {
+                let fits = range.length <= room;
+                if fits {
+                    room -= range.length;
+                } else {
+                    meter.count_prefetched(Prefetched::Serial);
+                }
+                fits
+            })
+            .collect();
+        let fetches = futures::stream::iter(ranges)
+            .map(|range| {
+                // Reserved when its fetch starts, never waited for.
+                let permit = budget
+                    .try_reserve_bytes(range.length.saturating_mul(2))
+                    .ok()
+                    .flatten();
+                async move {
+                    let outcome = match permit {
+                        None => Prefetched::Serial,
+                        // Counted when its decode takes it, or it is dropped.
+                        Some(_permit) => match self.fetch(&range).await {
+                            Ok(()) => return,
+                            Err(_) => Prefetched::Failed,
+                        },
+                    };
+                    meter.count_prefetched(outcome);
+                }
+            })
+            .buffer_unordered(PREFETCH_CONCURRENCY)
+            .collect::<()>();
+        // A deadline that expires here fails the decodes that follow.
+        let _ = runtime::run(metered::PREFETCH.scope((), async {
+            fetches.await;
+            Ok(())
+        }));
+    }
+
+    /// Read one range through Icechunk, which stages it, and drop the
+    /// bytes.
+    async fn fetch(&self, range: &ColdRange) -> Result<(), DataServerError> {
+        let ranges = std::iter::once(ByteRange::FromStart(range.offset, Some(range.length)));
+        let stream =
+            AsyncReadableStorageTraits::get_partial_many(&self.0, &range.key, Box::new(ranges))
+                .await
+                .map_err(storage_error)?;
+        if let Some(stream) = stream {
+            stream
+                .try_for_each(|_| std::future::ready(Ok(())))
+                .await
+                .map_err(storage_error)?;
+        }
+        Ok(())
+    }
+}
 
 fn storage_call<F, T>(future: F) -> Result<T, StorageError>
 where
@@ -395,3 +482,6 @@ mod tests;
 
 #[cfg(test)]
 mod preload_tests;
+
+#[cfg(test)]
+mod prefetch_tests;

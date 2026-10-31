@@ -1882,6 +1882,42 @@ static ZARR_ICECHUNK_STORAGE_READ_BYTES: LazyLock<IntCounterVec> = LazyLock::new
     .unwrap();
     per_collection(counter)
 });
+// What an Icechunk collection fetched ahead of its reads (#1353).
+static ZARR_ICECHUNK_PREFETCHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "zarr_icechunk_prefetched_ranges_total",
+            "Cold inner chunks a query planned to fetch together ahead of its decodes, by \
+             outcome: used (a decode took it), unused (dropped before any decode asked), \
+             serial (left to the decode's own read: no room or read budget), failed",
+        ),
+        &["collection", "outcome"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+// Ranges an Icechunk collection fetched ahead and no decode has taken yet,
+// held outside its payload cache (#1353), like the store gauges of #1307.
+static ZARR_ICECHUNK_STAGED_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "zarr_icechunk_staged_bytes",
+        "Bytes of the chunk ranges an Icechunk collection fetched ahead of their decodes \
+         and no decode has taken yet, held outside the payload cache; at most one payload \
+         cache shard",
+    )
+});
+static ZARR_ICECHUNK_PRELOADS_STOPPED: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "zarr_icechunk_preloads_stopped_total",
+            "Catalog builds that published before loading every manifest and shard index \
+             ahead, at the preload's time bound",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
 static ZARR_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "zarr_read_reserved_bytes",
@@ -1943,6 +1979,9 @@ struct CacheCounterState {
     zarr_icechunk_payload: HashMap<String, CacheSeen>,
     /// Icechunk storage `[requests, bytes]` per collection (#1353).
     zarr_icechunk_storage: HashMap<String, [u64; 2]>,
+    /// Icechunk read-ahead `[used, unused, serial, failed, preloads
+    /// stopped]` per collection (#1353).
+    zarr_icechunk_read_ahead: HashMap<String, [u64; 5]>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -1990,6 +2029,7 @@ impl CacheCounterState {
             zarr_object,
             zarr_icechunk_payload,
             zarr_icechunk_storage,
+            zarr_icechunk_read_ahead,
             postgis,
             nowcast,
             nowcast_tracks,
@@ -2010,6 +2050,7 @@ impl CacheCounterState {
         drop_keys(zarr_object, removed);
         drop_keys(zarr_icechunk_payload, removed);
         drop_keys(zarr_icechunk_storage, removed);
+        drop_keys(zarr_icechunk_read_ahead, removed);
         drop_keys(postgis, removed);
         drop_keys(nowcast, removed);
         drop_keys(nowcast_tracks, removed);
@@ -8393,6 +8434,37 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                     // Always touched, so both series exist before a read.
                     family.with_label_values(&[collection]).inc_by(delta);
                 }
+            }
+            if let Some(ahead) = engine.icechunk_read_ahead() {
+                let [used, unused, serial, failed, stopped] = delta_counts(
+                    &mut counter_state.zarr_icechunk_read_ahead,
+                    collection,
+                    [
+                        ahead.used,
+                        ahead.unused,
+                        ahead.serial,
+                        ahead.failed,
+                        ahead.preloads_stopped,
+                    ],
+                );
+                for (outcome, delta) in [
+                    ("used", used),
+                    ("unused", unused),
+                    ("serial", serial),
+                    ("failed", failed),
+                ] {
+                    ZARR_ICECHUNK_PREFETCHED
+                        .with_label_values(&[collection, outcome])
+                        .inc_by(delta);
+                }
+                ZARR_ICECHUNK_PRELOADS_STOPPED
+                    .with_label_values(&[collection])
+                    .inc_by(stopped);
+            }
+            if let Some(staged) = engine.icechunk_staged_bytes() {
+                ZARR_ICECHUNK_STAGED_BYTES
+                    .with_label_values(&[collection])
+                    .set(staged.min(i64::MAX as u64) as i64);
             }
         }
     }

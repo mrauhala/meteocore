@@ -33,6 +33,7 @@ mod store;
 mod trajectory;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -79,6 +80,30 @@ pub struct ZarrEngine {
     demand: ds_cache::plan::DemandSlot,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
+    /// How long a catalog build may spend loading manifests and shard
+    /// indexes ahead (#1353).
+    preload_bound: Duration,
+    /// Catalog builds whose preload stopped at that bound.
+    preloads_stopped: AtomicU64,
+}
+
+/// What an Icechunk collection fetched ahead of its reads (#1353),
+/// cumulative since the engine opened its repository.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadAhead {
+    /// Cold inner chunks a query fetched together ahead of its decodes,
+    /// which a decode then took.
+    pub used: u64,
+    /// Cold inner chunks fetched ahead and dropped before any decode asked
+    /// for them: another read had them first, or they waited too long.
+    pub unused: u64,
+    /// Cold inner chunks left to their decode's own read: past the room
+    /// for them or the read budget.
+    pub serial: u64,
+    /// Cold inner chunks whose fetch ahead failed; their decode read them.
+    pub failed: u64,
+    /// Catalog builds that published before their preload had finished.
+    pub preloads_stopped: u64,
 }
 
 impl ZarrEngine {
@@ -113,6 +138,7 @@ impl ZarrEngine {
             param_filter.as_deref(),
             decoded_cache.clone(),
         )?;
+        let preload_stopped = catalog.preload(collection_id, catalog::PRELOAD_BOUND);
         source.publish(&store);
 
         log_loaded(collection_id, &catalog);
@@ -133,6 +159,8 @@ impl ZarrEngine {
                 collection_id,
             ),
             shutdown: Shutdown::new(),
+            preload_bound: catalog::PRELOAD_BOUND,
+            preloads_stopped: AtomicU64::new(u64::from(preload_stopped)),
         };
         engine.publish_demand();
         Ok(engine)
@@ -200,6 +228,26 @@ impl ZarrEngine {
         self.source.storage_counts()
     }
 
+    /// What an Icechunk repository fetched ahead of its reads (#1353);
+    /// `None` for a plain store.
+    pub fn icechunk_read_ahead(&self) -> Option<ReadAhead> {
+        let [used, unused, serial, failed] = self.source.prefetched()?;
+        Some(ReadAhead {
+            used,
+            unused,
+            serial,
+            failed,
+            preloads_stopped: self.preloads_stopped.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Bytes an Icechunk repository fetched ahead that no decode has taken
+    /// yet, held outside its payload cache (#1353); `None` for a plain
+    /// store.
+    pub fn icechunk_staged_bytes(&self) -> Option<u64> {
+        self.source.staged_bytes()
+    }
+
     fn poll_once(&self) {
         let published = self.catalog.load().revision.clone();
         let rebuilt = self
@@ -214,7 +262,13 @@ impl ZarrEngine {
                             self.param_filter.as_deref(),
                             self.decoded_cache.clone(),
                         )
-                        .map(|catalog| (catalog, store))
+                        .map(|catalog| {
+                            // Bounded: the previous catalog serves meanwhile.
+                            if catalog.preload(&self.collection_id, self.preload_bound) {
+                                self.preloads_stopped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            (catalog, store)
+                        })
                     })
                     .transpose()
             });
@@ -514,6 +568,17 @@ impl EdrEngine for ZarrEngine {
         })?;
         let has_time = time_idx.len() > 1;
         let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| run_times[i]).collect();
+        // The windows' cold inner chunks, of every variable, together first
+        // (#1353).
+        let mut reads = Vec::new();
+        for &v in &selected {
+            for bb in &bboxes {
+                if let Some(read) = cat.window_read(v, run, t0..t1 + 1, *bb)? {
+                    reads.push((v, read.subset));
+                }
+            }
+        }
+        cat.prefetch(&reads);
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
         for v in selected {
@@ -582,16 +647,47 @@ impl EdrEngine for ZarrEngine {
         }))
     }
 
+    /// A point series per variable, bilinear over the 2×2 neighbourhood.
+    /// The variables' cold inner chunks are fetched together first (#1353).
     fn query_position(
         &self,
         coords: &str,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-        _z: Option<&[f64]>,
+        z: Option<&[f64]>,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
+        let mut response = None;
+        self.query_positions(
+            &[coords.to_owned()],
+            datetime,
+            parameters,
+            z,
+            reference_time,
+            &mut |coverage| {
+                response = Some(coverage);
+                Ok(())
+            },
+        )?;
+        response.ok_or_else(|| DataServerError::Engine("position query returned nothing".into()))
+    }
+
+    /// MULTIPOINT: every point's cold inner chunks, of every variable, are
+    /// fetched together before the points are sampled in order (#1353).
+    fn query_positions(
+        &self,
+        points: &[String],
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+        emit: &mut dyn FnMut(CoverageResponse) -> Result<(), DataServerError>,
+    ) -> Result<(), DataServerError> {
         ds_core::deadline::check()?;
-        let (lon, lat) = parse_coords(coords)?;
+        let points: Vec<(f64, f64)> = points
+            .iter()
+            .map(|point| parse_coords(point))
+            .collect::<Result<_, _>>()?;
         let cat = self.catalog.load();
         if cat.times.is_empty() {
             return Err(DataServerError::Engine("No Zarr data available".into()));
@@ -603,40 +699,53 @@ impl EdrEngine for ZarrEngine {
 
         let selected = select_vars(&cat, parameters)?;
 
-        let mut params_map = HashMap::new();
-        let mut ranges = HashMap::new();
-        for v in selected {
-            let values = cat.sample_series(v, run, lon, lat, &time_idx)?;
-            params_map.insert(
-                v.name.clone(),
-                ParameterDescription {
-                    label: v.label.clone(),
-                    unit: v.units.clone(),
-                    observed_property: v.name.clone(),
-                    standard_name: v.standard_name.clone(),
-                },
-            );
-            ranges.insert(
-                v.name.clone(),
-                NdArray {
-                    shape: vec![out_times.len()],
-                    axis_names: vec!["t".to_string()],
-                    values,
-                    precision: v.precision(),
-                },
-            );
+        let mut reads = Vec::new();
+        for &(lon, lat) in &points {
+            for &v in &selected {
+                if let Some(read) = cat.position_read(v, run, lon, lat, &time_idx)? {
+                    reads.push((v, read.subset));
+                }
+            }
         }
+        cat.prefetch(&reads);
 
-        Ok(CoverageResponse::Single(QueryResult {
-            domain: DomainDescription::PointSeries {
-                x: lon,
-                y: lat,
-                t: out_times,
-                z: None,
-            },
-            parameters: params_map,
-            ranges,
-        }))
+        for (lon, lat) in points {
+            ds_core::deadline::check()?;
+            let mut params_map = HashMap::new();
+            let mut ranges = HashMap::new();
+            for &v in &selected {
+                let values = cat.sample_series(v, run, lon, lat, &time_idx)?;
+                params_map.insert(
+                    v.name.clone(),
+                    ParameterDescription {
+                        label: v.label.clone(),
+                        unit: v.units.clone(),
+                        observed_property: v.name.clone(),
+                        standard_name: v.standard_name.clone(),
+                    },
+                );
+                ranges.insert(
+                    v.name.clone(),
+                    NdArray {
+                        shape: vec![out_times.len()],
+                        axis_names: vec!["t".to_string()],
+                        values,
+                        precision: v.precision(),
+                    },
+                );
+            }
+            emit(CoverageResponse::Single(QueryResult {
+                domain: DomainDescription::PointSeries {
+                    x: lon,
+                    y: lat,
+                    t: out_times.clone(),
+                    z: None,
+                },
+                parameters: params_map,
+                ranges,
+            }))?;
+        }
+        Ok(())
     }
 }
 

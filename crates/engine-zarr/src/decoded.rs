@@ -6,6 +6,7 @@ use ds_cache::{ByteBoundedCache, CacheEntry, CacheFillGuard, CacheMetrics, MIB};
 use ds_core::{deadline, error::DataServerError};
 use rayon::prelude::*;
 use zarrs::array::{Array, ArrayBytes, ArrayShardedExt, ArraySubset, ChunkGrid, CodecOptions};
+use zarrs::storage::StoreKey;
 
 use crate::{
     read_budget::{workspace_bytes, Budget, Permit},
@@ -40,6 +41,15 @@ fn overhead(key: &Key) -> u64 {
 }
 
 pub(crate) struct DecodedCache(ByteBoundedCache<Key, Arc<Vec<u8>>>);
+
+/// One cold inner chunk's encoded bytes: `length` bytes at `offset` in the
+/// object of shard `key` (#1353).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ColdRange {
+    pub(crate) key: StoreKey,
+    pub(crate) offset: u64,
+    pub(crate) length: u64,
+}
 
 impl DecodedCache {
     pub(crate) fn new(capacity: u64) -> Self {
@@ -145,6 +155,56 @@ impl DecodedArray {
     /// the default run.
     pub(crate) fn shard_indexes(&self) -> Option<&shards::ShardIndexes> {
         self.shards.as_ref()
+    }
+
+    /// The cold inner chunks a [`Self::read`] of `subset` would fetch, each
+    /// as the one byte range its decode then reads (#1353): those the cache
+    /// neither holds nor is filling for another read, in shards whose index
+    /// is resident. Every other chunk is left to the read: one it decodes as
+    /// its whole shard, one in a shard not resident, all-fill ones, and any
+    /// of an array whose inner chunks a decode reads in parts
+    /// ([`shards::ShardIndexes::inner_range`]).
+    pub(crate) fn cold_ranges(
+        &self,
+        array: &Array<EngineStore>,
+        subset: &ArraySubset,
+    ) -> Vec<ColdRange> {
+        let (Some(shards), Some(size)) = (&self.shards, array.data_type().fixed_size()) else {
+            return Vec::new();
+        };
+        let Ok(Some(chunks)) = self.grid.chunks_in_array_subset(subset) else {
+            return Vec::new();
+        };
+        let mut cold = Vec::new();
+        for indices in chunks.indices() {
+            let Ok((chunk, key, eligible)) = self.locate(array, indices.to_vec(), size) else {
+                continue;
+            };
+            if eligible && !self.vacant(&key) {
+                continue;
+            }
+            // What the read decodes: see `prepare_chunk`.
+            let source = if eligible {
+                chunk
+            } else {
+                match chunk.overlap(subset) {
+                    Ok(source) => source,
+                    Err(_) => continue,
+                }
+            };
+            let Some(range) = shards.inner_range(&key.indices) else {
+                continue;
+            };
+            if array.chunk_subset(&range.shard).ok().as_ref() == Some(&source) {
+                continue;
+            }
+            cold.push(ColdRange {
+                key: array.chunk_key(&range.shard),
+                offset: range.offset,
+                length: range.length,
+            });
+        }
+        cold
     }
 
     pub(crate) fn read(
@@ -291,15 +351,35 @@ impl DecodedArray {
         Ok(ArrayBytes::new_flen(output))
     }
 
-    fn prepare_chunk(
+    /// Whether `key` is neither cached nor being filled: the read of it
+    /// would fetch. Probes the fill claim without waiting and releases it
+    /// at once, so a read arriving in that instant may become its owner, as
+    /// after a failed fill.
+    fn vacant(&self, key: &Key) -> bool {
+        if self.cache.0.contains_key(key) {
+            return false;
+        }
+        match self
+            .cache
+            .0
+            .get_value_or_guard_untracked(key, Duration::ZERO)
+        {
+            CacheEntry::Vacant(claim) => {
+                drop(claim);
+                true
+            }
+            CacheEntry::Value(_) | CacheEntry::Timeout => false,
+        }
+    }
+
+    /// The inner chunk at `indices`, clipped to the array, its cache key,
+    /// and whether the cache keeps it.
+    fn locate(
         &self,
         array: &Array<EngineStore>,
-        subset: &ArraySubset,
         indices: Vec<u64>,
         size: usize,
-        wait: Duration,
-    ) -> Result<Option<PreparedChunk<'_>>, DataServerError> {
-        deadline::check()?;
+    ) -> Result<(ArraySubset, Key, bool), DataServerError> {
         let chunk = self
             .grid
             .subset(&indices)
@@ -316,6 +396,19 @@ impl DecodedArray {
         let eligible = chunk_length as u64 <= MAX_CHUNK_BYTES
             && (chunk_length as u64).saturating_add(overhead(&key))
                 <= self.cache.0.capacity_bytes();
+        Ok((chunk, key, eligible))
+    }
+
+    fn prepare_chunk(
+        &self,
+        array: &Array<EngineStore>,
+        subset: &ArraySubset,
+        indices: Vec<u64>,
+        size: usize,
+        wait: Duration,
+    ) -> Result<Option<PreparedChunk<'_>>, DataServerError> {
+        deadline::check()?;
+        let (chunk, key, eligible) = self.locate(array, indices, size)?;
         if !eligible {
             return Ok(Some(PreparedChunk {
                 source: chunk.overlap(subset).map_err(error)?,

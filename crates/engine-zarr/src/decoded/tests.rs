@@ -385,3 +385,54 @@ fn waiting_for_a_chunk_observes_the_waiters_deadline() {
         assert!(matches!(result, Err(DataServerError::DeadlineExceeded)));
     });
 }
+
+/// #1353: a chunk another read is filling is not fetched ahead, that read's
+/// decode answers for it; nor is a cached one.
+#[test]
+fn chunks_cached_or_being_filled_are_not_planned_to_be_fetched_ahead() {
+    let dir = tempfile::tempdir().unwrap();
+    let array = fixture(dir.path(), "/temperature", true, 0.0);
+    let cache = Arc::new(DecodedCache::new(MIB));
+    let reader = DecodedArray::new(&array, Some("snapshot"), "temperature", cache.clone()).unwrap();
+    reader
+        .shard_indexes()
+        .unwrap()
+        .load(&array, &[0, 0, 0], &crate::catalog::single_threaded_opts())
+        .unwrap();
+    // Inner chunks (0, 0, 0) and (0, 0, 1) of the first shard.
+    let subset = ArraySubset::new_with_ranges(&[0..2, 0..2, 0..4]);
+    assert_eq!(reader.cold_ranges(&array, &subset).len(), 2);
+    let filling = Key {
+        revision: "snapshot".into(),
+        array: "temperature".into(),
+        indices: vec![0, 0, 0],
+    };
+    let CacheEntry::Vacant(claim) = cache
+        .0
+        .get_value_or_guard_untracked(&filling, Duration::ZERO)
+    else {
+        panic!("a vacant chunk")
+    };
+    assert_eq!(
+        reader.cold_ranges(&array, &subset).len(),
+        1,
+        "left to its fill"
+    );
+    drop(claim);
+    assert_eq!(
+        reader.cold_ranges(&array, &subset).len(),
+        2,
+        "planning claims nothing"
+    );
+    read(
+        &reader,
+        &array,
+        &ArraySubset::new_with_ranges(&[0..2, 0..2, 0..2]),
+    );
+    assert_eq!(reader.cold_ranges(&array, &subset).len(), 1, "decoded now");
+    assert_eq!(
+        cache.metrics().hits + cache.metrics().misses,
+        1,
+        "planning counts nothing"
+    );
+}
