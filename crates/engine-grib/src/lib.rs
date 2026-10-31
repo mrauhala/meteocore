@@ -2142,7 +2142,7 @@ impl MapEngine for GribEngine {
         };
         let tile = self.render_field(&catalog, run, step_file, parameter, &field)?;
         // The next frames' messages, in the background (#1335).
-        self.read_ahead_after(&catalog, run, step, parameter.as_slice(), z);
+        self.read_ahead_after(&catalog, run, step, parameter.as_slice(), &field);
         Ok(tile)
     }
 
@@ -2178,7 +2178,7 @@ impl MapEngine for GribEngine {
             .map(|&parameter| self.render_field(&catalog, run, step_file, Some(parameter), &field))
             .collect::<Result<_, _>>()?;
         // The next frames' messages, in the background (#1335).
-        self.read_ahead_after(&catalog, run, step, parameters, z);
+        self.read_ahead_after(&catalog, run, step, parameters, &field);
         Ok(tiles)
     }
 

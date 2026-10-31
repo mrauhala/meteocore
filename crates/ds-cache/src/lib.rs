@@ -775,6 +775,16 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         let _ = self.inner.cache.get(&key);
     }
 
+    /// Look up `key` without touching the hit/miss counters or its recency:
+    /// for a caller that serves the value on behalf of a read that will
+    /// look it up itself, which then counts and promotes it once.
+    pub fn peek<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.cache.peek(key)
+    }
+
     /// Whether `key` is resident — no recency bump, no counter change.
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where

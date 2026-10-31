@@ -325,6 +325,18 @@ impl<'a> CarriedSteps<'a> {
         }
     }
 
+    /// The last of these steps before `step`: the frame a map animation
+    /// stepping forward drew before it (#1335).
+    pub fn before(&self, step: u32) -> Option<u32> {
+        match self {
+            Self::Every(run) => run.steps.range(..step).next_back().map(|(&s, _)| s),
+            Self::Listed(_, steps) => {
+                let split = steps.partition_point(|&s| s < step);
+                split.checked_sub(1).map(|i| steps[i])
+            }
+        }
+    }
+
     /// These steps after `step`, ascending: the frames a map animation
     /// draws next (#1335).
     pub fn after(&self, step: u32) -> impl Iterator<Item = (u32, &'a StepFile)> + '_ {

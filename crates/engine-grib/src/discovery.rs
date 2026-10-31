@@ -144,7 +144,7 @@ impl GribEngine {
         }
         // New steps may follow a frame the map read-ahead planned (#1335).
         if let Some(ahead) = &self.source.read_ahead {
-            ahead.forget_triggers();
+            ahead.forget_plans();
         }
         self.refresh_discovery();
     }
