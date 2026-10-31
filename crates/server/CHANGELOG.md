@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.15.0](https://github.com/mrauhala/meteocore/compare/v0.14.0...v0.15.0) (2026-10-31)
+
+
+### Features
+
+* **cache:** engines publish cache demand; the plan suggests sizes and warns below it ([#1372](https://github.com/mrauhala/meteocore/issues/1372)) ([a73cc0d](https://github.com/mrauhala/meteocore/commit/a73cc0d430b36e9637e2b2017bfd05d690c13701))
+* **cache:** resize caches and budgets in place; a reload resizes instead of rebuilding ([#1374](https://github.com/mrauhala/meteocore/issues/1374)) ([3c2d472](https://github.com/mrauhala/meteocore/commit/3c2d472a63eabada86b97fcd3189c11e09ea4b89))
+* **cache:** fit every cache and budget to the memory total, reported next to its configured size ([#1384](https://github.com/mrauhala/meteocore/issues/1384)) ([007162a](https://github.com/mrauhala/meteocore/commit/007162aef474735630de5957c782cb2831cdc781))
+* **ops:** ship Prometheus alert rules for stale collections and errors ([#1385](https://github.com/mrauhala/meteocore/issues/1385)) ([794d07d](https://github.com/mrauhala/meteocore/commit/794d07de1ee392a377e411f2f215e47d0efe3bbe))
+
+
+### Bug Fixes
+
+* **engine-grib:** a truncated or corrupt message is a decode error, not a grib panic ([#1382](https://github.com/mrauhala/meteocore/issues/1382)) ([b768e04](https://github.com/mrauhala/meteocore/commit/b768e046d7355025004583a4e1068ff5b3d34458))
+* **errors:** one DataServerError classification decides every API's status ([#1383](https://github.com/mrauhala/meteocore/issues/1383)) ([e46c169](https://github.com/mrauhala/meteocore/commit/e46c169105ac6550e21769ecbbe919c0b62cc567))
+
+
+### Performance Improvements
+
+* **engine-zarr:** fetch a query's cold Icechunk inner chunks together and bound the preload ([#1388](https://github.com/mrauhala/meteocore/issues/1388)) ([3b627fe](https://github.com/mrauhala/meteocore/commit/3b627feef192025fc35fd57f8241fa5ebda2cfb6))
+* **engine-grib:** read the next steps of a map animation ahead into the message cache ([#1386](https://github.com/mrauhala/meteocore/issues/1386)) ([f51dfb8](https://github.com/mrauhala/meteocore/commit/f51dfb81786420c966a14e017ed939fb2bf68c63))
+
 ## [0.14.0](https://github.com/mrauhala/meteocore/compare/v0.13.0...v0.14.0) (2026-10-30)
 
 
