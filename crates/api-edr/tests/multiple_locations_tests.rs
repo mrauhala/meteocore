@@ -199,6 +199,7 @@ fn app() -> App {
         derive_geopotential_height: None,
         discovery: None,
         derive_humidity: None,
+        expected_interval: None,
     };
     let state = Arc::new(ArcSwap::from_pointee(EdrState {
         engines: HashMap::from([("obs".to_string(), engine.clone() as Arc<dyn EdrEngine>)]),

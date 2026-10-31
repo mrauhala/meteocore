@@ -1,5 +1,5 @@
 # Every optional resource, for lint and schema validation. Not installed in CI:
-# ServiceMonitor and HTTPRoute need their CRDs.
+# ServiceMonitor, PrometheusRule and HTTPRoute need their CRDs.
 image:
   digest: sha256:0000000000000000000000000000000000000000000000000000000000000000
 config:
@@ -82,6 +82,10 @@ httpRoute:
   hostnames:
     - meteocore.example.com
 serviceMonitor:
+  enabled: true
+  labels:
+    release: prometheus
+prometheusRule:
   enabled: true
   labels:
     release: prometheus

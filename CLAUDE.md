@@ -1626,6 +1626,14 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   The Helm chart (`charts/meteocore`, #1365) also ships the dashboard,
   compacted in a ConfigMap of at most 1 MiB; its workflow fails above
   900 KB rendered.
+- **Alert rules live in this repo too:** `docker/prometheus/rules/meteocore.yml`
+  (#1375), loaded by the compose stack and shipped by the chart as a
+  PrometheusRule (`prometheusRule.enabled`, through a symlink; `helm.yml`
+  checks the rendered rules equal the file). Every selector names
+  `job="meteocore"`, which the chart replaces. Each alert has a firing and a
+  quiet case in `meteocore.test.yml`; CI runs `promtool check rules` and
+  `promtool test rules`. The README's Alerting section lists the alerts and
+  thresholds: change both together.
 - **State:** API state wrapped in `ArcSwap` for lock-free reads. Render
   semaphore (`[server] render_concurrency`, default 2× CPU cores, min 8;
   fixed at boot, so restart to change) shared across Maps/Tiles/WMS. Engine

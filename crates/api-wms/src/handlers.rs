@@ -215,6 +215,54 @@ enum Finished {
     Error(Result<CachedRendered, DataServerError>, DataServerError),
 }
 
+/// What a GetMap that served the red error tile attaches to its response,
+/// for `/metrics` `wms_error_tiles_total` (#1375): GetMap answers a failed
+/// render with the tile and HTTP 200 (#280), so no status code counts it.
+/// `collection` is the bottom layer's, as [`RenderTiming`] labels a served
+/// render, which an error tile carries none of; `reason` is one of
+/// [`ERROR_TILE_REASONS`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorTile {
+    pub collection: String,
+    pub reason: &'static str,
+}
+
+/// Every [`ErrorTile::reason`], a bounded label set: the data a request
+/// named is gone (`not_found`), the engine refused the request
+/// (`invalid_request`, such as a source read over its pixel cap), a source
+/// read failed (`storage`), or anything else (`internal`).
+pub const ERROR_TILE_REASONS: [&str; 4] = ["not_found", "invalid_request", "storage", "internal"];
+
+impl ErrorTile {
+    fn new(collection: &str, error: &DataServerError) -> Self {
+        use DataServerError as E;
+        let reason = match error {
+            E::CollectionNotFound(_)
+            | E::LocationNotFound(_)
+            | E::FeatureNotFound(_)
+            | E::ReferenceTimeNotFound(_) => "not_found",
+            E::InvalidDatetime(_)
+            | E::InvalidBbox(_)
+            | E::InvalidParameter(_)
+            | E::QueryTooLarge(_) => "invalid_request",
+            E::Storage(_) | E::Io(_) => "storage",
+            // `finish_render` answers a shed, timed-out or refused render
+            // (`ResourceExhausted`, `DeadlineExceeded`, `Unavailable`) with
+            // the 503, never the tile: named only to keep the match whole.
+            E::Engine(_)
+            | E::Config(_)
+            | E::Render(_)
+            | E::ResourceExhausted
+            | E::DeadlineExceeded
+            | E::Unavailable(_) => "internal",
+        };
+        Self {
+            collection: collection.to_owned(),
+            reason,
+        }
+    }
+}
+
 /// Turn a render's outcome into the image a GetMap serves. Runs inside the
 /// render job, after the render, so on a memo miss the empty image and the
 /// error tile are encoded by the worker that holds the CPU slot, under the
@@ -976,18 +1024,18 @@ pub async fn wms_handler(
             // don't (their bytes are deterministic for fixed dimensions and
             // format and come from their own memo, and the engine error case
             // shouldn't poison the cache).
-            let (cached, x_cache) = match finished {
+            let (cached, x_cache, error_tile) = match finished {
                 Ok(Finished::Image(cached, _)) => {
                     if let Some(cache_key) = cache_key {
                         rendered_cache.insert(cache_key, cached.clone());
                     }
-                    (cached, "MISS")
+                    (cached, "MISS", None)
                 }
                 Ok(Finished::Empty(tile, _)) => {
                     let cached = tile.map_err(|e| {
                         WmsError::Internal(format!("Failed to encode empty tile: {e}"))
                     })?;
-                    (cached, "EMPTY")
+                    (cached, "EMPTY", None)
                 }
                 // Only a shed or timed-out render (`ResourceExhausted`,
                 // `DeadlineExceeded`) is an error here, and it encoded nothing,
@@ -1005,7 +1053,7 @@ pub async fn wms_handler(
                     let cached = tile.map_err(|e| {
                         WmsError::Internal(format!("Failed to encode error tile: {e}"))
                     })?;
-                    (cached, "ERROR")
+                    (cached, "ERROR", Some(ErrorTile::new(&collection_id, &e)))
                 }
             };
             // A failed render is transient: never pin its error tile for a
@@ -1056,6 +1104,10 @@ pub async fn wms_handler(
                 response.extensions_mut().insert(
                     RenderTiming::since(&collection_id, outcome, render_start).with_phases(phases),
                 );
+            }
+            // A revalidated error tile (304) is a failed render too.
+            if let Some(error_tile) = error_tile {
+                response.extensions_mut().insert(error_tile);
             }
             Ok(response)
         }
@@ -1670,6 +1722,35 @@ mod tests {
             first.etag(),
             "another format is another encode"
         );
+    }
+
+    /// #1375: an error tile's metrics label names why the render failed,
+    /// from a bounded set, and the bottom layer's collection.
+    #[test]
+    fn error_tile_reasons_are_a_bounded_set() {
+        use DataServerError as E;
+        let cases = [
+            (E::ReferenceTimeNotFound("run".into()), "not_found"),
+            (E::CollectionNotFound("gone".into()), "not_found"),
+            (E::InvalidParameter("source area".into()), "invalid_request"),
+            (E::QueryTooLarge("cells".into()), "invalid_request"),
+            (E::Storage("reset".into()), "storage"),
+            (E::Io(std::io::Error::other("eof")), "storage"),
+            (E::Engine("decode".into()), "internal"),
+            (E::Render("encode".into()), "internal"),
+        ];
+        for (error, reason) in cases {
+            let tile = ErrorTile::new("radar", &error);
+            assert_eq!(
+                tile,
+                ErrorTile {
+                    collection: "radar".into(),
+                    reason
+                },
+                "{error}"
+            );
+            assert!(ERROR_TILE_REASONS.contains(&tile.reason), "{error}");
+        }
     }
 
     /// Two all-nodata views of one size, background and format share one

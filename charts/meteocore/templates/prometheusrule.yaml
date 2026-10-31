@@ -1,0 +1,25 @@
+{{- if .Values.prometheusRule.enabled }}
+{{- /*
+The repository's docker/prometheus/rules/meteocore.yml, a symlink in the
+chart's rules/ directory that packaging resolves, with its job="meteocore"
+selectors naming the job that scrapes this release: the ServiceMonitor's,
+which Prometheus Operator names after the Service.
+*/}}
+{{- $job := .Values.prometheusRule.job | default (include "meteocore.fullname" .) }}
+{{- $rules := .Files.Get "rules/meteocore.yml" | replace "job=\"meteocore\"" (printf "job=%q" $job) | fromYaml }}
+{{- if not $rules.groups }}
+{{- fail "rules/meteocore.yml holds no rule groups: the chart needs the file its symlink names" }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "meteocore.fullname" . }}
+  labels:
+    {{- include "meteocore.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    {{- toYaml $rules.groups | nindent 4 }}
+{{- end }}

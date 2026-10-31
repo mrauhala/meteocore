@@ -134,7 +134,8 @@ PNG is written 8-bit indexed when the image has at most 256 colours, else
 RGBA. A view with no data is the empty image (`x-cache: EMPTY`): `BGCOLOR`,
 or transparent with `TRANSPARENT=TRUE` in PNG or WebP. A render that fails
 in the engine is a red image with HTTP 200 (`x-cache: ERROR`), its cause
-only in the server log. Both come in the requested `FORMAT`. A render whose
+only in the server log; `/metrics` counts it as `wms_error_tiles_total` by
+collection and reason. Both come in the requested `FORMAT`. A render whose
 object store kept answering 429, 502, 503 or 504 through all of its retries
 is no red image but the 503 exception, with `Retry-After: 10`.
 

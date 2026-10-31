@@ -500,6 +500,15 @@ impl NowcastEngine {
         Some(Utc::now() - latest)
     }
 
+    /// The spacing of the newest generations' anchor frames, the timeline
+    /// [`Self::catalog_age`] is measured on, for the
+    /// `collection_expected_interval_seconds` gauge (#1375):
+    /// [`ds_core::health::expected_interval`]. `None` below two.
+    pub fn expected_interval(&self) -> Option<chrono::Duration> {
+        let state = self.state.load();
+        ds_core::health::expected_interval(state.generations.keys().rev().copied())
+    }
+
     /// (generations_total, failures_total, last_generation_ms, source_lag_secs,
     /// retained_generations, frames_in_latest) — one snapshot for /metrics.
     pub fn metrics(&self) -> (u64, u64, u64, u64, usize, usize) {

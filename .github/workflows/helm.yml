@@ -23,6 +23,7 @@ on:
       - .github/workflows/helm.yml
       - charts/**
       - docker/grafana/dashboards/**
+      - docker/prometheus/rules/**
       - scripts/helm_repo_index.sh
       - crates/server/Cargo.toml
   push:
@@ -31,6 +32,7 @@ on:
       - .github/workflows/helm.yml
       - charts/**
       - docker/grafana/dashboards/**
+      - docker/prometheus/rules/**
       - scripts/helm_repo_index.sh
       - crates/server/Cargo.toml
   workflow_dispatch:
@@ -45,7 +47,7 @@ concurrency:
 env:
   CHART: charts/meteocore
   # Schemas for the rendered manifests: Kubernetes, then the CRDs catalog for
-  # ServiceMonitor and HTTPRoute.
+  # ServiceMonitor, PrometheusRule and HTTPRoute.
   KUBERNETES_VERSION: 1.34.0
   KUBECONFORM_VERSION: v0.8.0
   KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
@@ -126,6 +128,28 @@ jobs:
             exit 1
           fi
 
+      # The PrometheusRule is docker/prometheus/rules/meteocore.yml through
+      # the chart's rules/ symlink (#1375), its job="meteocore" selectors
+      # naming the release's job. Compared as data: toYaml reorders keys.
+      - name: PrometheusRule holds the repository's rules
+        run: |
+          set -euo pipefail
+          rendered=$(helm template other "$CHART" --set prometheusRule.enabled=true \
+            --show-only templates/prometheusrule.yaml | yq -o=json '.spec | sort_keys(..)')
+          expected=$(sed 's/job="meteocore"/job="other-meteocore"/g' docker/prometheus/rules/meteocore.yml \
+            | yq -o=json 'sort_keys(..)')
+          if [ "$rendered" != "$expected" ]; then
+            echo "::error file=$CHART/templates/prometheusrule.yaml::The rendered PrometheusRule is not docker/prometheus/rules/meteocore.yml with job=\"other-meteocore\"."
+            diff <(echo "$expected") <(echo "$rendered") || true
+            exit 1
+          fi
+          custom=$(helm template other "$CHART" --set prometheusRule.enabled=true \
+            --set prometheusRule.job=custom --show-only templates/prometheusrule.yaml)
+          if grep -q 'job="other-meteocore"' <<<"$custom" || ! grep -q 'job="custom"' <<<"$custom"; then
+            echo "::error file=$CHART/templates/prometheusrule.yaml::prometheusRule.job does not name the rules' job."
+            exit 1
+          fi
+
       - name: Rejected values
         run: |
           set -uo pipefail
@@ -159,9 +183,12 @@ jobs:
           helm package "$CHART" --destination "$dist"
           version=$(sed -n 's/^version: \(.*\)$/\1/p' "$CHART/Chart.yaml")
           tgz="${dist}/meteocore-${version}.tgz"
-          # The dashboard is a symlink in the chart; the package holds the file.
+          # The dashboard and the rules are symlinks in the chart; the package
+          # holds the files.
           tar -xzf "$tgz" -O meteocore/dashboards/meteocore-overview.json \
             | cmp - docker/grafana/dashboards/meteocore-overview.json
+          tar -xzf "$tgz" -O meteocore/rules/meteocore.yml \
+            | cmp - docker/prometheus/rules/meteocore.yml
           if tar -tzf "$tgz" | grep -q '^meteocore/ci/'; then
             echo "::error::The package holds the chart's ci/ values files."
             exit 1

@@ -220,6 +220,7 @@ fn collection(id: &str, engine_type: &str) -> CollectionConfig {
         derive_geopotential_height: None,
         discovery: None,
         derive_humidity: None,
+        expected_interval: None,
     }
 }
 
