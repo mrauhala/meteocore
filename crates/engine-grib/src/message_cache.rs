@@ -208,6 +208,9 @@ struct Filling {
 struct Filled {
     done: Mutex<bool>,
     raised: Condvar,
+    /// Requests that waited for it, for tests to wait on.
+    #[cfg(test)]
+    waiters: AtomicUsize,
 }
 
 impl Filled {
@@ -215,6 +218,8 @@ impl Filled {
     /// takes, which the background budget bounds): whether it was raised.
     fn wait(&self, timeout: Option<Duration>) -> bool {
         let done = self.done.lock().unwrap();
+        #[cfg(test)]
+        self.waiters.fetch_add(1, Ordering::SeqCst);
         match timeout {
             None => *self.raised.wait_while(done, |done| !*done).unwrap(),
             Some(timeout) => {
@@ -550,10 +555,9 @@ impl MessageCache {
         };
         let mut joined = false;
         let bytes = loop {
-            if let Some(bytes) = self.first_read_ahead(&key) {
-                deadline::check()?;
-                return Ok((bytes, None));
-            }
+            // A fetch in flight first: looked for after the first read, a
+            // fetch finishing between the two would be found by a lookup,
+            // which promotes it.
             if !joined {
                 match self.join_read_ahead(&key) {
                     Join::None => {}
@@ -570,6 +574,10 @@ impl MessageCache {
                         return Ok((bytes, validated));
                     }
                 }
+            }
+            if let Some(bytes) = self.first_read_ahead(&key) {
+                deadline::check()?;
+                return Ok((bytes, None));
             }
             match self
                 .cache
@@ -761,6 +769,15 @@ impl MessageCache {
 
     pub fn metrics(&self) -> CacheMetrics {
         self.cache.metrics()
+    }
+
+    /// How many requests waited for the read-ahead fetching `key`, for
+    /// tests that start a request and must know it joined.
+    #[cfg(test)]
+    pub(crate) fn read_ahead_waiters(&self, key: &MessageKey) -> usize {
+        self.filling
+            .signal(key)
+            .map_or(0, |filled| filled.waiters.load(Ordering::SeqCst))
     }
 
     /// Evict every message, for tests of what follows an eviction.

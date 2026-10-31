@@ -421,15 +421,14 @@ fn a_request_waits_on_a_read_ahead_fill_at_most_half_its_time() {
         length: Some(len()),
         ..filler()
     };
-    // A fill that holds its claim until released, or for three seconds:
-    // a request waiting on it for longer fails the timing below rather
-    // than hang.
+    // A fill that holds its fetch until released, or for a minute: a
+    // request waiting on it for longer fails the test rather than hang.
     let hold = |offset: u64| {
         let (claimed, started) = mpsc::channel();
         let (release, released) = mpsc::channel::<()>();
         let timeout = release.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(3));
+            std::thread::sleep(Duration::from_secs(60));
             let _ = timeout.send(());
         });
         let cache = cache.clone();
@@ -447,10 +446,13 @@ fn a_request_waits_on_a_read_ahead_fill_at_most_half_its_time() {
     };
     let accept = |_: &[u8]| Ok::<_, DataServerError>(());
 
+    // With four seconds left the request waits two, then reads around the
+    // fill, which still holds the message, within its deadline.
     let (release, fill) = hold(0);
     let started = Instant::now();
+    let deadline = Duration::from_secs(4);
     {
-        let _deadline = ds_core::deadline::enter(Some(started + Duration::from_secs(1)));
+        let _deadline = ds_core::deadline::enter(Some(started + deadline));
         let (bytes, validated) = cache
             .get_with(&data, &path, &entry(0), false, accept)
             .unwrap();
@@ -458,10 +460,7 @@ fn a_request_waits_on_a_read_ahead_fill_at_most_half_its_time() {
         assert!(validated.is_some(), "read and validated around the fill");
     }
     let waited = started.elapsed();
-    assert!(
-        waited >= Duration::from_millis(500) && waited < Duration::from_secs(1),
-        "{waited:?}"
-    );
+    assert!(waited >= deadline / 2, "{waited:?}");
     assert_eq!(store.reads.lock().unwrap().attempts[path.as_ref()], 1);
     let key = MessageKey::new(path.as_ref(), &entry(0));
     assert!(!cache.is_resident(&key), "the fill still holds it");
@@ -481,7 +480,12 @@ fn a_request_waits_on_a_read_ahead_fill_at_most_half_its_time() {
                 .unwrap()
         }
     });
-    std::thread::sleep(Duration::from_millis(100));
+    let key = MessageKey::new(path.as_ref(), &entry(len()));
+    let waiting = Instant::now();
+    while cache.read_ahead_waiters(&key) == 0 {
+        assert!(waiting.elapsed() < Duration::from_secs(60), "no join");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     let _ = release.send(());
     assert_eq!(fill.join().unwrap(), Some(ECMWF.len()));
     let (bytes, validated) = joined.join().unwrap();
