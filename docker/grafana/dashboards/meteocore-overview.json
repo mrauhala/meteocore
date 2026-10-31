@@ -2049,8 +2049,8 @@
                               {
                                 "kind": "GridLayoutItem",
                                 "spec": {
-                                  "x": 0,
-                                  "y": 57,
+                                  "x": 12,
+                                  "y": 65,
                                   "width": 12,
                                   "height": 8,
                                   "element": {
@@ -2062,8 +2062,8 @@
                               {
                                 "kind": "GridLayoutItem",
                                 "spec": {
-                                  "x": 12,
-                                  "y": 57,
+                                  "x": 0,
+                                  "y": 73,
                                   "width": 12,
                                   "height": 8,
                                   "element": {
@@ -2075,8 +2075,8 @@
                               {
                                 "kind": "GridLayoutItem",
                                 "spec": {
-                                  "x": 0,
-                                  "y": 65,
+                                  "x": 12,
+                                  "y": 73,
                                   "width": 12,
                                   "height": 8,
                                   "element": {
