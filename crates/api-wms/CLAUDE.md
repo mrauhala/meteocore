@@ -328,8 +328,8 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   serve on the blocking worker that holds the CPU slot and the memory
   reservation, under the render deadline, and the handler only labels the
   result. Keep it there; `background_tile` and `error_tile` encode on a miss
-  and block a caller waiting for another's encode. A `ResourceExhausted`,
-  `DeadlineExceeded` or `Unavailable` render stays the 503 and encodes nothing. Maps and Tiles
+  and block a caller waiting for another's encode. A render whose error is
+  transient (`ErrorClass::is_transient`) stays the 503 and encodes nothing. Maps and Tiles
   finish their empty image in the job the same way (`render_job`).
 
 ## QUALITY / `[wms] webp_quality`
@@ -498,12 +498,12 @@ compares them). Never unwrap it to `f64` on the way out.
   put their blocking work back on request workers (root Critical Rule 7).
   `crates/server/tests/wms_get_feature_info.rs` serves its GRIB requests on
   a current-thread runtime, where that panics.
-  `LocationNotFound` / `FeatureNotFound` / `ReferenceTimeNotFound` /
-  `CollectionNotFound` is an empty answer (value null): no data there, or no
-  longer any after a run eviction or a reload. `ResourceExhausted` /
-  `DeadlineExceeded` 503; `Unavailable` 503 with `Retry-After: 10`; an engine `InvalidParameter` (and the other
-  client-error variants) a generic `InvalidParameterValue`; anything else
-  `Internal`, its detail only in the log (Critical Rule 11).
+  A read's error answers by `DataServerError::class()` (#17): `NotFound` is
+  an empty answer (value null): no data there, or no longer any after a run
+  eviction or a reload. `Busy` / `DeadlineExceeded` 503;
+  `SourceUnavailable` 503 with `Retry-After: 10`; `BadRequest` a generic
+  `InvalidParameterValue`; `Internal` `Internal`, its detail only in the
+  log (Critical Rule 11).
 - **Formats.** `params::INFO_FORMATS` is the one list capabilities
   advertises and `InfoFormat::parse` accepts; an omitted `INFO_FORMAT` is
   `text/plain`. JSON is a GeoJSON FeatureCollection through `axum::Json`

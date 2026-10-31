@@ -46,6 +46,9 @@ pub enum DataServerError {
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    /// A store failure the store did not classify as worth a retry: an
+    /// internal error (HTTP 500), not a 503 (#17). One it did classify is
+    /// [`Self::Unavailable`].
     #[error("Storage error: {0}")]
     Storage(String),
 
@@ -86,6 +89,85 @@ impl DataServerError {
             other => Self::Storage(format!("{context}: {other}")),
         }
     }
+
+    /// The [`ErrorClass`] that decides how every API answers this error
+    /// (#17). A [`Self::Storage`] error is internal: only a failure the
+    /// store classified as worth a retry is answered as one, and that is an
+    /// [`Self::Unavailable`].
+    pub const fn class(&self) -> ErrorClass {
+        match self {
+            Self::InvalidDatetime(_)
+            | Self::InvalidBbox(_)
+            | Self::QueryTooLarge(_)
+            | Self::InvalidParameter(_) => ErrorClass::BadRequest,
+            Self::CollectionNotFound(_)
+            | Self::LocationNotFound(_)
+            | Self::FeatureNotFound(_)
+            | Self::ReferenceTimeNotFound(_) => ErrorClass::NotFound,
+            Self::ResourceExhausted => ErrorClass::Busy,
+            Self::DeadlineExceeded => ErrorClass::DeadlineExceeded,
+            Self::Unavailable(_) => ErrorClass::SourceUnavailable,
+            Self::Engine(_)
+            | Self::Config(_)
+            | Self::Storage(_)
+            | Self::Render(_)
+            | Self::Io(_) => ErrorClass::Internal,
+        }
+    }
+}
+
+/// How every API answers a [`DataServerError`] (#17): each API crate's error
+/// mapping matches on [`DataServerError::class`], never on the variants, so
+/// a variant cannot answer one status in one API and another elsewhere.
+/// ds-core has no HTTP dependency, so the status is a number
+/// ([`Self::status_code`]); each API keeps its own body format, and a 5xx
+/// body never carries the error's detail (root CLAUDE.md, Critical Rule 11).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// A request the client can remedy: an invalid parameter, bbox or
+    /// datetime, or a result over a hard server cap. 400, with the error's
+    /// message, which is safe to return.
+    BadRequest,
+    /// The collection, location, feature or model run the request names is
+    /// absent: 404.
+    NotFound,
+    /// Shared transient resource admission failed: 503 with
+    /// `Retry-After: 1`.
+    Busy,
+    /// The request exhausted its absolute time budget: 503 with
+    /// `Retry-After: 1`, except from an EDR query: 504.
+    DeadlineExceeded,
+    /// A data source kept refusing the read: 503 with `Retry-After`
+    /// [`DataServerError::UNAVAILABLE_RETRY_AFTER_SECS`] and
+    /// [`DataServerError::UNAVAILABLE_DESCRIPTION`]. The detail names the
+    /// upstream, so it goes to the log only, at WARN.
+    SourceUnavailable,
+    /// Anything else, a store failure the store did not classify included:
+    /// 500 with a generic message, the detail logged.
+    Internal,
+}
+
+impl ErrorClass {
+    /// The HTTP status of an answer in this class. An EDR query answers a
+    /// [`Self::DeadlineExceeded`] 504 instead of this 503.
+    pub const fn status_code(self) -> u16 {
+        match self {
+            Self::BadRequest => 400,
+            Self::NotFound => 404,
+            Self::Busy | Self::DeadlineExceeded | Self::SourceUnavailable => 503,
+            Self::Internal => 500,
+        }
+    }
+
+    /// Whether the same request may succeed later: the server or a data
+    /// source is busy, or the deadline ran out. A WMS GetMap answers such an
+    /// error with its 503, never the red error tile.
+    pub const fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::Busy | Self::DeadlineExceeded | Self::SourceUnavailable
+        )
+    }
 }
 
 /// Carries a human-readable error reason across the axum middleware stack via
@@ -102,6 +184,56 @@ pub struct ErrorReason(pub String);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every variant's class and status, as `DataServerError`'s docs state
+    /// them (#17). A storage failure the store did not classify is a 500,
+    /// not a 503: only an `Unavailable` source asks for a retry.
+    #[test]
+    fn every_variant_has_its_documented_class_and_status() {
+        use ErrorClass as C;
+        let s = || String::from("x");
+        let cases = [
+            (DataServerError::DeadlineExceeded, C::DeadlineExceeded, 503),
+            (DataServerError::ResourceExhausted, C::Busy, 503),
+            (DataServerError::CollectionNotFound(s()), C::NotFound, 404),
+            (DataServerError::LocationNotFound(s()), C::NotFound, 404),
+            (DataServerError::InvalidDatetime(s()), C::BadRequest, 400),
+            (DataServerError::Engine(s()), C::Internal, 500),
+            (DataServerError::Config(s()), C::Internal, 500),
+            (DataServerError::FeatureNotFound(s()), C::NotFound, 404),
+            (
+                DataServerError::ReferenceTimeNotFound(s()),
+                C::NotFound,
+                404,
+            ),
+            (DataServerError::InvalidBbox(s()), C::BadRequest, 400),
+            (DataServerError::QueryTooLarge(s()), C::BadRequest, 400),
+            (DataServerError::InvalidParameter(s()), C::BadRequest, 400),
+            (DataServerError::Storage(s()), C::Internal, 500),
+            (DataServerError::Unavailable(s()), C::SourceUnavailable, 503),
+            (DataServerError::Render(s()), C::Internal, 500),
+            (
+                DataServerError::Io(std::io::Error::other("x")),
+                C::Internal,
+                500,
+            ),
+        ];
+        for (error, class, status) in cases {
+            assert_eq!(error.class(), class, "{error:?}");
+            assert_eq!(error.class().status_code(), status, "{error:?}");
+            assert_eq!(
+                error.class().is_transient(),
+                status == 503,
+                "{error:?}: only a 503 asks for a retry"
+            );
+        }
+        // An upstream's refusal keeps its class through an engine's
+        // context; any other store failure is internal.
+        let wrapped = DataServerError::Unavailable(s()).with_storage_context("GRIB");
+        assert_eq!(wrapped.class(), C::SourceUnavailable);
+        let wrapped = DataServerError::LocationNotFound(s()).with_storage_context("GRIB");
+        assert_eq!(wrapped.class(), C::Internal);
+    }
 
     /// An upstream's refusal keeps its variant through an engine's context;
     /// any other error becomes the storage error it always was.

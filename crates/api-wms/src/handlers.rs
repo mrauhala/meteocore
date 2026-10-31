@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use chrono::{DateTime, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::edr_engine::EdrEngine;
-use ds_core::error::DataServerError;
+use ds_core::error::{DataServerError, ErrorClass};
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
 use ds_render::{
@@ -266,10 +266,10 @@ impl ErrorTile {
 /// Turn a render's outcome into the image a GetMap serves. Runs inside the
 /// render job, after the render, so on a memo miss the empty image and the
 /// error tile are encoded by the worker that holds the CPU slot, under the
-/// render deadline, like every populated image (#1093). A shed or timed-out
-/// render (`ResourceExhausted`, `DeadlineExceeded`) stays an error, the 503,
-/// and encodes nothing; so does one whose data source kept refusing the
-/// reads (`Unavailable`, #1355).
+/// render deadline, like every populated image (#1093). A transient error
+/// ([`ErrorClass::is_transient`]: a shed or timed-out render, or one whose
+/// data source kept refusing the reads, #1355) stays an error, the 503, and
+/// encodes nothing.
 fn finish_render(
     rendered: Rendered,
     width: u32,
@@ -288,11 +288,7 @@ fn finish_render(
             ds_render::background_tile(width, height, background, format),
             path,
         ),
-        Err(
-            e @ (DataServerError::ResourceExhausted
-            | DataServerError::DeadlineExceeded
-            | DataServerError::Unavailable(_)),
-        ) => return Err(e),
+        Err(e) if e.class().is_transient() => return Err(e),
         // Semi-transparent red, so the failed area stays visible; encoded
         // once per (w, h, background, format) like the empty image.
         Err(e) => Finished::Error(ds_render::error_tile(width, height, background, format), e),
@@ -1037,17 +1033,15 @@ pub async fn wms_handler(
                     })?;
                     (cached, "EMPTY", None)
                 }
-                // Only a shed or timed-out render (`ResourceExhausted`,
-                // `DeadlineExceeded`) is an error here, and it encoded nothing,
-                // or one whose data source kept refusing the reads (#1355):
+                // Only a transient error is an error here, and it encoded
+                // nothing (`finish_render`): a shed or timed-out render, or
+                // one whose data source kept refusing the reads (#1355),
                 // logged at WARN, its 503 naming no upstream.
-                Err(e @ DataServerError::Unavailable(_)) => {
+                Err(e) if e.class() == ErrorClass::SourceUnavailable => {
                     tracing::warn!("WMS render error for layer '{layer_names}': {e}");
                     return Err(WmsError::SourceUnavailable);
                 }
-                Err(e) => {
-                    return Err(WmsError::ServiceUnavailable(e.to_string()));
-                }
+                Err(_) => return Err(WmsError::ServiceUnavailable),
                 Ok(Finished::Error(tile, e)) => {
                     tracing::warn!("WMS render error for layer '{layer_names}': {e}");
                     let cached = tile.map_err(|e| {
@@ -1675,7 +1669,7 @@ impl From<ds_executor::ExecutionError> for WmsError {
     fn from(error: ds_executor::ExecutionError) -> Self {
         match error {
             ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
-            other => Self::ServiceUnavailable(other.to_string()),
+            _ => Self::ServiceUnavailable,
         }
     }
 }

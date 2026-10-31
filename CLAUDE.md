@@ -363,6 +363,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   hot_allocation_holding(capacity, largest))` (the GRIB caches, #1332). A
   caller that will read a fill again but samples its own copy now `keep`s
   it, or the fills after it push it out of the cold ring (#1340).
+  The memory plan sizes a cache by its class (`ds_cache::plan::grant::class`,
+  #1312: demand, working set, traffic-driven with a weight, else fixed):
+  a new cache gets one there.
   Every cache and admission budget is entered in the memory plan,
   `ds_cache::plan` (#1306), under its `/metrics` family as id
   (`metatile_cache`, `geotiff_decode`), a scope and its size source. A
@@ -808,8 +811,8 @@ one never implies the other.
 - A new source cap must name the pixel space it counts and fail with
   `InvalidParameter`/`QueryTooLarge` (400 with its message in Maps/Tiles/EDR).
   `Engine(..)` is an opaque 500 there, and WMS GetMap turns every engine
-  error except `ResourceExhausted`/`DeadlineExceeded`/`Unavailable` (503)
-  into the red tile.
+  error whose class is not transient (`ErrorClass::is_transient`: busy,
+  deadline, unavailable source, each a 503) into the red tile.
 
 ## Shared Domain Machinery (ds-core, `crates/core/`)
 
@@ -1123,6 +1126,17 @@ one never implies the other.
   - GRIB position and trajectory queries fail with it, instead of sampling
     the field as null.
   - S3 stores retry per `S3_RETRY` in `crates/storage/src/lib.rs`.
+- **`DataServerError::class()`** (#17) is the one map from a variant to how
+  every API answers it (`ds_core::error::ErrorClass`): `BadRequest` 400 with
+  its message, `NotFound` 404, `Busy` 503 + `Retry-After: 1`,
+  `DeadlineExceeded` 503 + `Retry-After: 1` (EDR: 504), `SourceUnavailable`
+  503 + `Retry-After: 10`, `Internal` 500. API crates match on the class,
+  never on the variants, so a new variant needs only its class in ds-core.
+  `Storage` is `Internal`: a store failure worth a retry is `Unavailable`.
+  Each API keeps its own body (WMS XML, OGC JSON, 3D Tiles `{"error"}`,
+  MCP JSON-RPC). The per-API suites run every variant through a real
+  handler (`crates/api-common/tests/support/engine_errors.rs`); add a new
+  variant there too.
 
 ## Engine Capabilities
 
@@ -1201,6 +1215,14 @@ rate_limit_per_min = 60     # PER BUCKET — authenticated requests and failed
 # cannot introduce it on a server that started without it — the route is built
 # at boot. Enabling for the first time, and changing token_env or
 # rate_limit_per_min, all need a restart.
+
+# Optional: the memory this server may use, in MiB (at least 256), which the
+# memory plan fits every cache and budget into (#1312). Top-level config.toml
+# only. Unset: 80 % of a cgroup limit, else min(50 % of MemTotal, 80 % of
+# MemAvailable at boot), with a WARN. For now a report (/admin/cache-plan
+# planned_bytes, cache_planned_bytes): nothing is resized.
+[memory]
+total_mb = 28672
 
 # Optional named colormaps. Like [[style_bundles]], MUST live in top-level
 # config.toml (rejected in per-collection files). Registered next to the
@@ -1643,8 +1665,8 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
 
 - Use `thiserror` for error types, not manual `impl Display`.
 - Engine methods return `Result<T, DataServerError>`.
-- Keep handlers thin — delegate logic to the engine, map errors to HTTP
-  status codes.
+- Keep handlers thin — delegate logic to the engine, map engine errors to
+  HTTP status codes by `DataServerError::class()`, never by variant (#17).
 - Use `serde_json::json!` for building JSON responses.
 - Do not leak internal error details to clients — generic messages for 500s.
 - Public ds-core domain structs (`RasterInfo`, `CollectionConfig`, …) are

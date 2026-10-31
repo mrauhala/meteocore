@@ -99,12 +99,148 @@ struct Layout {
     data: usize,
 }
 
+impl Layout {
+    /// Template 5.2's or 5.3's groups in a Section 7 payload `payload_len`
+    /// bytes long, where `grib` slices each part of it. Another template, or
+    /// an order of spatial differencing `grib` does not decode, is
+    /// [`PointError::Unsupported`]; descriptors past the payload, or wider
+    /// than `grib` reads, are [`PointError::Invalid`]: `grib` slices them
+    /// without a bounds check (#1325).
+    fn new(template: &DataRepresentationTemplate, payload_len: usize) -> Result<Self, PointError> {
+        let (simple, complex, order, octets) = match template {
+            DataRepresentationTemplate::_5_2(template) => {
+                (&template.simple, &template.complex, 0, 0)
+            }
+            DataRepresentationTemplate::_5_3(template) => {
+                // `grib` panics on 255, the missing order.
+                if !matches!(template.spatial_diff_order, 1 | 2) {
+                    return Err(PointError::Unsupported("order of spatial differencing"));
+                }
+                if !(1..=4).contains(&template.num_extra_desc_octets) {
+                    return Err(invalid("extra descriptor octets"));
+                }
+                (
+                    &template.simple,
+                    &template.complex,
+                    template.spatial_diff_order,
+                    template.num_extra_desc_octets,
+                )
+            }
+            _ => return Err(PointError::Unsupported("not complex packing")),
+        };
+        let groups = u64::from(complex.num_groups);
+        // `grib` reads each entry into a `u32` and sizes each array with a
+        // `u32` product of the group count and its bits.
+        let descriptor_bits = [
+            simple.num_bits,
+            complex.num_group_width_bits,
+            complex.num_group_len_bits,
+        ];
+        if descriptor_bits
+            .iter()
+            .any(|&bits| bits > 32 || groups * u64::from(bits) > u64::from(u32::MAX))
+        {
+            return Err(invalid("group descriptors wider than 32 bits"));
+        }
+        let packed = |bits: u8| (groups * u64::from(bits)).div_ceil(8);
+        let refs = (u64::from(order) + 1) * u64::from(octets);
+        let widths = refs + packed(simple.num_bits);
+        let lengths = widths + packed(complex.num_group_width_bits);
+        let data = lengths + packed(complex.num_group_len_bits);
+        if data > payload_len as u64 {
+            return Err(invalid("group descriptors past Section 7"));
+        }
+        Ok(Self {
+            groups: groups as usize,
+            ref_bits: simple.num_bits.into(),
+            width_ref: complex.group_width_ref.into(),
+            width_bits: complex.num_group_width_bits.into(),
+            len_ref: complex.group_len_ref,
+            len_inc: complex.group_len_inc.into(),
+            len_last: complex.group_len_last,
+            len_bits: complex.num_group_len_bits.into(),
+            missing: complex.missing_value_management,
+            order,
+            octets: octets.into(),
+            // All within the payload.
+            refs: refs as usize,
+            widths: widths as usize,
+            lengths: lengths as usize,
+            data: data as usize,
+        })
+    }
+}
+
+/// Check that `payload`, Section 7's payload, holds what `grib`'s complex
+/// packing decoder (templates 5.2 and 5.3) slices out of it to decode
+/// `values` packed values, before it runs (#1325): the extra and group
+/// descriptors, then every group it enters, in full, through the one holding
+/// the last value, none longer than the field. `grib` slices them without a
+/// bounds check and panics on a Section 7 shorter than its groups. The walk
+/// is a point read's ([`Descriptors::find`]), with the same arithmetic.
+/// Other templates pass.
+pub(crate) fn check_section7(
+    template: &DataRepresentationTemplate,
+    values: usize,
+    payload: &[u8],
+) -> Result<(), String> {
+    if !matches!(
+        template,
+        DataRepresentationTemplate::_5_2(_) | DataRepresentationTemplate::_5_3(_)
+    ) {
+        return Ok(());
+    }
+    groups_in(template, values, payload).map_err(|error| match error {
+        PointError::Unsupported(reason) => reason.to_string(),
+        PointError::Invalid(reason) => reason,
+        PointError::Fatal(error) => error.to_string(),
+    })
+}
+
+/// [`check_section7`] of a template 5.2 or 5.3.
+fn groups_in(
+    template: &DataRepresentationTemplate,
+    values: usize,
+    payload: &[u8],
+) -> Result<(), PointError> {
+    let layout = Layout::new(template, payload.len())?;
+    // Without values `grib` enters no group.
+    let Some(last) = values.checked_sub(1) else {
+        return Ok(());
+    };
+    let descriptors = Descriptors::in_block(&layout, &payload[layout.refs..layout.data]);
+    let data_bits = 8 * (payload.len() - layout.data) as u64;
+    let (group, at) = descriptors.find(&layout, data_bits, GroupAt::default(), last)?;
+    // `grib` allocates a constant group's length whole, however long, so a
+    // group longer than the field, which only a corrupt message has, is an
+    // error rather than an allocation of up to 32 GiB. The groups before it
+    // end before the last value.
+    if group.length as usize > values {
+        return Err(invalid("a group longer than the field"));
+    }
+    // `grib` reads every value of the group holding the last one.
+    (u64::from(group.length) * u64::from(group.width))
+        .checked_add(at.bit)
+        .filter(|&end| end <= data_bits)
+        .map(drop)
+        .ok_or_else(|| invalid("data ends inside the last group"))
+}
+
 /// One group's descriptors, as `grib` reads them.
 #[derive(Debug, Clone, Copy)]
 struct Group {
     reference: i32,
     width: u32,
     length: u32,
+}
+
+/// Where a group starts: its index, its first value's packed index, and the
+/// data bit at which its values start. The default is the first group's.
+#[derive(Debug, Clone, Copy, Default)]
+struct GroupAt {
+    group: usize,
+    first: usize,
+    bit: u64,
 }
 
 /// One bit-packed descriptor array, `bits` per group.
@@ -165,11 +301,40 @@ impl<'a> Descriptors<'a> {
                 .wrapping_add(layout.len_ref)
         };
         Ok(Group {
-            // At most `MAX_BITS` bits.
-            reference: reference as i32,
+            // `grib` unwraps it as an `i32`.
+            reference: i32::try_from(reference)
+                .map_err(|_| invalid("group reference over 31 bits"))?,
             width,
             length,
         })
+    }
+
+    /// The group holding packed value `packed`, walking on from group `at`
+    /// (whose first value is at most `packed`): its descriptors and where it
+    /// starts. Every group passed must end within `data_bits`, as `grib`
+    /// slices each in full.
+    fn find(
+        &self,
+        layout: &Layout,
+        data_bits: u64,
+        mut at: GroupAt,
+        packed: usize,
+    ) -> Result<(Group, GroupAt), PointError> {
+        loop {
+            if at.group >= layout.groups {
+                return Err(invalid("the groups end before the field"));
+            }
+            let g = self.group(layout, at.group)?;
+            if packed - at.first < g.length as usize {
+                return Ok((g, at));
+            }
+            at.first += g.length as usize;
+            at.bit = (u64::from(g.length) * u64::from(g.width))
+                .checked_add(at.bit)
+                .filter(|&bit| bit <= data_bits)
+                .ok_or_else(|| invalid("a value past the data"))?;
+            at.group += 1;
+        }
     }
 }
 
@@ -357,6 +522,7 @@ impl Header {
     /// [`PointError::Unsupported`], and what the full decode would reject is
     /// [`PointError::Invalid`].
     pub(crate) fn parse(message: &[u8]) -> Result<Self, PointError> {
+        crate::ccsds::check_sections(message).map_err(invalid)?;
         let grib2 = grib::from_reader(Cursor::new(message)).map_err(invalid)?;
         let (_, submessage) = grib2
             .iter()
@@ -416,8 +582,9 @@ impl Header {
             ));
         };
         // What `grib` decodes: floating-point originals, general group
-        // splitting, missing value management 0 to 2, first or second order
-        // differences. It underflows `NG - 1` without groups.
+        // splitting, missing value management 0 to 2, and (checked with the
+        // layout) first or second order differences. It underflows `NG - 1`
+        // without groups.
         let complex = &template.complex;
         let simple = &template.simple;
         if template.orig_field_type != 0 {
@@ -428,12 +595,6 @@ impl Header {
         }
         if complex.missing_value_management > 2 {
             return Err(PointError::Unsupported("missing value management"));
-        }
-        if !matches!(template.spatial_diff_order, 1 | 2) {
-            return Err(PointError::Unsupported("order of spatial differencing"));
-        }
-        if !(1..=4).contains(&template.num_extra_desc_octets) {
-            return Err(invalid("extra descriptor octets"));
         }
         if complex.num_groups == 0 {
             return Err(PointError::Unsupported("no groups"));
@@ -525,16 +686,7 @@ impl Header {
         if payload_len > MAX_PAYLOAD_BYTES {
             return Err(PointError::Unsupported("payload over 512 MiB"));
         }
-        let groups = complex.num_groups as usize;
-        let packed = |bits: u8| (groups as u64 * u64::from(bits)).div_ceil(8);
-        let refs = (u64::from(template.spatial_diff_order) + 1)
-            * u64::from(template.num_extra_desc_octets);
-        let widths = refs + packed(simple.num_bits);
-        let lengths = widths + packed(complex.num_group_width_bits);
-        let data = lengths + packed(complex.num_group_len_bits);
-        if data > payload_len as u64 {
-            return Err(invalid("group descriptors past Section 7"));
-        }
+        let layout = Layout::new(&section5.payload.template, payload_len)?;
         Ok(Self {
             lattice,
             scale: Scale {
@@ -542,24 +694,7 @@ impl Header {
                 binary: 2_f32.powi(exp),
                 decimal: 10_f32.powi(-i32::from(simple.dec)),
             },
-            layout: Layout {
-                groups,
-                ref_bits: simple.num_bits.into(),
-                width_ref: complex.group_width_ref.into(),
-                width_bits: complex.num_group_width_bits.into(),
-                len_ref: complex.group_len_ref,
-                len_inc: complex.group_len_inc.into(),
-                len_last: complex.group_len_last,
-                len_bits: complex.num_group_len_bits.into(),
-                missing: complex.missing_value_management,
-                order: template.spatial_diff_order,
-                octets: template.num_extra_desc_octets.into(),
-                // All within the payload, under 512 MiB.
-                refs: refs as usize,
-                widths: widths as usize,
-                lengths: lengths as usize,
-                data: data as usize,
-            },
+            layout,
             values,
             bitmap,
             metadata,
@@ -902,40 +1037,28 @@ impl ComplexIndex {
     /// [`PointError::Invalid`].
     fn locate(&self, from: &Checkpoint, packed: usize) -> Result<(u64, u32), PointError> {
         let layout = &self.header.layout;
-        let descriptors = self.descriptors();
         let data_bits = 8 * (self.header.payload_len - layout.data) as u64;
-        let past = || invalid("a value past the data");
-        let mut group = from.group as usize;
         // The packed index of the group's first value, at most `packed`.
-        let mut first = (from.packed as usize)
+        let first = (from.packed as usize)
             .checked_sub(from.in_group as usize)
             .filter(|&first| first <= packed)
             .ok_or_else(|| invalid("checkpoint after the value"))?;
-        let mut bit = u64::from(from.group_bit);
-        loop {
-            if group >= layout.groups {
-                return Err(invalid("the groups end before the field"));
-            }
-            let g = descriptors.group(layout, group)?;
-            if packed - first < g.length as usize {
-                let start = ((packed - first) as u64)
-                    .checked_mul(u64::from(g.width))
-                    .and_then(|offset| bit.checked_add(offset))
-                    .filter(|start| {
-                        start
-                            .checked_add(u64::from(g.width))
-                            .is_some_and(|end| end <= data_bits)
-                    })
-                    .ok_or_else(past)?;
-                return Ok((start, g.width));
-            }
-            first += g.length as usize;
-            bit = (u64::from(g.length) * u64::from(g.width))
-                .checked_add(bit)
-                .filter(|&bit| bit <= data_bits)
-                .ok_or_else(past)?;
-            group += 1;
-        }
+        let from = GroupAt {
+            group: from.group as usize,
+            first,
+            bit: u64::from(from.group_bit),
+        };
+        let (g, at) = self.descriptors().find(layout, data_bits, from, packed)?;
+        let start = ((packed - at.first) as u64)
+            .checked_mul(u64::from(g.width))
+            .and_then(|offset| at.bit.checked_add(offset))
+            .filter(|start| {
+                start
+                    .checked_add(u64::from(g.width))
+                    .is_some_and(|end| end <= data_bits)
+            })
+            .ok_or_else(|| invalid("a value past the data"))?;
+        Ok((start, g.width))
     }
 
     /// Section 7's data in `part`, the message's bytes from offset `start`

@@ -143,36 +143,40 @@ fn error_response(description: &str) -> Value {
 /// request log reads (#119); a `(StatusCode, Json)` tuple converts via `?`.
 type HandlerError = JsonError;
 
-/// The response to an engine's error on `/items` or `/items/{featureId}`.
-/// A request the engine turns down (`QueryTooLarge`: a station grid's
-/// analysis cap) is a 400 with its message, a missing feature a 404, an
-/// engine that is not ready or busy (`ResourceExhausted`, as a station grid
-/// whose residuals are still being computed answers, or `DeadlineExceeded`)
-/// a 503 with `Retry-After`, a data source that kept refusing the read
-/// (`Unavailable`, #1355) the shared `SourceUnavailable` 503, and anything
-/// else a 500 that names nothing internal.
+/// The response to an engine's error on `/items` or `/items/{featureId}`,
+/// by its [`ErrorClass`], as every API answers it (#17). A request the
+/// engine turns down (`QueryTooLarge`: a station grid's analysis cap) is a
+/// 400 with its message, an absent resource a 404, an engine that is not
+/// ready or busy (`ResourceExhausted`,
+/// as a station grid whose residuals are still being computed answers, or
+/// `DeadlineExceeded`) a 503 with `Retry-After: 1`, a data source that kept
+/// refusing the read (`Unavailable`, #1355) the shared `SourceUnavailable`
+/// 503, and anything else a 500 that names nothing internal.
 fn engine_failure(e: &ds_core::error::DataServerError, route: &str) -> Response {
-    use ds_core::error::DataServerError as E;
-    if let E::Unavailable(_) = e {
-        tracing::warn!("Features {route} error: {e}");
-        return api_common::source_unavailable().into_response();
-    }
-    let (status, code, description) = match e {
-        E::InvalidParameter(_)
-        | E::InvalidBbox(_)
-        | E::InvalidDatetime(_)
-        | E::QueryTooLarge(_) => (StatusCode::BAD_REQUEST, "BadRequest", e.to_string()),
-        E::FeatureNotFound(_) => (
+    use ds_core::error::{DataServerError as E, ErrorClass};
+    let (status, code, description) = match e.class() {
+        ErrorClass::BadRequest => (StatusCode::BAD_REQUEST, "BadRequest", e.to_string()),
+        // The status is the class's; a missing feature keeps the wording
+        // `/items/{featureId}` has always answered it with.
+        ErrorClass::NotFound => (
             StatusCode::NOT_FOUND,
             "NotFound",
-            "Feature not found".to_string(),
+            match e {
+                E::FeatureNotFound(_) => "Feature not found".to_string(),
+                _ => e.to_string(),
+            },
         ),
-        E::ResourceExhausted | E::DeadlineExceeded => (
+        // `JsonError` adds the busy answer's `Retry-After: 1`.
+        ErrorClass::Busy | ErrorClass::DeadlineExceeded => (
             StatusCode::SERVICE_UNAVAILABLE,
             "ServerBusy",
             "Not ready or busy, try again later".to_string(),
         ),
-        _ => {
+        ErrorClass::SourceUnavailable => {
+            tracing::warn!("Features {route} error: {e}");
+            return api_common::source_unavailable().into_response();
+        }
+        ErrorClass::Internal => {
             tracing::error!("Features {route} error: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -181,17 +185,11 @@ fn engine_failure(e: &ds_core::error::DataServerError, route: &str) -> Response 
             )
         }
     };
-    let mut response = JsonError(
+    JsonError(
         status,
         Json(json!({ "code": code, "description": description })),
     )
-    .into_response();
-    if status == StatusCode::SERVICE_UNAVAILABLE {
-        response
-            .headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-    }
-    response
+    .into_response()
 }
 
 /// A 400 from a plain message (used for `?f=` content negotiation errors).

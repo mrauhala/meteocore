@@ -141,7 +141,7 @@ Errors are JSON `{"code": …, "description": …}`, or a page if HTML was asked
 | Status | Code | When |
 |---|---|---|
 | 400 | `BadRequest` | Bad or unknown parameter; engine `InvalidParameter`, `InvalidBbox`, `InvalidDatetime` or `QueryTooLarge` (with its message) |
-| 404 | `NotFound` | Unknown collection or style; no time step for the requested time; a model run gone before rendering |
+| 404 | `NotFound` | Unknown collection or style; no time step for the requested time; a model run gone before rendering, or anything else the engine reports absent |
 | 503 | `ServerBusy` | Render queue full, deadline passed, or an engine budget exhausted; with `Retry-After: 1` |
 | 503 | `SourceUnavailable` | The data's object store kept answering 429, 502, 503 or 504 through all of its retries; with `Retry-After: 10`. The description names no upstream; the server logs the error at WARN |
 | 500 | `ServerError` | Anything else, with a generic message |

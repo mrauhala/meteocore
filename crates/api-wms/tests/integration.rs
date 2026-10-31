@@ -22,6 +22,9 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 
+#[path = "../../api-common/tests/support/engine_errors.rs"]
+mod engine_errors;
+
 /// Mock engine that returns an all-`None` (all-nodata) `RasterTile`.
 /// Drives the empty-image fast path that skips colorization and serves
 /// the memoized empty image — the code path #162 and #1091 fixed.
@@ -4322,6 +4325,72 @@ async fn an_unavailable_source_is_503_not_a_red_error_tile() {
             "{view}: {xml}"
         );
         assert!(!xml.contains("secret"), "{view}: {xml}");
+    }
+}
+
+/// A `MapEngine` whose every render fails with
+/// `engine_errors::every_error()` at this index.
+struct FailingEngine(usize);
+impl MapEngine for FailingEngine {
+    fn get_raster_tile(
+        &self,
+        _: [f64; 4],
+        _: u32,
+        _: u32,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+        _: &OutputCrs,
+        _: Option<&str>,
+        _: Option<f64>,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        Err(engine_errors::every_error().swap_remove(self.0))
+    }
+    fn raster_info(&self) -> RasterInfo {
+        PopulatedMockMapEngine.raster_info()
+    }
+}
+
+/// A GetMap render's transient error (#17: a busy engine, the deadline, a
+/// data source that keeps refusing reads) is the 503 its class answers in
+/// every API, naming nothing internal; every other error is still the red
+/// error tile (#280), on the direct path and the meta-tiled one.
+#[tokio::test]
+async fn transient_render_errors_are_their_503_and_others_the_error_tile() {
+    for (i, error) in engine_errors::every_error().iter().enumerate() {
+        let app = build_populated_router_with_engine(Arc::new(FailingEngine(i)));
+        for view in [
+            "CRS=CRS:84&BBOX=20,60,25,65",
+            "CRS=EPSG:3857&BBOX=2226389,8399737,2782987,9349764",
+        ] {
+            let uri = format!(
+                "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&{view}\
+                 &WIDTH=32&HEIGHT=32&FORMAT=image/png"
+            );
+            let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+            };
+            let (retry_after, x_cache) = (header("retry-after"), header("x-cache"));
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            if error.class().is_transient() {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{error:?} {view}");
+                assert_eq!(
+                    retry_after.as_deref(),
+                    engine_errors::retry_after(error),
+                    "{error:?} {view}"
+                );
+                let xml = String::from_utf8(body.to_vec()).unwrap();
+                assert!(!xml.contains(engine_errors::SECRET), "{error:?}: {xml}");
+            } else {
+                assert_eq!(status, StatusCode::OK, "{error:?} {view}");
+                assert_eq!(x_cache.as_deref(), Some("ERROR"), "{error:?} {view}");
+            }
+        }
     }
 }
 

@@ -13,7 +13,7 @@ use ds_core::config::CollectionConfig;
 use ds_core::discovery::Discovery;
 use ds_core::edr_engine::{EdrEngine, TrajectoryShape};
 
-use ds_core::error::DataServerError;
+use ds_core::error::{DataServerError, ErrorClass};
 use ds_core::feature::MAX_AREA_VALUES;
 use ds_core::model::{CoverageResponse, Location, LocationSnapshot};
 use ds_core::trajectory::{TrajectoryPath, MAX_TRAJECTORY_NODES, MAX_TRAJECTORY_SAMPLES};
@@ -515,43 +515,36 @@ fn render_coverage_response(
     }
 }
 
-/// Map an engine error from a data query to its HTTP response: request
-/// errors → 400, absent resources → 404, a data source that kept refusing
-/// the read → 503 `SourceUnavailable` with `Retry-After: 10` (logged at
-/// WARN under `label`, #1355), everything else a generic 500 (logged at
-/// ERROR). One home for the four data-query handlers so a new
-/// `DataServerError` variant cannot map differently per query type.
+/// Map an engine error from a data query to its HTTP response by its
+/// [`ErrorClass`], as every API answers it (#17): request errors → 400,
+/// absent resources → 404, a busy engine → 503 `ServerBusy` with
+/// `Retry-After: 1`, the deadline → EDR's 504, a data source that kept
+/// refusing the read → 503 `SourceUnavailable` with `Retry-After: 10`
+/// (logged at WARN under `label`, #1355), everything else a generic 500
+/// (logged at ERROR). One home for every EDR route that calls an engine.
 pub(crate) fn map_query_error(e: &DataServerError, label: &str) -> HandlerError {
-    match e {
-        DataServerError::DeadlineExceeded => query_timeout(),
-        DataServerError::ResourceExhausted => JsonError(
+    match e.class() {
+        // EDR answers a query past its deadline 504, not the renders' 503.
+        ErrorClass::DeadlineExceeded => query_timeout(),
+        ErrorClass::Busy => JsonError(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"code": "ServerBusy", "description": "Server busy, try again later"})),
         ),
-        DataServerError::Unavailable(_) => {
+        ErrorClass::SourceUnavailable => {
             tracing::warn!("{label} query error: {e}");
             api_common::source_unavailable()
         }
-        DataServerError::InvalidParameter(_)
-        | DataServerError::InvalidBbox(_)
-        | DataServerError::InvalidDatetime(_)
-        | DataServerError::QueryTooLarge(_) => JsonError(
+        ErrorClass::BadRequest => JsonError(
             StatusCode::BAD_REQUEST,
             Json(json!({ "code": "BadRequest", "description": e.to_string() })),
         ),
-        DataServerError::LocationNotFound(_)
-        | DataServerError::CollectionNotFound(_)
-        | DataServerError::FeatureNotFound(_)
-        | DataServerError::ReferenceTimeNotFound(_) => JsonError(
+        ErrorClass::NotFound => JsonError(
             StatusCode::NOT_FOUND,
             Json(json!({ "code": "NotFound", "description": e.to_string() })),
         ),
-        _ => {
+        ErrorClass::Internal => {
             tracing::error!("{label} query error: {e}");
-            JsonError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-            )
+            server_error()
         }
     }
 }
@@ -1301,7 +1294,7 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             );
             list_responses["503"] = error_response(
                 503,
-                "The query executor or the response memory budget is at capacity (ServerBusy, with Retry-After), or the list is over its response limit (ResponseLimit): page a list over it with limit, or request a smaller limit",
+                "The query executor or the response memory budget is at capacity (ServerBusy, with Retry-After), a data source keeps refusing reads (SourceUnavailable, with a longer Retry-After), or the list is over its response limit (ResponseLimit): page a list over it with limit, or request a smaller limit",
             );
             collection_paths[&locations_path] = json!({
                 "get": {
@@ -2559,15 +2552,9 @@ pub async fn locations(
     let base_url = request_base_url(&state, &headers);
     let query_engine = engine.clone();
     let (body, etag) = execute_query(false, move |budget| {
-        let server_error = || {
-            JsonError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "code": "ServerError", "description": "Internal server error" })),
-            )
-        };
         // The engine's shared snapshot: pages and filters borrow from it,
         // nothing copies the list (#1083).
-        let inventory = query_engine.get_locations().map_err(|_| server_error())?;
+        let inventory = location_inventory(query_engine.as_ref(), "EDR locations")?;
         // Filter first, then page: `numberMatched` and the links count the
         // locations left. `contains` handles `west > east`; the box goes
         // first, so the time filter probes only the locations inside it.
@@ -3046,21 +3033,32 @@ fn query_location_list(
     Ok(found)
 }
 
+/// The engine's location inventory, or its error's answer
+/// ([`map_query_error`] under `label`). An engine whose inventory is itself
+/// not found (a radar site not in the network catalog yet, or one that
+/// dropped out) knows no locations: its list is empty, a 200, never a 404,
+/// since the collection exists (#17); a location id in it is still the 404.
+fn location_inventory(
+    engine: &dyn EdrEngine,
+    label: &str,
+) -> Result<Arc<LocationSnapshot>, HandlerError> {
+    match engine.get_locations() {
+        Ok(locations) => Ok(locations),
+        Err(DataServerError::LocationNotFound(_)) => Ok(LocationSnapshot::empty()),
+        Err(e) => Err(map_query_error(&e, label)),
+    }
+}
+
 /// The 404 for a listed location id the collection does not have. `known`
 /// holds the inventory snapshot across one list, read once and looked up by
-/// id (#1083). An engine whose inventory is itself not found (a radar site
-/// that dropped out) knows no ids.
+/// id (#1083), as [`location_inventory`] reads it.
 fn require_known_location(
     engine: &dyn EdrEngine,
     known: &mut Option<Arc<LocationSnapshot>>,
     id: &str,
 ) -> Result<(), HandlerError> {
     if known.is_none() {
-        *known = Some(match engine.get_locations() {
-            Ok(locations) => locations,
-            Err(DataServerError::LocationNotFound(_)) => LocationSnapshot::empty(),
-            Err(e) => return Err(map_query_error(&e, "Location")),
-        });
+        *known = Some(location_inventory(engine, "Location")?);
     }
     if known.as_ref().is_some_and(|known| known.contains(id)) {
         return Ok(());

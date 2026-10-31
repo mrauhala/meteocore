@@ -25,6 +25,10 @@
 //! [`snapshot`] logs a WARN for a cache that has just fallen below it
 //! (`ds_cache::plan::demand`): at boot, after a reload that resized it, or
 //! when a scrape is the first to see it. Nothing applies a suggestion.
+//!
+//! Each listing also carries the size the memory plan gives it (#1312,
+//! `crate::memory_plan`), fitted at boot and after each accepted reload to
+//! the memory the process may use. A report: nothing applies it either.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -43,6 +47,7 @@ use serde_json::{json, Value};
 use tracing::{info, warn};
 
 use crate::admin::{AdminState, MemoryReading, ServerState};
+use crate::memory_plan::{self, Report};
 
 /// Where the meta-tile and rendered-image cache sizes came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,7 +292,8 @@ pub async fn handler(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     crate::admin::require_admin_token(&state, &headers)?;
     let memory = crate::admin::refresh_metrics(&state);
-    Ok(Json(to_json(&snapshot(&state), &memory)))
+    let report = memory_plan::last();
+    Ok(Json(to_json(&snapshot(&state), &memory, report.as_deref())))
 }
 
 /// The endpoint's document: `caches` and `budgets`, one object each, their
@@ -298,13 +304,18 @@ pub async fn handler(
 /// `demand_bytes`, `demand_rule`, `demand_kind` (`demand`, or `floor` when
 /// the requests' working set comes on top), `suggested_bytes` (the demand
 /// plus 15 %, or the floor, in whole MiB) and `demand_inputs`
-/// ([`demand_inputs_json`]); null otherwise.
-pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
+/// ([`demand_inputs_json`]); null otherwise. With the memory plan of the
+/// last boot or reload (#1312), every entry has its `planned_bytes`,
+/// `planned_reason` and `expected_bytes` (null for one entered since), and
+/// `plan` has the total, the reserves and the pool
+/// (`memory_plan::header_json`).
+pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Report>) -> Value {
     let entries = |kind: Kind| -> Vec<Value> {
         rows.iter()
             .filter(|row| row.entry.kind == kind)
             .map(|row| {
                 let (entry, usage, demand) = (&row.entry, &row.usage, row.demand.as_ref());
+                let grant = memory_plan::grant(report, row);
                 json!({
                     "id": entry.id,
                     "scope": entry.scope.kind(),
@@ -323,6 +334,9 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
                     "demand_kind": demand.map(Demand::kind),
                     "suggested_bytes": demand.map(Demand::suggested_bytes),
                     "demand_inputs": demand.map(demand_inputs_json),
+                    "planned_bytes": grant.map(|g| g.bytes),
+                    "planned_reason": grant.map(|g| g.reason.to_string()),
+                    "expected_bytes": grant.map(|g| g.expected_bytes),
                 })
             })
             .collect()
@@ -348,6 +362,7 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading) -> Value {
             "budgets": totals(Kind::Budget),
         },
         "memory": memory,
+        "plan": report.map_or(Value::Null, memory_plan::header_json),
     })
 }
 
@@ -444,10 +459,12 @@ static LOGGED: Mutex<Option<Logged>> = Mutex::new(None);
 
 /// Log the plan as one INFO block. Process-wide caches and budgets enter the
 /// plan when first read, so this refreshes the `/metrics` families first:
-/// the block lists what `/metrics` reports.
+/// the block lists what `/metrics` reports. Fits the memory plan first
+/// (#1312), whose WARNs follow the block.
 pub(crate) fn log(state: &AdminState, occasion: Occasion) {
-    crate::admin::refresh_metrics(state);
+    let memory = crate::admin::refresh_metrics(state);
     let rows = snapshot(state);
+    let report = memory_plan::replan(state, &rows, &memory);
     let current: Logged = rows
         .iter()
         .map(|row| {
@@ -465,7 +482,8 @@ pub(crate) fn log(state: &AdminState, occasion: Occasion) {
         Occasion::Boot => "at boot",
         Occasion::Reload | Occasion::Recovery => "after reload",
     };
-    info!("{}", render(&rows, heading, logged.as_ref()));
+    info!("{}", render(&rows, heading, logged.as_ref(), Some(&report)));
+    memory_plan::log_warnings(&report, &rows);
     *logged = Some(current);
 }
 
@@ -478,11 +496,18 @@ pub(crate) fn mib(bytes: u64) -> String {
     }
 }
 
-/// The log block: a heading with the totals, then one line per cache and
-/// per budget, grouped by scope, with its capacity and source. A line whose
+/// The log block: a heading with the totals and, with a memory plan
+/// (#1312), a line on its total and pool, then one line per cache and per
+/// budget, grouped by scope, with its capacity and source. A line whose
 /// size differs from `previous` shows the size it had; a cache with a
-/// demand (#1309) shows it and the size it suggests.
-pub(crate) fn render(rows: &[Row], heading: &str, previous: Option<&Logged>) -> String {
+/// demand (#1309) shows it and the size it suggests; an entry the plan
+/// sizes, its planned size and why.
+pub(crate) fn render(
+    rows: &[Row],
+    heading: &str,
+    previous: Option<&Logged>,
+    report: Option<&Report>,
+) -> String {
     let caches = Totals::of(rows, Kind::Cache);
     let budgets = Totals::of(rows, Kind::Budget);
     let gib = |bytes: u64| bytes as f64 / (1024.0 * MIB as f64);
@@ -495,6 +520,9 @@ pub(crate) fn render(rows: &[Row], heading: &str, previous: Option<&Logged>) -> 
         mib(budgets.capacity_bytes),
         gib(budgets.capacity_bytes),
     );
+    if let Some(report) = report {
+        let _ = write!(out, "\n  {}", memory_plan::header_line(report));
+    }
     let name = |row: &Row| match row.entry.scope.collection() {
         Some(collection) => format!("{} {collection}", row.entry.id),
         None => row.entry.id.to_string(),
@@ -534,6 +562,9 @@ pub(crate) fn render(rows: &[Row], heading: &str, previous: Option<&Logged>) -> 
                 mib(demand.bytes),
                 mib(demand.suggested_bytes())
             );
+        }
+        if let Some(grant) = memory_plan::grant(report, row) {
+            out.push_str(&memory_plan::line_suffix(grant));
         }
     }
     out

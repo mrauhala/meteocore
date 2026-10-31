@@ -1406,6 +1406,32 @@
                                     "name": "panel-145"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 22,
+                                  "width": 6,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-180"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 6,
+                                  "y": 22,
+                                  "width": 18,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-181"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -18070,7 +18096,7 @@
         "spec": {
           "id": 120,
           "title": "Cache plan",
-          "description": "Every cache and admission budget with where its size came from: default, env:<variable>, config:<[server] key>, collection:<collection key> or constant (/admin/cache-plan has the same list). Capacity is the configured size and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used. Demand is what the engines say the cache must hold for their data (cache_demand_bytes; a floor for PVOL pixels), empty for a cache without one; /admin/cache-plan has its inputs and the suggested size.",
+          "description": "Every cache and admission budget with where its size came from: default, env:<variable>, config:<[server] key>, collection:<collection key> or constant (/admin/cache-plan has the same list). Capacity is the configured size and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used. Demand is what the engines say the cache must hold for their data (cache_demand_bytes; a floor for PVOL pixels), empty for a cache without one; /admin/cache-plan has its inputs and the suggested size. Planned is the size the memory plan gives each one (cache_planned_bytes), fitted at boot and at each reload to the plan's total; 0 for a cache no collection can reach. A report: the configured size is unchanged. /admin/cache-plan says why each size.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -18167,6 +18193,29 @@
                       }
                     }
                   }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "E",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (cache, collection) (cache_planned_bytes{job=~\"$job\"})",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
                 }
               ],
               "transformations": [
@@ -18213,8 +18262,9 @@
                         "collection": 1,
                         "source": 2,
                         "Value #B": 3,
-                        "Value #C": 4,
-                        "Value #D": 5
+                        "Value #E": 4,
+                        "Value #C": 5,
+                        "Value #D": 6
                       },
                       "renameByName": {
                         "cache": "Cache",
@@ -18222,7 +18272,8 @@
                         "source": "Source",
                         "Value #B": "Capacity",
                         "Value #C": "Used",
-                        "Value #D": "Demand"
+                        "Value #D": "Demand",
+                        "Value #E": "Planned"
                       }
                     }
                   }
@@ -18247,6 +18298,7 @@
                   "countRows": false,
                   "fields": [
                     "Capacity",
+                    "Planned",
                     "Used",
                     "Demand"
                   ]
@@ -18328,6 +18380,22 @@
                   {
                     "matcher": {
                       "id": "byName",
+                      "options": "Planned"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "bytes"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 0
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
                       "options": "Used"
                     },
                     "properties": [
@@ -18367,8 +18435,8 @@
         "kind": "Panel",
         "spec": {
           "id": 121,
-          "title": "Planned capacity",
-          "description": "Configured capacity of every cache and of every admission budget, summed (memory_capacity_total_bytes). Capacity, not memory: a cache holds no more than it is asked for, and budgets are reserved only while work runs. The Cache plan table lists each one.",
+          "title": "Configured capacity",
+          "description": "Configured capacity of every cache and of every admission budget, summed (memory_capacity_total_bytes). Capacity, not memory: a cache holds no more than it is asked for, and budgets are reserved only while work runs. The Cache plan table lists each one, with the size the memory plan gives it; Memory plan has the plan's total.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -21377,6 +21445,358 @@
                       {
                         "color": "red",
                         "value": 1
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-180": {
+        "kind": "Panel",
+        "spec": {
+          "id": 180,
+          "title": "Memory plan",
+          "description": "The memory the plan fits every cache and budget into (memory_plan_total_bytes: [memory] total_mb, else 80 % of a cgroup limit, else the smaller of half of MemTotal and 80 % of MemAvailable at boot), what the caches share of it after the reserves (memory_plan_pool_bytes: memory outside the caches, the render budget, the largest read budget and allocator slack), and how much more it needs with the pins kept and every other cache and budget at its floor (memory_plan_shortfall_bytes, red above 0). Fitted at boot and at each reload. A report: no size is changed. The server logs the plan with one WARN when it cuts a cache below its configured size; the Cache plan table has each planned size.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max(memory_plan_total_bytes{job=~\"$job\"})",
+                        "legendFormat": "total",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max(memory_plan_pool_bytes{job=~\"$job\"})",
+                        "legendFormat": "cache pool",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "C",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max(memory_plan_shortfall_bytes{job=~\"$job\"})",
+                        "legendFormat": "shortfall",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "stat",
+            "version": "",
+            "spec": {
+              "options": {
+                "reduceOptions": {
+                  "calcs": [
+                    "lastNotNull"
+                  ],
+                  "fields": "",
+                  "values": false
+                },
+                "orientation": "auto",
+                "textMode": "auto",
+                "colorMode": "value",
+                "graphMode": "none",
+                "justifyMode": "auto",
+                "wideLayout": true,
+                "showPercentChange": false
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "thresholds"
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "blue",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "mappings": [],
+                  "links": [
+                    {
+                      "title": "Open cache plan",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${__all_variables}&dtab=memory-admission&viewPanel=panel-120"
+                    }
+                  ],
+                  "decimals": 1
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "shortfall"
+                    },
+                    "properties": [
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "green",
+                              "value": null
+                            },
+                            {
+                              "color": "red",
+                              "value": 1
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "panel-181": {
+        "kind": "Panel",
+        "spec": {
+          "id": 181,
+          "title": "Plan against memory",
+          "description": "Caches and budgets summed, as the memory plan sizes them (cache_planned_bytes) and as configured (memory_capacity_total_bytes), against the plan's total and cache pool, and RSS (Linux only). Sizes are ceilings: a cache allocates as it fills, so either sum can lie above the total while RSS stays below it. A step is a restart or reload that planned again.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum(cache_planned_bytes{job=~\"$job\"})",
+                        "legendFormat": "planned",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum(memory_capacity_total_bytes{job=~\"$job\"})",
+                        "legendFormat": "configured",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "C",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max(memory_plan_total_bytes{job=~\"$job\"})",
+                        "legendFormat": "total",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "D",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max(memory_plan_pool_bytes{job=~\"$job\"})",
+                        "legendFormat": "cache pool",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "E",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max(process_resident_memory_bytes{job=~\"$job\"}) > 0",
+                        "legendFormat": "RSS",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Last *",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
                       }
                     ]
                   },

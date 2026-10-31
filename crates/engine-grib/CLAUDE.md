@@ -662,8 +662,28 @@ ones only in the legacy layout.
   octets, descriptor and group widths ≤ 31 bits, |E| ≤ 126, bitmap indicator
   0 or 255, canonical scan. Else `Unsupported`. Corrupt or truncated bytes
   are `Invalid`, never a panic: `grib` itself panics on a Section 7 shorter
-  than its groups (#1325), so keep
+  than its groups, so keep
   `malformed_messages_fail_or_agree_with_the_full_decode`.
+- What `grib` takes on trust is checked before it runs (#1325):
+  - Sections: `ccsds::check_sections` runs before every whole-message parse
+    (`ccsds::Header::parse`, `complex::Header::parse`, `decode_message`).
+    From Section 1 on, sections must tile the message up to Section 8 by
+    Section 0's total length, each at least 5 octets, Section 6 at least 6.
+    `find_section7`, the prefix walk, keeps the same minimum.
+  - Complex packing: `complex::check_section7` runs before `grib`'s decoder
+    on templates 5.2 and 5.3, with the point reads' `Layout::new` and group
+    walk (`Descriptors::find`), over the groups `grib` reads: every one
+    through the group holding the last value, in full, none longer than
+    the field. It also rejects order 255 and a group reference over 31
+    bits.
+  - Any other panic in the full decode is caught (`catching_panics`) as an
+    `Engine` error for that field, never a failed worker failing the whole
+    query. The catch needs unwinding: a `panic = "abort"` profile would
+    turn it off.
+  - Not covered: template 5.200's run lengths allocate unchecked.
+  - Tests: `a_section_7_shorter_than_its_groups_fails_the_full_decode` and
+    `sections_shorter_than_grib_parses_are_invalid` assert the checks'
+    errors, not the catch's.
 - Whole message: the first read of a message the message cache keeps
   decodes through the row after the last needed one (#1337); one read for
   a single field decodes every value once (about 5 ms against 16 ms for the
