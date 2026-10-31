@@ -119,6 +119,17 @@ fn sample(
             vars.len()
         )));
     }
+    // Every segment's cold inner chunks, of every variable, together first
+    // (#1353).
+    let mut reads = Vec::new();
+    for &var in vars {
+        for seg in &segments {
+            if let Some(read) = cat.window_read(var, run, seg.t0..seg.t1 + 1, seg.bbox)? {
+                reads.push((var, read.subset));
+            }
+        }
+    }
+    cat.prefetch(&reads);
     let mut values: Vec<Vec<Vec<Option<f64>>>> = vars
         .iter()
         .map(|_| fields.iter().map(|f| vec![None; f.points.len()]).collect())

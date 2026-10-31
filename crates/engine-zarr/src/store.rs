@@ -34,6 +34,9 @@ use ds_cache::ByteBoundedCache;
 use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::DataStore;
 
+use crate::decoded::ColdRange;
+use crate::read_budget::Budget;
+
 use zarrs::storage::byte_range::ByteRangeIterator;
 use zarrs::storage::{
     ListableStorageTraits, MaybeBytes, MaybeBytesIterator, ReadableStorageTraits, StorageError,
@@ -378,6 +381,10 @@ pub struct EngineStore {
     listable: Arc<dyn ListableStorageTraits>,
     pub(crate) revision: Option<String>,
     pub(crate) generation: Option<Arc<Generation>>,
+    /// An Icechunk session's reader, which also fetches a query's cold
+    /// inner chunks ahead of their decodes (#1353).
+    #[cfg(feature = "icechunk")]
+    icechunk: Option<Arc<crate::icechunk::Store>>,
 }
 
 impl EngineStore {
@@ -392,6 +399,8 @@ impl EngineStore {
             listable: arc,
             revision: None,
             generation: None,
+            #[cfg(feature = "icechunk")]
+            icechunk: None,
         }
     }
 
@@ -403,10 +412,29 @@ impl EngineStore {
         }
     }
 
+    /// An Icechunk session pinned at snapshot `revision`.
     #[cfg(feature = "icechunk")]
-    pub(crate) fn with_revision(mut self, revision: String) -> Self {
-        self.revision = Some(revision);
-        self
+    pub(crate) fn icechunk(store: crate::icechunk::Store, revision: String) -> Self {
+        let store = Arc::new(store);
+        Self {
+            readable: store.clone(),
+            listable: store.clone(),
+            revision: Some(revision),
+            generation: None,
+            icechunk: Some(store),
+        }
+    }
+
+    /// Fetch `ranges` together, ahead of the decodes that read them, which
+    /// find them under the payload cache's keys (#1353). A plain store has
+    /// no payload cache of ranges and fetches nothing.
+    pub(crate) fn prefetch(&self, budget: &Arc<Budget>, ranges: Vec<ColdRange>) {
+        #[cfg(feature = "icechunk")]
+        if let Some(store) = &self.icechunk {
+            store.prefetch(budget, ranges);
+        }
+        #[cfg(not(feature = "icechunk"))]
+        let _ = (budget, ranges);
     }
 }
 

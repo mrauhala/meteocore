@@ -1165,6 +1165,37 @@ mod tests {
             .count()
     }
 
+    /// A peek leaves an entry as it found it: unread entries a peek served
+    /// are evicted by later inserts as if nobody had looked, where a get
+    /// promotes them and they stay. A peek counts no hit.
+    #[test]
+    fn peek_counts_nothing_and_promotes_nothing() {
+        type Look = fn(&ByteBoundedCache<String, u64>, &String) -> Option<u64>;
+        let survivors = |look: Look| {
+            let cache =
+                ByteBoundedCache::build(100 * 1000, 1000, weigh_declared, Some(1), None, None);
+            for i in 0..300 {
+                cache.insert(format!("old{i}"), 1000);
+            }
+            for i in 0..2 {
+                cache.insert(format!("fresh{i}"), 1000);
+            }
+            for i in 0..2 {
+                assert_eq!(look(&cache, &format!("fresh{i}")), Some(1000));
+            }
+            let looked = cache.stats();
+            for i in 0..30 {
+                cache.insert(format!("later{i}"), 1000);
+            }
+            let kept = (0..2)
+                .filter(|i| cache.contains_key(&format!("fresh{i}")))
+                .count();
+            (kept, looked)
+        };
+        assert_eq!(survivors(|cache, key| cache.peek(key)), (0, (0, 0)));
+        assert_eq!(survivors(|cache, key| cache.get(key)), (2, (2, 0)));
+    }
+
     /// #992: under the default 0.97 hot target, unread inserts share a cold
     /// ring of 3 % of the budget, so 30 % of the budget inserted later evicts
     /// them all. At 0.5 the cold ring is half the budget and they stay.

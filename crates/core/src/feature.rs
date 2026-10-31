@@ -360,6 +360,12 @@ pub const MAX_AREA_DIM: usize = 256;
 /// `QueryTooLarge` as HTTP 400 `BadRequest`.
 pub const MAX_AREA_VALUES: usize = 1_000_000;
 
+/// Most values one EDR position response may carry, every MULTIPOINT point
+/// and parameter included. The API refuses a larger one; an engine that
+/// reads ahead for every point checks it first, so a response the API will
+/// refuse reads nothing ahead.
+pub const MAX_POSITION_VALUES: usize = 1_000_000;
+
 /// Enforce [`MAX_AREA_VALUES`] for a `timesteps × ny × nx × parameters`
 /// response, with the message every engine returns.
 pub fn check_area_budget(

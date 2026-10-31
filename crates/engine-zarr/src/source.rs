@@ -66,6 +66,27 @@ impl Source {
         }
     }
 
+    /// An Icechunk repository's inner-chunk ranges planned to be fetched
+    /// ahead, by outcome: used, unused, skipped, serial, failed, expired
+    /// (#1353); `None` for a plain store.
+    pub(crate) fn prefetched(&self) -> Option<[u64; 6]> {
+        match self {
+            Self::Plain(_) => None,
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(source) => Some(source.meter().prefetched()),
+        }
+    }
+
+    /// An Icechunk repository's bytes fetched ahead and not yet taken by a
+    /// decode (#1353); `None` for a plain store.
+    pub(crate) fn staged_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Plain(_) => None,
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(source) => Some(source.meter().staged_bytes()),
+        }
+    }
+
     /// `None` means the source is still at the published revision. A changed
     /// session is returned separately, so a failed catalog build never mutates
     /// the session used by requests or marks the new revision as published.
