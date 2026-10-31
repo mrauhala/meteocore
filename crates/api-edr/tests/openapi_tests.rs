@@ -24,6 +24,8 @@ use ds_core::feature::Bbox;
 use ds_core::instances::RunInfo;
 use ds_core::model::*;
 
+#[path = "../../api-common/tests/support/engine_errors.rs"]
+mod engine_errors;
 #[path = "../../api-common/tests/support/openapi_schema.rs"]
 mod openapi_schema;
 
@@ -60,6 +62,8 @@ enum Answer {
     /// `Unavailable`: a data source that kept refusing the read, the 503
     /// `SourceUnavailable` (#1355).
     Throttled,
+    /// The `engine_errors::every_error()` at this index, inventory included.
+    Fails(usize),
 }
 
 struct Stub {
@@ -100,14 +104,16 @@ impl Stub {
             Answer::Late => Err(DataServerError::DeadlineExceeded),
             Answer::Broken => Err(DataServerError::Engine("boom".into())),
             Answer::Throttled => Err(DataServerError::Unavailable(UPSTREAM.into())),
+            Answer::Fails(i) => Err(engine_errors::every_error().swap_remove(i)),
         }
     }
 }
 
 impl EdrEngine for Stub {
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
-        if self.answer == Answer::Broken {
-            return Err(DataServerError::Engine("boom".into()));
+        // The inventory fails as the queries do.
+        if let Some(e) = self.answer().err() {
+            return Err(e);
         }
         Ok(Arc::new(LocationSnapshot::new(vec![Location {
             id: "a".into(),
@@ -223,26 +229,32 @@ fn config(id: &str) -> CollectionConfig {
 }
 
 /// `obs` answers every query type with data; `busy`, `late`, `broken` and
-/// `throttled` fail every one; `grid` has no locations, as a gridded engine
-/// does not.
+/// `throttled` fail every one, and their location inventory; `grid` has no
+/// locations, as a gridded engine does not.
 fn app() -> axum::Router {
     let stub = |types, answer| Stub { types, answer };
-    let engines = vec![
-        ("obs", stub(ALL, Answer::Data)),
-        ("busy", stub(ALL, Answer::Busy)),
-        ("late", stub(ALL, Answer::Late)),
-        ("broken", stub(ALL, Answer::Broken)),
-        ("throttled", stub(ALL, Answer::Throttled)),
-        ("grid", stub(&["position", "area", "radius"], Answer::Data)),
-    ];
+    router(vec![
+        ("obs".into(), stub(ALL, Answer::Data)),
+        ("busy".into(), stub(ALL, Answer::Busy)),
+        ("late".into(), stub(ALL, Answer::Late)),
+        ("broken".into(), stub(ALL, Answer::Broken)),
+        ("throttled".into(), stub(ALL, Answer::Throttled)),
+        (
+            "grid".into(),
+            stub(&["position", "area", "radius"], Answer::Data),
+        ),
+    ])
+}
+
+fn router(engines: Vec<(String, Stub)>) -> axum::Router {
     let state = EdrState {
         collections: engines
             .iter()
-            .map(|(id, _)| (id.to_string(), config(id)))
+            .map(|(id, _)| (id.clone(), config(id)))
             .collect(),
         engines: engines
             .into_iter()
-            .map(|(id, e)| (id.to_string(), Arc::new(e) as Arc<dyn EdrEngine>))
+            .map(|(id, e)| (id, Arc::new(e) as Arc<dyn EdrEngine>))
             .collect(),
         styles: HashMap::new(),
         feature_engines: HashMap::new(),
@@ -365,7 +377,8 @@ fn cases() -> Vec<(String, String, StatusCode)> {
             S::NOT_FOUND,
         ),
         // `/locations`: an unsupported `f` and `crs` (not a /locations
-        // parameter) are 400s, the inventory failing a 500.
+        // parameter) are 400s, the inventory failing its error's status
+        // (#17): a 500, or the 503 or 504 every data query answers.
         (
             "/collections/obs/locations?f=GeoJSON",
             "/edr/collections/obs/locations",
@@ -385,6 +398,21 @@ fn cases() -> Vec<(String, String, StatusCode)> {
             "/collections/broken/locations",
             "/edr/collections/broken/locations",
             S::INTERNAL_SERVER_ERROR,
+        ),
+        (
+            "/collections/busy/locations",
+            "/edr/collections/busy/locations",
+            S::SERVICE_UNAVAILABLE,
+        ),
+        (
+            "/collections/late/locations",
+            "/edr/collections/late/locations",
+            S::GATEWAY_TIMEOUT,
+        ),
+        (
+            "/collections/throttled/locations",
+            "/edr/collections/throttled/locations",
+            S::SERVICE_UNAVAILABLE,
         ),
         (
             "/collections/obs/locations/a,zz",
@@ -498,6 +526,59 @@ async fn an_unavailable_source_is_a_503_naming_no_upstream() {
             }),
             "{uri}"
         );
+    }
+}
+
+/// Every engine error answers its class's status (#17) on a data query, an
+/// instance's, a location's and the `/locations` inventory: the deadline
+/// EDR's 504, every other class the status every API answers, and no 5xx
+/// names the engine's detail. An inventory that is itself not found (a
+/// per-site radar collection whose site is not in the catalog yet) is the
+/// empty list: the collection exists. A location id in it is the 404.
+#[tokio::test]
+async fn every_engine_error_answers_its_class_status() {
+    let errors = engine_errors::every_error();
+    let app = router(
+        (0..errors.len())
+            .map(|i| {
+                let stub = Stub {
+                    types: ALL,
+                    answer: Answer::Fails(i),
+                };
+                (format!("fails-{i}"), stub)
+            })
+            .collect(),
+    );
+    for (i, error) in errors.iter().enumerate() {
+        let expected = match error.class() {
+            ds_core::error::ErrorClass::DeadlineExceeded => 504,
+            class => class.status_code(),
+        };
+        let retry_after = engine_errors::retry_after(error).filter(|_| expected == 503);
+        for query in [
+            "position?coords=POINT(1%201)",
+            &format!("instances/{RUN}/position?coords=POINT(1%201)"),
+            "locations/a",
+            "locations",
+        ] {
+            let uri = format!("/collections/fails-{i}/{query}");
+            let reply = send(&app, &uri, None).await;
+            if query == "locations" && matches!(error, DataServerError::LocationNotFound(_)) {
+                assert_eq!(reply.status, StatusCode::OK, "{uri}: {}", reply.body);
+                assert_eq!(reply.body["type"], "FeatureCollection", "{uri}");
+                assert_eq!(reply.body["features"], json!([]), "{uri}");
+                continue;
+            }
+            assert_eq!(reply.status.as_u16(), expected, "{uri} {error:?}");
+            assert_eq!(reply.retry_after.as_deref(), retry_after, "{uri} {error:?}");
+            if reply.status.is_server_error() {
+                assert!(
+                    !reply.body.to_string().contains(engine_errors::SECRET),
+                    "{uri} {error:?}: {}",
+                    reply.body
+                );
+            }
+        }
     }
 }
 

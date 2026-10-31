@@ -14,6 +14,8 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_render::{BuiltinColormap, LutColorMap, RenderedCache, StyleInfo};
 
+#[path = "../../api-common/tests/support/engine_errors.rs"]
+mod engine_errors;
 #[path = "../../api-common/tests/support/openapi_schema.rs"]
 mod openapi_schema;
 
@@ -1958,6 +1960,70 @@ mod errors {
         let (status, json) = get("/collections/radar/map?bbox=invalid").await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["code"].is_string());
+    }
+
+    /// A `MapEngine` whose every render fails with
+    /// `engine_errors::every_error()` at this index.
+    struct Failing(usize);
+
+    impl MapEngine for Failing {
+        fn get_raster_tile(
+            &self,
+            _bbox: [f64; 4],
+            _width: u32,
+            _height: u32,
+            _time: Option<chrono::DateTime<chrono::Utc>>,
+            _output_crs: &OutputCrs,
+            _parameter: Option<&str>,
+            _z: Option<f64>,
+            _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+        ) -> Result<RasterTile, DataServerError> {
+            Err(engine_errors::every_error().swap_remove(self.0))
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            MockMapEngine::make_info()
+        }
+    }
+
+    /// Every engine error answers its class's status (#17), on the per-API
+    /// service and the shared root alike: an absent feature is the 404 every
+    /// API answers, no longer a 500. A 4xx carries the engine's message, a
+    /// 5xx never.
+    #[tokio::test]
+    async fn every_engine_error_answers_its_class_status() {
+        for (i, error) in engine_errors::every_error().iter().enumerate() {
+            let state = build_state_with_engine_and_wms(Arc::new(Failing(i)), None);
+            let shared = api_common::shared::router(api_common::shared::SharedApi::new(
+                "",
+                vec![Arc::new(api_maps::MapsBlock::new(state.clone()))],
+                vec![],
+            ));
+            for app in [api_maps::router(state), shared] {
+                let request = Request::builder()
+                    .uri("/collections/radar/map?bbox=10,55,30,70&width=64&height=48")
+                    .body(Body::empty())
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                assert_eq!(status.as_u16(), error.class().status_code(), "{error:?}");
+                assert_eq!(
+                    response
+                        .headers()
+                        .get("retry-after")
+                        .map(|v| v.to_str().unwrap()),
+                    engine_errors::retry_after(error),
+                    "{error:?}"
+                );
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                let body = String::from_utf8_lossy(&body);
+                assert_eq!(
+                    body.contains(engine_errors::SECRET),
+                    status.is_client_error(),
+                    "{error:?}: {body}"
+                );
+            }
+        }
     }
 }
 

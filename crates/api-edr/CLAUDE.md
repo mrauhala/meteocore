@@ -169,7 +169,12 @@ guard as trajectory), rejects `PNG`, and `data_queries.radius.link.
 variables.within_units` advertises the accepted units (`params::WITHIN_UNITS`).
 The radius is capped at 1000 km (`params::MAX_WITHIN_M`); a circle
 containing a pole or crossing the antimeridian is a 400 (#667). Engine
-errors from all data-query handlers map through `map_query_error`.
+errors from every route that calls an engine, the `/locations` inventory
+included, map through `map_query_error`, by `DataServerError::class()`
+(#17); its one EDR-specific answer is the deadline's 504. An inventory the
+engine reports `LocationNotFound` (a PVOL site not in the catalog yet) is
+an empty one (`location_inventory`): a 200 empty `/locations` list, and a
+404 for each id in it.
 
 ## Trajectory (#926)
 

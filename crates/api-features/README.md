@@ -185,14 +185,16 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
   detail. A request that asked for HTML gets the error as an HTML page with
   the same status. A rejected `/items` HTML request returns the items page
   with the request form filled in and the faulty field marked.
-- An engine's own error on `/items` or `/items/{featureId}`: a request it
+- An engine's own error on `/items` or `/items/{featureId}` answers by its
+  class, as in every API (`ds_core::error::ErrorClass`): a request it
   turns down (`QueryTooLarge`, such as a station grid's analysis cap) is a
   400 with its message; one it cannot answer yet or now
   (`ResourceExhausted`, `DeadlineExceeded`: a station grid whose residuals
   are still being computed) is a 503 with `Retry-After: 1`; an object
   store that kept refusing the read (`Unavailable`) is a 503
-  `SourceUnavailable` with `Retry-After: 10`; a missing feature is a 404;
-  anything else is a 500.
+  `SourceUnavailable` with `Retry-After: 10`; a missing feature, or any
+  other resource the engine reports absent, is a 404; anything else is a
+  500.
 
 ## HTML
 
