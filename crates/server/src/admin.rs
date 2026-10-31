@@ -28,7 +28,7 @@ use ds_core::config::{CollectionConfig, StyleBundle};
 // Prometheus metrics (global)
 // ---------------------------------------------------------------------------
 
-static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
+pub(crate) static REGISTRY: LazyLock<Registry> = LazyLock::new(Registry::new);
 
 /// Build and register a plain `IntGauge`.
 fn int_gauge(name: &str, help: &str) -> IntGauge {
@@ -47,7 +47,7 @@ static COLLECTION_FAMILIES: Mutex<Vec<(String, SeriesPruner)>> = Mutex::new(Vec:
 /// Register a family labelled by `collection`. Its series stay until a
 /// reload removes their collection, which drops them, whatever its other
 /// labels ([`prune_collection_series`]); a rebuilt collection keeps them.
-fn per_collection<T: MetricVecBuilder + 'static>(family: MetricVec<T>) -> MetricVec<T> {
+pub(crate) fn per_collection<T: MetricVecBuilder + 'static>(family: MetricVec<T>) -> MetricVec<T> {
     REGISTRY.register(Box::new(family.clone())).unwrap();
     let name = family.desc()[0].fq_name.clone();
     let pruned = family.clone();
@@ -710,6 +710,7 @@ fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
             .with_label_values(&[kind.as_str()])
             .set(total.capacity_bytes.min(i64::MAX as u64) as i64);
     }
+    crate::memory_plan::update_gauges();
 }
 
 static COLLECTIONS_HEALTHY: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -6830,6 +6831,8 @@ pub struct AcceptedLoad {
     rendered_cache_mb: u64,
     /// Where the two render cache sizes came from, for the memory plan.
     render_cache_sources: crate::cache_plan::RenderCacheSources,
+    /// `[memory] total_mb`, the memory plan's total when set (#1312).
+    memory_total_mb: Option<u64>,
     mcp_enabled: bool,
     fingerprint: u64,
 }
@@ -6853,6 +6856,7 @@ impl AcceptedLoad {
             metatile_cache_mb: config.server.metatile_cache_mb,
             rendered_cache_mb: config.rendered_cache_mb().0,
             render_cache_sources: crate::cache_plan::RenderCacheSources::of(config),
+            memory_total_mb: config.memory.as_ref().and_then(|m| m.total_mb),
             mcp_enabled: config.mcp.as_ref().is_some_and(|m| m.enabled),
             fingerprint,
         }
@@ -6860,6 +6864,10 @@ impl AcceptedLoad {
 
     pub(crate) fn render_cache_sources(&self) -> &crate::cache_plan::RenderCacheSources {
         &self.render_cache_sources
+    }
+
+    pub(crate) fn memory_total_mb(&self) -> Option<u64> {
+        self.memory_total_mb
     }
 }
 
