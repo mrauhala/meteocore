@@ -722,6 +722,7 @@ WARN block lists each cut; `total_mb`, or a larger limit, gives them back.
 | `derive_wind` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve wind speed and direction derived from u/v components (see [Derived wind](#derived-wind-speed-and-direction)). `false` opts out; the key on any other engine type is a load error. |
 | `derive_geopotential_height` | no | on | `grib`, `zarr` and `netcdf` only: serve geopotential height derived from geopotential where the collection has none at that level (see [Derived geopotential height](#derived-geopotential-height)). `false` opts out; the key on any other engine type is a load error. |
 | `derive_humidity` | no | on | `grib`, `querydata`, `zarr` and `netcdf` only: serve relative humidity and dew point derived from their ingredients where the collection has none at that level (see [Derived relative humidity and dew point](#derived-relative-humidity-and-dew-point)). `false` opts out; the key on any other engine type is a load error. |
+| `expected_interval` | no | measured | `geotiff`, `querydata`, `bufr`, `satellite`, `netcdf` and `nowcast` only: how often the collection's data arrives, an ISO 8601 duration such as `"PT6H"`. `collection_expected_interval_seconds` reports it in place of the measured spacing, which a staleness alert compares the data age with (see [Alerting](#alerting)): for an irregular feed, or one that keeps a single timestep or run. The key on any other engine type is a load error. |
 
 ### Discovery: WIS2 topics and WCMP2 records
 
@@ -2802,6 +2803,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `http_requests_total` | counter | method, path, status, api | Total HTTP requests |
 | `http_request_duration_seconds` | histogram | method, path, api | Request latency histogram |
 | `http_response_bytes_total` | counter | method, path, api | Response body bytes sent |
+| `wms_error_tiles_total` | counter | collection, reason | WMS GetMaps answered with the red error tile and HTTP 200, which no status code counts. `collection` is the bottom layer's; `reason`: `not_found` (the data the request named was gone), `invalid_request` (the engine refused the request, such as a source read over its pixel cap), `storage` (a source read failed), `internal` (any other) |
 
 **Collections & health:**
 
@@ -2813,6 +2815,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `collections_failed` | gauge | — | Collections in failed state |
 | `collection_data_age_seconds` | gauge | collection | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that hold data |
 | `collection_has_data` | gauge | collection | 1 while a collection whose engine reports a data age (GeoTIFF, QueryData, BUFR, satellite, NetCDF, nowcast) holds data, 0 when it holds none: it never loaded any, or all of it aged out of a satellite `time_window` or a BUFR `retention`. Alert on it next to the data age, which has no series then |
+| `collection_expected_interval_seconds` | gauge | collection | How often the collection's data arrives, measured on the timeline its data age is: the median spacing of the newest six timesteps (GeoTIFF), runs (QueryData, NetCDF with runs), valid times (NetCDF without runs), distinct report times (BUFR), scans (satellite) or generations (nowcast). The collection's `expected_interval` wins. No series below two timesteps without one |
 
 **GeoTIFF tile cache** (per-collection, compressed byte cache for remote COGs; every GeoTIFF collection has the series, a local one with capacity 0):
 
@@ -2990,7 +2993,7 @@ Services:
 | Service | Image | Port | Purpose |
 |---------|-------|------|---------|
 | `meteocore` | built from `./Dockerfile` | 8000 | The server, `LOG_FORMAT=json` |
-| `prometheus` | `dhi.io/prometheus:3.11` | 9090 | Scrapes `/metrics` every 15s |
+| `prometheus` | `dhi.io/prometheus:3.11` | 9090 | Scrapes `/metrics` every 15s and evaluates the [alert rules](#alerting) |
 | `loki` | `dhi.io/loki:3.6` | 3100 | Stores structured log events |
 | `alloy` | `dhi.io/alloy:1.15` | 12345 | Tails meteocore stdout, parses JSON, pushes to Loki |
 | `grafana` | `dhi.io/grafana:13.1` | 3000 | Auto-provisioned dashboard + both datasources; the dashboard needs Grafana 13 or newer |
@@ -3035,6 +3038,33 @@ reviews additionally require a branch in this repository. Fork PRs still run
 normal CI without the review credential.
 
 > Production note: the compose stack is intended for local dev. It uses anonymous admin Grafana, filesystem-backed Loki, no retention beyond 7 days, and runs Alloy as root so it can tail the Docker socket. Do not deploy it as-is.
+
+### Alerting
+
+`docker/prometheus/rules/meteocore.yml` holds Prometheus alert rules for the cases a dashboard only shows when someone looks: a source that stops publishing, changes its layout or throttles the server, render failures hidden behind HTTP 200, shed requests and memory growth. The compose stack loads them (`rule_files` in `docker/prometheus.yml`) and shows them on Prometheus's Alerts page, http://localhost:9090/alerts; the Helm chart ships the same rules as a PrometheusRule with `prometheusRule.enabled` (see [its README](charts/meteocore/README.md#monitoring)). Who is told, and how, is Alertmanager routing, which depends on the deployment and is not shipped.
+
+| Alert | Fires when | For | Severity |
+|-------|------------|-----|----------|
+| `MeteoCoreDown` | the scrape fails: `up == 0` | 2m | critical |
+| `CollectionStale` | `collection_data_age_seconds` is at least 3 × `collection_expected_interval_seconds`, and at least the interval + 15 min | 10m | warning |
+| `CollectionEmpty` | `collection_has_data == 0`: the collection never loaded data, or all of it aged out | 15m | warning |
+| `CollectionsFailed` | `collections_failed > 0` | 5m | warning |
+| `HighServerErrorRate` | 5xx responses above 5 % of an API's requests, per API (routes without an API, such as `/health`, are left out) | 10m | warning |
+| `WmsErrorTiles` | error tiles above 5 % of a collection's GetMap responses (`wms_error_tiles_total` over itself plus `render_duration_seconds_count{api="wms"}`) | 10m | warning |
+| `RequestsShed` | admission rejections and deadline expiries (`render_queue_rejected_total`, `render_budget_rejected_total{reason="oversize"}`, `render_deadline_exceeded_total` and each read budget's `*_rejected_total`) above 1 % of requests | 10m | warning |
+| `UpstreamThrottled` | `storage_host_throttled_total` rising: a remote host answers 429 | 15m | info |
+| `MemoryHigh` | `process_resident_memory_bytes` above the memory plan's total, `memory_plan_total_bytes` (#1312); no series, and so quiet, on a server without that gauge | 15m | warning |
+
+The freshness alert needs no per-feed threshold: each collection's expected interval is measured on the timeline its data age is, so a 5-minute radar composite is stale at 20 minutes and a model with four runs a day only after 18 hours, while a 6-hourly model 5 hours after its last run is not. The 15 minutes keep a feed every minute from being stale after three. A collection with a single timestep or run has no measured interval and never goes stale; give it `expected_interval` in its config, as an irregular feed would need too. A collection serving a fixed archive is stale by this rule: silence the alert for it in Alertmanager.
+
+The thresholds are starting points. Change them in `docker/prometheus/rules/meteocore.yml`: the number after the comparison, the `for` duration, the `[5m]` rate window. `MemoryHigh` compares with the server's own planned memory total, `memory_plan_total_bytes` (#1312), so it needs no number here and stays quiet until the server exports that gauge; for a fixed threshold, replace `memory_plan_total_bytes{job="meteocore"}` with a number of bytes. Every selector names `job="meteocore"`, the compose stack's scrape job; under another job name, replace it throughout (the chart does this itself). Run the rules' unit tests after a change; each alert has one that fires and one that stays quiet, and CI runs both commands:
+
+```bash
+promtool check rules docker/prometheus/rules/meteocore.yml
+promtool test rules docker/prometheus/rules/meteocore.test.yml
+```
+
+The dashboard shows the expected interval next to the data age (Storage & sources → Freshness: Data age vs expected interval, Data age over stale threshold) and the error tiles (Requests & latency → Traffic & errors).
 
 ## Testing
 

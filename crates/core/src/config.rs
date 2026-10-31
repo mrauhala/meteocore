@@ -404,7 +404,28 @@ pub struct CollectionConfig {
     /// other engine type rejects the key at load.
     #[serde(default)]
     pub derive_humidity: Option<bool>,
+    /// How often the collection's data normally arrives, an ISO 8601
+    /// duration such as `"PT6H"` (#1375). `/metrics` exports it as
+    /// `collection_expected_interval_seconds` in place of the spacing the
+    /// server measures on the newest timesteps or runs: for a feed whose
+    /// spacing is irregular, or which holds a single timestep or run. Only
+    /// for the engine types that report a data age
+    /// ([`DATA_AGE_ENGINES`]); any other rejects the key at load.
+    #[serde(default)]
+    pub expected_interval: Option<String>,
 }
+
+/// The engine types whose collections report a data age (`/health`
+/// `data_age_secs`, `collection_data_age_seconds`, #1007) and the
+/// interval their data is expected at (#1375).
+pub const DATA_AGE_ENGINES: [&str; 6] = [
+    "geotiff",
+    "querydata",
+    "bufr",
+    "satellite",
+    "netcdf",
+    "nowcast",
+];
 
 /// The engine types whose collections derive wind from u/v components.
 pub const DERIVE_WIND_ENGINES: [&str; 4] = ["grib", "querydata", "zarr", "netcdf"];
@@ -451,6 +472,12 @@ impl CollectionConfig {
     /// `None` = lossless.
     pub fn webp_quality(&self) -> Option<u8> {
         self.wms.as_ref()?.webp_quality
+    }
+
+    /// `expected_interval` as a duration, `None` when unset; validated at
+    /// load.
+    pub fn expected_interval_override(&self) -> Option<chrono::Duration> {
+        crate::datetime::parse_iso8601_duration(self.expected_interval.as_deref()?).ok()
     }
 }
 
@@ -4910,6 +4937,22 @@ impl ServerConfig {
                     collection.engine_type
                 )));
             }
+            if let Some(interval) = &collection.expected_interval {
+                if !DATA_AGE_ENGINES.contains(&collection.engine_type.as_str()) {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': 'expected_interval' applies only to engine types \
+                         {}, which report a data age, not '{}'",
+                        DATA_AGE_ENGINES.join(", "),
+                        collection.engine_type
+                    )));
+                }
+                crate::datetime::parse_iso8601_duration(interval).map_err(|e| {
+                    crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': 'expected_interval' is not a valid positive ISO \
+                         8601 duration: {e}"
+                    ))
+                })?;
+            }
 
             // GeoTIFF engine requires geotiff config section
             if collection.engine_type == "geotiff" && collection.geotiff.is_none() {
@@ -6509,6 +6552,46 @@ url = "https://creativecommons.org/licenses/by/4.0/"
         let toml = "[server]\nhost=\"h\"\nport=1\n[[collections]]\nid=\"c\"\ntitle=\"t\"\n\
                     description=\"d\"\nengine_type=\"grib\"\nderive_wind=\"no\"\n";
         assert!(toml::from_str::<ServerConfig>(toml).is_err());
+    }
+
+    /// `expected_interval` (#1375): an ISO 8601 duration on the engines
+    /// that report a data age, rejected on any other and when it does not
+    /// parse as a positive duration.
+    #[test]
+    fn expected_interval_overrides_on_data_age_engines_only() {
+        let netcdf = |extra: &str| {
+            collection_with(&format!(
+                "engine_type = \"netcdf\"\n{extra}[collections.netcdf]\ndata_path = \"/data\"\n"
+            ))
+        };
+        let none = netcdf("");
+        assert!(none.validate().is_ok());
+        assert_eq!(none.collections[0].expected_interval_override(), None);
+        let six_hours = netcdf("expected_interval = \"PT6H\"\n");
+        assert!(six_hours.validate().is_ok());
+        assert_eq!(
+            six_hours.collections[0].expected_interval_override(),
+            Some(chrono::Duration::hours(6))
+        );
+        for bad in ["6h", "PT0S", "-PT1H", "P1M"] {
+            let err = netcdf(&format!("expected_interval = \"{bad}\"\n"))
+                .validate()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("'expected_interval' is not a valid positive ISO 8601 duration"),
+                "{bad}: {err}"
+            );
+        }
+        let csv = collection_with("expected_interval = \"PT1H\"\n");
+        let err = csv.validate().unwrap_err().to_string();
+        assert!(
+            err.contains(
+                "'expected_interval' applies only to engine types geotiff, querydata, bufr, \
+                 satellite, netcdf, nowcast, which report a data age, not 'csv'"
+            ),
+            "{err}"
+        );
     }
 
     /// `derive_geopotential_height` (#948): on by default for the engines

@@ -225,6 +225,7 @@ fn config(id: &str) -> CollectionConfig {
         derive_geopotential_height: None,
         discovery: None,
         derive_humidity: None,
+        expected_interval: None,
     }
 }
 

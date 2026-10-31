@@ -516,6 +516,15 @@ impl BufrEngine {
         self.snapshot.load().temporal_extent.map(|(_, b)| b)
     }
 
+    /// The spacing of the newest distinct report times, whose newest is
+    /// [`Self::latest_report`], for the `collection_expected_interval_seconds`
+    /// gauge (#1375): [`ds_core::health::expected_interval`] over the
+    /// snapshot's instants. `None` below two.
+    pub fn expected_interval(&self) -> Option<chrono::Duration> {
+        let snapshot = self.snapshot.load();
+        ds_core::health::expected_interval(snapshot.instants.iter().rev().copied())
+    }
+
     /// One scan of the local source: fetch new files, decode, ingest. Files
     /// are ingested as each fetch chunk lands, so a backlog is never held in
     /// memory whole.
@@ -1542,6 +1551,23 @@ mod tests {
     fn decode_file(dir: &std::path::Path, e: &BufrEngine) -> persist::Decoded {
         let bytes = std::fs::read(snapshot_file(dir)).unwrap();
         persist::decode(&bytes, ID, &e.table).unwrap()
+    }
+
+    /// #1375: the expected interval is the spacing of the newest distinct
+    /// report times, the timeline `latest_report` is the newest of: the
+    /// stations' reports at one time are one instant.
+    #[test]
+    fn expected_interval_is_the_spacing_of_the_newest_report_times() {
+        let e = BufrEngine::new_with_state(&wis2_config("PT24H", None), ID, None).unwrap();
+        assert_eq!(e.expected_interval(), None, "no reports");
+        put(&e, "A", hours_ago(6), 280.0);
+        assert_eq!(e.expected_interval(), None, "one report time");
+        for hours in [3, 2, 1, 0] {
+            put(&e, "A", hours_ago(hours), 281.0);
+            put(&e, "B", hours_ago(hours), 271.0);
+        }
+        assert_eq!(e.latest_report(), Some(hours_ago(0)));
+        assert_eq!(e.expected_interval(), Some(chrono::Duration::hours(1)));
     }
 
     #[test]

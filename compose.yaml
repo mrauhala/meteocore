@@ -6,7 +6,8 @@ name: meteocore
 # small, distroless, non-root, no shell, CVE-scanned. Free tier, non-FIPS.
 #
 #   meteocore    — the server itself, built from the repo Dockerfile
-#   prometheus   — dhi.io/prometheus — scrapes /metrics every 15s
+#   prometheus   — dhi.io/prometheus — scrapes /metrics every 15s and
+#                  evaluates the alert rules (http://localhost:9090/alerts)
 #   loki         — dhi.io/loki       — stores structured log events
 #   alloy        — dhi.io/alloy      — ships container stdout to Loki
 #   grafana      — dhi.io/grafana    — dashboards (anonymous admin)
@@ -62,6 +63,7 @@ services:
       - --web.enable-lifecycle
     volumes:
       - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/rules:/etc/prometheus/rules:ro
       - prometheus-data:/var/prometheus
     ports:
       - "127.0.0.1:9090:9090"

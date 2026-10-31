@@ -1,0 +1,337 @@
+# Rule unit tests for meteocore.yml (#1375): every alert fires on a failing
+# series and stays quiet on a healthy one, and series of another job never
+# match.
+#
+#   promtool test rules docker/prometheus/rules/meteocore.test.yml
+
+rule_files:
+  - meteocore.yml
+
+evaluation_interval: 1m
+
+tests:
+  # Down from minute 2: pending until 2 minutes have passed.
+  - name: MeteoCoreDown
+    interval: 1m
+    input_series:
+      - series: 'up{job="meteocore", instance="a:8000"}'
+        values: '1 1 0x10'
+      - series: 'up{job="meteocore", instance="b:8000"}'
+        values: '1x12'
+      - series: 'up{job="node", instance="c:9100"}'
+        values: '0x12'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: MeteoCoreDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: MeteoCoreDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: meteocore
+              instance: a:8000
+            exp_annotations:
+              summary: "MeteoCore a:8000 is down"
+              description: "Prometheus has not scraped a:8000 for 2 minutes."
+
+  - name: CollectionsFailed
+    interval: 1m
+    input_series:
+      - series: 'collections_failed{job="meteocore", instance="a:8000"}'
+        values: '0 0 2x15'
+      - series: 'collections_failed{job="meteocore", instance="b:8000"}'
+        values: '0x17'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CollectionsFailed
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CollectionsFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+            exp_annotations:
+              summary: "2 collection(s) failed on a:8000"
+              description: "Collections failed to load or lost their source. /health names them and their errors."
+
+  # Stale = data age at least 3 intervals and at least an interval + 15 min.
+  #   radar: 5-minute interval, 20 minutes old: stale (threshold 20 min).
+  #   radar-fresh: 5-minute interval, 10 minutes old: not stale.
+  #   model: 6-hourly runs, 5 hours old: not stale (threshold 18 h).
+  #   model-waiting: 6-hourly runs, 9 hours old as the next run is due: an
+  #     interval + 15 min old, but not 3 intervals, so not stale.
+  #   model-late: 6-hourly runs, 19 hours old: stale.
+  #   minutely: 1-minute interval, 10 minutes old: 3 intervals, but not
+  #     15 minutes past one, so not stale.
+  #   single: no interval series (one timestep, no expected_interval).
+  #   other job: never matched.
+  - name: CollectionStale
+    interval: 1m
+    input_series:
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="radar"}'
+        values: '1200x20'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="radar"}'
+        values: '300x20'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="radar-fresh"}'
+        values: '600x20'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="radar-fresh"}'
+        values: '300x20'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="model"}'
+        values: '18000x20'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="model"}'
+        values: '21600x20'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="model-waiting"}'
+        values: '32400x20'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="model-waiting"}'
+        values: '21600x20'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="model-late"}'
+        values: '68400x20'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="model-late"}'
+        values: '21600x20'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="minutely"}'
+        values: '600x20'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="minutely"}'
+        values: '60x20'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="single"}'
+        values: '999999x20'
+      - series: 'collection_data_age_seconds{job="other", instance="x:8000", collection="radar"}'
+        values: '99999x20'
+      - series: 'collection_expected_interval_seconds{job="other", instance="x:8000", collection="radar"}'
+        values: '300x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CollectionStale
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: CollectionStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: radar
+            exp_annotations:
+              summary: "Collection radar is stale"
+              description: "The newest data radar serves is 20m 0s old, over 3 times the interval its data arrives at."
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: model-late
+            exp_annotations:
+              summary: "Collection model-late is stale"
+              description: "The newest data model-late serves is 19h 0m 0s old, over 3 times the interval its data arrives at."
+
+  - name: CollectionEmpty
+    interval: 1m
+    input_series:
+      - series: 'collection_has_data{job="meteocore", instance="a:8000", collection="obs"}'
+        values: '0x20'
+      - series: 'collection_has_data{job="meteocore", instance="a:8000", collection="radar"}'
+        values: '1x20'
+      # Empty for 10 minutes after a start, then filled: never fires.
+      - series: 'collection_has_data{job="meteocore", instance="a:8000", collection="wis2"}'
+        values: '0x10 1x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CollectionEmpty
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: CollectionEmpty
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: obs
+            exp_annotations:
+              summary: "Collection obs holds no data"
+              description: "obs has held no data for 15 minutes: it never loaded any, or all of it aged out."
+
+  # edr: 10 errors in 110 requests a minute (9 %). wms: 1 in 101 (1 %).
+  # Operational routes (api="") are left out: /health answers 503 while
+  # every collection has failed. Another job never matches.
+  - name: HighServerErrorRate
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="meteocore", instance="a:8000", api="edr", method="GET", path="/edr/collections/{id}/position", status="200"}'
+        values: '0+100x30'
+      - series: 'http_requests_total{job="meteocore", instance="a:8000", api="edr", method="GET", path="/edr/collections/{id}/position", status="500"}'
+        values: '0+10x30'
+      - series: 'http_requests_total{job="meteocore", instance="a:8000", api="wms", method="GET", path="/wms", status="200"}'
+        values: '0+100x30'
+      - series: 'http_requests_total{job="meteocore", instance="a:8000", api="wms", method="GET", path="/wms", status="503"}'
+        values: '0+1x30'
+      - series: 'http_requests_total{job="meteocore", instance="a:8000", api="", method="GET", path="/health", status="503"}'
+        values: '0+6x30'
+      - series: 'http_requests_total{job="other", instance="x:80", api="edr", method="GET", path="/", status="500"}'
+        values: '0+100x30'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: HighServerErrorRate
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: HighServerErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              api: edr
+            exp_annotations:
+              summary: "edr answers 9.091% of requests with 5xx"
+              description: "More than 5 % of edr requests on a:8000 failed with a 5xx status for 10 minutes."
+
+  # Per minute: radar 10 error tiles and 90 renders (10 %); broken only
+  # error tiles (100 %), so no render series at all; fine 1 in 100 (1 %),
+  # its renders split over outcomes; a Maps render is not a GetMap.
+  - name: WmsErrorTiles
+    interval: 1m
+    input_series:
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="radar", reason="storage"}'
+        values: '0+10x30'
+      - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="wms", collection="radar", outcome="cold"}'
+        values: '0+90x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="broken", reason="internal"}'
+        values: '0+5x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="fine", reason="not_found"}'
+        values: '0+1x30'
+      - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="wms", collection="fine", outcome="hit"}'
+        values: '0+60x30'
+      - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="wms", collection="fine", outcome="cold"}'
+        values: '0+39x30'
+      - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="maps", collection="maps-only", outcome="cold"}'
+        values: '0+100x30'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: WmsErrorTiles
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: WmsErrorTiles
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: radar
+            exp_annotations:
+              summary: "WMS serves error tiles for radar"
+              description: "10% of GetMap responses for radar on a:8000 are the red error tile; the server log has the render errors."
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: broken
+            exp_annotations:
+              summary: "WMS serves error tiles for broken"
+              description: "100% of GetMap responses for broken on a:8000 are the red error tile; the server log has the render errors."
+
+  # 1000 requests a minute on each instance.
+  #   a: queue 3, GeoTIFF decode 4 and Zarr read 4 rejections (1.1 %).
+  #     Summed as three counters; collapsed onto one label set, the two
+  #     budgets would count once (0.7 %).
+  #   b: deadline expiries 8 and their memory waits 8 (0.8 %); the memory
+  #     waits are the same requests and must not count twice (1.6 %).
+  - name: RequestsShed
+    interval: 1m
+    input_series:
+      - series: 'http_requests_total{job="meteocore", instance="a:8000", api="wms", method="GET", path="/wms", status="200"}'
+        values: '0+989x30'
+      - series: 'http_requests_total{job="meteocore", instance="a:8000", api="wms", method="GET", path="/wms", status="503"}'
+        values: '0+11x30'
+      - series: 'render_queue_rejected_total{job="meteocore", instance="a:8000"}'
+        values: '0+3x30'
+      - series: 'geotiff_decode_rejected_total{job="meteocore", instance="a:8000"}'
+        values: '0+4x30'
+      - series: 'zarr_read_rejected_total{job="meteocore", instance="a:8000"}'
+        values: '0+4x30'
+      - series: 'render_deadline_exceeded_total{job="meteocore", instance="a:8000", stage="queue"}'
+        values: '0x30'
+      - series: 'http_requests_total{job="meteocore", instance="b:8000", api="wms", method="GET", path="/wms", status="200"}'
+        values: '0+992x30'
+      - series: 'http_requests_total{job="meteocore", instance="b:8000", api="wms", method="GET", path="/wms", status="503"}'
+        values: '0+8x30'
+      - series: 'render_queue_rejected_total{job="meteocore", instance="b:8000"}'
+        values: '0x30'
+      - series: 'render_deadline_exceeded_total{job="meteocore", instance="b:8000", stage="queue"}'
+        values: '0+8x30'
+      - series: 'render_budget_rejected_total{job="meteocore", instance="b:8000", reason="deadline"}'
+        values: '0+8x30'
+      - series: 'render_budget_rejected_total{job="meteocore", instance="b:8000", reason="oversize"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: RequestsShed
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: RequestsShed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+            exp_annotations:
+              summary: "MeteoCore a:8000 sheds 1.1% of requests"
+              description: "Admission rejections and deadline expiries are above 1 % of requests for 10 minutes. The Rendering & caches and Memory & admission tabs of the dashboard show which queue or budget."
+
+  # One host answers 429 every minute; another throttled once, long ago.
+  - name: UpstreamThrottled
+    interval: 1m
+    input_series:
+      - series: 'storage_host_throttled_total{job="meteocore", instance="a:8000", host="objects.example.com"}'
+        values: '0+3x40'
+      - series: 'storage_host_throttled_total{job="meteocore", instance="a:8000", host="files.example.com"}'
+        values: '7x40'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: UpstreamThrottled
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: UpstreamThrottled
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              job: meteocore
+              instance: a:8000
+              host: objects.example.com
+            exp_annotations:
+              summary: "objects.example.com throttles MeteoCore"
+              description: "objects.example.com has answered 429 Too Many Requests for 15 minutes; collections it serves may fall behind."
+
+  # Against the memory plan's total: a holds 20 GiB of a 16 GiB plan, b 4 of
+  # 8. c has no plan gauge (a server before #1312), so no series to compare
+  # with, and another job's plan gauge is never matched.
+  - name: MemoryHigh
+    interval: 1m
+    input_series:
+      - series: 'process_resident_memory_bytes{job="meteocore", instance="a:8000"}'
+        values: '21474836480x30'
+      - series: 'memory_plan_total_bytes{job="meteocore", instance="a:8000"}'
+        values: '17179869184x30'
+      - series: 'process_resident_memory_bytes{job="meteocore", instance="b:8000"}'
+        values: '4294967296x30'
+      - series: 'memory_plan_total_bytes{job="meteocore", instance="b:8000"}'
+        values: '8589934592x30'
+      - series: 'process_resident_memory_bytes{job="meteocore", instance="c:8000"}'
+        values: '68719476736x30'
+      - series: 'process_resident_memory_bytes{job="database", instance="db:9187"}'
+        values: '68719476736x30'
+      - series: 'memory_plan_total_bytes{job="database", instance="db:9187"}'
+        values: '1073741824x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: MemoryHigh
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: MemoryHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+            exp_annotations:
+              summary: "MeteoCore a:8000 uses 20GiB of memory"
+              description: "Resident memory has been above the memory plan's total for 15 minutes. GET /admin/cache-plan lists the caches and budgets that hold it."

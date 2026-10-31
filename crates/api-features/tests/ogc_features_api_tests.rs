@@ -186,6 +186,7 @@ fn build_router_with(engine: Arc<dyn FeatureEngine>) -> axum::Router {
             derive_geopotential_height: None,
             discovery: None,
             derive_humidity: None,
+            expected_interval: None,
         },
     );
 
@@ -517,6 +518,7 @@ mod vector_tile_discovery {
                 derive_geopotential_height: None,
                 discovery: None,
                 derive_humidity: None,
+                expected_interval: None,
             },
         );
         Arc::new(ArcSwap::from_pointee(FeaturesState {
@@ -1188,6 +1190,7 @@ mod metadata_extras {
                 derive_geopotential_height: None,
                 discovery: None,
                 derive_humidity: None,
+                expected_interval: None,
             },
         );
         let state = Arc::new(ArcSwap::from_pointee(FeaturesState {
