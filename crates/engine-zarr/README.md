@@ -61,8 +61,31 @@ or map window. Nothing is converted or copied first.
 - **Loading ahead.** An Icechunk catalog build loads each variable's
   manifest and the default run's shard indexes (a store without runs: its
   latest step's), eight at a time, before the snapshot is published. The
-  shard indexes stay with the catalog, up to 256 KiB per variable, so a
-  cold inner chunk is one request.
+  shard indexes stay with the catalog, up to 512 KiB per variable, so a
+  cold inner chunk is one request. The loading stops after 30 s: the
+  catalog then publishes with what has loaded, and reads fetch the rest.
+  The previous catalog serves until then.
+- **Fetching together.** An Icechunk position, `MULTIPOINT`, area or
+  trajectory query first fetches the cold inner chunks of all its
+  variables, points and windows, eight at a time. Its reads then decode
+  them one variable after another, as before. Each fetched range waits in
+  a staging area outside the payload cache until its decode asks for it.
+  The decode's read then misses the payload cache and fills it, as a read
+  from storage would, so the cache's hits, admissions and evictions are
+  those of serial reads. Only chunks a decode reads as one range are
+  fetched this way: their outermost codec is Blosc, gzip or zstd, their
+  shard index is resident, and the decoded cache neither has them nor is
+  filling them for another read. The staging area holds at most what one
+  shard of the payload cache holds, shared by concurrent queries: each
+  range reserves its room first, and one that does not fit is refused,
+  never made room for by dropping another query's. A range no decode takes
+  is dropped after 30 s, at the next staging call or scrape. While it is
+  fetched, a range takes memory from the read budget only while half the
+  budget stays free for requests, without waiting. A range refused either
+  room, a fetch that fails, a query with one cold chunk, a `MULTIPOINT`
+  response past the API's million-value cap and a plain store all read as
+  before. Shards of runs other than the default are fetched ahead only
+  once a first read has loaded their index.
 - **Memory admission.** A read first reserves its estimated source buffers
   from one process-wide budget, `MC_ZARR_READ_MEMORY_MB` (default 1024 MiB,
   an estimate, not a RAM limit); one that does not fit fails at once with
@@ -70,8 +93,12 @@ or map window. Nothing is converted or copied first.
 - **Diagnostics.** Catalog builds log chunk shapes and warn when each time
   step is one whole-field chunk (a point time series then decodes whole
   fields). `/metrics` has `zarr_read_*` and `zarr_decoded_cache_*`; for
-  Icechunk also `zarr_icechunk_payload_cache_*` and
-  `zarr_icechunk_storage_{requests,read_bytes}_total`, per collection.
+  Icechunk also `zarr_icechunk_payload_cache_*`,
+  `zarr_icechunk_storage_{requests,read_bytes}_total`,
+  `zarr_icechunk_prefetched_ranges_total` (each planned range once, by
+  outcome: used, unused, skipped, serial, failed, expired),
+  `zarr_icechunk_staged_bytes` (ranges fetched ahead and not yet taken) and `zarr_icechunk_preloads_stopped_total`, per
+  collection.
   `/admin/cache-plan` lists the payload cache.
 
 ## What it serves
@@ -88,7 +115,8 @@ or map window. Nothing is converted or copied first.
   case and an unknown one is a 400. Without `datetime` it covers every step
   of the run, else the steps in the interval, ends included (none: 404).
 - `position` takes `POINT(lon lat)`; a `MULTIPOINT` is answered point by
-  point. A point off the grid is null.
+  point, after one fetch of every point's cold chunks. A point off the
+  grid is null.
 - `area` returns a CRS84 grid over the polygon's bounding box at the
   store's resolution, at most 256 cells per axis. Cells outside the polygon
   are null; a polygon outside the extent is a 404. A box crossing the

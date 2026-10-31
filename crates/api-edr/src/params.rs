@@ -1360,7 +1360,7 @@ pub const MAX_POSITION_POINTS: usize = 64;
 /// Critical Rule 9).
 pub const MAX_POSITION_LOOKUPS: usize = 256;
 /// Combined position response budget, including every point and parameter.
-pub const MAX_POSITION_VALUES: usize = 1_000_000;
+pub const MAX_POSITION_VALUES: usize = ds_core::feature::MAX_POSITION_VALUES;
 
 /// Most location ids one locations query may list (EDR 1.2
 /// `/req/edr/REQ_rc-locationid-definition`, #923), the MULTIPOINT cap. Each

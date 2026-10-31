@@ -775,6 +775,16 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         let _ = self.inner.cache.get(&key);
     }
 
+    /// Look up `key` without touching the hit/miss counters or its recency:
+    /// for a caller that serves the value on behalf of a read that will
+    /// look it up itself, which then counts and promotes it once.
+    pub fn peek<Q>(&self, key: &Q) -> Option<V>
+    where
+        Q: Hash + Equivalent<K> + ?Sized,
+    {
+        self.inner.cache.peek(key)
+    }
+
     /// Whether `key` is resident — no recency bump, no counter change.
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
@@ -1153,6 +1163,37 @@ mod tests {
         (0..10)
             .filter(|i| cache.contains_key(&format!("fresh{i}")))
             .count()
+    }
+
+    /// A peek leaves an entry as it found it: unread entries a peek served
+    /// are evicted by later inserts as if nobody had looked, where a get
+    /// promotes them and they stay. A peek counts no hit.
+    #[test]
+    fn peek_counts_nothing_and_promotes_nothing() {
+        type Look = fn(&ByteBoundedCache<String, u64>, &String) -> Option<u64>;
+        let survivors = |look: Look| {
+            let cache =
+                ByteBoundedCache::build(100 * 1000, 1000, weigh_declared, Some(1), None, None);
+            for i in 0..300 {
+                cache.insert(format!("old{i}"), 1000);
+            }
+            for i in 0..2 {
+                cache.insert(format!("fresh{i}"), 1000);
+            }
+            for i in 0..2 {
+                assert_eq!(look(&cache, &format!("fresh{i}")), Some(1000));
+            }
+            let looked = cache.stats();
+            for i in 0..30 {
+                cache.insert(format!("later{i}"), 1000);
+            }
+            let kept = (0..2)
+                .filter(|i| cache.contains_key(&format!("fresh{i}")))
+                .count();
+            (kept, looked)
+        };
+        assert_eq!(survivors(|cache, key| cache.peek(key)), (0, (0, 0)));
+        assert_eq!(survivors(|cache, key| cache.get(key)), (2, (2, 0)));
     }
 
     /// #992: under the default 0.97 hot target, unread inserts share a cold

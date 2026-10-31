@@ -54,6 +54,20 @@ impl Budget {
         }))
     }
 
+    /// For optional reads, such as fetching ahead (#1353): only while at
+    /// least half the budget stays free for requests, so a request's
+    /// admission meets at most half the budget held by them; never waiting,
+    /// and a refusal is not a rejected request.
+    #[cfg_attr(not(feature = "icechunk"), allow(dead_code))]
+    pub(crate) fn try_reserve_spare(&self, bytes: u64) -> Option<Arc<Permit>> {
+        self.bytes.try_reserve_background(bytes).map(|permit| {
+            Arc::new(Permit {
+                _bytes: permit,
+                parallelism: 1,
+            })
+        })
+    }
+
     pub(crate) fn reject(&self) -> DataServerError {
         self.bytes.reject()
     }

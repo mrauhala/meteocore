@@ -35,6 +35,7 @@ use crate::read_budget::{self, Budget, Permit};
 use crate::store::EngineStore;
 
 mod preload;
+pub(crate) use preload::BOUND as PRELOAD_BOUND;
 
 /// The store type backing every Zarr collection. A backend-agnostic wrapper so
 /// the catalog stays non-generic across the plain (`ds-storage`) and Icechunk
@@ -319,30 +320,17 @@ impl Catalog {
         bbox: [f64; 4],
     ) -> Result<Option<Vec<Window>>, DataServerError> {
         ds_core::deadline::check()?;
-        let [west, south, east, north] = bbox;
-        let (Some((i0, i1)), Some((j0, j1))) = (
-            axis_window(&self.lons, west, east),
-            axis_window(&self.lats, south, north),
-        ) else {
+        let Some(WindowRead {
+            subset,
+            i0,
+            i1,
+            j0,
+            j1,
+            nt,
+        }) = self.window_read(var, run, time_span, bbox)?
+        else {
             return Ok(None); // bbox entirely outside the grid
         };
-        let nt = time_span.len().max(1);
-
-        let mut ranges: Vec<Range<u64>> = Vec::with_capacity(var.ndim);
-        for a in 0..var.ndim {
-            if Some(a) == var.time_axis {
-                ranges.push(time_span.start as u64..time_span.start as u64 + nt as u64);
-            } else if a == var.lat_axis {
-                ranges.push(j0 as u64..(j1 as u64) + 1);
-            } else if a == var.lon_axis {
-                ranges.push(i0 as u64..(i1 as u64) + 1);
-            } else if Some(a) == var.ref_axis {
-                ranges.push(Self::ref_range(run)?);
-            } else {
-                ranges.push(0..1);
-            }
-        }
-        let subset = ArraySubset::new_with_ranges(&ranges);
         let axes_bytes = (i1 - i0 + 1)
             .checked_add(j1 - j0 + 1)
             .and_then(|n| n.checked_mul(size_of::<f64>()))
@@ -361,7 +349,7 @@ impl Catalog {
                 reservation.parallelism(),
             )?
         };
-        let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
+        let lens: Vec<usize> = subset.shape().iter().map(|&n| n as usize).collect();
 
         let nrow = j1 - j0 + 1;
         let ncol = i1 - i0 + 1;
@@ -421,39 +409,18 @@ impl Catalog {
         time_idx: &[usize],
     ) -> Result<Vec<Option<f64>>, DataServerError> {
         ds_core::deadline::check()?;
-        let (xb, yb) = match (cf::locate(&self.lons, lon), cf::locate(&self.lats, lat)) {
-            (Some(x), Some(y)) => (x, y),
-            _ => return Ok(vec![None; time_idx.len()]), // off-grid → all nodata
+        let Some(PositionRead {
+            subset,
+            t_start,
+            jc1,
+            ic1,
+            wx,
+            wy,
+        }) = self.position_read(var, run, lon, lat, time_idx)?
+        else {
+            // Off the grid → all nodata; no steps → nothing.
+            return Ok(vec![None; time_idx.len()]);
         };
-        let (i0, i1, wx) = xb;
-        let (j0, j1, wy) = yb;
-
-        // Build the read window: only the contiguous span of requested time
-        // steps (not the whole axis — a single-step query on an 8760-step store
-        // must not decode every time chunk), the 2×2 spatial block, and other
-        // dims pinned to index 0.
-        let (t_start, t_end) = match (
-            time_idx.iter().copied().min(),
-            time_idx.iter().copied().max(),
-        ) {
-            (Some(a), Some(b)) => (a, b),
-            _ => return Ok(Vec::new()), // empty request (caller guards against this)
-        };
-        let mut ranges: Vec<Range<u64>> = Vec::with_capacity(var.ndim);
-        for a in 0..var.ndim {
-            if Some(a) == var.time_axis {
-                ranges.push(t_start as u64..(t_end as u64) + 1);
-            } else if a == var.lat_axis {
-                ranges.push(j0 as u64..(j1 as u64) + 1);
-            } else if a == var.lon_axis {
-                ranges.push(i0 as u64..(i1 as u64) + 1);
-            } else if Some(a) == var.ref_axis {
-                ranges.push(Self::ref_range(run)?);
-            } else {
-                ranges.push(0..1);
-            }
-        }
-        let subset = ArraySubset::new_with_ranges(&ranges);
         let output_bytes = time_idx
             .len()
             .checked_mul(size_of::<Option<f64>>())
@@ -470,11 +437,7 @@ impl Catalog {
                 reservation.parallelism(),
             )?
         };
-        let lens: Vec<usize> = ranges.iter().map(|r| (r.end - r.start) as usize).collect();
-
-        // Local corner offsets within the read window.
-        let jc1 = j1 - j0; // 1, or 0 for a single-cell axis
-        let ic1 = i1 - i0;
+        let lens: Vec<usize> = subset.shape().iter().map(|&n| n as usize).collect();
 
         let sample_at = |t_local: usize, jc: usize, ic: usize| -> Option<f64> {
             let mut off = 0usize;
@@ -511,6 +474,168 @@ impl Catalog {
         }
         Ok(out)
     }
+
+    /// What [`Self::sample_series`] reads of `var` at `(lon, lat)`: only the
+    /// contiguous span of requested time steps (not the whole axis — a
+    /// single-step query on an 8760-step store must not decode every time
+    /// chunk), the 2×2 spatial block, and other dims pinned to index 0.
+    /// `None` off the grid or for no time steps. The query's prefetch plans
+    /// from the same subset, so it fetches what the read decodes (#1353).
+    pub(crate) fn position_read(
+        &self,
+        var: &Variable,
+        run: Option<usize>,
+        lon: f64,
+        lat: f64,
+        time_idx: &[usize],
+    ) -> Result<Option<PositionRead>, DataServerError> {
+        let (Some((i0, i1, wx)), Some((j0, j1, wy))) =
+            (cf::locate(&self.lons, lon), cf::locate(&self.lats, lat))
+        else {
+            return Ok(None);
+        };
+        let (Some(t_start), Some(t_end)) = (
+            time_idx.iter().copied().min(),
+            time_idx.iter().copied().max(),
+        ) else {
+            return Ok(None); // empty request (callers guard against this)
+        };
+        let subset = self.subset(var, run, t_start..t_end + 1, (i0, i1), (j0, j1))?;
+        Ok(Some(PositionRead {
+            subset,
+            t_start,
+            jc1: j1 - j0, // 1, or 0 for a single-cell axis
+            ic1: i1 - i0,
+            wx,
+            wy,
+        }))
+    }
+
+    /// What [`Self::read_window_span`] reads of `var` over `bbox`: the
+    /// native cells covering it, the `time_span` steps (at least one), other
+    /// dims pinned to index 0. `None` when `bbox` lies entirely off the
+    /// grid. Area and trajectory queries prefetch from it (#1353).
+    pub(crate) fn window_read(
+        &self,
+        var: &Variable,
+        run: Option<usize>,
+        time_span: Range<usize>,
+        bbox: [f64; 4],
+    ) -> Result<Option<WindowRead>, DataServerError> {
+        let [west, south, east, north] = bbox;
+        let (Some((i0, i1)), Some((j0, j1))) = (
+            axis_window(&self.lons, west, east),
+            axis_window(&self.lats, south, north),
+        ) else {
+            return Ok(None);
+        };
+        let nt = time_span.len().max(1);
+        let span = time_span.start..time_span.start + nt;
+        let subset = self.subset(var, run, span, (i0, i1), (j0, j1))?;
+        Ok(Some(WindowRead {
+            subset,
+            i0,
+            i1,
+            j0,
+            j1,
+            nt,
+        }))
+    }
+
+    /// `var`'s steps `time`, columns `i0..=i1` and rows `j0..=j1` of `run`,
+    /// other dims at index 0.
+    fn subset(
+        &self,
+        var: &Variable,
+        run: Option<usize>,
+        time: Range<usize>,
+        (i0, i1): (usize, usize),
+        (j0, j1): (usize, usize),
+    ) -> Result<ArraySubset, DataServerError> {
+        let mut ranges: Vec<Range<u64>> = Vec::with_capacity(var.ndim);
+        for a in 0..var.ndim {
+            if Some(a) == var.time_axis {
+                ranges.push(time.start as u64..time.end as u64);
+            } else if a == var.lat_axis {
+                ranges.push(j0 as u64..(j1 as u64) + 1);
+            } else if a == var.lon_axis {
+                ranges.push(i0 as u64..(i1 as u64) + 1);
+            } else if Some(a) == var.ref_axis {
+                ranges.push(Self::ref_range(run)?);
+            } else {
+                ranges.push(0..1);
+            }
+        }
+        Ok(ArraySubset::new_with_ranges(&ranges))
+    }
+
+    /// Fetch the cold inner chunks that `reads` of a query will decode
+    /// together, before reading them one variable after another (#1353):
+    /// up to eight requests at once instead of one after another.
+    ///
+    /// The plan is each variable's [`DecodedArray::cold_ranges`]: inner
+    /// chunks the decoded cache neither holds nor is filling, in resident
+    /// shards, whose decode reads the one indexed range fetched here. Each
+    /// waits for that decode, which then fills the payload cache with it as
+    /// a serial read would. A single cold chunk is left to its read, as fast
+    /// alone; so is everything on a plain store, which has neither. Only
+    /// fetching happens here: values come from the reads as before, and
+    /// nothing here fails the query ([`EngineStore::prefetch`]).
+    pub(crate) fn prefetch(&self, reads: &[(&Variable, ArraySubset)]) {
+        if self.revision.is_none() {
+            return;
+        }
+        let mut seen = HashSet::new();
+        let mut ranges = Vec::new();
+        for (var, subset) in reads {
+            if let Some(decoded) = &var.decoded {
+                for range in decoded.cold_ranges(&var.array, subset) {
+                    if seen.insert(range.clone()) {
+                        ranges.push(range);
+                    }
+                }
+            }
+        }
+        if ranges.len() < 2 {
+            return;
+        }
+        if let Some((var, _)) = reads.first() {
+            var.array.storage().prefetch(&self.read_budget, ranges);
+        }
+    }
+}
+
+#[cfg(all(test, feature = "icechunk"))]
+impl Catalog {
+    /// This catalog admitting its reads from `budget`.
+    pub(crate) fn with_read_budget(mut self, budget: Arc<Budget>) -> Self {
+        self.read_budget = budget;
+        self
+    }
+}
+
+/// What a position read of one variable covers ([`Catalog::position_read`]).
+pub(crate) struct PositionRead {
+    pub(crate) subset: ArraySubset,
+    /// The first step read, on the run's time axis.
+    t_start: usize,
+    /// Corner offsets in the read: 1, or 0 for a single-cell axis.
+    jc1: usize,
+    ic1: usize,
+    /// Bilinear weights toward the east and south corners.
+    wx: f64,
+    wy: f64,
+}
+
+/// What a window read of one variable covers ([`Catalog::window_read`]).
+pub(crate) struct WindowRead {
+    pub(crate) subset: ArraySubset,
+    i0: usize,
+    i1: usize,
+    j0: usize,
+    j1: usize,
+    /// Steps read.
+    nt: usize,
 }
 
 /// An in-memory spatial slab of one variable at one time, covering a render
@@ -620,15 +745,13 @@ pub fn build(
     param_filter: Option<&[String]>,
     decoded_cache: Arc<DecodedCache>,
 ) -> Result<Catalog, DataServerError> {
-    let catalog = build_with_codec_setup(
+    build_with_codec_setup(
         store,
         collection_id,
         param_filter,
         decoded_cache,
         crate::codec_limits::bounded_array,
-    )?;
-    preload::run(&catalog, collection_id);
-    Ok(catalog)
+    )
 }
 
 fn build_with_codec_setup(

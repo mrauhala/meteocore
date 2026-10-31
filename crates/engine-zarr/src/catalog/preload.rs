@@ -11,9 +11,14 @@
 //! The run is the catalog's own default, `Catalog::resolve_run(None)`, so
 //! this follows whatever the read path selects. A store without runs loads
 //! the shards of its latest time step.
-use std::sync::atomic::{AtomicUsize, Ordering};
+//!
+//! The loading is bounded in time ([`BOUND`]): storage slow enough to
+//! exceed it would hold back publishing the new catalog, while the previous
+//! one keeps serving the old run. Past the bound the catalog publishes with
+//! what has loaded, and reads fetch the rest as they did before.
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use zarrs::array::ArraySubset;
 use zarrs::storage::ReadableStorageTraits;
@@ -22,6 +27,13 @@ use super::{single_threaded_opts, Catalog, Variable};
 
 /// Loads in flight at once (Critical Rule 9): each waits for its requests.
 const CONCURRENCY: usize = 8;
+/// The longest a catalog build spends loading ahead. A healthy remote
+/// repository needs a few round trips of eight loads: a manifest, then an
+/// index, a few seconds in all. Each saves one variable's first read under
+/// a second, while every request waits for the new run until the catalog
+/// publishes.
+pub(crate) const BOUND: Duration = Duration::from_secs(30);
+
 /// Most shards of one variable loaded ahead; a default run normally has one
 /// or two.
 const MAX_SHARDS: usize = 64;
@@ -34,19 +46,26 @@ enum Job<'a> {
     Manifest(&'a Variable, Vec<u64>),
 }
 
-/// Load ahead for an Icechunk catalog. Failures only log: a read then
-/// fetches what is missing, as it did before.
-pub(super) fn run(catalog: &Catalog, collection_id: &str) {
+impl Catalog {
+    /// Load ahead for an Icechunk catalog, for at most `bound`; `true` when
+    /// it stopped there with loads left. Failures only log: a read then
+    /// fetches what is missing, as it did before.
+    pub(crate) fn preload(&self, collection_id: &str, bound: Duration) -> bool {
+        run(self, collection_id, bound)
+    }
+}
+
+fn run(catalog: &Catalog, collection_id: &str, bound: Duration) -> bool {
     // A plain store has no manifests, and its size lookups would fetch
     // whole objects.
     if catalog.revision.is_none() {
-        return;
+        return false;
     }
     let run = match catalog.resolve_run(None) {
         Ok(run) => run,
         Err(error) => {
             tracing::warn!("[{collection_id}] Zarr preload skipped: {error}");
-            return;
+            return false;
         }
     };
     let mut jobs = Vec::new();
@@ -68,15 +87,24 @@ pub(super) fn run(catalog: &Catalog, collection_id: &str) {
         }
     }
     if jobs.is_empty() {
-        return;
+        return false;
     }
     let started = Instant::now();
+    // Every load runs under this deadline, its storage requests included:
+    // one in flight at the bound ends there.
+    let end = started + bound;
     let next = AtomicUsize::new(0);
     let loaded = AtomicUsize::new(0);
+    let stopped = AtomicBool::new(false);
     let failure = Mutex::new(None);
     let work = || {
+        let _deadline = ds_core::deadline::enter(Some(end));
         let options = single_threaded_opts();
         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
+            if ds_core::deadline::check().is_err() {
+                stopped.store(true, Ordering::Relaxed);
+                break;
+            }
             let result = match job {
                 Job::Shard(var, shard) => var
                     .decoded
@@ -93,6 +121,11 @@ pub(super) fn run(catalog: &Catalog, collection_id: &str) {
             match result {
                 Ok(()) => {
                     loaded.fetch_add(1, Ordering::Relaxed);
+                }
+                // Cut off at the bound, not failed.
+                Err(_) if ds_core::deadline::check().is_err() => {
+                    stopped.store(true, Ordering::Relaxed);
+                    break;
                 }
                 Err(error) => {
                     let name = match job {
@@ -118,17 +151,25 @@ pub(super) fn run(catalog: &Catalog, collection_id: &str) {
         })
     });
     let loaded = loaded.into_inner();
-    let elapsed = started.elapsed().as_millis();
+    let ms = started.elapsed().as_millis();
+    let stopped = stopped.into_inner();
     match failure.into_inner().unwrap_or_else(|e| e.into_inner()) {
+        _ if stopped => tracing::warn!(
+            "[{collection_id}] Zarr preload stopped at its {} s bound: {loaded} of {} \
+             shard indexes and manifests loaded; the catalog publishes, reads fetch the rest",
+            bound.as_secs_f64(),
+            jobs.len()
+        ),
         None => tracing::info!(
-            "[{collection_id}] Zarr preload: {loaded} shard indexes and manifests in {elapsed} ms"
+            "[{collection_id}] Zarr preload: {loaded} shard indexes and manifests in {ms} ms"
         ),
         Some(first) => tracing::warn!(
-            "[{collection_id}] Zarr preload: {loaded} of {} loaded in {elapsed} ms; \
+            "[{collection_id}] Zarr preload: {loaded} of {} loaded in {ms} ms; \
              reads fetch the rest (first failure: {first})",
             jobs.len()
         ),
     }
+    stopped
 }
 
 /// What a default read of `var` covers: the run's whole grid over all its
