@@ -320,18 +320,25 @@ errors clearly if the table is set without the feature.
   `a_cold_blosc_decode_reads_each_inner_chunk_as_one_range_of_its_index`).
   Uncompressed or CRC32C-outermost inner chunks are read in parts, at other
   payload keys. `icechunk::Store::prefetch` fetches on the I/O runtime under
-  the request deadline, at most 8 at once and one payload-cache shard of
-  bytes per query, each range `try_reserve`d at twice its length and never
-  waited for: no room or a failed fetch leaves it to the decode's serial
-  read, as before. Reads inside `metered::PREFETCH` go to
+  the request deadline, at most 8 at once. Each range first reserves its
+  staging room (`Meter::plan_ahead`, `staging::weight`, the weight staging
+  then charges) against what every query has staged and reserved: never
+  drop another query's staged range to make room. Its read-budget permit is
+  `Budget::try_reserve_spare` (half the budget stays free for requests),
+  never waited for. A refusal or failed fetch leaves the range to the
+  decode's serial read, as before. `Meter::finish_ahead` counts every
+  planned range exactly once: used, unused, skipped, serial, failed,
+  expired. A MULTIPOINT past `ds_core::feature::MAX_POSITION_VALUES`
+  plans nothing. Reads inside `metered::PREFETCH` go to
   `metered::staging`, never the payload cache: the decode's read misses
   the cache, takes the staged range, and inserts it exactly as a storage
   read would, so payload hits, admissions and churn match serial reads
   (pinned by `ranges_fetched_ahead_fill_the_payload_cache_as_serial_reads_do`).
-  Ranges already cached are `peek`-ed, never `get`. Staging is a FIFO, not
-  a ds-cache cache, because unread entries must age out (30 s, or newer
-  ranges needing the room). A single cold range is left to its read. Never
-  decode in the prefetch or wait on a decoded fill guard.
+  Ranges already cached are `peek`-ed, never `get`. Staging is not a
+  ds-cache cache because unread entries must age out: 30 s, checked at each
+  staging call and at each scrape (`Meter::staged_bytes`, the
+  `zarr_icechunk_staged_bytes` gauge). A single cold range is left to its
+  read. Never decode in the prefetch or wait on a decoded fill guard.
 - **Preload bound.** The engine runs `Catalog::preload` after
   `catalog::build` and before publishing, under a 30 s deadline
   (`catalog::PRELOAD_BOUND`) that its storage requests observe. At the bound

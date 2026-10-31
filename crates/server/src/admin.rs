@@ -1887,9 +1887,11 @@ static ZARR_ICECHUNK_PREFETCHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
             "zarr_icechunk_prefetched_ranges_total",
-            "Cold inner chunks a query planned to fetch together ahead of its decodes, by \
-             outcome: used (a decode took it), unused (dropped before any decode asked), \
-             serial (left to the decode's own read: no room or read budget), failed",
+            "Cold inner chunks a query planned to fetch together ahead of its decodes, each \
+             counted once by outcome: used (a decode took it), unused (dropped after 30 s \
+             with no decode asking), skipped (cached or staged already, or inline or \
+             absent), serial (no staging room, or under half the read budget free), failed, \
+             expired (the request deadline ended the fetch)",
         ),
         &["collection", "outcome"],
     )
@@ -1979,9 +1981,9 @@ struct CacheCounterState {
     zarr_icechunk_payload: HashMap<String, CacheSeen>,
     /// Icechunk storage `[requests, bytes]` per collection (#1353).
     zarr_icechunk_storage: HashMap<String, [u64; 2]>,
-    /// Icechunk read-ahead `[used, unused, serial, failed, preloads
-    /// stopped]` per collection (#1353).
-    zarr_icechunk_read_ahead: HashMap<String, [u64; 5]>,
+    /// Icechunk read-ahead `[used, unused, skipped, serial, failed,
+    /// expired, preloads stopped]` per collection (#1353).
+    zarr_icechunk_read_ahead: HashMap<String, [u64; 7]>,
     /// PostGIS per-collection `(refreshes, refresh_failures, pings, ping_failures)`
     /// last-scraped values. Engines are replaced on reload (counts reset), so
     /// the scrape rebaselines on a backward step — see `metrics_handler`.
@@ -8435,23 +8437,34 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                     family.with_label_values(&[collection]).inc_by(delta);
                 }
             }
+            // First: reading it drops ranges past their time, counted
+            // unused in the read-ahead counts below.
+            if let Some(staged) = engine.icechunk_staged_bytes() {
+                ZARR_ICECHUNK_STAGED_BYTES
+                    .with_label_values(&[collection])
+                    .set(staged.min(i64::MAX as u64) as i64);
+            }
             if let Some(ahead) = engine.icechunk_read_ahead() {
-                let [used, unused, serial, failed, stopped] = delta_counts(
+                let [used, unused, skipped, serial, failed, expired, stopped] = delta_counts(
                     &mut counter_state.zarr_icechunk_read_ahead,
                     collection,
                     [
                         ahead.used,
                         ahead.unused,
+                        ahead.skipped,
                         ahead.serial,
                         ahead.failed,
+                        ahead.expired,
                         ahead.preloads_stopped,
                     ],
                 );
                 for (outcome, delta) in [
                     ("used", used),
                     ("unused", unused),
+                    ("skipped", skipped),
                     ("serial", serial),
                     ("failed", failed),
+                    ("expired", expired),
                 ] {
                     ZARR_ICECHUNK_PREFETCHED
                         .with_label_values(&[collection, outcome])
@@ -8460,11 +8473,6 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                 ZARR_ICECHUNK_PRELOADS_STOPPED
                     .with_label_values(&[collection])
                     .inc_by(stopped);
-            }
-            if let Some(staged) = engine.icechunk_staged_bytes() {
-                ZARR_ICECHUNK_STAGED_BYTES
-                    .with_label_values(&[collection])
-                    .set(staged.min(i64::MAX as u64) as i64);
             }
         }
     }

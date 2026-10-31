@@ -18,7 +18,9 @@
 //! A range a query fetches ahead of its decode ([`PREFETCH`]) waits in
 //! [`staging`], outside the payload cache, and touches the cache only as
 //! the decode's read of it does: that read misses, takes the staged range,
-//! and fills the cache as if it had just read it from storage.
+//! and fills the cache as if it had just read it from storage. Each range a
+//! query plans to fetch ahead is counted once, in one [`Prefetched`]
+//! outcome.
 
 use std::{
     fmt,
@@ -26,10 +28,11 @@ use std::{
     ops::Range,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     task::{Context, Poll},
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -49,9 +52,9 @@ use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt as _, ReadBuf};
 const CHUNKS: &str = icechunk::format::CHUNKS_FILE_PATH;
 
 tokio::task_local! {
-    /// Set around a query's fetches ahead of its decodes (#1353): each
-    /// range read is staged for its decode, not put in the payload cache.
-    pub(super) static PREFETCH: ();
+    /// Set around each range a query fetches ahead of its decodes (#1353):
+    /// the read stages it for its decode, not in the payload cache.
+    pub(super) static PREFETCH: Arc<Ahead>;
 }
 
 mod staging;
@@ -74,8 +77,8 @@ pub(crate) struct Meter {
     payload: ByteBoundedCache<PayloadKey, Bytes>,
     /// Ranges fetched ahead, until their decodes take them.
     staging: staging::Staging,
-    /// Ranges fetched ahead, by [`Prefetched`].
-    prefetched: [AtomicU64; 4],
+    /// Ranges planned to be fetched ahead, by [`Prefetched`].
+    prefetched: [AtomicU64; 6],
     /// Every request in order: `(path, range)`, for tests that assert which
     /// objects a read touched.
     #[cfg(test)]
@@ -85,18 +88,51 @@ pub(crate) struct Meter {
     issued: std::sync::Mutex<Vec<std::time::Instant>>,
 }
 
-/// What became of one range a query planned to fetch ahead (#1353).
+/// What became of one range a query planned to fetch ahead (#1353): each
+/// planned range ends in exactly one.
 #[derive(Clone, Copy)]
 pub(crate) enum Prefetched {
-    /// Fetched, then taken by a decode.
+    /// Fetched, staged, then taken by a decode.
     Used = 0,
-    /// Fetched, then dropped before any decode asked for it.
+    /// Fetched and staged, then dropped after waiting [`staging::HELD_FOR`]
+    /// with no decode asking for it.
     Unused = 1,
-    /// Left to its decode's own read: no room in staging or the read
-    /// budget.
-    Serial = 2,
-    /// The fetch failed; the decode reads it again.
-    Failed = 3,
+    /// Nothing to fetch: the payload cache or staging already had it, or
+    /// Icechunk answered from its manifest (an inline or absent chunk).
+    Skipped = 2,
+    /// Not fetched ahead: no room in staging, or less than half the read
+    /// budget free. Its decode reads it.
+    Serial = 3,
+    /// The fetch failed; its decode reads it again.
+    Failed = 4,
+    /// The request's deadline ended the fetch first.
+    Expired = 5,
+}
+
+/// One range a query fetches ahead (#1353): the staging room reserved for
+/// it, what its read found and how its fetch ended.
+pub(crate) struct Ahead {
+    weight: u64,
+    /// [`Self::NOT_READ`], [`Self::STAGED`] or [`Self::ON_HAND`].
+    found: AtomicU8,
+    /// `None` until the fetch ends, else its outcome: `Skipped` for a fetch
+    /// that ended without staging, `Serial` or `Failed`.
+    ended: std::sync::Mutex<Option<Prefetched>>,
+}
+
+impl Ahead {
+    const NOT_READ: u8 = 0;
+    const STAGED: u8 = 1;
+    const ON_HAND: u8 = 2;
+
+    /// How the fetch ended, short of staging.
+    pub(crate) fn end(&self, outcome: Prefetched) {
+        *self.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(outcome);
+    }
+
+    fn found(&self, found: u8) {
+        self.found.store(found, Ordering::Relaxed);
+    }
 }
 
 impl Meter {
@@ -123,43 +159,67 @@ impl Meter {
         self.payload.shard_capacity_bytes()
     }
 
-    pub(crate) fn count_prefetched(&self, outcome: Prefetched) {
-        self.count_many(outcome, 1);
-    }
-
-    fn count_many(&self, outcome: Prefetched, ranges: u64) {
+    fn count(&self, outcome: Prefetched, ranges: u64) {
         self.prefetched[outcome as usize].fetch_add(ranges, Ordering::Relaxed);
     }
 
-    /// Ranges fetched ahead and used, unused, left serial, and failed,
-    /// cumulative. A range still staged is in none yet.
-    pub(crate) fn prefetched(&self) -> [u64; 4] {
+    /// Ranges planned to be fetched ahead, cumulative, in [`Prefetched`]
+    /// order. A range still being fetched or staged is in none yet.
+    pub(crate) fn prefetched(&self) -> [u64; 6] {
         self.prefetched
             .each_ref()
             .map(|count| count.load(Ordering::Relaxed))
     }
 
+    /// Plan to fetch a range of `length` bytes ahead: reserve its room in
+    /// staging, beside what other queries staged and reserved. `None`,
+    /// counted `Serial`, when it does not fit.
+    pub(crate) fn plan_ahead(&self, length: u64) -> Option<Arc<Ahead>> {
+        let weight = staging::weight(length);
+        if !self.staging.reserve(weight, self.prefetch_room()) {
+            self.count(Prefetched::Serial, 1);
+            return None;
+        }
+        Some(Arc::new(Ahead {
+            weight,
+            found: AtomicU8::new(Ahead::NOT_READ),
+            ended: Default::default(),
+        }))
+    }
+
+    /// Count a planned range once its fetch has ended or been cut off, and
+    /// give back the room it did not stage into. A staged range is counted
+    /// when a decode takes it, or it is dropped unread.
+    pub(crate) fn finish_ahead(&self, ahead: &Ahead) {
+        if ahead.found.load(Ordering::Relaxed) == Ahead::STAGED {
+            return;
+        }
+        self.staging.release(ahead.weight);
+        let ended = *ahead.ended.lock().unwrap_or_else(|e| e.into_inner());
+        self.count(ended.unwrap_or(Prefetched::Expired), 1);
+    }
+
     /// Bytes of ranges fetched ahead and not yet taken: held memory outside
-    /// the payload cache, at most [`Self::prefetch_room`].
+    /// the payload cache, at most [`Self::prefetch_room`]. Drops, first,
+    /// those that have waited out [`staging::HELD_FOR`], so an idle
+    /// repository's staging empties at its scrapes.
     pub(crate) fn staged_bytes(&self) -> u64 {
+        self.staged_bytes_at(Instant::now())
+    }
+
+    fn staged_bytes_at(&self, now: Instant) -> u64 {
+        self.count(Prefetched::Unused, self.staging.expire(now));
         self.staging.weight()
     }
 
     /// A range a decode wants, taken from staging if fetched ahead.
     fn take_staged(&self, key: &PayloadKey) -> Option<Bytes> {
-        let (bytes, dropped) = self.staging.take(key, std::time::Instant::now());
-        self.count_many(Prefetched::Unused, dropped);
+        let (bytes, dropped) = self.staging.take(key, Instant::now());
+        self.count(Prefetched::Unused, dropped);
         if bytes.is_some() {
-            self.count_prefetched(Prefetched::Used);
+            self.count(Prefetched::Used, 1);
         }
         bytes
-    }
-
-    fn stage(&self, key: PayloadKey, bytes: Bytes) {
-        let dropped =
-            self.staging
-                .stage(key, bytes, self.prefetch_room(), std::time::Instant::now());
-        self.count_many(Prefetched::Unused, dropped);
     }
 
     /// Storage requests issued and object-body bytes received, cumulative.
@@ -309,17 +369,25 @@ impl Storage for MeteredStorage {
         let cached = |bytes: Bytes| -> (Pin<Box<dyn AsyncBufRead + Send>>, VersionInfo) {
             (Box::pin(Cursor::new(bytes)), VersionInfo::for_creation())
         };
-        if PREFETCH.try_with(|_| ()).is_ok() {
+        if let Ok(ahead) = PREFETCH.try_with(Arc::clone) {
             // Already at hand: the decode finds it, and counts it, itself.
             if let Some(bytes) = meter
                 .payload
                 .peek(&key)
                 .or_else(|| meter.staging.peek(&key))
             {
+                ahead.found(Ahead::ON_HAND);
                 return Ok(cached(bytes));
             }
             let (bytes, version) = self.read_payload(ctx, path, range).await?;
-            meter.stage(key, bytes.clone());
+            let staged = meter
+                .staging
+                .stage(key, bytes.clone(), ahead.weight, Instant::now());
+            ahead.found(if staged {
+                Ahead::STAGED
+            } else {
+                Ahead::ON_HAND
+            });
             return Ok((Box::pin(Cursor::new(bytes)), version));
         }
         if let Some(bytes) = meter.payload.get(&key) {

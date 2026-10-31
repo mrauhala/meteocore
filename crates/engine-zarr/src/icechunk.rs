@@ -152,57 +152,51 @@ impl Store {
     /// ([`metered::PREFETCH`]); the decode then fills the payload cache as
     /// a serial read would.
     ///
-    /// Nothing here fails the query, or makes it wait for memory. Only ranges
-    /// that fit [`Meter::prefetch_room`] together are fetched; each reserves
-    /// two copies of its bytes, the body read and Icechunk's, from the read
-    /// budget with `try_reserve` while in flight. A range that does not fit,
-    /// and one whose fetch fails, is left to its decode's serial read, as
-    /// every range was before. Staged bytes are bounded by that room, apart
-    /// from the read budget, as cached bytes are.
+    /// Nothing here fails the query, makes it wait for memory, or takes
+    /// memory a request may need. Each range first reserves its room in
+    /// staging, beside what other queries hold there ([`Meter::plan_ahead`]);
+    /// then, as its fetch starts, two copies of its bytes, the body read and
+    /// Icechunk's, from the read budget, only while half the budget stays
+    /// free ([`Budget::try_reserve_spare`]). A range refused either, or whose
+    /// fetch fails, is left to its decode's serial read, as every range was
+    /// before. Every planned range is counted once ([`Meter::finish_ahead`]).
     pub(crate) fn prefetch(&self, budget: &Arc<Budget>, ranges: Vec<ColdRange>) {
         let meter = &self.1;
-        let mut room = meter.prefetch_room();
-        if room == 0 {
+        if meter.prefetch_room() == 0 {
             return;
         }
-        let ranges: Vec<ColdRange> = ranges
+        let planned: Vec<(ColdRange, Arc<metered::Ahead>)> = ranges
             .into_iter()
-            .filter(|range| {
-                let fits = range.length <= room;
-                if fits {
-                    room -= range.length;
-                } else {
-                    meter.count_prefetched(Prefetched::Serial);
-                }
-                fits
-            })
+            .filter_map(|range| meter.plan_ahead(range.length).map(|ahead| (range, ahead)))
             .collect();
-        let fetches = futures::stream::iter(ranges)
-            .map(|range| {
+        let fetches = futures::stream::iter(planned.clone())
+            .map(|(range, ahead)| {
                 // Reserved when its fetch starts, never waited for.
-                let permit = budget
-                    .try_reserve_bytes(range.length.saturating_mul(2))
-                    .ok()
-                    .flatten();
-                async move {
-                    let outcome = match permit {
-                        None => Prefetched::Serial,
-                        // Counted when its decode takes it, or it is dropped.
-                        Some(_permit) => match self.fetch(&range).await {
-                            Ok(()) => return,
-                            Err(_) => Prefetched::Failed,
-                        },
+                let permit = budget.try_reserve_spare(range.length.saturating_mul(2));
+                let scope = ahead.clone();
+                let fetch = async move {
+                    let Some(_permit) = permit else {
+                        ahead.end(Prefetched::Serial);
+                        return;
                     };
-                    meter.count_prefetched(outcome);
-                }
+                    ahead.end(match self.fetch(&range).await {
+                        Ok(()) => Prefetched::Skipped,
+                        Err(_) => Prefetched::Failed,
+                    });
+                };
+                metered::PREFETCH.scope(scope, fetch)
             })
             .buffer_unordered(PREFETCH_CONCURRENCY)
             .collect::<()>();
-        // A deadline that expires here fails the decodes that follow.
-        let _ = runtime::run(metered::PREFETCH.scope((), async {
+        // A deadline that expires here fails the decodes that follow; the
+        // fetches it cut off are counted `Expired`.
+        let _ = runtime::run(async {
             fetches.await;
             Ok(())
-        }));
+        });
+        for (_, ahead) in &planned {
+            meter.finish_ahead(ahead);
+        }
     }
 
     /// Read one range through Icechunk, which stages it, and drop the

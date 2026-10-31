@@ -415,10 +415,12 @@ async fn ranges_fetched_ahead_fill_the_payload_cache_as_serial_reads_do() {
             assert!(meter(&serial).take_log().is_empty());
         }
     }
+    // Round two found every range cached: planned, nothing fetched.
     assert_eq!(
         read_ahead(&ahead),
         ReadAhead {
             used: NINE.len() as u64,
+            skipped: NINE.len() as u64,
             ..Default::default()
         }
     );
@@ -454,6 +456,16 @@ async fn a_prefetch_on_a_blocking_worker_keeps_the_request_deadline() {
         "{result:?}"
     );
     assert!(elapsed < latency, "{elapsed:?}");
+    // Each planned range counted once, as the deadline left it, and none
+    // still holds room.
+    assert_eq!(
+        read_ahead(&engine),
+        ReadAhead {
+            expired: NINE.len() as u64,
+            ..Default::default()
+        }
+    );
+    assert_eq!(engine.icechunk_staged_bytes(), Some(0));
 
     meter(&engine).take_log();
     let (result, _) = query(engine.clone(), names.clone(), Duration::from_secs(10))
@@ -471,11 +483,12 @@ async fn a_prefetch_on_a_blocking_worker_keeps_the_request_deadline() {
     for (name, base) in NINE {
         assert_close(&series(&result, name), &expected_series(base, 0.0));
     }
+    assert_eq!(read_ahead(&engine).used, NINE.len() as u64);
 }
 
-/// With the read budget taken by other reads, nothing is fetched ahead and
-/// nothing fails: each decode reads its chunk itself, one after another,
-/// as before #1353.
+/// With half the read budget taken by other reads, nothing is fetched
+/// ahead and nothing fails: the other half stays for requests, and each
+/// decode reads its chunk itself, one after another, as before #1353.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_read_budget_to_spare_every_chunk_is_left_to_its_serial_read() {
     let dir = tempfile::tempdir().unwrap();
@@ -509,8 +522,8 @@ async fn without_read_budget_to_spare_every_chunk_is_left_to_its_serial_read() {
     let meter = meter(&engine);
     meter.take_log();
 
-    // Other reads hold all but a byte of the budget.
-    let held = budget.reserve_bytes(64 * ds_cache::MIB - 1).unwrap();
+    // Other reads hold half the budget.
+    let held = budget.reserve_bytes(32 * ds_cache::MIB).unwrap();
     catalog.prefetch(&reads);
     assert!(meter.take_log().is_empty(), "nothing fetched ahead");
     assert_eq!(
@@ -671,4 +684,222 @@ async fn a_preload_cut_off_by_slow_storage_still_publishes_the_catalog() {
     for (name, base) in VARIABLES {
         assert_close(&series(&result, name), &expected_series(base, 0.5));
     }
+}
+
+/// A store without runs: `names` over `steps` hourly steps of a `rows` ×
+/// `cols` grid, 60° N down and 10° E up at 0.1°, in `shard`s of `inner`
+/// chunks. Blosc keeps the values uncompressed, so an inner chunk's range
+/// is its native size.
+async fn grid_repository(
+    dir: &std::path::Path,
+    names: &[&str],
+    [steps, rows, cols]: [u64; 3],
+    shard: [u64; 3],
+    inner: [u64; 3],
+) {
+    let storage = icechunk::new_local_filesystem_storage(dir).await.unwrap();
+    let repo = Repository::create(storage)
+        .config(RepositoryConfig {
+            inline_chunk_threshold_bytes: Some(0),
+            ..Default::default()
+        })
+        .execute()
+        .await
+        .unwrap();
+    let store = Arc::new(AsyncIcechunkStore::new(
+        repo.writable_session("main").await.unwrap(),
+    ));
+    zarrs::group::GroupBuilder::new()
+        .build(store.clone(), "/")
+        .unwrap()
+        .async_store_metadata()
+        .await
+        .unwrap();
+    let axis = |n: u64, start: f64, step: f64| (0..n).map(|i| start + step * i as f64).collect();
+    for (name, values, units) in [
+        ("time", axis(steps, 0.0, 1.0), "hours since 2026-01-01"),
+        ("lat", axis(rows, 60.0, -0.1), "degrees_north"),
+        ("lon", axis(cols, 10.0, 0.1), "degrees_east"),
+    ] {
+        let values: Vec<f64> = values;
+        let array = zarrs::array::ArrayBuilder::new(
+            vec![values.len() as u64],
+            vec![values.len() as u64],
+            zarrs::array::data_type::float64(),
+            f64::NAN,
+        )
+        .dimension_names(Some([name]))
+        .attributes(
+            serde_json::json!({ "units": units })
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build(store.clone(), &format!("/{name}"))
+        .unwrap();
+        array.async_store_metadata().await.unwrap();
+        array.async_store_chunk(&[0], values).await.unwrap();
+    }
+    let stored = BloscCodec::new(
+        BloscCompressor::LZ4,
+        0.try_into().unwrap(),
+        None,
+        BloscShuffleMode::NoShuffle,
+        Some(4),
+    )
+    .unwrap();
+    for (v, name) in names.iter().enumerate() {
+        let sharding = zarrs::array::codec::ShardingCodecBuilder::new(
+            inner.map(|n| n.try_into().unwrap()).to_vec(),
+            &zarrs::array::data_type::float32(),
+        )
+        .bytes_to_bytes_codecs(vec![Arc::new(stored.clone())])
+        .build();
+        let array = zarrs::array::ArrayBuilder::new(
+            vec![steps, rows, cols],
+            shard.to_vec(),
+            zarrs::array::data_type::float32(),
+            f32::NAN,
+        )
+        .array_to_bytes_codec(Arc::new(sharding))
+        .dimension_names(Some(["time", "lat", "lon"]))
+        .attributes(
+            serde_json::json!({"units": "1"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+        .build(store.clone(), &format!("/{name}"))
+        .unwrap();
+        array.async_store_metadata().await.unwrap();
+        let values: Vec<f32> = (0..steps * rows * cols)
+            .map(|i| v as f32 + (i % 1000) as f32 / 1000.0)
+            .collect();
+        array
+            .async_store_array_subset(
+                &ArraySubset::new_with_shape(vec![steps, rows, cols]),
+                values,
+            )
+            .await
+            .unwrap();
+    }
+    super::preload_tests::commit(&store, "grid").await;
+}
+
+/// Two queries planning at once share staging's room: the second gets what
+/// the first left, and the rest of its chunks are read serially, but the
+/// first finds every range it fetched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_plan_never_takes_a_first_plans_staged_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let names: Vec<String> = (0..16).map(|v| format!("v{v:02}")).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    // Inner chunks of 3 × 64 × 128 float32: 96 KiB each, ten to the MiB of
+    // room one MiB of payload cache gives.
+    grid_repository(dir.path(), &refs, [3, 64, 256], [3, 64, 256], [3, 64, 128]).await;
+    let mut config = config(dir.path());
+    config.cache_mb = 1;
+    let (engine, _) = engine("plans", &config);
+    let catalog = engine.catalog.load();
+    let steps: Vec<usize> = (0..3).collect();
+    let reads = |vars: std::ops::Range<usize>| -> Vec<_> {
+        catalog.vars[vars]
+            .iter()
+            .map(|var| {
+                let read = catalog.position_read(var, None, 10.55, 59.95, &steps);
+                (var, read.unwrap().unwrap().subset)
+            })
+            .collect()
+    };
+    let (first, second) = (reads(0..8), reads(8..16));
+    let meter = meter(&engine);
+    meter.take_log();
+
+    // (Icechunk reads a range this long in parts, each a request: count
+    // ranges by what staging holds.)
+    catalog.prefetch(&first);
+    let staged = engine.icechunk_staged_bytes().unwrap();
+    let range = staged / 8;
+    assert_eq!(staged, 8 * range, "every range of the first plan");
+    catalog.prefetch(&second);
+    assert_eq!(
+        engine.icechunk_staged_bytes(),
+        Some(10 * range),
+        "and what it left"
+    );
+    assert_eq!(read_ahead(&engine).serial, 6);
+    meter.take_log();
+
+    // The first query's decodes find all their ranges.
+    for (var, _) in &first {
+        let values = catalog
+            .sample_series(var, None, 10.55, 59.95, &steps)
+            .unwrap();
+        assert!(values.iter().all(Option::is_some));
+    }
+    assert!(
+        meter.take_log().is_empty(),
+        "every range of the first plan staged"
+    );
+    for (var, _) in &second[..2] {
+        catalog
+            .sample_series(var, None, 10.55, 59.95, &steps)
+            .unwrap();
+    }
+    assert!(
+        meter.take_log().is_empty(),
+        "the second's two staged ranges"
+    );
+    for (var, _) in &second[2..] {
+        catalog
+            .sample_series(var, None, 10.55, 59.95, &steps)
+            .unwrap();
+        assert!(!meter.take_log().is_empty(), "a refused range is read");
+    }
+    assert_eq!(
+        read_ahead(&engine),
+        ReadAhead {
+            used: 10,
+            serial: 6,
+            ..Default::default()
+        }
+    );
+    assert_eq!(engine.icechunk_staged_bytes(), Some(0));
+}
+
+/// A MULTIPOINT response the API will refuse for its size reads nothing
+/// ahead; one within the cap does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multipoint_past_the_response_cap_fetches_nothing_ahead() {
+    let dir = tempfile::tempdir().unwrap();
+    // 8000 steps: 64 points × 2 variables × 8000 is past the million.
+    grid_repository(
+        dir.path(),
+        &["a", "b"],
+        [8000, 2, 4],
+        [8000, 2, 2],
+        [1000, 2, 2],
+    )
+    .await;
+    let names = vec!["a".to_owned(), "b".to_owned()];
+    let query = |points: Vec<String>| {
+        let (engine, _) = engine("cap", &config(dir.path()));
+        let mut emitted = 0;
+        engine
+            .query_positions(&points, None, Some(&names), None, None, &mut |_| {
+                emitted += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(emitted, points.len());
+        read_ahead(&engine)
+    };
+    let point = |i: usize| {
+        let lon = if i.is_multiple_of(2) { 10.05 } else { 10.25 };
+        format!("POINT({lon} 59.95)")
+    };
+    const { assert!(64 * 2 * 8000 > ds_core::feature::MAX_POSITION_VALUES) };
+    assert_eq!(query((0..64).map(point).collect()), ReadAhead::default());
+    // One point: two variables' eight inner chunks each, fetched ahead.
+    assert_eq!(query(vec![point(0)]).used, 16);
 }

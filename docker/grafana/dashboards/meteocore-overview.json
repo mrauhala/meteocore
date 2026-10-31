@@ -21382,7 +21382,7 @@
         "spec": {
           "id": 170,
           "title": "Icechunk inner chunks fetched ahead",
-          "description": "Cold inner chunks per second that EDR position, MULTIPOINT, area and trajectory queries plan to fetch together, eight at a time, before decoding their variables one after another (#1353), by outcome. used: fetched and taken by its decode, which then filled the payload cache as a serial read would. unused: fetched but dropped before any decode asked for it, because another read had it first or it waited 30 s. serial: left to the decode's own read, one after another as before, because the staging room (one shard of cache_mb) or the read budget (MC_ZARR_READ_MEMORY_MB) had no room for it. failed: the fetch failed and the decode read it again. A query with a single cold chunk plans nothing. Steady serial points at a payload cache too small for the queries' chunks or a read budget under pressure; steady unused at concurrent queries for the same chunks.",
+          "description": "Cold inner chunks per second that EDR position, MULTIPOINT, area and trajectory queries plan to fetch together, eight at a time, before decoding their variables one after another (#1353); each planned chunk is counted once, by outcome. used: fetched, staged and taken by its decode, which then filled the payload cache as a serial read would. unused: staged but dropped after 30 s with no decode asking. skipped: nothing to fetch, as the payload cache or staging had it already, or it is inline or absent. serial: left to the decode's own read, because staging (one shard of cache_mb, shared by concurrent queries) had no room or less than half the read budget (MC_ZARR_READ_MEMORY_MB) was free. failed: the fetch failed and the decode read it again. expired: the request's deadline cut the fetch off. Steady serial points at concurrent queries outgrowing staging or a read budget under pressure; steady unused at queries that ended before their decodes.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -21604,7 +21604,7 @@
         "spec": {
           "id": 172,
           "title": "Icechunk ranges staged for their decodes",
-          "description": "Bytes of chunk ranges each Icechunk collection fetched ahead of its decodes (#1353) that no decode has taken yet: memory held outside the payload cache, at most one payload-cache shard (cache_mb divided among its shards). Normally near zero between queries, as each decode takes its range within its query; a level that stays up means ranges waiting out their 30 s, dropped as unused on panel 170.",
+          "description": "Bytes of chunk ranges each Icechunk collection fetched ahead of its decodes (#1353) that no decode has taken yet: memory held outside the payload cache, at most one payload-cache shard (cache_mb divided among its shards). Normally near zero between queries, as each decode takes its range within its query; a range no decode takes is dropped after 30 s, at the latest at the next scrape, and counted unused on panel 170.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

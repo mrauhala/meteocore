@@ -66,9 +66,10 @@ impl Source {
         }
     }
 
-    /// An Icechunk repository's inner-chunk ranges fetched ahead and used,
-    /// unused, left serial and failed (#1353); `None` for a plain store.
-    pub(crate) fn prefetched(&self) -> Option<[u64; 4]> {
+    /// An Icechunk repository's inner-chunk ranges planned to be fetched
+    /// ahead, by outcome: used, unused, skipped, serial, failed, expired
+    /// (#1353); `None` for a plain store.
+    pub(crate) fn prefetched(&self) -> Option<[u64; 6]> {
         match self {
             Self::Plain(_) => None,
             #[cfg(feature = "icechunk")]

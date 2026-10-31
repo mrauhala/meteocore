@@ -91,17 +91,21 @@ pub struct ZarrEngine {
 /// cumulative since the engine opened its repository.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReadAhead {
-    /// Cold inner chunks a query fetched together ahead of its decodes,
-    /// which a decode then took.
+    /// Cold inner chunks a query planned to fetch ahead of its decodes,
+    /// each counted once, in one of the next six. Fetched, staged and
+    /// taken by a decode.
     pub used: u64,
-    /// Cold inner chunks fetched ahead and dropped before any decode asked
-    /// for them: another read had them first, or they waited too long.
+    /// Fetched and staged, then dropped after 30 s with no decode asking.
     pub unused: u64,
-    /// Cold inner chunks left to their decode's own read: past the room
-    /// for them or the read budget.
+    /// Nothing to fetch: cached or staged already, or inline or absent.
+    pub skipped: u64,
+    /// Left to their decode's own read: no staging room, or less than half
+    /// the read budget free.
     pub serial: u64,
-    /// Cold inner chunks whose fetch ahead failed; their decode read them.
+    /// The fetch failed; their decode read them.
     pub failed: u64,
+    /// The request's deadline ended the fetch first.
+    pub expired: u64,
     /// Catalog builds that published before their preload had finished.
     pub preloads_stopped: u64,
 }
@@ -231,12 +235,14 @@ impl ZarrEngine {
     /// What an Icechunk repository fetched ahead of its reads (#1353);
     /// `None` for a plain store.
     pub fn icechunk_read_ahead(&self) -> Option<ReadAhead> {
-        let [used, unused, serial, failed] = self.source.prefetched()?;
+        let [used, unused, skipped, serial, failed, expired] = self.source.prefetched()?;
         Some(ReadAhead {
             used,
             unused,
+            skipped,
             serial,
             failed,
+            expired,
             preloads_stopped: self.preloads_stopped.load(Ordering::Relaxed),
         })
     }
@@ -699,15 +705,23 @@ impl EdrEngine for ZarrEngine {
 
         let selected = select_vars(&cat, parameters)?;
 
-        let mut reads = Vec::new();
-        for &(lon, lat) in &points {
-            for &v in &selected {
-                if let Some(read) = cat.position_read(v, run, lon, lat, &time_idx)? {
-                    reads.push((v, read.subset));
+        // A response the API will refuse for its size reads nothing ahead:
+        // its points are read in turn until the refusal, as before.
+        let values = points
+            .len()
+            .saturating_mul(selected.len())
+            .saturating_mul(time_idx.len());
+        if values <= ds_core::feature::MAX_POSITION_VALUES {
+            let mut reads = Vec::new();
+            for &(lon, lat) in &points {
+                for &v in &selected {
+                    if let Some(read) = cat.position_read(v, run, lon, lat, &time_idx)? {
+                        reads.push((v, read.subset));
+                    }
                 }
             }
+            cat.prefetch(&reads);
         }
-        cat.prefetch(&reads);
 
         for (lon, lat) in points {
             ds_core::deadline::check()?;

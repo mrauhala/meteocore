@@ -75,14 +75,17 @@ or map window. Nothing is converted or copied first.
   those of serial reads. Only chunks a decode reads as one range are
   fetched this way: their outermost codec is Blosc, gzip or zstd, their
   shard index is resident, and the decoded cache neither has them nor is
-  filling them for another read. The staging area, and so one query's
-  fetches, holds at most what one shard of the payload cache holds; a
-  range no decode takes is dropped after 30 s or when newer ones need the
-  room. Each range takes its memory from the read budget without waiting.
-  A range that does not fit, a fetch that fails, a query with one cold
-  chunk and a plain store all read as before: fetching ahead rejects no
-  query. Shards of runs other than the default are fetched ahead only once
-  a first read has loaded their index.
+  filling them for another read. The staging area holds at most what one
+  shard of the payload cache holds, shared by concurrent queries: each
+  range reserves its room first, and one that does not fit is refused,
+  never made room for by dropping another query's. A range no decode takes
+  is dropped after 30 s, at the next staging call or scrape. While it is
+  fetched, a range takes memory from the read budget only while half the
+  budget stays free for requests, without waiting. A range refused either
+  room, a fetch that fails, a query with one cold chunk, a `MULTIPOINT`
+  response past the API's million-value cap and a plain store all read as
+  before. Shards of runs other than the default are fetched ahead only
+  once a first read has loaded their index.
 - **Memory admission.** A read first reserves its estimated source buffers
   from one process-wide budget, `MC_ZARR_READ_MEMORY_MB` (default 1024 MiB,
   an estimate, not a RAM limit); one that does not fit fails at once with
@@ -92,9 +95,9 @@ or map window. Nothing is converted or copied first.
   fields). `/metrics` has `zarr_read_*` and `zarr_decoded_cache_*`; for
   Icechunk also `zarr_icechunk_payload_cache_*`,
   `zarr_icechunk_storage_{requests,read_bytes}_total`,
-  `zarr_icechunk_prefetched_ranges_total` (by outcome: used, unused,
-  serial, failed), `zarr_icechunk_staged_bytes` (ranges fetched ahead and
-  not yet taken) and `zarr_icechunk_preloads_stopped_total`, per
+  `zarr_icechunk_prefetched_ranges_total` (each planned range once, by
+  outcome: used, unused, skipped, serial, failed, expired),
+  `zarr_icechunk_staged_bytes` (ranges fetched ahead and not yet taken) and `zarr_icechunk_preloads_stopped_total`, per
   collection.
   `/admin/cache-plan` lists the payload cache.
 
