@@ -40,7 +40,7 @@ use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 
 use ds_core::edr_engine::EdrEngine;
-use ds_core::error::DataServerError;
+use ds_core::error::{DataServerError, ErrorClass};
 use ds_core::feature::{Geometry, PropertyValue};
 use ds_core::feature_pick::{FeaturePick, PickMap, PickedFeature, PickedFeatures};
 use ds_core::map_engine::MapEngine;
@@ -530,15 +530,10 @@ enum Reply {
 
 /// Whether a read's error is an empty answer: no data at the point or the
 /// time, or no longer any: a run evicted, or a collection reloaded away,
-/// since the map resolved.
+/// since the map resolved. That is every [`ErrorClass::NotFound`], the 404
+/// the other APIs answer it with.
 fn is_no_data(error: &DataServerError) -> bool {
-    matches!(
-        error,
-        DataServerError::LocationNotFound(_)
-            | DataServerError::FeatureNotFound(_)
-            | DataServerError::ReferenceTimeNotFound(_)
-            | DataServerError::CollectionNotFound(_)
-    )
+    error.class() == ErrorClass::NotFound
 }
 
 /// Each query layer's read at `pixel`, in `queries` order. One admission
@@ -579,36 +574,34 @@ async fn read_layers(
 
     let mut replies = Vec::with_capacity(queries.len());
     for (query, answer) in queries.iter().zip(answers) {
+        // A failed read answers by its error's class, as in every API (#17).
         replies.push(match answer {
             Ok(reply) => reply,
-            Err(e) if is_no_data(&e) => Reply::Nothing,
-            Err(e @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded)) => {
-                return Err(WmsError::ServiceUnavailable(e.to_string()));
-            }
-            // A data source that kept refusing the read (#1355).
-            Err(e @ DataServerError::Unavailable(_)) => {
-                tracing::warn!("WMS GetFeatureInfo error for layer '{}': {e}", query.layer);
-                return Err(WmsError::SourceUnavailable);
-            }
-            Err(
-                e @ (DataServerError::InvalidParameter(_)
-                | DataServerError::InvalidDatetime(_)
-                | DataServerError::InvalidBbox(_)
-                | DataServerError::QueryTooLarge(_)),
-            ) => {
-                tracing::warn!(
-                    "WMS GetFeatureInfo on layer '{}' refused by the engine: {e}",
-                    query.layer
-                );
-                return Err(WmsError::invalid_parameter(&format!(
-                    "Layer '{}' cannot be queried with these dimension values",
-                    query.layer
-                )));
-            }
-            Err(e) => {
-                tracing::warn!("WMS GetFeatureInfo error for layer '{}': {e}", query.layer);
-                return Err(WmsError::Internal(e.to_string()));
-            }
+            Err(e) => match e.class() {
+                ErrorClass::NotFound => Reply::Nothing,
+                ErrorClass::Busy | ErrorClass::DeadlineExceeded => {
+                    return Err(WmsError::ServiceUnavailable);
+                }
+                // A data source that kept refusing the read (#1355).
+                ErrorClass::SourceUnavailable => {
+                    tracing::warn!("WMS GetFeatureInfo error for layer '{}': {e}", query.layer);
+                    return Err(WmsError::SourceUnavailable);
+                }
+                ErrorClass::BadRequest => {
+                    tracing::warn!(
+                        "WMS GetFeatureInfo on layer '{}' refused by the engine: {e}",
+                        query.layer
+                    );
+                    return Err(WmsError::invalid_parameter(&format!(
+                        "Layer '{}' cannot be queried with these dimension values",
+                        query.layer
+                    )));
+                }
+                ErrorClass::Internal => {
+                    tracing::warn!("WMS GetFeatureInfo error for layer '{}': {e}", query.layer);
+                    return Err(WmsError::Internal(e.to_string()));
+                }
+            },
         });
     }
     Ok(replies)

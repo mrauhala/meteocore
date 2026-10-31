@@ -20,6 +20,9 @@ use ds_core::error::DataServerError;
 use ds_core::feature::*;
 use ds_core::feature_engine::FeatureEngine;
 
+#[path = "../../api-common/tests/support/engine_errors.rs"]
+mod engine_errors;
+
 const TOKEN: &str = "test-token-abc123";
 /// Deliberately not loopback. rmcp's default allowlist is localhost-only, so
 /// testing through 127.0.0.1 passes while every request behind a real proxy
@@ -722,6 +725,71 @@ async fn an_engine_failure_does_not_leak_internal_detail() {
             body.contains("Query failed"),
             "{tool}: the client should still learn the query failed: {body}"
         );
+    }
+}
+
+/// An engine whose frame queries fail with `engine_errors::every_error()` at
+/// this index.
+struct FailingWith(usize);
+
+impl FeatureEngine for FailingWith {
+    fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        Err(engine_errors::every_error().swap_remove(self.0))
+    }
+    fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
+        Err(DataServerError::FeatureNotFound(id.into()))
+    }
+    fn available_times(&self) -> Vec<chrono::DateTime<chrono::Utc>> {
+        vec!["2026-08-21T14:25:00Z".parse().unwrap()]
+    }
+}
+
+/// An engine's error answers by its class, as in every API (#17): a request
+/// the engine turns down or a resource it does not have is the caller's
+/// `invalid_params` with the engine's message, a busy engine, the deadline
+/// and a data source that keeps refusing reads an internal error saying to
+/// retry, and anything else "Query failed". Only the first names the
+/// engine's detail.
+#[tokio::test]
+async fn an_engine_failure_answers_by_its_class() {
+    use ds_core::error::ErrorClass;
+    for (i, error) in engine_errors::every_error().iter().enumerate() {
+        let mut engines: HashMap<String, Arc<dyn FeatureEngine>> = HashMap::new();
+        engines.insert("cells".into(), Arc::new(FailingWith(i)));
+        let mut collections = HashMap::new();
+        collections.insert("cells".to_string(), collection("cells", "nowcast"));
+        let app = api_mcp::router(
+            Arc::new(ArcSwap::from_pointee(McpState {
+                engines,
+                collections,
+            })),
+            Arc::new(McpAuth::new(TOKEN.to_string(), 0)),
+            api_mcp::allowed_hosts(BASE_URL, &[]),
+        );
+        let sid = handshake(&app).await;
+        let (status, _, body) = call(
+            &app,
+            Some(TOKEN),
+            Some(&sid),
+            json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                   "params": {"name": "get_storm_cells", "arguments": {"collection": "cells"}}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{error:?}");
+        let doc = parse_rpc(&body);
+        let (code, message) = match error.class() {
+            ErrorClass::BadRequest | ErrorClass::NotFound => (-32602, error.to_string()),
+            ErrorClass::Busy | ErrorClass::DeadlineExceeded => {
+                (-32603, "Server busy, try again later".to_string())
+            }
+            ErrorClass::SourceUnavailable => (
+                -32603,
+                "Data source temporarily unavailable, try again later".to_string(),
+            ),
+            ErrorClass::Internal => (-32603, "Query failed".to_string()),
+        };
+        assert_eq!(doc["error"]["code"], code, "{error:?}: {doc}");
+        assert_eq!(doc["error"]["message"], message, "{error:?}: {doc}");
     }
 }
 

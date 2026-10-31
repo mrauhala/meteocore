@@ -31,8 +31,11 @@ pub enum WmsError {
     InvalidPoint(String),
     /// Internal server error.
     Internal(String),
-    /// Server too busy (render semaphore exhausted).
-    ServiceUnavailable(String),
+    /// Server busy: the request was not admitted or ran out of time, or the
+    /// engine was busy (`ErrorClass::Busy`, `ErrorClass::DeadlineExceeded`).
+    /// A 503 with `Retry-After: 1` and a fixed message: it carries nothing a
+    /// caller could fill with internal state (#122).
+    ServiceUnavailable,
     /// A data source that kept refusing the reads
     /// (`DataServerError::Unavailable`, #1355): the busy answer's 503, with
     /// `Retry-After: 10` and a message of its own that names no upstream.
@@ -89,7 +92,7 @@ impl WmsError {
             WmsError::LayerNotQueryable(_) => "LayerNotQueryable",
             WmsError::InvalidPoint(_) => "InvalidPoint",
             WmsError::Internal(_) => "Internal",
-            WmsError::ServiceUnavailable(_) | WmsError::SourceUnavailable => "Internal",
+            WmsError::ServiceUnavailable | WmsError::SourceUnavailable => "Internal",
         }
     }
 
@@ -99,7 +102,7 @@ impl WmsError {
     /// `ServiceExceptionReport` is shipped to the requesting client. Per
     /// CLAUDE.md ("Do not leak internal error details to clients — use
     /// generic messages for 500 errors") and the `MapsError` precedent,
-    /// `Internal` and `ServiceUnavailable` get a fixed redacted message;
+    /// `Internal` gets a fixed redacted message, as the payload-free 503s do;
     /// the original detail is captured at the handler via `tracing::warn!`
     /// before the error is mapped, so operators don't lose it.
     fn message(&self) -> &str {
@@ -115,7 +118,7 @@ impl WmsError {
             | WmsError::LayerNotQueryable(m)
             | WmsError::InvalidPoint(m) => m,
             WmsError::Internal(_) => "Internal server error",
-            WmsError::ServiceUnavailable(_) => "Server busy, try again later",
+            WmsError::ServiceUnavailable => "Server busy, try again later",
             WmsError::SourceUnavailable => ds_core::error::DataServerError::UNAVAILABLE_DESCRIPTION,
         }
     }
@@ -123,7 +126,7 @@ impl WmsError {
     fn status_code(&self) -> StatusCode {
         match self {
             WmsError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            WmsError::ServiceUnavailable(_) | WmsError::SourceUnavailable => {
+            WmsError::ServiceUnavailable | WmsError::SourceUnavailable => {
                 StatusCode::SERVICE_UNAVAILABLE
             }
             _ => StatusCode::BAD_REQUEST,
@@ -134,7 +137,7 @@ impl WmsError {
     /// answer's 1, a data source's 10 (#1355).
     fn retry_after(&self) -> Option<u64> {
         match self {
-            WmsError::ServiceUnavailable(_) => Some(1),
+            WmsError::ServiceUnavailable => Some(1),
             WmsError::SourceUnavailable => {
                 Some(ds_core::error::DataServerError::UNAVAILABLE_RETRY_AFTER_SECS)
             }
@@ -266,7 +269,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()[header::RETRY_AFTER], "10");
         assert_eq!(response.headers()[header::CONTENT_TYPE], "text/xml");
-        let busy = WmsError::ServiceUnavailable("shed".into()).into_response();
+        let busy = WmsError::ServiceUnavailable.into_response();
         assert_eq!(busy.headers()[header::RETRY_AFTER], "1");
     }
 

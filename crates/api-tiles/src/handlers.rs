@@ -2044,14 +2044,9 @@ async fn render_vector_tile(
         property_filters: Vec::new(),
     };
 
-    let page = engine.get_features(&query).map_err(|e| match e {
-        // A data source that kept refusing the reads (#1355).
-        ds_core::error::DataServerError::Unavailable(_) => {
-            tracing::warn!("Vector tile feature query for '{id}' failed: {e}");
-            TilesError::SourceUnavailable
-        }
-        e => TilesError::Internal(format!("Feature query failed: {e}")),
-    })?;
+    let page = engine
+        .get_features(&query)
+        .map_err(|e| TilesError::from_engine(e, "vector tile", id))?;
 
     if page.features.len() > params::MAX_FEATURES_PER_TILE {
         // 422 (Unprocessable Content), not 400: the request itself is
@@ -2839,51 +2834,8 @@ async fn render_tile(
         .await
         .map_err(TilesError::from)?;
 
-    let (finished, phases) = render_result.map_err(|e| {
-        use ds_core::error::DataServerError as DSE;
-        // A client mistake (multi-parameter collection rendered without a
-        // parameter, bad bbox/datetime) is a 400 with the engine's message,
-        // not a 500 that hides it.
-        match e {
-            DSE::ResourceExhausted | DSE::DeadlineExceeded => {
-                TilesError::ServiceUnavailable(e.to_string())
-            }
-            // A data source that kept refusing the reads (#1355): WARN, not
-            // a server fault, and a 503 naming no upstream.
-            DSE::Unavailable(_) => {
-                tracing::warn!("Tiles render error for collection '{}': {e}", collection_id);
-                TilesError::SourceUnavailable
-            }
-            DSE::InvalidParameter(_)
-            | DSE::InvalidBbox(_)
-            | DSE::InvalidDatetime(_)
-            | DSE::QueryTooLarge(_) => {
-                // 4xx-class: DEBUG (not WARN) so a misconfigured client stays
-                // diagnosable without flooding the warn stream.
-                tracing::debug!(
-                    "Tiles render bad-request for collection '{}': {e}",
-                    collection_id
-                );
-                TilesError::BadRequest(e.to_string())
-            }
-            // ReferenceTimeNotFound is documented to map to 404 (EDR already
-            // does); reachable when a pinned run is pruned between resolution
-            // and render — routine for nowcast generations (#522).
-            DSE::CollectionNotFound(_)
-            | DSE::LocationNotFound(_)
-            | DSE::ReferenceTimeNotFound(_) => {
-                tracing::debug!(
-                    "Tiles render not-found for collection '{}': {e}",
-                    collection_id
-                );
-                TilesError::NotFound(e.to_string())
-            }
-            _ => {
-                tracing::warn!("Tiles render error for collection '{}': {e}", collection_id);
-                TilesError::Internal(format!("Render failed: {e}"))
-            }
-        }
-    })?;
+    let (finished, phases) =
+        render_result.map_err(|e| TilesError::from_engine(e, "render", collection_id))?;
 
     // Empty tiles return a memoized empty image in the requested format
     // without caching; populated tiles get cached. Both are a
@@ -2956,7 +2908,7 @@ impl From<ds_executor::ExecutionError> for TilesError {
     fn from(error: ds_executor::ExecutionError) -> Self {
         match error {
             ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
-            other => Self::ServiceUnavailable(other.to_string()),
+            _ => Self::ServiceUnavailable,
         }
     }
 }

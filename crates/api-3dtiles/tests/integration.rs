@@ -18,6 +18,9 @@ use ds_core::volume::{
 };
 use ds_render::{BuiltinColormap, LutColorMap};
 
+#[path = "../../api-common/tests/support/engine_errors.rs"]
+mod engine_errors;
+
 /// Mock engine: a tiny fixed cloud, one quantity (`DBZH`), a coverage region.
 struct MockVolume;
 
@@ -1201,6 +1204,57 @@ fn router_with(id: &str, engine: Arc<dyn VolumeEngine>) -> axum::Router {
         trust_proxy_headers: false,
     }));
     api_3dtiles::router(state)
+}
+
+/// [`MockVolume`]'s collection whose every read fails with
+/// `engine_errors::every_error()` at this index.
+struct FailingVolume(usize);
+
+impl VolumeEngine for FailingVolume {
+    fn read_point_cloud(
+        &self,
+        _quantity: Option<&str>,
+        _time: Option<chrono::DateTime<chrono::Utc>>,
+        _min_value: Option<f64>,
+        _reference_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<VolumePointCloud, DataServerError> {
+        Err(engine_errors::every_error().swap_remove(self.0))
+    }
+
+    fn volume_info(&self) -> Arc<VolumeInfo> {
+        MockVolume.volume_info()
+    }
+}
+
+/// Every engine error answers its class's status (#17): an absent model run
+/// is the 404 every API answers, no longer a 500. A 4xx carries the
+/// engine's message, a 5xx never.
+#[tokio::test]
+async fn every_engine_error_answers_its_class_status() {
+    for (i, error) in engine_errors::every_error().iter().enumerate() {
+        // A collection of its own: the content cache is process-global.
+        let id = format!("fails-{i}");
+        let app = router_with(&id, Arc::new(FailingVolume(i)));
+        let (status, body, headers) = get_on(
+            &app,
+            &format!("/collections/{id}/content.pnts?quantity=DBZH"),
+        )
+        .await;
+        assert_eq!(status.as_u16(), error.class().status_code(), "{error:?}");
+        assert_eq!(
+            headers
+                .get(axum::http::header::RETRY_AFTER)
+                .map(|v| v.to_str().unwrap()),
+            engine_errors::retry_after(error),
+            "{error:?}"
+        );
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(
+            body.contains(engine_errors::SECRET),
+            status.is_client_error(),
+            "{error:?}: {body}"
+        );
+    }
 }
 
 async fn get_on(router: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>, axum::http::HeaderMap) {
