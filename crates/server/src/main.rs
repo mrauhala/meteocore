@@ -4,6 +4,7 @@ mod cache_plan;
 mod colormaps;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc;
+mod memory_plan;
 mod preview;
 mod robots;
 mod sld;
@@ -492,6 +493,9 @@ async fn serve(cli: CliArgs) {
         tracing::error!("{e}");
         std::process::exit(1);
     }
+    // The memory plan's facts (#1312), before loading takes any of the
+    // memory available at boot.
+    memory_plan::read_at_boot();
     // Likewise: engines restore their snapshots from it while being built.
     admin::init_state_store(
         config

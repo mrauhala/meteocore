@@ -63,7 +63,8 @@ pub struct CacheDemand {
     /// config key.
     pub setting: &'static str,
     /// The facts `rule` reads, by name, in order. A name ending in `_bytes`
-    /// is a size.
+    /// is a size, and the first such is the size of one entry the cache
+    /// holds ([`Self::entry_bytes`]).
     pub inputs: Vec<(&'static str, u64)>,
 }
 
@@ -105,6 +106,16 @@ impl CacheDemand {
     /// The size this demand alone suggests ([`Demand::suggested_bytes`]).
     pub fn suggested_bytes(&self) -> u64 {
         suggested(self.bytes, self.floor)
+    }
+
+    /// The size of one entry: the first input whose name ends in `_bytes`
+    /// (a field, frame, grid, chunk, sweep or scan), the size the memory
+    /// plan gives a cache's shard layout (#1312).
+    pub fn entry_bytes(&self) -> Option<u64> {
+        self.inputs
+            .iter()
+            .find(|(name, _)| name.ends_with("_bytes"))
+            .map(|(_, bytes)| *bytes)
     }
 }
 
@@ -172,6 +183,15 @@ impl Demand {
     /// cache (0) never is.
     pub fn exceeds(&self, capacity_bytes: u64) -> bool {
         capacity_bytes > 0 && self.bytes > capacity_bytes
+    }
+
+    /// The largest entry its collections publish
+    /// ([`CacheDemand::entry_bytes`]).
+    pub fn entry_bytes(&self) -> Option<u64> {
+        self.parts
+            .iter()
+            .filter_map(|(_, part)| part.entry_bytes())
+            .max()
     }
 }
 
@@ -514,6 +534,27 @@ mod tests {
         assert!(of(2, false).exceeds(1));
         assert!(!of(2, false).exceeds(2));
         assert!(!of(2, false).exceeds(0), "a disabled cache is never short");
+    }
+
+    /// The first `_bytes` input is the size of an entry; a cache's is the
+    /// largest of its collections'.
+    #[test]
+    fn the_first_bytes_input_is_the_entry_size() {
+        let grid = CacheDemand::demand(48, "", "")
+            .input("cells", 12)
+            .input("grid_bytes", 4)
+            .input("terrain_mask_bytes", 9);
+        assert_eq!(grid.entry_bytes(), Some(4));
+        let none = CacheDemand::demand(1, "", "").input("fields", 16);
+        assert_eq!(none.entry_bytes(), None);
+        let larger = CacheDemand::demand(6, "", "").input("grid_bytes", 6);
+        let demand = Demand::of(vec![
+            ("a".into(), grid),
+            ("b".into(), larger),
+            ("c".into(), none),
+        ])
+        .unwrap();
+        assert_eq!(demand.entry_bytes(), Some(6));
     }
 
     /// A process-wide cache sums its collections' slots, the newest of each

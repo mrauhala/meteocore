@@ -36,7 +36,27 @@ pub struct ServerConfig {
     /// collection's [`DiscoveryConfig`].
     #[serde(default)]
     pub discovery: Option<DiscoverySettings>,
+    /// The memory the process may use (`[memory]`, #1312). Top-level
+    /// config.toml only.
+    #[serde(default)]
+    pub memory: Option<MemoryConfig>,
 }
+
+/// The top-level `[memory]` table (#1312).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// The memory the process may use, in MiB: the total the memory plan
+    /// fits every cache and budget into. Unset, the plan detects it (a
+    /// cgroup limit, else the host's memory). At least
+    /// [`MIN_MEMORY_TOTAL_MB`].
+    #[serde(default)]
+    pub total_mb: Option<u64>,
+}
+
+/// The least `[memory] total_mb`: under it the process would not hold its
+/// own baseline.
+pub const MIN_MEMORY_TOTAL_MB: u64 = 256;
 
 /// The top-level `[discovery]` table.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -240,6 +260,7 @@ impl ServerConfig {
             colormaps: Vec::new(),
             parameter_defaults: Vec::new(),
             discovery: None,
+            memory: None,
         }
     }
 
@@ -4545,6 +4566,12 @@ impl ServerConfig {
                      move the block to the top-level config.toml"
                 )));
             }
+            if raw.contains_key("memory") {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "{filename}: [memory] is not allowed in per-collection files — \
+                     move the block to the top-level config.toml"
+                )));
+            }
             if raw.contains_key("parameter_defaults") {
                 return Err(crate::error::DataServerError::Config(format!(
                     "{filename}: [[parameter_defaults]] is not allowed in per-collection \
@@ -4597,6 +4624,15 @@ impl ServerConfig {
                     "[server] render_concurrency must be between 1 and \
                      {MAX_RENDER_CONCURRENCY} (got {n}); omit it for the default \
                      of 2x available CPUs, min 8"
+                )));
+            }
+        }
+
+        if let Some(total) = self.memory.as_ref().and_then(|m| m.total_mb) {
+            if total < MIN_MEMORY_TOTAL_MB {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "[memory] total_mb must be at least {MIN_MEMORY_TOTAL_MB} (got {total}); \
+                     omit it to detect the total"
                 )));
             }
         }
@@ -7671,6 +7707,59 @@ colormap = "radar_dbz"
             .unwrap_err()
             .to_string()
             .contains("unknown field `catalogue`"),);
+    }
+
+    /// `[memory]` (#1312): `total_mb` loads; under 256, an unknown key, or
+    /// the table in a collection file is a load error.
+    #[test]
+    fn memory_settings_load_and_validate() {
+        let tmp = TempDir::new().unwrap();
+        let collections_dir = tmp.path().join("collections.d");
+        fs::create_dir(&collections_dir).unwrap();
+        let load = |top: &str, collection: &str| {
+            write_config(
+                tmp.path(),
+                "config.toml",
+                &format!(
+                    "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                     collections_dir = \"collections.d\"\n{top}"
+                ),
+            );
+            write_config(
+                &collections_dir,
+                "nwp.toml",
+                &format!("id = \"nwp\"\ntitle = \"NWP\"\ndescription = \"\"\n{collection}"),
+            );
+            let path = tmp.path().join("config.toml");
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+        let error = |top: &str, collection: &str| load(top, collection).unwrap_err().to_string();
+
+        let config = load("[memory]\ntotal_mb = 4096\n", "").unwrap();
+        assert_eq!(
+            config.memory,
+            Some(MemoryConfig {
+                total_mb: Some(4096)
+            })
+        );
+        assert_eq!(load("", "").unwrap().memory, None);
+        assert_eq!(
+            load("[memory]\n", "").unwrap().memory,
+            Some(MemoryConfig::default())
+        );
+        assert!(load("[memory]\ntotal_mb = 256\n", "").is_ok());
+        let low = error("[memory]\ntotal_mb = 255\n", "");
+        assert!(
+            low.contains("[memory] total_mb must be at least 256 (got 255)"),
+            "{low}"
+        );
+        let unknown = error("[memory]\nmode = \"auto\"\n", "");
+        assert!(unknown.contains("unknown field `mode`"), "{unknown}");
+        let per_collection = error("", "[memory]\ntotal_mb = 4096\n");
+        assert!(
+            per_collection.contains("nwp.toml: [memory] is not allowed in per-collection files"),
+            "{per_collection}"
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use axum::response::IntoResponse;
@@ -227,7 +227,20 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
             health.error
         );
     }
+    // #1312 acceptance: the plan is a report: it changes no size.
+    crate::admin::refresh_metrics(&state);
+    let sizes = |rows: &[Row]| -> Vec<(&'static str, Option<String>, u64)> {
+        rows.iter()
+            .map(|r| {
+                let collection = r.entry.scope.collection().map(str::to_string);
+                (r.entry.id, collection, r.usage.capacity_bytes)
+            })
+            .collect()
+    };
+    let before = sizes(&snapshot(&state));
     log(&state, Occasion::Boot);
+    assert_eq!(sizes(&snapshot(&state)), before, "the plan resized a cache");
+    let report = memory_plan::last().expect("planned at boot");
     let response = crate::admin::metrics_handler(State(state.clone()))
         .await
         .into_response();
@@ -494,7 +507,50 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
         .contains("cache_demand_ratio{cache=\"grib_message_cache\",collection=\"grib-default\"}"));
 
     // The log block and the endpoint list the same entries and sizes.
-    assert_log_and_json_agree(&rows);
+    assert_log_and_json_agree(&rows, Some(&report));
+
+    // Every entry has its planned size (#1312), on `/metrics` too, and
+    // the plan its total. Nothing serves vector tiles here: its cache is
+    // planned at 0, configured at 128 MiB.
+    let plan = report.plan.as_ref().expect("a total on any test host");
+    for row in &rows {
+        assert!(
+            plan.grant(&row.entry).is_some(),
+            "{:?} unplanned",
+            row.entry
+        );
+    }
+    let vector = plan
+        .caches
+        .iter()
+        .find(|g| g.entry.id == "vector_tile_cache")
+        .unwrap();
+    assert_eq!((vector.capacity_bytes, vector.bytes), (128 * MIB, 0));
+    let grid = plan
+        .caches
+        .iter()
+        .find(|g| g.entry.id == "grid_cache" && g.entry.scope.collection() == Some("grib-sized"))
+        .unwrap();
+    for line in [
+        format!(
+            "memory_plan_total_bytes {}",
+            report.total.as_ref().unwrap().bytes
+        ),
+        format!("memory_plan_pool_bytes {}", plan.pool_bytes),
+        format!("memory_plan_shortfall_bytes {}", plan.shortfall_bytes),
+        "cache_planned_bytes{cache=\"vector_tile_cache\",collection=\"\"} 0".into(),
+        format!(
+            "cache_planned_bytes{{cache=\"grid_cache\",collection=\"grib-sized\"}} {}",
+            grid.bytes
+        ),
+    ] {
+        assert!(metrics.contains(&line), "{line}");
+    }
+    assert_eq!(grid.bytes, 512 * MIB, "pinned");
+    assert_eq!(
+        count("cache_planned_bytes"),
+        plan.caches.len() + plan.budgets.len()
+    );
 
     // The lightning layer's strike-window cache is built only with a
     // PostGIS collection, which needs a database; built, it is entered.
@@ -509,10 +565,11 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
 }
 
 /// For every entry of the endpoint's document, the log block has a line
-/// naming it, its collection, its capacity and its source.
-fn assert_log_and_json_agree(rows: &[Row]) {
-    let log = render(rows, "at boot", None);
-    let json = to_json(rows, &MemoryReading::default());
+/// naming it, its collection, its capacity and its source, and its planned
+/// size and why when `report` plans it.
+fn assert_log_and_json_agree(rows: &[Row], report: Option<&Report>) {
+    let log = render(rows, "at boot", None, report);
+    let json = to_json(rows, &MemoryReading::default(), report);
     let mut lines = 0;
     for kind in ["caches", "budgets"] {
         for entry in json[kind].as_array().unwrap() {
@@ -534,6 +591,16 @@ fn assert_log_and_json_agree(rows: &[Row]) {
                 })
                 .unwrap_or_else(|| panic!("no log line for {name}:\n{log}"));
             assert!(line.contains(&expected), "{line:?} disagrees with {entry}");
+            if let Some(planned) = entry["planned_bytes"].as_u64() {
+                let expected = format!(
+                    ", planned {} ({})",
+                    mib(planned),
+                    entry["planned_reason"].as_str().unwrap()
+                );
+                assert!(line.ends_with(&expected), "{line:?} disagrees with {entry}");
+            } else {
+                assert!(!line.contains(", planned "), "{line:?}");
+            }
             lines += 1;
         }
     }
@@ -656,7 +723,8 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
         ("process_resident_memory_bytes", Some(42)),
         ("jemalloc_allocated_bytes", None),
     ]);
-    let json = to_json(&rows, &memory);
+    let report = sample_report(&rows);
+    let json = to_json(&rows, &memory, Some(&report));
     assert_eq!(
         json["caches"][3],
         json!({
@@ -689,9 +757,14 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
                 "bytes": 400 * MIB,
                 "inputs": {"fields": 16, "nodes": 3601 * 1801, "field_bytes": 25 * MIB},
             }],
+            "planned_bytes": 1536 * MIB,
+            "planned_reason": "pinned",
+            "expected_bytes": 768 * MIB,
         })
     );
     assert_eq!(json["caches"][2]["demand_bytes"], Value::Null);
+    assert_eq!(json["caches"][2]["planned_bytes"], 256 * MIB);
+    assert_eq!(json["caches"][2]["planned_reason"], "working set");
     assert_eq!(
         json["budgets"],
         json!([{
@@ -712,6 +785,9 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
             "demand_kind": null,
             "suggested_bytes": null,
             "demand_inputs": null,
+            "planned_bytes": 4096 * MIB,
+            "planned_reason": "pinned",
+            "expected_bytes": 4096 * MIB,
         }])
     );
     let caches = (8192 + 4096 + 256 + 1536) * MIB;
@@ -726,7 +802,87 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
         json["memory"],
         json!({"process_resident_memory_bytes": 42, "jemalloc_allocated_bytes": null})
     );
-    assert_log_and_json_agree(&rows);
+    // The plan's header (#1312): the total and its source, the reserves,
+    // the pool and its sums.
+    let plan = &json["plan"];
+    assert_eq!(plan["total_bytes"], 32 * 1024 * MIB);
+    assert_eq!(plan["total_source"], "[memory] total_mb");
+    assert_eq!(plan["cgroup_low_bytes"], Value::Null);
+    assert_eq!(
+        plan["reserves"],
+        json!({
+            "outside_bytes": 256 * MIB,
+            "heap_bytes": 32 * MIB,
+            "baseline": "estimated",
+            "render_budget_bytes": 4096 * MIB,
+            "read_budget_bytes": 0,
+            "read_budget": null,
+            "slack_bytes": report.plan.as_ref().unwrap().reserves.slack_bytes,
+        })
+    );
+    assert_eq!(plan["pinned_bytes"], (8192 + 4096 + 1536) * MIB);
+    assert_eq!(plan["demand_bytes"], 400 * MIB);
+    assert_eq!(plan["shortfall_bytes"], 0);
+    assert_eq!(plan["cut"], false);
+    assert_log_and_json_agree(&rows, Some(&report));
+    // Without a plan, the fields are null.
+    let json = to_json(&rows, &memory, None);
+    assert_eq!(json["plan"], Value::Null);
+    assert_eq!(json["caches"][0]["planned_bytes"], Value::Null);
+    assert_log_and_json_agree(&rows, None);
+}
+
+/// The sample rows planned for `[memory] total_mb = 32768`, with their
+/// GeoTIFF and GRIB collections.
+fn sample_report(rows: &[Row]) -> Report {
+    let config: ServerConfig = toml::from_str(
+        "[server]\nhost = \"h\"\nport = 1\n\
+         [[collections]]\nid = \"opera\"\ntitle = \"t\"\ndescription = \"d\"\n\
+         engine_type = \"geotiff\"\napis = [\"wms\"]\n\
+         [[collections]]\nid = \"ifs\"\ntitle = \"t\"\ndescription = \"d\"\n\
+         engine_type = \"grib\"\napis = [\"edr\"]\n",
+    )
+    .unwrap();
+    let collections: HashMap<String, CollectionConfig> = config
+        .collections
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+    memory_plan::report(
+        Some(32 * 1024),
+        &memory_plan::detect::Reading::default(),
+        rows,
+        &collections,
+        ds_cache::plan::grant::Baseline::Estimated,
+    )
+}
+
+/// With a plan (#1312), the block's second line has its total and pool,
+/// and each entry line its planned size and why.
+#[test]
+fn the_log_block_shows_planned_next_to_configured() {
+    let rows = sample_rows();
+    let report = sample_report(&rows);
+    let log = render(&rows, "at boot", None, Some(&report));
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(
+        lines[1].starts_with("  memory total 32.00 GiB ([memory] total_mb): 0.28 GiB outside"),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[1].ends_with("A report: no size is changed"),
+        "{}",
+        lines[1]
+    );
+    let line = |name: &str| *lines.iter().find(|l| l.contains(name)).unwrap();
+    assert!(
+        line("tile_cache opera").ends_with("  default, planned 256 MiB (working set)"),
+        "{}",
+        line("tile_cache opera")
+    );
+    assert!(line("grid_cache ifs")
+        .ends_with("demand 400 MiB, suggested 460 MiB, planned 1536 MiB (pinned)"));
 }
 
 /// #1308: a cache's last hour in the document: its label, turnover, the
@@ -787,7 +943,7 @@ fn the_last_hour_says_whether_a_cache_needs_memory() {
 /// One line per entry, grouped by scope under a heading with the totals.
 #[test]
 fn the_log_block_groups_entries_by_scope() {
-    let log = render(&sample_rows(), "at boot", None);
+    let log = render(&sample_rows(), "at boot", None, None);
     let expected = "\
 Cache and memory plan at boot: 4 caches 14080 MiB (13.75 GiB), 1 budgets 4096 MiB (4.00 GiB)
   caches, process:
@@ -818,7 +974,7 @@ fn a_changed_size_shows_the_old_one() {
         .collect();
     rows[3].usage.capacity_bytes = 256 * MIB;
     rows[3].entry.source = SizeSource::Default;
-    let log = render(&rows, "after reload", Some(&previous));
+    let log = render(&rows, "after reload", Some(&previous), None);
     let changed: Vec<&str> = log.lines().filter(|l| l.contains("(was ")).collect();
     assert_eq!(
         changed,
