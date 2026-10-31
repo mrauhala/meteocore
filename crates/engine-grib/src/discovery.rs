@@ -142,6 +142,10 @@ impl GribEngine {
         if let Some(index) = &self.source.point_index {
             index.forget_layouts();
         }
+        // New steps may follow a frame the map read-ahead planned (#1335).
+        if let Some(ahead) = &self.source.read_ahead {
+            ahead.forget_triggers();
+        }
         self.refresh_discovery();
     }
 

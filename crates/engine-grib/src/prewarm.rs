@@ -17,8 +17,9 @@
 //! at most [`SHARE_PERCENT`] of the message cache per run, the earliest
 //! steps first, and nothing of a key whose messages of the run the cache
 //! cannot hold ([`MessageCache::holds`]), where a query over it fetches only
-//! parts of them; [`CONCURRENCY`] GETs in flight, a bucket answers 503
-//! SlowDown to three; [`BUDGET`] for one poll's pre-warm. The fetches run
+//! parts of them; [`CONCURRENCY`] GETs in flight, shared with the map
+//! read-ahead ([`BackgroundGets`]), since a bucket answers 503 SlowDown to
+//! three; [`BUDGET`] for one poll's pre-warm. The fetches run
 //! as field jobs on the runtime the scan runs on, the poll runtime, each
 //! GET through an explicit handle under [`FetchBudget::Background`] (root
 //! Critical Rules 6, 7 and 9), outside the cache's single-flight so no
@@ -33,12 +34,14 @@
 //! count, nor do map tiles; WMS GetFeatureInfo, a position query, does.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
+use ds_storage::bytes::Bytes;
 use ds_storage::object_store::path::Path;
 use ds_storage::FetchBudget;
 
@@ -56,12 +59,14 @@ const READ_WINDOW: Duration = Duration::from_secs(24 * 3600);
 const MAX_KEYS: usize = 256;
 
 /// The share of the message cache, in percent, one run's pre-warm may fill:
-/// the rest is the maps' and the queries' own.
-const SHARE_PERCENT: u64 = 25;
+/// the rest is the maps' and the queries' own. The map read-ahead has a
+/// share of its own (`readahead.rs`).
+pub(crate) const SHARE_PERCENT: u64 = 25;
 
-/// GETs in flight per source: a public bucket answers 503 SlowDown to a
+/// GETs in flight per source, the pre-warm's and the map read-ahead's
+/// together ([`BackgroundGets`]): a public bucket answers 503 SlowDown to a
 /// third.
-const CONCURRENCY: usize = 2;
+pub(crate) const CONCURRENCY: usize = 2;
 
 /// The longest one poll's pre-warm runs: the poll loop waits for it, and a
 /// stalled store must not hold back the next step's discovery. What it has
@@ -78,6 +83,51 @@ fn clock_secs() -> i64 {
 /// Whether a read at `last` is within [`READ_WINDOW`] of `now`.
 fn within_window(last: i64, now: i64) -> bool {
     now.saturating_sub(last) < READ_WINDOW.as_secs() as i64
+}
+
+/// The GETs a source's background fills have in flight, the pre-warm's and
+/// the map read-ahead's together (#1335): at most [`CONCURRENCY`]. Each
+/// bounds its own jobs too, but the bucket counts both: two of each would
+/// be the four in flight that it answers 503 SlowDown to.
+#[derive(Default)]
+pub(crate) struct BackgroundGets {
+    in_flight: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl BackgroundGets {
+    /// One of the [`CONCURRENCY`] GETs, waiting at most `wait` for one to
+    /// free; `None` past it.
+    pub(crate) fn acquire(&self, wait: Duration) -> Option<GetPermit<'_>> {
+        let in_flight = self.in_flight.lock().unwrap();
+        let (mut in_flight, _) = self
+            .freed
+            .wait_timeout_while(in_flight, wait, |n| *n >= CONCURRENCY)
+            .unwrap();
+        if *in_flight >= CONCURRENCY {
+            return None;
+        }
+        *in_flight += 1;
+        Some(GetPermit(self))
+    }
+}
+
+/// One GET of [`BackgroundGets`], freed when dropped.
+pub(crate) struct GetPermit<'a>(&'a BackgroundGets);
+
+impl Drop for GetPermit<'_> {
+    fn drop(&mut self) {
+        *self.0.in_flight.lock().unwrap() -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// The byte range of `entry` in its file; `None` for a message of unknown
+/// length (a wgrib2 tail record) or one past the address space.
+pub(crate) fn message_range(entry: &MessageEntry) -> Option<Range<usize>> {
+    let length = entry.length?;
+    let start = usize::try_from(entry.offset).ok()?;
+    Some(start..start.checked_add(usize::try_from(length).ok()?)?)
 }
 
 /// When position queries last read each parameter level of a source.
@@ -293,6 +343,53 @@ struct Outcome {
 }
 
 impl GribEngine {
+    /// [`Self::background_fetch`] once one of the source's
+    /// [`BackgroundGets`] is free, waiting at most `wait` for it; `None`
+    /// past it.
+    fn background_get(
+        &self,
+        path: &Path,
+        range: Range<usize>,
+        wait: Duration,
+        counters: (&AtomicU64, &AtomicU64),
+    ) -> Result<Option<Bytes>, DataServerError> {
+        let Some(_permit) = self.source.background_gets.acquire(wait) else {
+            return Ok(None);
+        };
+        self.background_fetch(path, range, counters).map(Some)
+    }
+
+    /// One GET of a background fill, the pre-warm's or the map
+    /// read-ahead's (#1335), under a [`GetPermit`] the caller holds:
+    /// `range` of `path` under [`FetchBudget::Background`]. The caller runs
+    /// inside `block_in_place` on a runtime worker, whose handle drives the
+    /// GET (root Critical Rule 7). `counters` count the GET and the bytes
+    /// it read; a short read is an error.
+    pub(crate) fn background_fetch(
+        &self,
+        path: &Path,
+        range: Range<usize>,
+        (gets, bytes_read): (&AtomicU64, &AtomicU64),
+    ) -> Result<Bytes, DataServerError> {
+        gets.fetch_add(1, Ordering::Relaxed);
+        let handle = tokio::runtime::Handle::current();
+        let bytes = self.source.store.get_range_on_with_budget(
+            path,
+            range.clone(),
+            &handle,
+            FetchBudget::Background,
+        )?;
+        bytes_read.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        if bytes.len() != range.len() {
+            return Err(DataServerError::Storage(format!(
+                "short GRIB message read: {} of {} bytes",
+                bytes.len(),
+                range.len()
+            )));
+        }
+        Ok(bytes)
+    }
+
     /// The pre-warm's GETs and bytes, and the pre-warmed messages requests
     /// then read, each counted at its first read (#1335), per source;
     /// zeroes when it is off.
@@ -448,34 +545,16 @@ impl GribEngine {
         let entry = &fetch.entry;
         let path = Path::from(fetch.url.as_str());
         let key = MessageKey::new(path.as_ref(), entry);
-        let Some(range) = entry.length.and_then(|length| {
-            let start = usize::try_from(entry.offset).ok()?;
-            Some(start..start.checked_add(usize::try_from(length).ok()?)?)
-        }) else {
+        let Some(range) = message_range(entry) else {
             return Ok(Warmed::Skipped);
         };
         let get = || {
-            prewarm.gets.fetch_add(1, Ordering::Relaxed);
-            // The job runs inside `block_in_place` on a runtime worker: its
-            // handle drives the GET (root Critical Rule 7).
-            let handle = tokio::runtime::Handle::current();
-            let bytes = self.source.store.get_range_on_with_budget(
-                &path,
-                range.clone(),
-                &handle,
-                FetchBudget::Background,
-            )?;
-            prewarm
-                .bytes
-                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
-            if bytes.len() != range.len() {
-                return Err(DataServerError::Storage(format!(
-                    "short GRIB message read: {} of {} bytes",
-                    bytes.len(),
-                    range.len()
-                )));
-            }
-            Ok(bytes)
+            // A GET the read-ahead holds is waited for within the budget.
+            let wait = ds_core::deadline::current()
+                .map_or(BUDGET, |end| end.saturating_duration_since(Instant::now()));
+            let counters = (&prewarm.gets, &prewarm.bytes);
+            self.background_get(&path, range, wait, counters)?
+                .ok_or(DataServerError::DeadlineExceeded)
         };
         // Validated before admission as a position query's first read is:
         // the complete point index when the message takes one, whatever

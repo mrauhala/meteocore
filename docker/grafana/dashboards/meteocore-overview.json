@@ -1912,7 +1912,7 @@
                                   "height": 8,
                                   "element": {
                                     "kind": "ElementReference",
-                                    "name": "panel-143"
+                                    "name": "panel-160"
                                   }
                                 }
                               },
@@ -1921,6 +1921,45 @@
                                 "spec": {
                                   "x": 12,
                                   "y": 49,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-161"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 57,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-162"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 57,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-143"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 65,
                                   "width": 12,
                                   "height": 8,
                                   "element": {
@@ -20918,6 +20957,365 @@
                       },
                       "spec": {
                         "expr": "sum by (collection) (increase(grib_prewarm_hits_total{job=~\"$job\", collection=~\"$collection\"}[24h])) / sum by (collection) (increase(grib_prewarm_gets_total{job=~\"$job\", collection=~\"$collection\"}[24h]))",
+                        "legendFormat": "{{collection}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [
+                    {
+                      "title": "Filter dashboard to ${__field.labels.collection}",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=engines&engines-dtab=gridded-sources"
+                    }
+                  ],
+                  "min": 0,
+                  "decimals": 1,
+                  "max": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-160": {
+        "kind": "Panel",
+        "spec": {
+          "id": 160,
+          "title": "GRIB map read-ahead: messages fetched and read",
+          "description": "Messages per second the GRIB map read-ahead fetches after a WMS, Maps or Tiles render draws a step, the messages it would draw at the run's next steps, and read-ahead messages a request then reads, each counted at its first read, a request that joined the fetch included. Bursts follow animations over a cold run. Fetched far above read means clients do not step forward through the run: the read-ahead fetches frames nobody draws.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(grib_read_ahead_gets_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}} · fetched",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(grib_read_ahead_hits_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}} · read",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "ops",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [
+                    {
+                      "title": "Filter dashboard to ${__field.labels.collection}",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=engines&engines-dtab=gridded-sources"
+                    }
+                  ],
+                  "min": 0,
+                  "decimals": 2
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-161": {
+        "kind": "Panel",
+        "spec": {
+          "id": 161,
+          "title": "GRIB map read-ahead bytes",
+          "description": "Bytes per second the GRIB map read-ahead fetches into the message cache. Each run takes at most a quarter of the source's message_cache_mb, a share of its own beside the pre-warm's, with two GETs in flight shared with the pre-warm, and nothing of a parameter whose next steps the cache cannot hold together.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(grib_read_ahead_bytes_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "Bps",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [
+                    {
+                      "title": "Filter dashboard to ${__field.labels.collection}",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=engines&engines-dtab=gridded-sources"
+                    }
+                  ],
+                  "min": 0,
+                  "decimals": 2
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-162": {
+        "kind": "Panel",
+        "spec": {
+          "id": 162,
+          "title": "GRIB read-ahead messages read, last 24 h",
+          "description": "Share of the messages the GRIB map read-ahead fetched over the last 24 hours that a request then read. Low means clients jump between steps or runs rather than step forward, and the read-ahead costs storage reads for frames nobody draws; read_ahead = 0 turns it off for a source.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (increase(grib_read_ahead_hits_total{job=~\"$job\", collection=~\"$collection\"}[24h])) / sum by (collection) (increase(grib_read_ahead_gets_total{job=~\"$job\", collection=~\"$collection\"}[24h]))",
                         "legendFormat": "{{collection}}",
                         "range": true,
                         "instant": false,

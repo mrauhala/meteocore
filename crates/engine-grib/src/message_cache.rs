@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ds_cache::{ByteBoundedCache, CacheEntry, CacheMetrics, MIB};
 use ds_core::{deadline, error::DataServerError};
@@ -62,29 +62,33 @@ pub(crate) fn message_weight(path: &str, length: u64) -> u64 {
 pub(crate) struct MessageCache {
     cache: ByteBoundedCache<MessageKey, Bytes>,
     /// What the pre-warm fetched and requests then read (#1335).
-    prewarmed: Prewarmed,
+    prewarmed: Unread,
+    /// What the map read-ahead fetched and requests then read (#1335).
+    read_ahead: Unread,
+    /// The messages whose fill a map read-ahead holds right now.
+    filling: Filling,
 }
 
-/// The most pre-warmed messages [`Prewarmed`] waits on a first read of.
-/// Each pre-warm first forgets those the cache no longer holds, so this
-/// binds only a cache of tiny messages; a fetch past it is not counted when
-/// read.
+/// The most messages an [`Unread`] waits on a first read of. Each pre-warm
+/// first forgets those the cache no longer holds, as does a read-ahead fill
+/// that finds the set full, so this binds only a cache of tiny messages; a
+/// fetch past it is not counted when read.
 const MAX_UNREAD: usize = 4096;
 
-/// Messages the pre-warm fetched that no request has read yet, and how many
-/// it fetched that one then read (#1335): how much of what it fetches is
-/// used.
+/// Messages a background fill, the pre-warm's or the map read-ahead's,
+/// fetched that no request has read yet, and how many it fetched that one
+/// then read (#1335): how much of what it fetches is used.
 #[derive(Default)]
-struct Prewarmed {
+struct Unread {
     unread: Mutex<HashSet<MessageKey>>,
     /// `unread`'s length, so a hit skips the lock while nothing waits.
     pending: AtomicUsize,
     hits: AtomicU64,
 }
 
-impl Prewarmed {
-    /// A request read `key` from the cache: count it if the pre-warm
-    /// fetched it and no request had read it yet.
+impl Unread {
+    /// A request read `key` from the cache: count it if the fill fetched
+    /// it and no request had read it yet.
     fn read(&self, key: &MessageKey) {
         if self.pending.load(Ordering::Relaxed) == 0 {
             return;
@@ -94,6 +98,76 @@ impl Prewarmed {
             self.pending.store(unread.len(), Ordering::Relaxed);
             self.hits.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Wait on a first read of `key`, just fetched. A full set first
+    /// forgets the messages `cache` no longer holds.
+    fn insert(&self, key: &MessageKey, cache: &ByteBoundedCache<MessageKey, Bytes>) {
+        let mut unread = self.unread.lock().unwrap();
+        if unread.len() >= MAX_UNREAD {
+            unread.retain(|key| cache.contains_key(key));
+        }
+        if unread.len() < MAX_UNREAD {
+            unread.insert(key.clone());
+        }
+        self.pending.store(unread.len(), Ordering::Relaxed);
+    }
+
+    fn remove(&self, key: &MessageKey) {
+        let mut unread = self.unread.lock().unwrap();
+        unread.remove(key);
+        self.pending.store(unread.len(), Ordering::Relaxed);
+    }
+
+    /// Stop waiting on a first read of the messages `cache` has evicted.
+    fn forget_evicted(&self, cache: &ByteBoundedCache<MessageKey, Bytes>) {
+        let mut unread = self.unread.lock().unwrap();
+        unread.retain(|key| cache.contains_key(key));
+        self.pending.store(unread.len(), Ordering::Relaxed);
+    }
+}
+
+/// The messages whose single-flight fill a map read-ahead holds (#1335):
+/// a request that finds one in flight waits on it for at most half its
+/// remaining time ([`MessageCache::get_with`]), where it waits on another
+/// request's fill as long as that takes.
+#[derive(Default)]
+struct Filling {
+    keys: Mutex<HashSet<MessageKey>>,
+    /// `keys`' length, so a lookup skips the lock while nothing fills.
+    pending: AtomicUsize,
+}
+
+impl Filling {
+    fn contains(&self, key: &MessageKey) -> bool {
+        self.pending.load(Ordering::Relaxed) > 0 && self.keys.lock().unwrap().contains(key)
+    }
+
+    /// Mark `key` filled ahead until the mark drops. Marked before its
+    /// claim is taken and unmarked after it is released, so a request that
+    /// finds the claim taken sees the mark. The read-ahead queues a message
+    /// once, so one mark at a time.
+    fn mark(&self, key: &MessageKey) -> FillMark<'_> {
+        let mut keys = self.keys.lock().unwrap();
+        keys.insert(key.clone());
+        self.pending.store(keys.len(), Ordering::Relaxed);
+        FillMark {
+            filling: self,
+            key: key.clone(),
+        }
+    }
+}
+
+struct FillMark<'a> {
+    filling: &'a Filling,
+    key: MessageKey,
+}
+
+impl Drop for FillMark<'_> {
+    fn drop(&mut self) {
+        let mut keys = self.filling.keys.lock().unwrap();
+        keys.remove(&self.key);
+        self.filling.pending.store(keys.len(), Ordering::Relaxed);
     }
 }
 
@@ -120,7 +194,9 @@ impl MessageCache {
                     ds_cache::hot_allocation_holding(capacity, largest),
                 )
                 .with_ghosts(),
-                prewarmed: Prewarmed::default(),
+                prewarmed: Unread::default(),
+                read_ahead: Unread::default(),
+                filling: Filling::default(),
             }
         })
     }
@@ -181,8 +257,15 @@ impl MessageCache {
     pub(crate) fn get_resident(&self, key: &MessageKey) -> Option<Bytes> {
         let bytes = self.cache.get_untracked(key)?;
         self.cache.record_hit();
-        self.prewarmed.read(key);
+        self.note_read(key);
         Some(bytes)
+    }
+
+    /// A request read `key` from the cache: its first read of a message a
+    /// background fill fetched counts (#1335).
+    fn note_read(&self, key: &MessageKey) {
+        self.prewarmed.read(key);
+        self.read_ahead.read(key);
     }
 
     pub fn read(
@@ -196,7 +279,11 @@ impl MessageCache {
         })?;
         let grid = match decoded {
             Some(grid) => grid, // reuse the validating decode on a cold fill
-            None => reader::decode_message(&bytes, &entry.param)?,
+            None => reader::decode_message(&bytes, &entry.param).inspect_err(|_| {
+                // A map read-ahead admits undecoded bytes (#1335): one that
+                // does not decode leaves, so the next read fetches it again.
+                self.cache.remove(&MessageKey::new(path.as_ref(), entry));
+            })?,
         };
         deadline::check()?;
         Ok(grid)
@@ -214,6 +301,14 @@ impl MessageCache {
     /// the hot ring rather than evicted from the cold one by the window's
     /// later fills. Unkept, a full cache held only the last 3 % of a window
     /// (#1340). A map's fills are not kept: a one-off read leaves first.
+    ///
+    /// A map read-ahead's fill of the message in flight (#1335) is waited
+    /// on for at most half the request's remaining time, which keeps the
+    /// other half for a GET of its own, read around the cache: the
+    /// read-ahead's GET runs under the background budget, and a stalled one
+    /// must not fail the frame it was meant to speed up. Another request's
+    /// fill, and any fill without a deadline in scope, is waited on as long
+    /// as it takes, as before.
     pub(crate) fn get_with<T>(
         &self,
         store: &DataStore,
@@ -225,7 +320,7 @@ impl MessageCache {
         deadline::check()?;
         let key = MessageKey::new(path.as_ref(), entry);
         let mut validated = None;
-        let bytes = self.cache.get_or_insert_with(&key, || {
+        let fill = || {
             let bytes = reader::fetch_message_bytes(store, path, entry)?;
             deadline::check()?;
             validated = Some(validate(&bytes)?);
@@ -238,16 +333,117 @@ impl MessageCache {
             } else {
                 bytes
             })
-        })?;
+        };
+        // Probed before the read-ahead's mark is read: it marks a fill
+        // before claiming it, so a claim found taken by a read-ahead is
+        // always seen marked.
+        let bytes = match self
+            .cache
+            .get_value_or_guard_untracked(&key, Duration::ZERO)
+        {
+            CacheEntry::Value(bytes) => {
+                self.cache.record_hit();
+                bytes
+            }
+            CacheEntry::Vacant(claim) => self.fill_claimed(&key, claim, fill)?,
+            CacheEntry::Timeout => match self.read_ahead_wait(&key) {
+                None => self.cache.get_or_insert_with(&key, fill)?,
+                Some(wait) => match self.cache.get_value_or_guard_untracked(&key, wait) {
+                    CacheEntry::Value(bytes) => {
+                        self.cache.record_hit();
+                        bytes
+                    }
+                    CacheEntry::Vacant(claim) => self.fill_claimed(&key, claim, fill)?,
+                    CacheEntry::Timeout => {
+                        // Read around the stalled read-ahead, admitting
+                        // nothing: it still holds the fill.
+                        self.cache.record_bypass();
+                        let bytes = fill()?;
+                        return Ok((bytes, validated));
+                    }
+                },
+            },
+        };
         if validated.is_none() {
             // A hit, or another reader's fill: the first read of a
-            // pre-warmed message counts (#1335).
-            self.prewarmed.read(&key);
+            // pre-warmed or read-ahead message counts (#1335).
+            self.note_read(&key);
         } else if window {
             self.cache.keep(key, bytes.clone());
         }
         deadline::check()?;
         Ok((bytes, validated))
+    }
+
+    /// Fill `claim` with what `fill` reads, counting a miss first, as
+    /// [`ByteBoundedCache::get_or_insert_with`] does: a failed fill still
+    /// counts, and releases the claim for a later reader.
+    fn fill_claimed(
+        &self,
+        key: &MessageKey,
+        claim: ds_cache::CacheFillGuard<'_, MessageKey, Bytes>,
+        fill: impl FnOnce() -> Result<Bytes, DataServerError>,
+    ) -> Result<Bytes, DataServerError> {
+        self.cache.record_miss_for(key);
+        let bytes = fill()?;
+        let _ = claim.insert(bytes.clone());
+        Ok(bytes)
+    }
+
+    /// How long a request waits on the fill of `key` a map read-ahead holds
+    /// (#1335): half its remaining time. `None` when no read-ahead fills it,
+    /// or no deadline is in scope.
+    fn read_ahead_wait(&self, key: &MessageKey) -> Option<Duration> {
+        if !self.filling.contains(key) {
+            return None;
+        }
+        deadline::current().map(|end| end.saturating_duration_since(Instant::now()) / 2)
+    }
+
+    /// Fill `key` ahead of a map's read of it (#1335): claim its
+    /// single-flight fill, `fetch` the message and admit it. A request for
+    /// the message meanwhile joins the fill rather than fetch it again, for
+    /// at most half its remaining time. Not kept, as a map's own fill is
+    /// not: in a full cache it waits in the cold ring until a map reads it,
+    /// which promotes it, or later fills evict it.
+    ///
+    /// The one fill admitted without a decode: `fetch` checks the length,
+    /// and [`Self::read`] evicts a message that then does not decode, so a
+    /// corrupt payload stays retryable as a failed decode of any fill does.
+    ///
+    /// Returns the bytes fetched; `None` without a fetch for a message
+    /// resident or being filled by another reader. Counts no hit and no
+    /// miss: no request asked for it.
+    pub(crate) fn read_ahead(
+        &self,
+        key: &MessageKey,
+        fetch: impl FnOnce() -> Result<Bytes, DataServerError>,
+    ) -> Result<Option<usize>, DataServerError> {
+        if self.cache.contains_key(key) {
+            return Ok(None);
+        }
+        // Dropped after the claim, which is declared after it.
+        let _mark = self.filling.mark(key);
+        let CacheEntry::Vacant(claim) =
+            self.cache.get_value_or_guard_untracked(key, Duration::ZERO)
+        else {
+            return Ok(None);
+        };
+        let bytes = fetch()?;
+        let fetched = bytes.len();
+        // Waiting on a first read before the fill is published, so that a
+        // request joining it counts.
+        self.read_ahead.insert(key, &self.cache);
+        let bytes = if weight(key, &bytes) <= self.cache.capacity_bytes() {
+            Bytes::copy_from_slice(&bytes)
+        } else {
+            bytes
+        };
+        let _ = claim.insert(bytes);
+        if !self.cache.contains_key(key) {
+            self.read_ahead.remove(key);
+        }
+        Ok(Some(fetched))
     }
 
     /// Fill `key` ahead of its first read (#1335): `fetch` the message and
@@ -284,13 +480,7 @@ impl MessageCache {
         let _ = fill.insert(bytes.clone());
         self.cache.keep(key.clone(), bytes);
         if self.cache.contains_key(key) {
-            let mut unread = self.prewarmed.unread.lock().unwrap();
-            if unread.len() < MAX_UNREAD {
-                unread.insert(key.clone());
-                self.prewarmed
-                    .pending
-                    .store(unread.len(), Ordering::Relaxed);
-            }
+            self.prewarmed.insert(key, &self.cache);
         }
         Ok(Some(fetched))
     }
@@ -298,17 +488,20 @@ impl MessageCache {
     /// Stop waiting on a first read of pre-warmed messages the cache has
     /// evicted unread. Once per pre-warm, before it fetches.
     pub(crate) fn forget_evicted_prewarms(&self) {
-        let mut unread = self.prewarmed.unread.lock().unwrap();
-        unread.retain(|key| self.cache.contains_key(key));
-        self.prewarmed
-            .pending
-            .store(unread.len(), Ordering::Relaxed);
+        self.prewarmed.forget_evicted(&self.cache);
     }
 
     /// Pre-warmed messages a request then read, each counted at its first
     /// read (#1335).
     pub(crate) fn prewarm_hits(&self) -> u64 {
         self.prewarmed.hits.load(Ordering::Relaxed)
+    }
+
+    /// Messages the map read-ahead fetched that a request then read, each
+    /// counted at its first read, a request that joined the fill included
+    /// (#1335).
+    pub(crate) fn read_ahead_hits(&self) -> u64 {
+        self.read_ahead.hits.load(Ordering::Relaxed)
     }
 
     pub fn metrics(&self) -> CacheMetrics {

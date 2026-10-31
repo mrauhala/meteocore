@@ -325,6 +325,22 @@ impl<'a> CarriedSteps<'a> {
         }
     }
 
+    /// These steps after `step`, ascending: the frames a map animation
+    /// draws next (#1335).
+    pub fn after(&self, step: u32) -> impl Iterator<Item = (u32, &'a StepFile)> + '_ {
+        let after = (std::ops::Bound::Excluded(step), std::ops::Bound::Unbounded);
+        let (every, listed) = match self {
+            Self::Every(run) => (Some(run.steps.range(after)), None),
+            Self::Listed(_, steps) => {
+                let split = steps.partition_point(|&s| s <= step);
+                (None, Some(steps[split..].iter()))
+            }
+        };
+        let every = every.into_iter().flatten().map(|(&s, file)| (s, file));
+        let listed = listed.into_iter().flatten().filter_map(|&s| self.file(s));
+        every.chain(listed)
+    }
+
     /// Whether `time` lies within the first and last of these steps.
     pub fn covers(&self, time: DateTime<Utc>) -> bool {
         match (self.first(), self.last()) {

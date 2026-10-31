@@ -718,6 +718,17 @@ impl GridCache {
         self.cache.get_untracked(&key)
     }
 
+    /// Whether the grid of the message at `url`, `offset` is resident,
+    /// without touching its recency or a counter: the map read-ahead
+    /// (#1335) fetches no message whose grid a map would find here.
+    pub(crate) fn contains(&self, url: &str, offset: u64) -> bool {
+        let key = GridKey {
+            url: Arc::from(url),
+            offset,
+        };
+        self.cache.contains_key(&key)
+    }
+
     /// Count one hit, for [`Self::get_untracked`] callers.
     pub(crate) fn record_hit(&self) {
         self.cache.record_hit();

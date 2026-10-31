@@ -194,6 +194,7 @@ parameters = ["2t", "10u", "10v", "msl", "tp", "t", "z"]
 | `message_cache_mb` | `0` | Compressed-message cache per source; `0` disables it. |
 | `point_index_cache_mb` | 25 % of `message_cache_mb`, at least `16` | Point-index cache per source, one shard, for CCSDS and template 5.3 fields; `0` decodes every position field in full. An index is 1–6 KB for CCSDS and 100–140 KB for GFS 0.25°, 13–23 % of its message. Unset, it follows the message cache, so the indexes of the messages it keeps stay resident: 256 MiB for `message_cache_mb = 1024`. A value set, `0` included, is the size. |
 | `prewarm` | `true` | As the poll catalogues new steps of the newest run, fetch their messages of the parameters and levels EDR position queries read in the last 24 h into the message cache and index them. At most 25 % of `message_cache_mb` per run, earliest steps first, two GETs at a time; nothing without a message cache or a recent read, and nothing of a parameter level whose messages of the run the cache cannot hold. Reads are remembered in memory only. |
+| `read_ahead` | `3` | Steps a map render reads ahead: after WMS, Maps or Tiles draws a step, fetch the messages it would draw at the run's next `read_ahead` steps carrying the parameter into the message cache, on the GRIB I/O runtime. At most 25 % of `message_cache_mb` per run (its own share), two GETs at a time together with the pre-warm, nothing either cache holds, nothing of a parameter whose next steps the cache cannot hold together. A request for a message being read ahead joins that GET for at most half its remaining time. At most `12`; `0` turns it off. |
 
 With `level_types`, the collection id names a source, and the server
 registers one view per enabled family once data for it is found:
@@ -216,7 +217,9 @@ caches, the misses of recently evicted keys (`*_ghost_hits_total`), and
 `mode`: `whole`, `prefix`, `range` or `continuation`.
 `grib_prewarm_gets_total` and `grib_prewarm_bytes_total` count the
 pre-warm's storage reads, `grib_prewarm_hits_total` the pre-warmed messages
-a request then read, each at its first read.
+a request then read, each at its first read;
+`grib_read_ahead_{gets,bytes,hits}_total` the same for the map read-ahead,
+a request that joined its GET counted as a read.
 
 Runnable examples read public buckets
 ([`ecmwf-ifs`](../../collections.d/ecmwf-ifs.toml),

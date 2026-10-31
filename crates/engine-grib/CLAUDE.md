@@ -329,7 +329,8 @@ on the request path. Single-level and legacy views require exact metadata.
   planned. Checking all keys together would switch the pre-warm off where
   it matters: five keys × 85 steps of 0.25° IFS is about 640 MB against a
   512 MiB cache. Fetches run as `run_field_jobs` at 2 in flight on the
-  scan's runtime (the poll runtime), each a
+  scan's runtime (the poll runtime), under `BackgroundGets` permits
+  shared with the map read-ahead (below), each a
   `get_range_on_with_budget(.., FetchBudget::Background)`, under a 120 s
   deadline per poll, which the poll loop waits for. Before admission,
   `index_message` builds the complete point index (`Reach::Full`, #1337),
@@ -347,6 +348,50 @@ on the request path. Single-level and legacy views require exact metadata.
   hits counts a pre-warmed message's first request read, from an unread set
   of at most 4096 keys pruned to resident ones before each pre-warm.
   `[grib] prewarm = false` turns it off.
+- Map read-ahead (#1335, `readahead.rs`): after `get_raster_tile(s)` draws
+  step k, `read_ahead_after` plans the messages `map_message` would draw at
+  the run's next `[grib] read_ahead` steps carrying the parameters
+  (`CarriedSteps::after`; default 3, at most 12, `0` off): forward and
+  within the run only. Once per frame: the first tile's `frame_id` (view,
+  parameters, z, run, step) enters `triggered`, which `publish_catalog`
+  clears, since new steps may follow a planned frame; the other tiles pay
+  a hash and a lock. Skipped: a message resident in the message cache, one
+  whose grid the grid cache holds (`GridCache::contains`), one queued or in
+  flight. A parameter whose next steps `holds` rejects together is not read
+  ahead: its fills would evict each other unread. The window is the steps
+  ahead, not the run as for the pre-warm, since a map always reads whole
+  messages through the cache.
+- Its share is its own 25 % per run, not the pre-warm's: the pre-warm spends
+  its share at once as a poll catalogues new steps, and a shared one would
+  switch the run's maps off, or a map loop the next pre-warm. Queued bytes
+  count against it and what was not fetched is given back; at most 32
+  queued. The plan runs on the render's thread with no I/O; the fetches on
+  at most 2 workers per source on the GRIB I/O runtime
+  (`runtime::spawn_background`, `block_in_place`), so the render returns at
+  once (`the_triggering_render_does_not_wait_for_the_read_ahead`). Each GET
+  takes a `BackgroundGets` permit before claiming the fill, shared with the
+  pre-warm, so the two keep 2 GETs in flight together, never 4
+  (`the_read_ahead_keeps_two_gets_in_flight_with_the_prewarm_and_its_share_of_each_run`),
+  then `get_range_on_with_budget(.., FetchBudget::Background)`. Admitted
+  undecoded once its length checks, the one exception to admitting bytes
+  only after a decode: `MessageCache::read` evicts a hit that does not
+  decode, so a corrupt fill stays retryable
+  (`a_read_ahead_message_that_does_not_decode_is_fetched_again`). Its grid
+  is not put in the grid cache: that would save a 0.25° frame only its
+  decode, small beside the GET, and a 0.1° source's three grids ahead
+  cannot share a cold ring sized to hold one (#1332). Not kept: one a map
+  reads is promoted, one nobody reads leaves first.
+- `MessageCache::read_ahead` holds the message's single-flight claim through
+  its GET, unlike `prewarm`: a client asking for the next frame while that
+  GET is in flight would otherwise GET it again. It marks the key
+  (`Filling`) before claiming and unmarks after release, and `get_with`
+  probes the claim with zero wait before reading the mark, so a claim the
+  read-ahead holds is always seen marked. A request with a deadline waits on
+  a marked fill for half its remaining time, then reads the message around
+  the cache (a bypass, nothing admitted); without a deadline, or on another
+  request's fill, it waits as before. `/metrics`:
+  `grib_read_ahead_{gets,bytes,hits}_total`, hits counting each read-ahead
+  message's first request read, a request that joined the fill included.
 - Key by source-local path, offset and indexed length. Like the decoded cache,
   this assumes immutable files at a given path/offset; engine reconstruction
   clears both caches. Changing the cache configuration triggers reconstruction

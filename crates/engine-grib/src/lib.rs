@@ -30,6 +30,7 @@ mod point_index;
 mod point_index_tests;
 mod position;
 mod prewarm;
+mod readahead;
 pub mod reader;
 #[cfg(test)]
 mod retained_runs_tests;
@@ -237,6 +238,11 @@ struct GribSource {
     /// What position queries read, to pre-warm a new run's steps of it
     /// (#1335); `None` when `prewarm` is off or there is no message cache.
     prewarm: Option<prewarm::Prewarm>,
+    /// The map read-ahead (#1335); `None` when `read_ahead` is 0 or there
+    /// is no message cache.
+    read_ahead: Option<readahead::ReadAhead>,
+    /// The GETs the pre-warm and the read-ahead have in flight together.
+    background_gets: prewarm::BackgroundGets,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
     /// Allowed parameters (None = all).
@@ -548,6 +554,7 @@ impl GribEngine {
             message_cache = message_cache.map(message_cache::MessageCache::prewarmed);
         }
         let prewarm = prewarm::Prewarm::new(config.prewarm, message_cache.as_ref());
+        let read_ahead = readahead::ReadAhead::new(config.read_ahead, message_cache.as_ref());
 
         let index_format = index::IndexFormat::from_config(config.index_format.as_deref())
             .ok_or_else(|| {
@@ -570,6 +577,8 @@ impl GribEngine {
                 point_fields: point_index::PointFields::default(),
                 point_fetches: point_index::PointFetches::default(),
                 prewarm,
+                read_ahead,
+                background_gets: prewarm::BackgroundGets::default(),
                 shutdown: Shutdown::new(),
                 param_filter: config.parameters.clone(),
                 time_window,
@@ -2122,7 +2131,7 @@ impl MapEngine for GribEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<RasterTile, DataServerError> {
         let catalog = self.catalog();
-        let (run, _, step_file) =
+        let (run, step, step_file) =
             select_run_step(&catalog, parameter.as_slice(), reference_time, time)?;
         let field = MapField {
             bbox,
@@ -2131,7 +2140,10 @@ impl MapEngine for GribEngine {
             output_crs,
             z,
         };
-        self.render_field(&catalog, run, step_file, parameter, &field)
+        let tile = self.render_field(&catalog, run, step_file, parameter, &field)?;
+        // The next frames' messages, in the background (#1335).
+        self.read_ahead_after(&catalog, run, step, parameter.as_slice(), z);
+        Ok(tile)
     }
 
     /// Every band from the one step carrying them all that
@@ -2153,7 +2165,7 @@ impl MapEngine for GribEngine {
             return Ok(Vec::new());
         }
         let catalog = self.catalog();
-        let (run, _, step_file) = select_run_step(&catalog, parameters, reference_time, time)?;
+        let (run, step, step_file) = select_run_step(&catalog, parameters, reference_time, time)?;
         let field = MapField {
             bbox,
             width,
@@ -2161,10 +2173,13 @@ impl MapEngine for GribEngine {
             output_crs,
             z,
         };
-        parameters
+        let tiles = parameters
             .iter()
             .map(|&parameter| self.render_field(&catalog, run, step_file, Some(parameter), &field))
-            .collect()
+            .collect::<Result<_, _>>()?;
+        // The next frames' messages, in the background (#1335).
+        self.read_ahead_after(&catalog, run, step, parameters, z);
+        Ok(tiles)
     }
 
     fn resolve_time(

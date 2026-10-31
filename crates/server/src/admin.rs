@@ -1835,6 +1835,43 @@ static GRIB_PREWARM_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .unwrap();
     per_collection(counter)
 });
+// The map read-ahead of the next steps a WMS/Maps/Tiles render will draw
+// (#1335), per source; families of their own so the pre-warm's keep theirs.
+static GRIB_READ_AHEAD_GETS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_read_ahead_gets_total",
+            "GETs the GRIB map read-ahead made for the messages of the steps after \
+             a frame a map drew",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+static GRIB_READ_AHEAD_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_read_ahead_bytes_total",
+            "Bytes the GRIB map read-ahead fetched, as grib_read_ahead_gets_total",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+static GRIB_READ_AHEAD_HITS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "grib_read_ahead_hits_total",
+            "GRIB messages the map read-ahead fetched that a request then read, \
+             each counted at its first read, a request that joined the fetch included",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
 static ZARR_DECODED_CACHE_METRICS: LazyLock<CollectionCacheMetricSet> = LazyLock::new(|| {
     CollectionCacheMetricSet::new(
         "zarr_decoded_cache",
@@ -1938,6 +1975,8 @@ struct CacheCounterState {
     grib_point_fetches: HashMap<String, [(u64, u64); 4]>,
     /// GRIB pre-warm `[GETs, bytes, hits]` per source (#1335).
     grib_prewarm: HashMap<String, [u64; 3]>,
+    /// GRIB map read-ahead `[GETs, bytes, hits]` per source (#1335).
+    grib_read_ahead: HashMap<String, [u64; 3]>,
     zarr_decoded: HashMap<String, CacheSeen>,
     zarr_object: HashMap<String, CacheSeen>,
     zarr_icechunk_payload: HashMap<String, CacheSeen>,
@@ -1986,6 +2025,7 @@ impl CacheCounterState {
             grib_point_fields,
             grib_point_fetches,
             grib_prewarm,
+            grib_read_ahead,
             zarr_decoded,
             zarr_object,
             zarr_icechunk_payload,
@@ -2006,6 +2046,7 @@ impl CacheCounterState {
         drop_keys(grib_point_fields, removed);
         drop_keys(grib_point_fetches, removed);
         drop_keys(grib_prewarm, removed);
+        drop_keys(grib_read_ahead, removed);
         drop_keys(zarr_decoded, removed);
         drop_keys(zarr_object, removed);
         drop_keys(zarr_icechunk_payload, removed);
@@ -8473,6 +8514,23 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                 // Always touched, so every series exists before a pre-warm.
                 family.with_label_values(&[collection]).inc_by(delta);
             }
+            let (gets, bytes, hits) = engine.read_ahead_counts();
+            let deltas = delta_counts(
+                &mut counter_state.grib_read_ahead,
+                collection,
+                [gets, bytes, hits],
+            );
+            for (family, delta) in [
+                &GRIB_READ_AHEAD_GETS,
+                &GRIB_READ_AHEAD_BYTES,
+                &GRIB_READ_AHEAD_HITS,
+            ]
+            .into_iter()
+            .zip(deltas)
+            {
+                // Always touched, so every series exists before a map read.
+                family.with_label_values(&[collection]).inc_by(delta);
+            }
             let entries = engine.grid_cache_utilization().2;
             GRID_CACHE_METRICS.update(
                 collection,
@@ -12355,6 +12413,38 @@ prewarm_sweeps = 0
                 Some((series.to_string(), value.parse().ok()?))
             })
             .collect()
+    }
+
+    /// #1335: a GRIB source with a message cache has its pre-warm and map
+    /// read-ahead counters from the first scrape, at 0 before either runs,
+    /// in families of their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn grib_background_fill_series_exist_from_boot() {
+        let id = "series-grib";
+        let grib = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/grib-local");
+        let config = format!(
+            "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+             [[collections]]\nid = \"{id}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"grib\"\napis = [\"wms\"]\n\
+             [collections.grib]\ndata_path = \"{grib}\"\nindex_format = \"ecmwf-json\"\n\
+             message_cache_mb = 8\n"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, config).unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        let series = series_of(&scrape(&state).await, id);
+        for family in [
+            "grib_prewarm_gets_total",
+            "grib_prewarm_bytes_total",
+            "grib_prewarm_hits_total",
+            "grib_read_ahead_gets_total",
+            "grib_read_ahead_bytes_total",
+            "grib_read_ahead_hits_total",
+        ] {
+            let line = format!("{family}{{collection=\"{id}\"}}");
+            assert_eq!(series.get(&line), Some(&0.0), "{line} in {series:?}");
+        }
     }
 
     /// #1307: every GeoTIFF collection has its tile-cache counters from the
