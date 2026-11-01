@@ -44,14 +44,17 @@ groups:
       # its expected_interval. Stale: 3 intervals old, and at least 15
       # minutes past one interval, so a feed every minute is not stale after
       # three. A collection with no interval series (a single timestep and
-      # no expected_interval) never matches.
+      # no expected_interval) never matches. Series labelled
+      # alerting="false" are left out here and in CollectionEmpty: radar
+      # sites, whose radars another service runs and takes down for
+      # maintenance.
       - alert: CollectionStale
         expr: |
-          collection_data_age_seconds{job="meteocore"}
-            >= 3 * collection_expected_interval_seconds{job="meteocore"}
+          collection_data_age_seconds{job="meteocore", alerting!="false"}
+            >= 3 * collection_expected_interval_seconds{job="meteocore", alerting!="false"}
           and
-          collection_data_age_seconds{job="meteocore"}
-            >= collection_expected_interval_seconds{job="meteocore"} + 900
+          collection_data_age_seconds{job="meteocore", alerting!="false"}
+            >= collection_expected_interval_seconds{job="meteocore", alerting!="false"} + 900
         for: 10m
         labels:
           severity: warning
@@ -62,7 +65,7 @@ groups:
       # A collection that never loaded data, or whose data all aged out of
       # its window, has no data age series: collection_has_data says so.
       - alert: CollectionEmpty
-        expr: collection_has_data{job="meteocore"} == 0
+        expr: collection_has_data{job="meteocore", alerting!="false"} == 0
         for: 15m
         labels:
           severity: warning

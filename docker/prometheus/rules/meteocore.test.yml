@@ -67,6 +67,8 @@ tests:
   #   minutely: 1-minute interval, 10 minutes old: 3 intervals, but not
   #     15 minutes past one, so not stale.
   #   single: no interval series (one timestep, no expected_interval).
+  #   radar-site: as stale as radar, but labelled alerting="false" (a
+  #     radar site, #193): never matched.
   #   other job: never matched.
   - name: CollectionStale
     interval: 1m
@@ -97,6 +99,10 @@ tests:
         values: '60x20'
       - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="single"}'
         values: '999999x20'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="radar-site", alerting="false"}'
+        values: '1200x20'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="radar-site", alerting="false"}'
+        values: '300x20'
       - series: 'collection_data_age_seconds{job="other", instance="x:8000", collection="radar"}'
         values: '99999x20'
       - series: 'collection_expected_interval_seconds{job="other", instance="x:8000", collection="radar"}'
@@ -135,6 +141,10 @@ tests:
       # Empty for 10 minutes after a start, then filled: never fires.
       - series: 'collection_has_data{job="meteocore", instance="a:8000", collection="wis2"}'
         values: '0x10 1x10'
+      # A radar site (#193), empty all along: labelled alerting="false",
+      # never matched.
+      - series: 'collection_has_data{job="meteocore", instance="a:8000", collection="radar-site", alerting="false"}'
+        values: '0x20'
     alert_rule_test:
       - eval_time: 10m
         alertname: CollectionEmpty

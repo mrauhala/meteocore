@@ -43,6 +43,26 @@ around `ds-storage` calls (Critical Rules 6–7).
   `Arc`s), the parse cache's table and keys, and `SiteMeta`. A new owned
   field in `PolarVolume`/`Sweep`/`PolarMoment` goes into its `HeapSize` impl
   in `pvol.rs`.
+- **Scan metrics (#193).** `ParseCache` holds the parsed volumes with the
+  `ScanCounts` atomics (`src/scan_metrics.rs`): `scan_source` counts every
+  scan, the construction scan included, with its duration, and
+  `build_catalog` each pending volume once its outcome is known: cached,
+  parsed, read failure (a whole failed batch counts each file) or parse
+  failure. `scan_metrics()` reads them with one catalog snapshot; the
+  server turns them into `pvol_scans_total`, `pvol_scan_volumes_total`
+  and the catalog gauges. Do not name a family `*_cache_hits_total` for
+  the parse cache: the dashboard reads every such family as a byte-bounded
+  cache. Volumes `max_files` trims leave the parse cache, so every scan
+  reads them again and counts them as `parsed`. `storage_bytes_read()` is
+  the source store's counter, shared by every clone of the store (pixel
+  reads, cell warm-ups), and COMP's `OdimEngine::storage_bytes_read` the
+  same over its catalog's locations. `site_data_ages()` gives each site's
+  data age and measured interval; `admin::collection_data_ages` lists every
+  Ready `{base}-{nod}` health entry, so a site whose volumes all left the
+  catalog reports `collection_has_data` 0. Radar sites never alert: their
+  data age series carry `alerting="false"` and the rules exclude it, so
+  `odim-volume` is not in `DATA_AGE_ENGINES` and takes no
+  `expected_interval` (see `crates/server/CLAUDE.md`).
 
 ## Parameters & labels
 

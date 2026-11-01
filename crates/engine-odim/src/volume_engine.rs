@@ -92,6 +92,7 @@ use crate::pvol::{read_polar_volume, PolarMoment, PolarVolume, Sweep};
 use crate::quantities;
 use crate::read_budget::{Budget, Permit, BUDGET as READ_BUDGET};
 use crate::reader::{PixelClass, RawPixels, ReadError, VALUE_PRECISION};
+use crate::scan_metrics::{ScanCounts, ScanMetrics};
 
 /// Default lazy-pixel cache size (MB) when `MC_PVOL_PIXEL_CACHE_MB` is
 /// unset. One shared budget bounds resident decoded pixels across every
@@ -500,6 +501,16 @@ pub(crate) enum Source {
 /// `catalog::Location`). A plain `String` identity — the path string
 /// for local files, the object key for remote ones — sidesteps that.
 type FileId = String;
+
+/// A [`PolarVolumeEngine`]'s parse cache and what its scans did (#193).
+#[derive(Default)]
+pub(crate) struct ParseCache {
+    /// Metadata-only volumes keyed by file identity: exactly the catalog's,
+    /// sharing its `Arc`s ([`derive_catalog`] drops the rest).
+    pub(crate) volumes: Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+    /// Bumped by [`scan_source`] and [`build_catalog`].
+    pub(crate) counts: ScanCounts,
+}
 
 /// An inclusive `(start, end)` UTC time range — a parsed `time_window`
 /// resolved against "now".
@@ -2277,6 +2288,9 @@ pub(crate) struct Catalog {
     /// The estimated heap this catalog and the engine's parse cache hold
     /// (#1307), computed in [`derive_catalog`]: `pvol_catalog_bytes`.
     pub(crate) heap_bytes: u64,
+    /// The volumes `by_site` holds, counted in [`derive_catalog`]:
+    /// `pvol_catalog_volumes` (#193).
+    volumes: usize,
 }
 
 /// The estimated heap of one site's derived metadata (#1307).
@@ -2382,11 +2396,38 @@ const FETCH_CONCURRENCY: usize = 12;
 /// than every volume it holds for the site gets its `CELLS` cell set built
 /// from the bytes in hand (#1155). `None` at construction.
 ///
+/// Each scan is counted in `cache`'s [`ScanCounts`], with its duration
+/// (#193).
+///
 /// Blocking — remote scans bridge async object-store I/O internally.
 fn scan_source(
     collection_id: &str,
     source: &Source,
-    cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+    cache: &ParseCache,
+    max_files: Option<usize>,
+    depth: ScanDepth,
+    prewarm: &Prewarm,
+    cells_after: Option<&Catalog>,
+) -> Result<Catalog, EngineError> {
+    let started = std::time::Instant::now();
+    let scanned = list_and_build(
+        collection_id,
+        source,
+        cache,
+        max_files,
+        depth,
+        prewarm,
+        cells_after,
+    );
+    cache.counts.scanned(started.elapsed(), scanned.is_ok());
+    scanned
+}
+
+/// [`scan_source`]'s scan, uncounted.
+fn list_and_build(
+    collection_id: &str,
+    source: &Source,
+    cache: &ParseCache,
     max_files: Option<usize>,
     depth: ScanDepth,
     prewarm: &Prewarm,
@@ -2417,7 +2458,7 @@ fn scan_source(
             let mut by_site =
                 build_catalog(collection_id, pending, source, cache, prewarm, cells_after);
             retain_within(&mut by_site, time_filter);
-            Ok(derive_catalog(by_site, cache, max_files))
+            Ok(derive_catalog(by_site, &cache.volumes, max_files))
         }
         Source::Remote {
             store,
@@ -2433,7 +2474,7 @@ fn scan_source(
             // object listing can include volumes just outside the
             // window (the prefix is a whole UTC day).
             retain_within(&mut by_site, time_filter);
-            Ok(derive_catalog(by_site, cache, max_files))
+            Ok(derive_catalog(by_site, &cache.volumes, max_files))
         }
     }
 }
@@ -2729,15 +2770,28 @@ fn enumerate_remote(
 /// logged and skipped — it does not sink the whole scan. The grouped
 /// map is finalised (sorted, capped, metadata-derived) by
 /// [`derive_catalog`].
+///
+/// Each pending file is counted in `cache`'s counts (#193): taken from the
+/// parse cache, or read and then parsed, or failed to read or to parse.
 fn build_catalog(
     collection_id: &str,
     pending: Vec<PendingFile>,
     source: &Source,
-    cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+    cache: &ParseCache,
     prewarm: &Prewarm,
     cells_after: Option<&Catalog>,
 ) -> HashMap<String, Vec<VolumeEntry>> {
     use ds_storage::object_store::path::Path as ObjectPath;
+
+    let counts = &cache.counts;
+    let parse = |id: &str, bytes: &Bytes| {
+        let volume = parse_and_cache(collection_id, id, bytes, &cache.volumes);
+        match volume {
+            Some(_) => counts.parsed(),
+            None => counts.parse_failed(),
+        }
+        volume
+    };
 
     // The single source store backs every remote fetch (a scan has exactly
     // one `Source`); `None` for a local source, whose files are read inline.
@@ -2754,10 +2808,11 @@ fn build_catalog(
     for PendingFile { id, spec } in pending {
         // Cache hit — reuse the parsed volume, no fetch.
         let cached = {
-            let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let guard = cache.volumes.lock().unwrap_or_else(|e| e.into_inner());
             guard.get(&id).cloned()
         };
         if let Some(v) = cached {
+            counts.cached();
             insert_volume(collection_id, &mut by_site, id, v);
             continue;
         }
@@ -2765,7 +2820,7 @@ fn build_catalog(
             // Local reads are cheap; do them inline.
             FetchSpec::Local(path) => match std::fs::read(&path).map(Bytes::from) {
                 Ok(bytes) => {
-                    if let Some(v) = parse_and_cache(collection_id, &id, &bytes, cache) {
+                    if let Some(v) = parse(&id, &bytes) {
                         // Prime the pixel cache from the bytes still in hand
                         // (#472): off-peak the page cache for these files is
                         // routinely reclaimed, so without this the first
@@ -2789,7 +2844,10 @@ fn build_catalog(
                         insert_volume(collection_id, &mut by_site, id, v);
                     }
                 }
-                Err(e) => tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}"),
+                Err(e) => {
+                    counts.read_failed(1);
+                    tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}")
+                }
             },
             // Defer remote reads to the concurrent batch below.
             FetchSpec::Remote { key } => {
@@ -2809,6 +2867,7 @@ fn build_catalog(
                 remote_fetch.len()
             );
         }
+        counts.read_failed(remote_fetch.len());
         return by_site;
     };
 
@@ -2832,6 +2891,7 @@ fn build_catalog(
         ) {
             Ok(r) => r,
             Err(e) => {
+                counts.read_failed(chunk.len());
                 tracing::warn!("[{collection_id}] PVOL batch fetch failed: {e}");
                 continue;
             }
@@ -2839,7 +2899,7 @@ fn build_catalog(
         for ((id, _), res) in chunk.iter().zip(results) {
             match res {
                 Ok(bytes) => {
-                    if let Some(v) = parse_and_cache(collection_id, id, &bytes, cache) {
+                    if let Some(v) = parse(id, &bytes) {
                         // Prime the pixel cache from the bytes still in hand
                         // (background runtime), so the first interactive render
                         // of this newly-fetched volume is a cache hit instead
@@ -2853,6 +2913,7 @@ fn build_catalog(
                     }
                 }
                 Err(e) => {
+                    counts.read_failed(1);
                     tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}")
                 }
             }
@@ -3222,6 +3283,7 @@ fn derive_catalog(
     let heap_bytes = cache_bytes
         + catalog_bytes(&by_site, &by_site_meta)
         + ds_core::heap::HeapSize::heap_size(&sorted_nods);
+    let volumes = by_site.values().map(Vec::len).sum();
     Catalog {
         by_site,
         by_site_meta,
@@ -3230,6 +3292,7 @@ fn derive_catalog(
         features_time,
         feature_version,
         heap_bytes: heap_bytes as u64,
+        volumes,
     }
 }
 
@@ -3478,11 +3541,12 @@ pub struct PolarVolumeEngine {
     /// identity (local path string or S3 object key — see [`FileId`]) so a
     /// poll doesn't re-parse unchanged files' structure. Tiny now that
     /// pixel arrays are excluded (#289): a whole network's catalog fits in
-    /// memory. Behind an `Arc` so a scan can be moved off `self`.
+    /// memory. Behind an `Arc` so a scan can be moved off `self`. Carries
+    /// the counts of what the scans did ([`Self::scan_metrics`], #193).
     ///
     /// (Decoded pixel arrays live in the process-global [`pixel_cache`] LRU,
     /// not here — one byte-budget for the whole radar network.)
-    parse_cache: Arc<Mutex<HashMap<FileId, Arc<PolarVolume>>>>,
+    parse_cache: Arc<ParseCache>,
     poll_interval: Duration,
     /// Resampling method for the per-site Cartesian render, propagated to every
     /// [`PolarVolumeSiteView`] this engine spawns (`OdimConfig.resampling`).
@@ -3553,7 +3617,7 @@ impl PolarVolumeEngine {
             );
         }
 
-        let parse_cache = Arc::new(Mutex::new(HashMap::new()));
+        let parse_cache = Arc::new(ParseCache::default());
         // Bootstrap scan: parse only the most-recent slots so a whole-network
         // S3 source doesn't download hundreds of multi-MB volumes before the
         // server can bind. The background poll fills the full `time_window`
@@ -3646,7 +3710,7 @@ impl PolarVolumeEngine {
             prefix_pattern: prefix_pattern.to_string(),
             time_window: None,
         });
-        let parse_cache = Arc::new(Mutex::new(HashMap::new()));
+        let parse_cache = Arc::new(ParseCache::default());
         // Pre-warm one sweep so the test path exercises the prime-from-bytes
         // branch (the integration suite drives the full remote scan).
         let catalog = scan_source(
@@ -3687,6 +3751,45 @@ impl PolarVolumeEngine {
     /// read is O(1).
     pub fn catalog_bytes(&self) -> u64 {
         self.catalog.load().heap_bytes
+    }
+
+    /// What this engine's scans have done and the catalog they hold (#193):
+    /// atomic loads and one catalog snapshot, for `/metrics`.
+    pub fn scan_metrics(&self) -> ScanMetrics {
+        let catalog = self.catalog.load();
+        self.parse_cache
+            .counts
+            .snapshot(catalog.volumes, catalog.by_site.len())
+    }
+
+    /// The bytes read from the remote store since the engine was built:
+    /// the scans' downloads, the pixel reads and the cell-set warm-ups (#193).
+    /// 0 for a local source.
+    pub fn storage_bytes_read(&self) -> u64 {
+        match &*self.source {
+            Source::Remote { store, .. } => store.bytes_read(),
+            Source::Local { .. } => 0,
+        }
+    }
+
+    /// Each radar site's data age and expected interval, keyed by `nod`,
+    /// from one catalog snapshot (#193): now minus the site's newest volume
+    /// time, and the spacing of its newest volume times
+    /// ([`ds_core::health::expected_interval`], `None` below two). A site
+    /// whose volumes all left the catalog is absent: its collection holds
+    /// no data.
+    pub fn site_data_ages(&self) -> HashMap<String, (chrono::Duration, Option<chrono::Duration>)> {
+        let now = Utc::now();
+        self.catalog
+            .load()
+            .by_site_meta
+            .iter()
+            .filter_map(|(nod, meta)| {
+                let newest = *meta.times.last()?;
+                let interval = ds_core::health::expected_interval(meta.times.iter().rev().copied());
+                Some((nod.clone(), (now - newest, interval)))
+            })
+            .collect()
     }
 
     /// Publish the catalog's floor on the pixel cache ([`prewarm_floor`],
@@ -12762,7 +12865,7 @@ mod tests {
             }),
             max_files: None,
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
-            parse_cache: Arc::new(Mutex::new(HashMap::new())),
+            parse_cache: Arc::default(),
             poll_interval: Duration::from_secs(30),
             resampling: ResamplingMethod::default(),
             prewarm: Prewarm::default_quantity(1),
@@ -13123,5 +13226,164 @@ mod tests {
             crate::resize_composite_cache,
         );
         resizes_in_place(crate::cell_set_cache_metrics, crate::resize_cell_set_cache);
+    }
+
+    // -- Scan metrics (#193) ------------------------------------------------
+
+    /// #193: every scan of a local source is counted, the construction scan
+    /// included, with each volume taken from the parse cache or read: a
+    /// later scan reads only what the cache lacks, a file that does not
+    /// parse is read again by every scan, and a scan that cannot list the
+    /// source counts as failed and keeps the catalog.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scans_count_parse_cache_hits_misses_and_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("volumes");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("a.h5"), COLD_BATCH).unwrap();
+        std::fs::write(data.join("broken.h5"), b"not an HDF5 file").unwrap();
+        let config = ds_core::config::OdimConfig {
+            prewarm_sweeps: 0,
+            ..empty_config()
+        };
+        let engine = PolarVolumeEngine::new("pvol-scans-193", data.to_str(), &config).unwrap();
+        let built = engine.scan_metrics();
+        assert!(built.last_scan > Duration::ZERO, "{built:?}");
+        assert_eq!(
+            ScanMetrics {
+                last_scan: Duration::ZERO,
+                ..built
+            },
+            ScanMetrics {
+                scans_ok: 1,
+                parsed: 1,
+                parse_failures: 1,
+                volumes: 1,
+                sites: 1,
+                ..ScanMetrics::default()
+            }
+        );
+        assert_eq!(engine.storage_bytes_read(), 0, "a local source");
+
+        engine.poll_once().await;
+        let polled = engine.scan_metrics();
+        assert_eq!(
+            (polled.scans_ok, polled.cached, polled.parsed),
+            (2, 1, 1),
+            "{polled:?}"
+        );
+        assert_eq!(
+            polled.parse_failures, 2,
+            "the broken file is read again: {polled:?}"
+        );
+
+        std::fs::remove_dir_all(&data).unwrap();
+        engine.poll_once().await;
+        let failed = engine.scan_metrics();
+        assert_eq!((failed.scans_ok, failed.scans_failed), (2, 1), "{failed:?}");
+        assert_eq!(
+            (failed.volumes, failed.sites),
+            (1, 1),
+            "the catalog is kept"
+        );
+    }
+
+    /// #193: a remote scan counts a download that fails as a read failure
+    /// and one that does not parse as a parse failure, both parse-cache
+    /// misses; the downloads count in `storage_bytes_read`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_scans_count_read_failures_and_the_bytes_downloaded() {
+        use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+        let inner = Arc::new(ds_storage::object_store::memory::InMemory::new());
+        let put = |key: &'static str, bytes: &'static [u8]| {
+            let inner = inner.clone();
+            async move {
+                let key = ds_storage::object_store::path::Path::from(key);
+                inner
+                    .put(&key, PutPayload::from_static(bytes))
+                    .await
+                    .unwrap();
+            }
+        };
+        put("scan-193/202609161200_test_PVOL.h5", COLD_BATCH).await;
+        put("scan-193/202609161205_test_PVOL.h5", COLD_BATCH).await;
+        let counted = Arc::new(CountingStore {
+            inner: inner.clone(),
+            gets: Mutex::default(),
+            fail_first: Mutex::default(),
+            forbidden: Mutex::default(),
+        });
+        let store = ds_storage::DataStore::new(counted.clone());
+        let engine =
+            PolarVolumeEngine::new_remote_for_test("pvol-remote-193", store, "scan-193/").unwrap();
+        let built = engine.scan_metrics();
+        assert_eq!(
+            (built.scans_ok, built.parsed, built.volumes),
+            (1, 2, 2),
+            "{built:?}"
+        );
+        let len = COLD_BATCH.len() as u64;
+        assert_eq!(engine.storage_bytes_read(), 2 * len, "both downloads");
+
+        let forbidden = "scan-193/202609161210_test_PVOL.h5";
+        put(forbidden, COLD_BATCH).await;
+        counted.forbid(forbidden, true);
+        put("scan-193/202609161215_test_PVOL.h5", b"not an HDF5 file").await;
+        engine.poll_once().await;
+        let polled = engine.scan_metrics();
+        assert_eq!(
+            ScanMetrics {
+                last_scan: Duration::ZERO,
+                ..polled
+            },
+            ScanMetrics {
+                scans_ok: 2,
+                cached: 2,
+                parsed: 2,
+                read_failures: 1,
+                parse_failures: 1,
+                volumes: 2,
+                sites: 1,
+                ..ScanMetrics::default()
+            }
+        );
+        // The broken file's download at least; the poll also builds the
+        // `CELLS` sets of the catalogued volumes from downloads of its own.
+        assert!(engine.storage_bytes_read() >= 2 * len + 16);
+    }
+
+    /// #193: each site's data age is now minus its newest volume, with the
+    /// spacing of its newest volumes as its expected interval, `None` for a
+    /// single volume.
+    #[test]
+    fn site_data_ages_are_each_sites_newest_volume_and_spacing() {
+        let now = Utc::now();
+        let at = |minutes_ago: i64, lon: f64, id: &str| {
+            let mut volume = synthetic_volume(lon, 60.0);
+            volume.time = now - chrono::Duration::minutes(minutes_ago);
+            entry(volume, id)
+        };
+        let mut by_site = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![
+                at(20, 24.5, "ages-a"),
+                at(15, 24.5, "ages-b"),
+                at(10, 24.5, "ages-c"),
+            ],
+        );
+        by_site.insert("fikor".to_string(), vec![at(30, 21.0, "ages-d")]);
+        let engine = engine_for(by_site, "pvol-ages-193");
+        let ages = engine.site_data_ages();
+        assert_eq!(ages.len(), 2, "{ages:?}");
+        let (age, interval) = ages["fivih"];
+        assert!(
+            (chrono::Duration::minutes(10)..chrono::Duration::minutes(11)).contains(&age),
+            "{age}"
+        );
+        assert_eq!(interval, Some(chrono::Duration::minutes(5)));
+        assert_eq!(ages["fikor"].1, None, "one volume has no spacing");
+        let metrics = engine.scan_metrics();
+        assert_eq!((metrics.volumes, metrics.sites), (4, 2));
     }
 }

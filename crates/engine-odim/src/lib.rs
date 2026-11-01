@@ -30,12 +30,14 @@ pub mod pvol;
 pub mod quantities;
 pub mod read_budget;
 pub mod reader;
+mod scan_metrics;
 pub mod volume_engine;
 pub mod voxel_diagnostics;
 
 pub use cells::{cell_set_cache_metrics, resize_cell_set_cache};
 pub use engine::{composite_cache_metrics, resize_composite_cache, EngineError, OdimEngine};
 pub use pixel_cache::PixelCache;
+pub use scan_metrics::ScanMetrics;
 pub use volume_engine::{
     pixel_cache_metrics, resize_pixel_cache, resize_voxel_grid_cache, voxel_grid_cache_metrics,
     AbortReason, PolarVolumeEngine, PolarVolumeSiteView,

@@ -2812,7 +2812,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 
 | Field | Meaning |
 |-------|---------|
-| `data_age_secs` | Now minus the newest data the collection serves: the newest timestep (GeoTIFF), the newest run's origin time (QueryData), the newest report (BUFR), the newest scan (satellite), the latest generation's anchor frame (nowcast). The `collection_data_age_seconds` gauge reports the same value. It keeps growing when a feeder stalls even though the old files are still found. Absent while the collection holds no data, which `collection_has_data` 0 reports |
+| `data_age_secs` | Now minus the newest data the collection serves: the newest timestep (GeoTIFF), the newest run's origin time (QueryData), the newest report (BUFR), the newest scan (satellite), the latest generation's anchor frame (nowcast), a radar site collection's newest volume (polar volumes; the source's site inventory has none). The `collection_data_age_seconds` gauge reports the same value, for a radar site labelled `alerting="false"`. It keeps growing when a feeder stalls even though the old files are still found. Absent while the collection holds no data, which `collection_has_data` 0 reports |
 | `poll_age_secs` | GeoTIFF and QueryData: time since the last poll that found data. It grows while the source is unreachable or empty |
 
 ### Prometheus Metrics
@@ -2836,9 +2836,9 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `collections_healthy` | gauge | — | Collections in ready state |
 | `collections_degraded` | gauge | — | Collections in degraded state |
 | `collections_failed` | gauge | — | Collections in failed state |
-| `collection_data_age_seconds` | gauge | collection | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that hold data |
-| `collection_has_data` | gauge | collection | 1 while a collection whose engine reports a data age (GeoTIFF, QueryData, BUFR, satellite, NetCDF, nowcast) holds data, 0 when it holds none: it never loaded any, or all of it aged out of a satellite `time_window` or a BUFR `retention`. Alert on it next to the data age, which has no series then |
-| `collection_expected_interval_seconds` | gauge | collection | How often the collection's data arrives, measured on the timeline its data age is: the median spacing of the newest six timesteps (GeoTIFF), runs (QueryData, NetCDF with runs), valid times (NetCDF without runs), distinct report times (BUFR), scans (satellite) or generations (nowcast). The collection's `expected_interval` wins. No series below two timesteps without one |
+| `collection_data_age_seconds` | gauge | collection, alerting | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that hold data. A radar site's series, and its two below, carry `alerting="false"`, which the freshness alerts leave out (see [Alerting](#alerting)); no other series has the label |
+| `collection_has_data` | gauge | collection, alerting | 1 while a collection whose engine reports a data age (GeoTIFF, QueryData, BUFR, satellite, NetCDF, nowcast, polar-volume site) holds data, 0 when it holds none: it never loaded any, or all of it aged out of a satellite `time_window`, a BUFR `retention` or a polar-volume source's window. Alert on it next to the data age, which has no series then |
+| `collection_expected_interval_seconds` | gauge | collection, alerting | How often the collection's data arrives, measured on the timeline its data age is: the median spacing of the newest six timesteps (GeoTIFF), runs (QueryData, NetCDF with runs), valid times (NetCDF without runs), distinct report times (BUFR), scans (satellite), generations (nowcast) or volumes (polar-volume site). The collection's `expected_interval` wins. No series below two timesteps without one |
 
 **GeoTIFF tile cache** (per-collection, compressed byte cache for remote COGs; every GeoTIFF collection has the series, a local one with capacity 0):
 
@@ -2961,12 +2961,22 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `render_deadline_exceeded_total` | counter | stage | Render deadline expiries: `queue` waiting for memory or a slot, `render` after admission |
 | `render_phase_seconds` | histogram | api, phase | Served WMS/Maps/Tiles render time per phase: `queue`, `engine`, `assemble` (WMS meta-tiles), `encode` |
 | `render_semaphore_total` | gauge | — | Total render permits (`[server] render_concurrency`, default 2× CPU cores, min 8) |
-| `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage |
+| `storage_bytes_read_total` | counter | collection, engine_type | Bytes read from remote storage by a GeoTIFF, GRIB, ODIM composite (`odim`) or polar-volume (`odim-volume`, by the source's id) collection |
 | `zarr_icechunk_storage_requests_total` | counter | collection | Storage requests an Icechunk repository issued: each part of a ranged read, each listing and each Icechunk retry. Retries inside the HTTP client are not counted |
 | `zarr_icechunk_storage_read_bytes_total` | counter | collection | Bytes the bodies of an Icechunk repository's storage reads yielded |
 | `zarr_icechunk_prefetched_ranges_total` | counter | collection, outcome | Cold inner chunks a query planned to fetch together ahead of its decodes, each counted once: `used`, taken by a decode; `unused`, dropped after 30 s with no decode asking; `skipped`, cached or staged already, or inline or absent; `serial`, refused staging room or half the read budget; `failed`; `expired`, cut off by the request deadline |
 | `zarr_icechunk_staged_bytes` | gauge | collection | Bytes of chunk ranges an Icechunk collection fetched ahead that no decode has taken yet, held outside the payload cache; at most one payload-cache shard |
 | `zarr_icechunk_preloads_stopped_total` | counter | collection | Catalog builds that published before loading every manifest and shard index ahead, at the preload's 30-second bound |
+
+**Polar-volume sources** (per `odim-volume` source, by the source's id; its radar sites' data ages are under Collections & health):
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pvol_scans_total` | counter | collection, result | Scans of the source, the construction scan included: `ok`, or `failed` when the source could not be listed and the previous catalog is kept |
+| `pvol_last_scan_duration_seconds` | gauge | collection | Duration of the latest scan: listing, downloads, parses and the pixel pre-warm |
+| `pvol_scan_volumes_total` | counter | collection, outcome | Volumes the scans went through: `cached`, from the parse cache with nothing read; `parsed`; `read_failed`; `parse_failed`. All but `cached` are parse-cache misses, and a failed volume is read again by the next scan. Misses well above the new volumes per poll mean `max_files` trims volumes the window still lists: every scan reads them again, so bound the source with `time_window` |
+| `pvol_catalog_volumes` | gauge | collection | Volumes the catalog holds. The parse cache holds exactly these; their heap is `pvol_catalog_bytes` |
+| `pvol_catalog_sites` | gauge | collection | Radar sites the catalog holds |
 
 #### Computing cache hit rates
 
@@ -3069,8 +3079,8 @@ normal CI without the review credential.
 | Alert | Fires when | For | Severity |
 |-------|------------|-----|----------|
 | `MeteoCoreDown` | the scrape fails: `up == 0` | 2m | critical |
-| `CollectionStale` | `collection_data_age_seconds` is at least 3 × `collection_expected_interval_seconds`, and at least the interval + 15 min | 10m | warning |
-| `CollectionEmpty` | `collection_has_data == 0`: the collection never loaded data, or all of it aged out | 15m | warning |
+| `CollectionStale` | `collection_data_age_seconds` is at least 3 × `collection_expected_interval_seconds`, and at least the interval + 15 min; not for radar sites | 10m | warning |
+| `CollectionEmpty` | `collection_has_data == 0`: the collection never loaded data, or all of it aged out; not for radar sites | 15m | warning |
 | `CollectionsFailed` | `collections_failed > 0` | 5m | warning |
 | `HighServerErrorRate` | 5xx responses above 5 % of an API's requests, per API (routes without an API, such as `/health`, are left out) | 10m | warning |
 | `WmsErrorTiles` | error tiles above 5 % of a collection's GetMap responses (`wms_error_tiles_total` over itself plus `render_duration_seconds_count{api="wms"}`) | 10m | warning |
@@ -3078,7 +3088,7 @@ normal CI without the review credential.
 | `UpstreamThrottled` | `storage_host_throttled_total` rising: a remote host answers 429 | 15m | info |
 | `MemoryHigh` | `process_resident_memory_bytes` above the memory plan's total, `memory_plan_total_bytes` (#1312); no series, and so quiet, on a server without that gauge | 15m | warning |
 
-The freshness alert needs no per-feed threshold: each collection's expected interval is measured on the timeline its data age is, so a 5-minute radar composite is stale at 20 minutes and a model with four runs a day only after 18 hours, while a 6-hourly model 5 hours after its last run is not. The 15 minutes keep a feed every minute from being stale after three. A collection with a single timestep or run has no measured interval and never goes stale; give it `expected_interval` in its config, as an irregular feed would need too. A collection serving a fixed archive is stale by this rule: silence the alert for it in Alertmanager.
+The freshness alert needs no per-feed threshold: each collection's expected interval is measured on the timeline its data age is, so a 5-minute radar composite is stale at 20 minutes and a model with four runs a day only after 18 hours, while a 6-hourly model 5 hours after its last run is not. The 15 minutes keep a feed every minute from being stale after three. A collection with a single timestep or run has no measured interval and never goes stale; give it `expected_interval` in its config, as an irregular feed would need too. A collection serving a fixed archive is stale by this rule: silence the alert for it in Alertmanager. Radar sites of a polar-volume source report a data age, but both freshness alerts leave them out: their series carry `alerting="false"`, which each selector excludes. Those radars are run by another service and go down for maintenance, which this server cannot fix; the dashboards still show their age.
 
 The thresholds are starting points. Change them in `docker/prometheus/rules/meteocore.yml`: the number after the comparison, the `for` duration, the `[5m]` rate window. `MemoryHigh` compares with the server's own planned memory total, `memory_plan_total_bytes` (#1312), so it needs no number here and stays quiet until the server exports that gauge; for a fixed threshold, replace `memory_plan_total_bytes{job="meteocore"}` with a number of bytes. Every selector names `job="meteocore"`, the compose stack's scrape job; under another job name, replace it throughout (the chart does this itself). Run the rules' unit tests after a change; each alert has one that fires and one that stays quiet, and CI runs both commands:
 
