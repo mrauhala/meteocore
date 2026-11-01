@@ -84,13 +84,19 @@ impl InFlightLoads {
     }
 
     /// Park until no other thread is loading `path`, then atomically either
-    /// observe the work done or claim the path. Returns `None` if `is_done`
-    /// reports the work complete (nothing left to do); `Some(guard)` if the
-    /// caller is now the loader — dropping the guard (on success, error, or
-    /// panic) releases the claim and wakes waiters, so the pairing is
-    /// compiler-enforced. If the in-flight loader exceeds
+    /// observe the work done or claim the path. Returns `Ok(None)` if
+    /// `is_done` reports the work complete (nothing left to do);
+    /// `Ok(Some(guard))` if the caller is now the loader — dropping the guard
+    /// (on success, error, or panic) releases the claim and wakes waiters, so
+    /// the pairing is compiler-enforced. If the in-flight loader exceeds
     /// `CONCURRENT_LOAD_WAIT` the caller claims the path anyway rather than
     /// failing the request.
+    ///
+    /// `until` is the request's deadline when one is in scope (#18). The wait
+    /// ends there with `DeadlineExceeded` and no claim, so the loader's load
+    /// runs on and installs for the requests after it. Nor does a caller
+    /// claim a load it would start past `until`. Without a deadline the wait
+    /// is as above.
     ///
     /// `is_done` is invoked while `self.paths` is held; it must not acquire
     /// that lock (directly or transitively) or the thread deadlocks itself.
@@ -98,12 +104,23 @@ impl InFlightLoads {
         &self,
         path: &Path,
         is_done: impl Fn() -> bool,
-    ) -> Option<InFlightGuard<'_>> {
+        until: Option<std::time::Instant>,
+    ) -> Result<Option<InFlightGuard<'_>>, DataServerError> {
         let mut in_flight = self.paths.lock().unwrap_or_else(|e| e.into_inner());
-        let deadline = std::time::Instant::now() + CONCURRENT_LOAD_WAIT;
+        let stuck = std::time::Instant::now() + CONCURRENT_LOAD_WAIT;
+        let expired = |now| until.is_some_and(|until| now >= until);
         while in_flight.contains(path) {
             let now = std::time::Instant::now();
-            if now >= deadline {
+            if expired(now) {
+                // Leave the load to its loader: never claim it from under
+                // the requests waiting on it.
+                return if is_done() {
+                    Ok(None)
+                } else {
+                    Err(DataServerError::DeadlineExceeded)
+                };
+            }
+            if now >= stuck {
                 // Stuck loader: deliberately claim anyway rather than fail
                 // the request. The insert below is a no-op and whichever
                 // load finishes first clears the path — same liveness
@@ -113,18 +130,22 @@ impl InFlightLoads {
                 // fetches of the same asset, not just one duplicate.
                 break;
             }
+            let end = until.map_or(stuck, |until| until.min(stuck));
             let (guard, _) = self
                 .completed
-                .wait_timeout(in_flight, deadline - now)
+                .wait_timeout(in_flight, end.saturating_duration_since(now))
                 .unwrap_or_else(|e| e.into_inner());
             in_flight = guard;
         }
         if is_done() {
-            return None;
+            return Ok(None);
+        }
+        if expired(std::time::Instant::now()) {
+            return Err(DataServerError::DeadlineExceeded);
         }
         in_flight.insert(path.to_path_buf());
         drop(in_flight);
-        Some(InFlightGuard::new(self, path.to_path_buf()))
+        Ok(Some(InFlightGuard::new(self, path.to_path_buf())))
     }
 
     /// Non-blocking claim for the async poll-cycle preload (#90): never
@@ -475,6 +496,15 @@ impl GeoTiffEngine {
                 prev + 1,
                 STAC_CIRCUIT_BREAKER_COOLDOWN.as_secs()
             );
+        }
+    }
+
+    /// Record a failed on-demand STAC listing for the circuit breaker,
+    /// unless the request's deadline kept it from starting (#18): that says
+    /// nothing of the STAC API.
+    fn record_stac_listing_error(&self, e: &DataServerError) {
+        if !matches!(e, DataServerError::DeadlineExceeded) {
+            self.record_stac_failure();
         }
     }
 
@@ -1402,6 +1432,12 @@ impl GeoTiffEngine {
     /// Uses `loading_in_flight` to prevent concurrent loads for the same entry.
     /// An entry whose asset the load finds gone leaves the catalog (#1119);
     /// that is no error.
+    ///
+    /// Under a request deadline (`ds_core::deadline`, #18), waiting for
+    /// another loader of the entry ends at the deadline with
+    /// `DeadlineExceeded` while that load goes on, and no load starts past
+    /// it. A load this call started runs to its end whatever the deadline:
+    /// other requests may be waiting for it, and it installs for the retry.
     fn ensure_metadata(&self, timestamp: &DateTime<Utc>) -> Result<(), DataServerError> {
         // Fast path: check if already loaded
         if self.is_metadata_loaded(timestamp) {
@@ -1426,10 +1462,11 @@ impl GeoTiffEngine {
         // done-check happens under the in-flight lock, so two losers of the
         // race can't both end up loading the same asset. The guard releases
         // the claim and wakes waiters on drop — success, error, or panic.
-        let _guard = match self
-            .loading_in_flight
-            .wait_then_claim(path, || self.is_metadata_loaded(timestamp))
-        {
+        let _guard = match self.loading_in_flight.wait_then_claim(
+            path,
+            || self.is_metadata_loaded(timestamp),
+            ds_core::deadline::current(),
+        )? {
             None => return Ok(()),
             Some(guard) => guard,
         };
@@ -1539,14 +1576,17 @@ impl GeoTiffEngine {
     /// load `STAC_PRELOAD_CONCURRENCY` at a time through the shared async
     /// loader, under one `block_on` of the STAC bridge, never as N sequential
     /// round trips (root Critical Rule 9). No load starts once the request's
-    /// deadline (`ds_core::deadline`) has passed: the query is then the
-    /// 504, and what loaded stays loaded for a retry. An item the poll
-    /// preload or another request is loading is waited for afterwards, when
-    /// this query holds no claim, so two loaders never wait on each other.
-    /// The first failed load fails the query, as the sequential loop did; the
-    /// loads still in flight are dropped and release their claims. A load
-    /// that finds its asset gone is no failure: the item leaves the catalog,
-    /// so the query answers without it (#1119).
+    /// deadline (`ds_core::deadline`) has passed; the EDR executor has
+    /// answered the client's 504 by then. The worker still waits for the
+    /// loads in flight to end, a failed one included, before it returns
+    /// (#18): other requests may be waiting for them, and what loaded stays
+    /// loaded for a retry. An item the poll preload or another request is
+    /// loading is waited for afterwards, when this query holds no claim, so
+    /// two loaders never wait on each other, and no longer than the deadline.
+    /// Within the deadline the first failed load fails the query, as the
+    /// sequential loop did; the loads still in flight are dropped and release
+    /// their claims. A load that finds its asset gone is no failure: the item
+    /// leaves the catalog, so the query answers without it (#1119).
     fn load_cold_stac_entries(
         &self,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -1568,27 +1608,49 @@ impl GeoTiffEngine {
             Some(d) if std::time::Instant::now() >= d => Err(DataServerError::DeadlineExceeded),
             _ => Ok(()),
         };
-        let held_elsewhere = client.block_on(async {
+        let (held_elsewhere, expired) = client.block_on(async {
             let mut loads = futures::stream::iter(cold)
                 .map(|target| async move {
-                    check_deadline()?;
+                    // `None`: not started, the deadline has passed.
+                    if check_deadline().is_err() {
+                        return Ok(None);
+                    }
                     let timestamp = target.0;
                     let load = self.claim_and_load_stac_entry(client, target).await?;
-                    Ok::<_, DataServerError>((timestamp, load))
+                    Ok::<_, DataServerError>(Some((timestamp, load)))
                 })
                 .buffer_unordered(STAC_PRELOAD_CONCURRENCY);
             let mut held_elsewhere = Vec::new();
+            let mut expired = false;
+            // Past the deadline the loads left start nothing, while the ones
+            // in flight, claims other requests may wait on, all end (#18):
+            // a failed one is logged, not a reason to drop the others.
             while let Some(load) = loads.next().await {
-                if let (timestamp, StacLoad::HeldElsewhere) = load? {
-                    held_elsewhere.push(timestamp);
+                match load {
+                    Ok(Some((timestamp, StacLoad::HeldElsewhere))) => {
+                        held_elsewhere.push(timestamp)
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => expired = true,
+                    Err(e) if check_deadline().is_err() => {
+                        expired = true;
+                        tracing::warn!(
+                            "[{}] STAC metadata load failed past the query deadline: {e}",
+                            self.collection_id
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
             }
-            Ok(held_elsewhere)
+            Ok((held_elsewhere, expired))
         })?;
-        // Each waits for its loader and loads the item itself only if that
-        // loader failed or dropped it. Bounded by the other loaders' claims
-        // on this window, not by the window: never loop `ensure_metadata`
-        // over the cold items themselves.
+        if expired {
+            return Err(DataServerError::DeadlineExceeded);
+        }
+        // Each waits for its loader, no longer than the deadline, and loads
+        // the item itself only if that loader failed or dropped it. Bounded
+        // by the other loaders' claims on this window, not by the window:
+        // never loop `ensure_metadata` over the cold items themselves.
         for timestamp in &held_elsewhere {
             check_deadline()?;
             self.ensure_metadata(timestamp)?;
@@ -1704,7 +1766,7 @@ impl GeoTiffEngine {
                 ))
             }
             Err(e) => {
-                self.record_stac_failure();
+                self.record_stac_listing_error(&e);
                 Err(e)
             }
         }
@@ -2056,6 +2118,9 @@ impl GeoTiffEngine {
         let tile_cache = self.request_tile_cache();
 
         for (timestamp, entry) in &entries {
+            // Past the request's deadline no further file is read (#18): a
+            // local read checks no deadline of its own.
+            ds_core::deadline::check()?;
             times.push(**timestamp);
 
             let (metadata, source) = match (entry.metadata(), entry.source()) {
@@ -2198,6 +2263,8 @@ impl GeoTiffEngine {
         let tile_cache = self.request_tile_cache();
 
         for (timestamp, entry) in &entries {
+            // As in `query_point`: no further file past the deadline (#18).
+            ds_core::deadline::check()?;
             times.push(**timestamp);
 
             let (metadata, source) = match (entry.metadata(), entry.source()) {
@@ -2466,7 +2533,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                         self.store_stac_catalog(updated);
                     }
                     Err(e) => {
-                        self.record_stac_failure();
+                        self.record_stac_listing_error(&e);
                         return Err(e);
                     }
                 }
@@ -2559,6 +2626,11 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 values: ds_core::map_engine::RasterValues::F64(vec![None; total_pixels]),
             });
         };
+
+        // A render whose deadline passed, during a STAC load it finished for
+        // the retry or meanwhile, builds no grid and decodes nothing (#18):
+        // its answer is gone. A local read checks no deadline of its own.
+        ds_core::deadline::check()?;
 
         // Select the best overview level for the output resolution.
         // This avoids reading millions of full-resolution pixels for zoomed-out views.
@@ -3193,7 +3265,7 @@ mod tests {
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Loader claims the path.
-        let loader_guard = loads.wait_then_claim(&path, || false);
+        let loader_guard = loads.wait_then_claim(&path, || false, None).unwrap();
         assert!(loader_guard.is_some());
 
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -3205,7 +3277,8 @@ mod tests {
             std::thread::spawn(move || {
                 barrier.wait();
                 loads
-                    .wait_then_claim(&path, || done.load(Ordering::SeqCst))
+                    .wait_then_claim(&path, || done.load(Ordering::SeqCst), None)
+                    .unwrap()
                     .is_none()
             })
         };
@@ -3234,7 +3307,7 @@ mod tests {
         let loads = Arc::new(InFlightLoads::new());
         let path = PathBuf::from("b.tif");
 
-        let loader_guard = loads.wait_then_claim(&path, || false);
+        let loader_guard = loads.wait_then_claim(&path, || false, None).unwrap();
         assert!(loader_guard.is_some());
 
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -3244,7 +3317,7 @@ mod tests {
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 barrier.wait();
-                let takeover = loads.wait_then_claim(&path, || false);
+                let takeover = loads.wait_then_claim(&path, || false, None).unwrap();
                 let claimed = takeover.is_some();
                 // While the takeover guard is alive, the claim is held.
                 if claimed {
@@ -3270,16 +3343,61 @@ mod tests {
     fn in_flight_unclaimed_path_claims_immediately() {
         let loads = InFlightLoads::new();
         let path = PathBuf::from("c.tif");
-        let guard = loads.wait_then_claim(&path, || false);
+        let guard = loads.wait_then_claim(&path, || false, None).unwrap();
         assert!(guard.is_some());
         assert!(loads.paths.lock().unwrap().contains(&path));
         // Already-done work short-circuits without claiming.
         let other = PathBuf::from("d.tif");
-        assert!(loads.wait_then_claim(&other, || true).is_none());
+        assert!(loads
+            .wait_then_claim(&other, || true, None)
+            .unwrap()
+            .is_none());
         assert!(!loads.paths.lock().unwrap().contains(&other));
         // Dropping the guard releases the claim.
         drop(guard);
         assert!(!loads.paths.lock().unwrap().contains(&path));
+    }
+
+    /// #18: the request's deadline bounds the wait for another loader. The
+    /// wait ends there with `DeadlineExceeded` and no claim, so the loader
+    /// keeps its load; no load is claimed past the deadline, while work done
+    /// is still found done. Without a deadline the wait is as in the tests
+    /// above.
+    #[test]
+    fn in_flight_wait_ends_at_the_deadline_and_leaves_the_claim() {
+        use std::time::Instant;
+        let loads = InFlightLoads::new();
+        let path = PathBuf::from("e.tif");
+        let loader = loads.wait_then_claim(&path, || false, None).unwrap();
+        assert!(loader.is_some());
+
+        let start = Instant::now();
+        let until = start + Duration::from_millis(50);
+        let waited = loads.wait_then_claim(&path, || false, Some(until));
+        assert!(matches!(waited, Err(DataServerError::DeadlineExceeded)));
+        assert!(Instant::now() >= until, "waits until the deadline");
+        assert!(
+            start.elapsed() < CONCURRENT_LOAD_WAIT / 2,
+            "not until the stuck-loader bound"
+        );
+        assert!(
+            loads.paths.lock().unwrap().contains(&path),
+            "the loader keeps its claim"
+        );
+        // A load settled before its claim drops is found done.
+        assert!(loads
+            .wait_then_claim(&path, || true, Some(start))
+            .unwrap()
+            .is_none());
+
+        drop(loader);
+        let late = loads.wait_then_claim(&path, || false, Some(start));
+        assert!(matches!(late, Err(DataServerError::DeadlineExceeded)));
+        assert!(!loads.paths.lock().unwrap().contains(&path), "no claim");
+        assert!(loads
+            .wait_then_claim(&path, || true, Some(start))
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -4019,6 +4137,50 @@ mod tests {
         let ndarray = &result.ranges["reflectivity"];
         assert_eq!(ndarray.shape, vec![5, y.len(), x.len()]);
         assert_eq!(ndarray.values.len(), 5 * y.len() * x.len());
+    }
+
+    /// #18: a request past its deadline reads no further file. A local read
+    /// checks no deadline of its own, so the EDR position and area loops
+    /// check it before each file and a render before it decodes, instead of
+    /// reading what nobody will receive. Without a deadline in scope, or
+    /// within it, the same requests answer.
+    #[test]
+    fn a_request_past_its_deadline_reads_no_further_file() {
+        use ds_core::map_engine::{MapEngine, OutputCrs};
+        let engine = radar_engine();
+        let requests = |deadline: Option<std::time::Instant>| {
+            let _deadline = ds_core::deadline::enter(deadline);
+            [
+                engine.query_point(60.2, 24.7, None, None).map(drop),
+                engine
+                    .query_bbox(24.5, 60.0, 25.0, 60.5, None, None)
+                    .map(drop),
+                engine
+                    .get_raster_tile(
+                        [20.0, 59.0, 32.0, 70.0],
+                        64,
+                        64,
+                        None,
+                        &OutputCrs::Wgs84,
+                        None,
+                        None,
+                        None,
+                    )
+                    .map(drop),
+            ]
+        };
+        for result in requests(Some(std::time::Instant::now())) {
+            assert!(
+                matches!(result, Err(DataServerError::DeadlineExceeded)),
+                "{result:?}"
+            );
+        }
+        let later = std::time::Instant::now() + Duration::from_secs(60);
+        for deadline in [None, Some(later)] {
+            for result in requests(deadline) {
+                assert!(result.is_ok(), "{deadline:?}: {result:?}");
+            }
+        }
     }
 
     /// A range's precision is its files' sample type (#1341): the float32
