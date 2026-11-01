@@ -743,11 +743,16 @@ what it cannot take away yet:
   count), where a GRIB grid or message cache's hot share still holds a 0.1°
   field (its build size, 256 MiB by default), and at the 8 MiB the NetCDF
   metadata block cache needs. The plan never gives a cache less than that.
-  To go lower, pin the size: a changed key rebuilds the cache at it.
+  A restart does not help: it builds the same caches at the same default
+  sizes, with the same shards and hot shares, so the floors come back. To
+  go lower, pin the size with its key or `MC_…` variable, so the cache is
+  built small: a changed key rebuilds it at once, a variable at the next
+  restart. On a small host with many CPUs, pin the meta-tile, PVOL pixel
+  and GRIB grid caches this way.
 - **What a held cache keeps, the plan counts**, by how long the hold
   lasts:
-  - A shrink stopped in place lasts until a restart, so it counts as a
-    pin: everything else is cut around it in the order above, the
+  - A shrink stopped in place lasts as long as the cache was built that
+    way, a restart included, so it counts as a pin: everything else is cut around it in the order above, the
     budgets toward 128 and 64 MiB and the demand caches last, and the
     plan still fits where the total allows.
   - A warm cache's hold passes with the next reloads: the other
@@ -793,12 +798,13 @@ what it cannot take away yet:
 - Back in `report` mode, a reload gives each size the plan set its
   configured size again.
 
-Two settings do not pin today. A collection key set to exactly its
-default (`[grib] grid_cache_mb = 256`) reads as `default` until the keys
-can tell set from unset (#1313), so `auto` sizes that cache: pin it at
-another value. An `MC_…` variable set to something that is not a whole
-number of MB (`2G`) keeps its cache at its default, pinned, and the plan
-log warns.
+Two settings do not pin as they look. A `[server]` or collection key set
+to exactly its default (`metatile_cache_mb = 1024`, `[grib]
+grid_cache_mb = 256`) reads as `default` until the keys can tell set from
+unset (#1313), so `auto` sizes that cache: pin it at another value, or
+with its `MC_…` variable where it has one. An `MC_…` variable set to
+something that is not a whole number of MB (`2G`) keeps its cache or
+budget at its default, pinned, and the plan log warns.
 
 Worked example: `total_mb = 8192` and one local GeoTIFF radar served over
 WMS and EDR, the baseline estimated. The render budget is 819 MiB, the

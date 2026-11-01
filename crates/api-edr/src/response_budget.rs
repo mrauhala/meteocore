@@ -28,16 +28,19 @@ static BUDGET: LazyLock<Arc<ByteBudget>> = LazyLock::new(|| {
              response memory budget, MC_EDR_RESPONSE_MEMORY_MB (default 512)"
         );
     }
-    const VAR: &str = "MC_EDR_RESPONSE_MEMORY_MB";
-    let source = match parse_env::<usize>(VAR) {
-        Some(_) => SizeSource::Env(VAR),
-        None => SizeSource::Default,
-    };
-    let bytes = env_usize(VAR, 512).saturating_mul(MIB);
-    let budget = Arc::new(ByteBudget::new(u64::try_from(bytes).unwrap_or(u64::MAX)));
+    let (bytes, source) = size("MC_EDR_RESPONSE_MEMORY_MB");
+    let budget = Arc::new(ByteBudget::new(bytes));
     budget.register("edr_response", Scope::Process, source);
     budget
 });
+
+/// The budget's size from `var`, in MiB, and where it came from: as every
+/// `MC_…` size, a value that is not a whole number keeps the 512 MiB
+/// default but pins it, which the plan log warns about
+/// ([`ds_cache::plan::env_size`]).
+fn size(var: &'static str) -> (u64, SizeSource) {
+    ds_cache::plan::env_bytes(var, 512)
+}
 
 /// The per-response cap of a `/locations` body.
 static LOCATIONS_LIMIT: LazyLock<usize> =
@@ -234,6 +237,18 @@ mod tests {
 
     fn used(budget: &ByteBudget) -> u64 {
         budget.metrics().0
+    }
+
+    /// #1312: a size that is not a whole number pins the default, as every
+    /// `MC_…` cache size does; a whole number, trimmed, sizes it.
+    #[test]
+    fn an_unparsable_size_pins_the_default() {
+        const VAR: &str = "MC_TEST_EDR_RESPONSE_MEMORY_MB";
+        assert_eq!(size(VAR), (512 << 20, SizeSource::Default));
+        std::env::set_var(VAR, "2G");
+        assert_eq!(size(VAR), (512 << 20, SizeSource::Env(VAR)));
+        std::env::set_var(VAR, " 64 ");
+        assert_eq!(size(VAR), (64 << 20, SizeSource::Env(VAR)));
     }
 
     #[test]

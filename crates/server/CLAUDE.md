@@ -294,12 +294,14 @@ need no reload pruning.
   cache's `grant::Least` from its row (what `bounded` keeps of a warm
   cache's bytes, and `Resize::least`, where a shrink stops in place). The
   planner never grants below `least`, and splits by how long a hold lasts
-  (`grant::plan`): an in-place hold (`Least::in_place`, until a restart)
-  counts as a pin, and the full cut order runs around it, budgets toward
-  128/64 MiB and demand caches last, so the plan fits where it can; a warm
-  hold, which passes, makes the traffic-driven and working-set caches give
-  way but keeps budgets and demand caches at the in-place-only plan's
-  grants, the rest being the shortfall. `apply` then resizes each unpinned row to
+  (`grant::plan`): an in-place hold (`Least::in_place`, lasting as long
+  as the cache is built that way; a restart rebuilds the same one, only a
+  pinned smaller size builds it small) counts as a pin, and the full cut
+  order runs around it, budgets toward 128/64 MiB and demand caches last,
+  so the plan fits where it can; a warm hold, which passes, makes the
+  traffic-driven and working-set caches give way but keeps budgets and
+  demand caches at the in-place-only plan's grants, the rest being the
+  shortfall. `apply` then resizes each unpinned row to
   `plan` through `ds_cache::plan::apply` (shrinks first), clears an
   unreachable cache that holds entries (`plan::clear`: never through 0,
   which resets the hot share and the ghost ring), and leaves unreachable

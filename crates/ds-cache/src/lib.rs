@@ -707,6 +707,11 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         if from == 0 {
             return false;
         }
+        // Built with one shard, as one built at any size would be: no
+        // throwaway cache to ask (the memory plan asks per scrape, #1312).
+        if self.inner.shape.shards == Some(1) {
+            return true;
+        }
         let shards = self.shards();
         let fresh = self.inner.shape.shards_at(capacity_bytes);
         if capacity_bytes < from {
@@ -1760,6 +1765,18 @@ mod tests {
 
     fn weigh_value(_: &u64, value: &u64) -> u64 {
         *value
+    }
+
+    /// A one-shard cache resizes in place to any size: one built at it has
+    /// one shard too. Only a disabled one grown does not.
+    #[test]
+    fn a_single_shard_cache_resizes_in_place_to_any_size() {
+        let cache = ByteBoundedCache::<u64, u64>::new_single_shard(256 * MIB, MIB, weigh_value);
+        for mb in [1, 64, 256, 4096] {
+            assert!(cache.resizes_in_place_to(mb * MIB), "{mb}");
+        }
+        let off = ByteBoundedCache::<u64, u64>::new_single_shard(0, MIB, weigh_value);
+        assert!(!off.resizes_in_place_to(64 * MIB));
     }
 
     /// #1312: `least_capacity` is exactly where a shrink stops: the slice
