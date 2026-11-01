@@ -56,6 +56,9 @@ use crate::cells2d::{
     advance_tracks_coasting, apply_lightning, CellTrack, CELL_MIN_AREA_KM2, CELL_THRESHOLD_DBZ,
 };
 use crate::impact::ImpactIndex;
+use crate::lead_skill::{
+    GenerationFrames, LeadSkills, Outcome, SkillFrame, SkillRing, SKILL_THRESHOLDS,
+};
 use crate::motion::MotionField;
 use crate::motion_grid::{
     self, param_spec, GridSpec, PARAM_QUALITY, PARAM_SPECS, PARAM_U, PARAM_V,
@@ -167,6 +170,8 @@ impl GridGeom {
 
 /// One stored frame: either raw bytes with decode parameters (preferred — 1
 /// byte/px end to end) or decoded f32 (sources that return boxed `F64`).
+/// Cloned only into the fixed-lead skill ring (#648).
+#[derive(Clone)]
 enum FrameData {
     U8 {
         data: Vec<u8>,
@@ -184,6 +189,18 @@ impl FrameData {
             FrameData::U8 { data, .. } => data.capacity() as u64,
             FrameData::F32(field) => (field.capacity() * std::mem::size_of::<f32>()) as u64,
         }
+    }
+}
+
+/// The skill ring holds frames in their stored form and decodes them only
+/// to score.
+impl SkillFrame for FrameData {
+    fn to_grid(&self, width: usize, height: usize) -> Grid {
+        frame_to_grid(self, width, height)
+    }
+
+    fn heap_bytes(&self) -> u64 {
+        self.bytes()
     }
 }
 
@@ -313,8 +330,9 @@ pub struct NowcastEngine {
     /// Seconds between the source anchor frame and the wall clock at the end
     /// of the last generation (how far the nowcast lags reality).
     source_lag_secs: AtomicU64,
-    /// Bytes of the frames the retained generations hold, set whenever the
-    /// state swaps in a generation ([`Self::frame_bytes`]).
+    /// Bytes of the frames the retained generations and the skill ring
+    /// hold, set whenever the state swaps in a generation
+    /// ([`Self::frame_bytes`]).
     frame_bytes: AtomicU64,
     /// One-shot latch for the lead-cap warning (source-cadence default step
     /// only; an explicit step is validated at construction).
@@ -324,6 +342,13 @@ pub struct NowcastEngine {
     /// baseline. `u64::MAX` = not yet measured.
     lead_csi_permille: AtomicU64,
     lead_persistence_csi_permille: AtomicU64,
+    /// Forecasts held until their valid time to score skill at fixed leads
+    /// (#648). Locked only by the poll loop; `/metrics` reads
+    /// [`Self::lead_skill`] instead.
+    skill_ring: std::sync::Mutex<SkillRing<FrameData, GridGeom>>,
+    /// The ring's counts and latest scores, published after every
+    /// generation for an O(1) read.
+    lead_skill: ArcSwap<LeadSkills>,
     /// Monotonic id source for cell tracks (#544).
     next_track_id: AtomicU64,
     /// Cumulative tracker bookkeeping (#643): births, deaths, pass-2
@@ -463,6 +488,8 @@ impl NowcastEngine {
             lead_cap_warned: std::sync::atomic::AtomicBool::new(false),
             lead_csi_permille: AtomicU64::new(u64::MAX),
             lead_persistence_csi_permille: AtomicU64::new(u64::MAX),
+            skill_ring: std::sync::Mutex::new(SkillRing::new()),
+            lead_skill: ArcSwap::from_pointee(SkillRing::<FrameData, GridGeom>::new().stats()),
             next_track_id: AtomicU64::new(Utc::now().timestamp_millis().max(0) as u64 * 1_000_000),
             track_births_total: AtomicU64::new(0),
             track_deaths_total: AtomicU64::new(0),
@@ -529,10 +556,11 @@ impl NowcastEngine {
         )
     }
 
-    /// Bytes of the frames the retained generations hold (#1307): each
-    /// one's analysis frame and leads, 1 byte per pixel from a raw `U8`
-    /// source, 4 on the f32 fallback. Exact, from the buffers' capacities,
-    /// set when a generation is swapped in.
+    /// Bytes of the frames the engine holds (#1307): each retained
+    /// generation's analysis frame and leads, plus the skill ring's
+    /// forecasts in flight (#648, at most two frames per scored lead), 1
+    /// byte per pixel from a raw `U8` source, 4 on the f32 fallback. Exact,
+    /// from the buffers' capacities, set when a generation is swapped in.
     pub fn frame_bytes(&self) -> u64 {
         self.frame_bytes.load(Ordering::Relaxed)
     }
@@ -556,6 +584,13 @@ impl NowcastEngine {
         let f = self.lead_csi_permille.load(Ordering::Relaxed);
         let p = self.lead_persistence_csi_permille.load(Ordering::Relaxed);
         (f != u64::MAX && p != u64::MAX).then_some((f, p))
+    }
+
+    /// Skill at the fixed leads (#648): per lead, the scored and skipped
+    /// pair counts since this engine was built and the latest scored pair
+    /// per threshold. A snapshot published by the poll loop — O(1).
+    pub fn lead_skill(&self) -> Arc<LeadSkills> {
+        self.lead_skill.load_full()
     }
 
     /// Signal the poll loop to exit (server reload/shutdown).
@@ -714,6 +749,9 @@ impl NowcastEngine {
                 if let Some((_, prev)) = old.generations.iter().next_back() {
                     self.score_previous_generation(prev, &generation, anchor);
                 }
+                // #648: the deeper leads, from forecasts held past their
+                // generation's retention.
+                let ring_bytes = self.score_leads(&generation);
                 let mut generations = old.generations.clone();
                 generations.insert(anchor, Arc::new(generation));
                 while generations.len() > self.cfg.max_generations {
@@ -725,7 +763,8 @@ impl NowcastEngine {
                     .values()
                     .flat_map(|g| &g.frames)
                     .map(FrameData::bytes)
-                    .sum();
+                    .sum::<u64>()
+                    + ring_bytes;
                 let generation_ref = generations.get(&anchor).expect("just inserted");
                 // Impact areas: ONE bounded fetch per generation covering the
                 // whole working grid, never one per cell (the `EventSource`
@@ -890,6 +929,72 @@ impl NowcastEngine {
             persistence_csi.map(|v| format!("{v:.3}")).unwrap_or_else(|| "n/a".into()),
             (anchor - prev.reference_time).num_minutes(),
         );
+    }
+
+    /// Feed a new generation to the fixed-lead skill ring (#648): score the
+    /// forecasts its analysis settles against it and persistence, then hold
+    /// its own frames for the leads in flight. Poll runtime only — scoring
+    /// decodes up to three frames per lead. Returns the bytes the ring
+    /// holds.
+    fn score_leads(&self, generation: &Generation) -> u64 {
+        let mut ring = self.skill_ring.lock().unwrap_or_else(|e| e.into_inner());
+        let outcomes = ring.advance(GenerationFrames {
+            times: &generation.times,
+            frames: &generation.frames,
+            geom: generation.geom,
+            width: generation.geom.width as usize,
+            height: generation.geom.height as usize,
+        });
+        self.lead_skill.store(Arc::new(ring.stats()));
+        let bytes = ring.heap_bytes();
+        drop(ring);
+        let show = |c: Option<f64>| c.map_or_else(|| "n/a".to_string(), |v| format!("{v:.3}"));
+        for outcome in outcomes {
+            match outcome {
+                Outcome::Scored {
+                    lead_minutes,
+                    issued,
+                    valid,
+                    csi,
+                } => {
+                    let scores = SKILL_THRESHOLDS
+                        .iter()
+                        .zip(csi)
+                        .map(|(t, (nowcast, persistence))| {
+                            format!(
+                                ">= {t}: CSI {} (persistence {})",
+                                show(nowcast),
+                                show(persistence)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    tracing::info!(
+                        "[{}] nowcast skill at +{lead_minutes} min for {valid} (issued {issued}): \
+                         {scores}",
+                        self.collection_id,
+                    );
+                }
+                Outcome::Skipped {
+                    lead_minutes,
+                    valid,
+                    reason,
+                } => tracing::debug!(
+                    collection = %self.collection_id,
+                    lead_minutes,
+                    %valid,
+                    reason = reason.label(),
+                    "nowcast skill pair skipped"
+                ),
+                Outcome::Unissuable { lead_minutes } => tracing::warn!(
+                    "[{}] nowcast skill at +{lead_minutes} min is not measured: no forecast frame \
+                     is valid exactly {lead_minutes} minutes after the anchor (a horizon shorter \
+                     than the lead, or a step that does not divide it)",
+                    self.collection_id,
+                ),
+            }
+        }
+        bytes
     }
 
     /// Produce one generation anchored on `anchor` (the source's latest

@@ -168,8 +168,22 @@ A named source that is missing or of the wrong kind fails the collection.
 - `/health` reports the collection degraded until the first generation.
 - `/metrics` exports per-collection `nowcast_*` series: generation counts,
   duration and source lag, tracker counters, the previous generation's
-  lead-1 CSI next to persistence (`nowcast_lead1_csi_permille`), and
-  `nowcast_frame_bytes`, the exact bytes of the retained frames.
+  lead-1 CSI next to persistence (`nowcast_lead1_csi_permille`), skill at
+  fixed leads, and `nowcast_frame_bytes`, the exact bytes of the frames
+  held.
+- **Skill at fixed leads.** One +30 and one +60 min forecast are held
+  until the analysis for their valid time arrives, whatever
+  `max_generations` is, then scored at 20 and 35 dBZ next to persistence:
+  the analysis the forecast was issued from, on the same pixels.
+  `nowcast_lead_csi_permille` and `nowcast_lead_persistence_csi_permille`
+  (labels `lead`, minutes, and `threshold`) carry the latest pair, and are
+  absent when it had no echo at that threshold. A lead is scored once per
+  lead time. `nowcast_lead_scored_pairs_total` and
+  `nowcast_lead_skipped_pairs_total` (`reason`: `no_analysis` when no
+  generation ran at exactly the valid time, `grid_mismatch` when the
+  working grid changed) count the pairs. A lead the schedule never lands on
+  (horizon shorter than it, or a `step` that does not divide it) logs one
+  warning and is not scored.
 - A reload with unchanged config and source engine keeps generations, cell
   history and track ids.
 
@@ -178,9 +192,12 @@ A named source that is missing or of the wrong kind fails the collection.
 - Advection only: echo does not grow, decay or form along the leads
   (`growth_decay` is an experimental exception).
 - Extrapolates the source's default parameter at its default level only.
-- Frame memory ≈ working pixels × (leads + 1) × `max_generations` × 1 byte
-  for a byte source with a nodata byte, else 4 bytes: up to 600 MB per byte
-  source at the defaults and a 5-minute cadence (24 leads).
+- Frame memory ≈ working pixels × ((leads + 1) × `max_generations` + 4) ×
+  1 byte for a byte source with a nodata byte, else 4 bytes: up to 600 MB
+  per byte source at the defaults and a 5-minute cadence (24 leads). The
+  `+ 4` is the fixed-lead skill forecasts.
+- Skill is pixel CSI only: forecast frames are not segmented, so there is
+  no object (cell) CSI in operation; `examples/skill_spike.rs` has it.
 - Cell rules (35 dBZ, severity steps) assume a dBZ source. Cells describe
   the anchor frame only; there are no forecast cell positions.
 - EDR serves the motion field, not the extrapolated values. WMS
@@ -199,7 +216,8 @@ cargo test -p engine-nowcast
 
 - `tests/integration.rs`: a mock source draws a disc moving at constant
   speed for any time, so extrapolated frames are checked against the true
-  future. Also covers instances, cell tracking, ranking and the joins.
+  future. Also covers instances, cell tracking, ranking, the joins and
+  skill at fixed leads.
 - `tests/clutter_regression.rs`: two captured cell responses in
   `tests/fixtures/`, one frame of pure clutter and one of widespread rain.
 - `examples/skill_spike.rs`: hindcast over a directory of GeoTIFF frames
