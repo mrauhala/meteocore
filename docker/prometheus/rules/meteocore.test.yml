@@ -170,6 +170,135 @@ tests:
               summary: "Collection scan-stopped is stale"
               description: "The newest data scan-stopped serves is 1h 12m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
 
+  # The delay counted is the lowest the gauge read over the past day, so a
+  # feed that keeps delivering, later and later, cannot teach the alert its
+  # new delay. A 10-minute scan normally 30 minutes late, its age 35
+  # minutes, falls 2 hours behind from hour 3: its age climbs until the
+  # first late scan at 4.5 h, then stays 2 hours. Its median follows the
+  # late arrivals to 2 hours by 6.5 h, which would make the threshold 2.5
+  # hours and silence the alert; the day's minimum keeps it at an hour, so
+  # it fires at 3.5 h, an hour old for 10 minutes, and keeps firing.
+  - name: CollectionStale delay jumps
+    interval: 5m
+    input_series:
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '2100x35 2400+300x17 7200x71'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '600x125'
+      - series: 'collection_expected_delay_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '1800x77 7200x47'
+    alert_rule_test:
+      - eval_time: 3h29m
+        alertname: CollectionStale
+        exp_alerts: []
+      - eval_time: 3h30m
+        alertname: CollectionStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: scan
+            exp_annotations:
+              summary: "Collection scan is stale"
+              description: "The newest data scan serves is 1h 10m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
+      - eval_time: 7h
+        alertname: CollectionStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: scan
+            exp_annotations:
+              summary: "Collection scan is stale"
+              description: "The newest data scan serves is 2h 0m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
+      - eval_time: 10h
+        alertname: CollectionStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: scan
+            exp_annotations:
+              summary: "Collection scan is stale"
+              description: "The newest data scan serves is 2h 0m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
+
+  # A restart: the delay series is gone for 30 minutes, until the first
+  # arrival after the restart, while the age is back at once. Counting no
+  # delay meanwhile, the scan delivered 32 minutes late at 41 minutes old
+  # would be stale; the day's minimum keeps its delay, so it is not. gone:
+  # a collection a reload removed at 30 minutes, of which only the day's
+  # minimum delay lingers, never matches.
+  - name: CollectionStale restart
+    interval: 5m
+    input_series:
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="scan-late"}'
+        values: '2460x36'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="scan-late"}'
+        values: '600x36'
+      - series: 'collection_expected_delay_seconds{job="meteocore", instance="a:8000", collection="scan-late"}'
+        values: '1920x11 _x5 1920x18'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="gone"}'
+        values: '2460x6 _x29'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="gone"}'
+        values: '600x6 _x29'
+      - series: 'collection_expected_delay_seconds{job="meteocore", instance="a:8000", collection="gone"}'
+        values: '1920x6 _x29'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: CollectionStale
+        exp_alerts: []
+      - eval_time: 3h
+        alertname: CollectionStale
+        exp_alerts: []
+
+  # A 2-hour outage of a scan normally 30 minutes late, from hour 2: stale
+  # from 2.5 h. Its backlog then trickles in over the next hour, each scan
+  # late, lifting the median to 1h 45m, and the age back to 35 minutes by
+  # 5 h. The feed stops again at 6 h. Counting the lifted median, it would
+  # be stale only at 2h 15m old; the day's minimum keeps the threshold at
+  # an hour, so it fires at 6.5 h, as after the first stop.
+  - name: CollectionStale backlog then stop
+    interval: 5m
+    input_series:
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '2100x23 2400+300x23 9000-600x11 2100x11 2400+300x23'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '600x95'
+      - series: 'collection_expected_delay_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '1800x51 3600 5400 6300x41'
+    alert_rule_test:
+      - eval_time: 2h30m
+        alertname: CollectionStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: scan
+            exp_annotations:
+              summary: "Collection scan is stale"
+              description: "The newest data scan serves is 1h 10m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
+      - eval_time: 5h30m
+        alertname: CollectionStale
+        exp_alerts: []
+      - eval_time: 6h29m
+        alertname: CollectionStale
+        exp_alerts: []
+      - eval_time: 6h30m
+        alertname: CollectionStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: scan
+            exp_annotations:
+              summary: "Collection scan is stale"
+              description: "The newest data scan serves is 1h 10m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
+
   - name: CollectionEmpty
     interval: 1m
     input_series:

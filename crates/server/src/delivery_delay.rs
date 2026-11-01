@@ -4,8 +4,8 @@
 //! The data age is now minus the newest data a collection serves
 //! (`admin::collection_data_ages`), so it includes the feed's delivery
 //! delay: a scan published 30 minutes after its timestamp is 30 minutes old
-//! the moment the server serves it. `CollectionStale` adds the delay
-//! measured here to its threshold.
+//! the moment the server serves it. `CollectionStale` adds the lowest
+//! delay measured here over the past day to its threshold.
 //!
 //! [`DeliveryDelays`] watches the newest timestep of every collection whose
 //! engine reports a data age, read through the same accessor the age is
@@ -34,8 +34,12 @@
 //!   registry loses them.
 //! - **An outage freezes it.** No arrival, no delay: the median stays what
 //!   it was, so a stopped feed's age outgrows the threshold and the alert
-//!   fires. Late arrivals, a backlog trickling in after an outage, leave the
-//!   median while they are fewer than half the window.
+//!   fires.
+//! - **It learns a new delay.** Each late arrival, say one of a backlog
+//!   trickling in after an outage, moves the median up one rank, and once
+//!   half the window is late it reads the late delay. A feed that keeps
+//!   delivering but falls behind thus becomes its own normal here, which
+//!   is why the alert counts the day's minimum of the gauge, not its value.
 //! - **Memory:** at most [`WINDOW`] delays per collection; an observation
 //!   is O(collections × WINDOW), a scrape one map lookup per collection.
 
@@ -48,7 +52,8 @@ use chrono::{DateTime, Utc};
 
 /// How many of a collection's newest arrivals the delay is the median of:
 /// two hours of a 5-minute radar, four of a 10-minute scan, six days of a
-/// 6-hourly model. Up to 11 late arrivals among them leave the median.
+/// 6-hourly model. Each late arrival moves the median up one rank; it
+/// reads a late delay once 12 of the 24 are late.
 pub(crate) const WINDOW: usize = 24;
 
 /// How often the server reads the newest timesteps

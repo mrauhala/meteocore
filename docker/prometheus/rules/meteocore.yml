@@ -46,17 +46,25 @@ groups:
       # The age includes that delay, so a feed published half an hour late
       # is half an hour old when it lands. Stale: the delay plus 3 intervals
       # old, and at least the delay plus an interval plus 15 minutes, so a
-      # feed every minute is not stale after three. A collection with no
-      # delay series (no arrival seen since the server started) counts no
-      # delay, nor does data that arrives ahead of its timestamp. A
-      # collection with no interval series (a single timestep and no
-      # expected_interval) never matches.
+      # feed every minute is not stale after three.
+      #
+      # The delay counted is the lowest the gauge read over the past day.
+      # The median follows the newest arrivals, so a feed that keeps
+      # delivering but later and later would teach it the new delay and go
+      # quiet while behind: the day's minimum keeps such a feed alerting for
+      # a day, keeps a backlog trickling in after an outage from loosening
+      # the threshold, and bridges a restart while the series keep their
+      # instance label. With no delay series in the day (no arrival seen),
+      # the rule counts no delay, nor does it for data that arrives ahead of
+      # its timestamp. A collection with no interval series (a single
+      # timestep and no expected_interval) never matches, nor does the
+      # lingering minimum of a collection a reload removed.
       - alert: CollectionStale
         expr: |
           collection_data_age_seconds{job="meteocore"}
             >= 3 * collection_expected_interval_seconds{job="meteocore"}
               + (
-                  clamp_min(collection_expected_delay_seconds{job="meteocore"}, 0)
+                  clamp_min(min_over_time(collection_expected_delay_seconds{job="meteocore"}[1d]), 0)
                 or
                   collection_expected_interval_seconds{job="meteocore"} * 0
               )
@@ -64,7 +72,7 @@ groups:
           collection_data_age_seconds{job="meteocore"}
             >= collection_expected_interval_seconds{job="meteocore"} + 900
               + (
-                  clamp_min(collection_expected_delay_seconds{job="meteocore"}, 0)
+                  clamp_min(min_over_time(collection_expected_delay_seconds{job="meteocore"}[1d]), 0)
                 or
                   collection_expected_interval_seconds{job="meteocore"} * 0
               )

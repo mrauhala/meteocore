@@ -354,7 +354,12 @@ need no reload pruning.
   never fires for the collection. Same lifecycle as the age series, in the
   same `REPORTED` lock.
 - `collection_expected_delay_seconds` (#1389) is how late the data
-  arrives, which `CollectionStale` adds to its threshold:
+  arrives; `CollectionStale` adds its lowest value of the past day
+  (`min_over_time(…[1d])`) to its threshold, so a feed that falls behind
+  and keeps delivering cannot teach the median its new delay and go quiet,
+  and a backlog cannot loosen the next stop's threshold. That history
+  survives a restart only while `instance` stays the same; on Kubernetes a
+  new pod starts with none. The gauge comes from
   `delivery_delay::DeliveryDelays`, one engine-agnostic tracker on
   `ServerState`. The age is read per scrape; the tracker reads the same
   `DataTimeline::newest` on its own 10 s tick on the poll runtime
