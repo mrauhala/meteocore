@@ -25,6 +25,11 @@
 (function () {
     'use strict';
 
+    // Beside this script, wherever the server put it: behind a gateway that
+    // strips a path prefix the shell loads `<prefix>/preview/app.js`, and a
+    // root-relative `/preview/manifest.json` would miss the prefix (#1403).
+    const manifestUrl = new URL('manifest.json', document.currentScript.src).href;
+
     const map = new maplibregl.Map({
         container: 'map',
         style: {
@@ -69,7 +74,7 @@
     // glyph/sprite resolution and a minimal style with only a background
     // layer doesn't always fire it in MapLibre 5.
 
-    fetch('/preview/manifest.json')
+    fetch(manifestUrl)
         .then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.json();

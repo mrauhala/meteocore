@@ -726,9 +726,7 @@ pub type AppState = Arc<ArcSwap<EdrState>>;
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
 pub(crate) fn request_base_url(state: &EdrState, headers: &HeaderMap) -> String {
-    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
-        headers.get(name).and_then(|v| v.to_str().ok())
-    })
+    api_common::request_base_url(&state.base_url, state.trust_proxy_headers, headers)
 }
 
 #[allow(clippy::type_complexity)]
@@ -1234,7 +1232,10 @@ fn cube_operation(
     })
 }
 
-pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let state = state.load_full();
     let mut collection_paths = json!({});
     for config in state.collections.values() {
@@ -2003,6 +2004,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         }
     });
+    // Outside the `json!` above, whose size is at the macro recursion limit.
+    api_common::set_openapi_servers(&mut openapi, &request_base_url(&state, &headers));
     // Items components (#928), named `items-*` so they cannot collide with
     // another query's parameters.
     if !state.feature_engines.is_empty() {

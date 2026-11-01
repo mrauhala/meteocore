@@ -62,9 +62,7 @@ pub const CONFORMANCE: &[&str] = &[
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
 pub(crate) fn request_base_url(state: &FeaturesState, headers: &HeaderMap) -> String {
-    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
-        headers.get(name).and_then(|v| v.to_str().ok())
-    })
+    api_common::request_base_url(&state.base_url, state.trust_proxy_headers, headers)
 }
 
 /// Custom response type for GeoJSON with correct Content-Type.
@@ -702,6 +700,7 @@ pub(crate) fn openapi_components(name: ComponentName) -> Value {
 pub async fn api_definition(
     State(state): State<AppState>,
     Extension(Mount(m)): Extension<Mount>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let state = state.load_full();
     let mut paths = Map::new();
@@ -756,7 +755,7 @@ pub async fn api_definition(
     }
     paths.extend(items_openapi_paths(&state, m, plain_name));
 
-    Json(json!({
+    let mut openapi = json!({
         "openapi": "3.0.3",
         "info": {
             "title": "MeteoCore - OGC API Features",
@@ -765,7 +764,9 @@ pub async fn api_definition(
         },
         "paths": paths,
         "components": openapi_components(plain_name)
-    }))
+    });
+    api_common::set_openapi_servers(&mut openapi, &request_base_url(&state, &headers));
+    Json(openapi)
 }
 
 pub async fn api_docs(

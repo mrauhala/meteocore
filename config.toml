@@ -6,7 +6,8 @@ collections_dir = "collections.d"
 # .sld), one per file, name = file stem. See colormaps.d/ for examples.
 colormaps_dir = "colormaps.d"
 # Derive each request's absolute link base from reverse-proxy headers
-# (Forwarded / X-Forwarded-*). Default false; enable only behind a trusted proxy.
+# (Forwarded / X-Forwarded-*, X-Forwarded-Prefix for a stripped path prefix).
+# Default false; enable only behind a trusted proxy that sets or removes them.
 # trust_proxy_headers = true
 # Keep engine state across restarts (the WIS2 CAP alert set, #1000, and the
 # WIS2 BUFR report store, #1002): snapshots go to

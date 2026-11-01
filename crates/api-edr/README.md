@@ -68,7 +68,7 @@ Part 1 `core` and Part 2 `collections` with `https://` URIs, the form EDR
 | Route | Answers |
 |---|---|
 | `/`, `/conformance` | landing page, conformance |
-| `/api`, `/api/docs` | OpenAPI 3.0 document, Swagger UI (assets embedded, no CDN). `/api` takes only `f`: another parameter, or `f` given twice, is a 400 |
+| `/api`, `/api/docs` | OpenAPI 3.0 document, Swagger UI (assets embedded, no CDN). `/api` takes only `f`: another parameter, or `f` given twice, is a 400. When the request's base URL has a path, a `base_url` path or a proxy's `X-Forwarded-Prefix` under `trust_proxy_headers`, it is the document's `servers` (#1403) |
 | `/collections`, `/collections/{id}` | catalog with Common search and paging ([api-common](../api-common/README.md)), collection document; WIS2 topic `themes`, configured or from a WIS2 subscription, and WCMP2 `describedby` links, configured or learned from WIS2 notifications (#1356) |
 | `/collections/{id}/locations` | GeoJSON list of named locations |
 | `/collections/{id}/locations/{locId}` | data at one location, or at a comma-separated list |

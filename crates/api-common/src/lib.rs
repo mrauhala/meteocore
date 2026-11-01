@@ -848,6 +848,36 @@ pub fn collection_parameters() -> Value {
     }).collect())
 }
 
+/// The external base URL of a request (#12, #1403):
+/// [`ds_core::proxy::resolve_base_url`] over **every** line of each
+/// forwarding header. Every HTTP caller goes through here: which line counts
+/// differs by header, and a caller passing only the first (`headers.get`)
+/// would let a client's own `Forwarded` line, sent before the proxy's,
+/// decide the links. A line that is not text is passed as `""`, an invalid
+/// value.
+pub fn request_base_url(fallback: &str, trust: bool, headers: &axum::http::HeaderMap) -> String {
+    ds_core::proxy::resolve_base_url(fallback, trust, |name| {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap_or(""))
+            .collect()
+    })
+}
+
+/// Give an OpenAPI document a `servers` member when the request's base URL
+/// has a path (#1403): a stripped `X-Forwarded-Prefix` or a `base_url` path,
+/// which its path keys continue. Without the member the server defaults to
+/// `/`, resolved against the document's own URL to the origin's root, which
+/// drops that path. A base without one leaves the document alone: `/` is then
+/// right, and resolves against the address the client actually used, where
+/// the static base can be an unreachable bind address (`http://0.0.0.0:8000`).
+pub fn set_openapi_servers(document: &mut Value, base: &str) {
+    if !ds_core::proxy::path_of(base).is_empty() {
+        document["servers"] = json!([{"url": base}]);
+    }
+}
+
 /// Shared collection operation, including representations and validation errors.
 pub fn collection_operation() -> Value {
     json!({
@@ -879,6 +909,69 @@ mod tests {
     use super::*;
     use ds_core::error::ErrorReason;
     use ds_core::map_engine::ParameterInfo;
+
+    fn lines(pairs: &[(&'static str, &'static str)]) -> axum::http::HeaderMap {
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(*name, HeaderValue::from_static(value));
+        }
+        headers
+    }
+
+    /// The resolver sees every line (#1403): `Forwarded`'s last element
+    /// across lines is the proxy's, and a prefix on two lines is none.
+    #[test]
+    fn request_base_url_passes_every_header_line() {
+        let fallback = "http://127.0.0.1:8000";
+        let forwarded = lines(&[
+            ("forwarded", "host=evil.example.com;proto=https"),
+            ("forwarded", "host=gw.example.org;proto=https"),
+        ]);
+        assert_eq!(
+            request_base_url(fallback, true, &forwarded),
+            "https://gw.example.org"
+        );
+        let prefixes = lines(&[
+            ("x-forwarded-host", "gw.example.org"),
+            ("x-forwarded-prefix", "/local"),
+            ("x-forwarded-prefix", "/open"),
+        ]);
+        assert_eq!(
+            request_base_url(fallback, true, &prefixes),
+            "http://gw.example.org"
+        );
+        let prefix = lines(&[
+            ("x-forwarded-host", "gw.example.org"),
+            ("x-forwarded-prefix", "/open"),
+        ]);
+        assert_eq!(
+            request_base_url(fallback, true, &prefix),
+            "http://gw.example.org/open"
+        );
+        assert_eq!(request_base_url(fallback, false, &prefix), fallback);
+        // A line that is not text is a line, and an invalid one.
+        let mut binary = prefix.clone();
+        binary.append(
+            "x-forwarded-prefix",
+            HeaderValue::from_bytes(b"/\xff").unwrap(),
+        );
+        assert_eq!(
+            request_base_url(fallback, true, &binary),
+            "http://gw.example.org"
+        );
+    }
+
+    #[test]
+    fn openapi_servers_only_for_a_base_with_a_path() {
+        let mut document = json!({"openapi": "3.0.3"});
+        set_openapi_servers(&mut document, "http://0.0.0.0:8000");
+        assert!(document.get("servers").is_none());
+        set_openapi_servers(&mut document, "https://gw.example.org/open");
+        assert_eq!(
+            document["servers"],
+            json!([{"url": "https://gw.example.org/open"}])
+        );
+    }
 
     fn raster(parameters: &[(&str, &str, &str)]) -> RasterInfo {
         RasterInfo {

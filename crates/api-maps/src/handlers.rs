@@ -51,9 +51,7 @@ pub type AppState = Arc<ArcSwap<MapsState>>;
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
 pub(crate) fn request_base_url(state: &MapsState, headers: &HeaderMap) -> String {
-    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
-        headers.get(name).and_then(|v| v.to_str().ok())
-    })
+    api_common::request_base_url(&state.base_url, state.trust_proxy_headers, headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -838,6 +836,7 @@ pub(crate) fn openapi_components() -> serde_json::Value {
 pub async fn api_definition(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let state = state.load_full();
     let m = mount.0;
@@ -878,7 +877,7 @@ pub async fn api_definition(
         }
     }
 
-    let openapi = json!({
+    let mut openapi = json!({
         "openapi": "3.0.3",
         "info": {
             "title": "MeteoCore - OGC API Maps",
@@ -888,6 +887,7 @@ pub async fn api_definition(
         "paths": paths,
         "components": openapi_components()
     });
+    api_common::set_openapi_servers(&mut openapi, &request_base_url(&state, &headers));
 
     Json(openapi)
 }
