@@ -798,8 +798,8 @@ static COLLECTION_EXPECTED_DELAY_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(
         "collection_expected_delay_seconds",
         "Seconds between a timestep's timestamp and when the server first served it, on the \
          timeline the data age is measured on: the median over the newest arrivals the server \
-         observed. Negative for data that arrives ahead of its timestamp. No series until a \
-         timestep arrives after boot or a rebuild of the collection",
+         observed. Negative for data that arrives ahead of its timestamp. No series until 5 \
+         timesteps have arrived since boot",
     )
 });
 
@@ -7987,8 +7987,8 @@ pub(crate) struct DataAge {
     /// The spacing its data is expected at; `None` without
     /// `expected_interval` and below two timesteps.
     pub expected_interval: Option<i64>,
-    /// How late its data arrives (#1389); `None` until an arrival was
-    /// observed.
+    /// How late its data arrives (#1389); `None` until
+    /// `delivery_delay::MIN_ARRIVALS` arrivals were observed.
     pub expected_delay: Option<i64>,
 }
 
@@ -7997,8 +7997,8 @@ pub(crate) struct DataAge {
 /// `collection_expected_delay_seconds` from [`collection_data_ages`], the
 /// `/health` source. A collection holding no data has `collection_has_data`
 /// 0 and no age series (#1055), one without an expected interval no
-/// interval series (#1375), one without an observed arrival no delay series
-/// (#1389); a collection a reload removed has none. Only
+/// interval series (#1375), one with fewer than 5 observed arrivals no
+/// delay series (#1389); a collection a reload removed has none. Only
 /// those series are removed, never the whole family, so a concurrent scrape
 /// cannot gather it half filled. Every `/metrics` scrape calls this; returns
 /// what it set.
@@ -15082,10 +15082,11 @@ colormap = "no_such_map"
 
     /// #1389: `collection_expected_delay_seconds` times only the arrivals
     /// the server observed. What every engine held at the first observation
-    /// is a baseline, so no collection has a series after boot; a run a
-    /// NetCDF poll found is an arrival, its delay the observation minus its
-    /// reference time; a GeoTIFF engine rebuilt over a newer file is a new
-    /// baseline; a collection a reload removed loses its series.
+    /// is a baseline, so no collection has a series after boot; each run a
+    /// NetCDF poll finds is an arrival, its delay the observation minus its
+    /// reference time, and the gauge is their median from the
+    /// `MIN_ARRIVALS`th on; a GeoTIFF engine rebuilt over a newer file is a
+    /// new baseline; a collection a reload removed loses its series.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn delivery_delay_counts_only_observed_arrivals() {
         let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
@@ -15135,23 +15136,52 @@ colormap = "no_such_map"
         super::observe_delivery(&state);
         assert_eq!(delays(&state), std::collections::BTreeMap::new());
 
-        // The 09Z run arrives and a poll finds it.
-        copy(&format!("meps-netcdf/{}", run("09")), meps.join(run("09")));
-        let netcdf = state.netcdf_engines.read().unwrap()[0].clone();
-        netcdf.poll_once();
-        let reference_time = chrono::DateTime::parse_from_rfc3339("2026-10-15T09:00:00Z")
+        // Runs 07Z to 11Z arrive, an hour apart, each found by a poll: the
+        // fixture's 06Z lead 00 with its reference and valid time moved, the
+        // two f64 seconds the file stores them as.
+        let fixture = std::fs::read(format!("{testdata}/meps-netcdf/{}", run("06"))).unwrap();
+        let six = chrono::DateTime::parse_from_rfc3339("2026-10-15T06:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let before = chrono::Utc::now();
-        super::observe_delivery(&state);
-        let after = chrono::Utc::now();
+        let netcdf = state.netcdf_engines.read().unwrap()[0].clone();
+        let arrivals = crate::delivery_delay::MIN_ARRIVALS as i64;
+        let mut timed = Vec::new();
+        for hours in 1..=arrivals {
+            let reference_time = six + chrono::Duration::hours(hours);
+            let (from, to) = (
+                (six.timestamp() as f64).to_le_bytes(),
+                (reference_time.timestamp() as f64).to_le_bytes(),
+            );
+            let mut bytes = fixture.clone();
+            let stored: Vec<usize> = (0..bytes.len() - 8)
+                .filter(|&i| bytes[i..i + 8] == from)
+                .collect();
+            assert_eq!(stored.len(), 2, "the run and the valid time");
+            for i in stored {
+                bytes[i..i + 8].copy_from_slice(&to);
+            }
+            let name = run(&format!("{:02}", 6 + hours));
+            std::fs::write(meps.join(name), bytes).unwrap();
+            netcdf.poll_once();
+            let before = chrono::Utc::now();
+            super::observe_delivery(&state);
+            let after = chrono::Utc::now();
+            timed.push(
+                (before - reference_time).num_seconds()..=(after - reference_time).num_seconds(),
+            );
+            let observed = delays(&state);
+            if hours < arrivals {
+                assert_eq!(
+                    observed,
+                    std::collections::BTreeMap::new(),
+                    "{hours} arrivals"
+                );
+            }
+        }
+        // Each later run is an hour less late: the median is the third.
         let observed = delays(&state);
         let delay = observed["delay-netcdf"];
-        assert!(
-            ((before - reference_time).num_seconds()..=(after - reference_time).num_seconds())
-                .contains(&delay),
-            "{delay}"
-        );
+        assert!(timed[2].contains(&delay), "{delay} not in {:?}", timed[2]);
         assert_eq!(observed.len(), 1, "{observed:?}");
 
         // A reload rebuilds the GeoTIFF collection, whose new engine scans a

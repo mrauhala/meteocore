@@ -170,14 +170,15 @@ tests:
               summary: "Collection scan-stopped is stale"
               description: "The newest data scan-stopped serves is 1h 12m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
 
-  # The delay counted is the lowest the gauge read over the past day, so a
-  # feed that keeps delivering, later and later, cannot teach the alert its
-  # new delay. A 10-minute scan normally 30 minutes late, its age 35
+  # The delay counted is the gauge's lower quartile over the past day, so
+  # a feed that keeps delivering, later and later, cannot teach the alert
+  # its new delay. A 10-minute scan normally 30 minutes late, its age 35
   # minutes, falls 2 hours behind from hour 3: its age climbs until the
   # first late scan at 4.5 h, then stays 2 hours. Its median follows the
   # late arrivals to 2 hours by 6.5 h, which would make the threshold 2.5
-  # hours and silence the alert; the day's minimum keeps it at an hour, so
-  # it fires at 3.5 h, an hour old for 10 minutes, and keeps firing.
+  # hours and silence the alert; the day's lower quartile keeps it at an
+  # hour, so it fires at 3.5 h, an hour old for 10 minutes, and keeps
+  # firing.
   - name: CollectionStale delay jumps
     interval: 5m
     input_series:
@@ -225,12 +226,12 @@ tests:
               summary: "Collection scan is stale"
               description: "The newest data scan serves is 2h 0m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
 
-  # A restart: the delay series is gone for 30 minutes, until the first
+  # A restart: the delay series is gone for 50 minutes, until the fifth
   # arrival after the restart, while the age is back at once. Counting no
   # delay meanwhile, the scan delivered 32 minutes late at 41 minutes old
-  # would be stale; the day's minimum keeps its delay, so it is not. gone:
-  # a collection a reload removed at 30 minutes, of which only the day's
-  # minimum delay lingers, never matches.
+  # would be stale; the day's lower quartile keeps its delay, so it is not.
+  # gone: a collection a reload removed at 30 minutes, whose delay history
+  # lingers, never matches.
   - name: CollectionStale restart
     interval: 5m
     input_series:
@@ -239,7 +240,7 @@ tests:
       - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="scan-late"}'
         values: '600x36'
       - series: 'collection_expected_delay_seconds{job="meteocore", instance="a:8000", collection="scan-late"}'
-        values: '1920x11 _x5 1920x18'
+        values: '1920x11 _x9 1920x14'
       - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="gone"}'
         values: '2460x6 _x29'
       - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="gone"}'
@@ -258,8 +259,8 @@ tests:
   # from 2.5 h. Its backlog then trickles in over the next hour, each scan
   # late, lifting the median to 1h 45m, and the age back to 35 minutes by
   # 5 h. The feed stops again at 6 h. Counting the lifted median, it would
-  # be stale only at 2h 15m old; the day's minimum keeps the threshold at
-  # an hour, so it fires at 6.5 h, as after the first stop.
+  # be stale only at 2h 15m old; the day's lower quartile keeps the
+  # threshold at an hour, so it fires at 6.5 h, as after the first stop.
   - name: CollectionStale backlog then stop
     interval: 5m
     input_series:
@@ -298,6 +299,33 @@ tests:
             exp_annotations:
               summary: "Collection scan is stale"
               description: "The newest data scan serves is 1h 10m 0s old, over its usual delivery delay plus 3 times the interval its data arrives at."
+
+  # A fast spell must not make the next day stricter. A 10-minute scan
+  # normally 26 minutes late, its age held at 40 minutes, the top of its
+  # sawtooth, comes 8 minutes late for 3 hours from hour 24, which brings
+  # its median down to 8 minutes from 26h10m to 28 h. The day's minimum
+  # would then hold the threshold at 38 minutes for a day, and the scan
+  # would be stale from 27h10m; the day's lower quartile stays 26
+  # minutes, a threshold of 56, so it never is.
+  - name: CollectionStale fast spell
+    interval: 5m
+    input_series:
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '2400x287 900x35 2400x288'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '600x612'
+      - series: 'collection_expected_delay_seconds{job="meteocore", instance="a:8000", collection="scan"}'
+        values: '1560x313 480x22 1560x275'
+    alert_rule_test:
+      - eval_time: 27h30m
+        alertname: CollectionStale
+        exp_alerts: []
+      - eval_time: 40h
+        alertname: CollectionStale
+        exp_alerts: []
+      - eval_time: 50h30m
+        alertname: CollectionStale
+        exp_alerts: []
 
   - name: CollectionEmpty
     interval: 1m
