@@ -220,7 +220,9 @@ it.
 `parentRefs` to your Gateway. Behind either, set `[server] base_url`, or
 `trust_proxy_headers = true` when the proxy sends `Forwarded` or
 `X-Forwarded-Proto` and `X-Forwarded-Host`,
-so that links in responses point at the public address.
+so that links in responses point at the public address. A route that strips a
+path prefix also sends it as `X-Forwarded-Prefix`; the proxy must set or
+remove that header on every route, as it does the others.
 
 Every path is routed, `/metrics` and `/admin/*` included. The admin endpoints
 answer 403 without `ADMIN_TOKEN` and need its bearer token with it.

@@ -7083,3 +7083,69 @@ async fn projected_getmap_wholly_outside_its_projection_is_empty() {
         }
     }
 }
+
+/// GetCapabilities requested through a gateway that strips `/open` and sends
+/// `X-Forwarded-Prefix` (#1403), with `trust_proxy_headers` on.
+async fn capabilities_via_gateway(prefix: &str) -> String {
+    let state = build_populated_state(Arc::new(PopulatedMockMapEngine));
+    let mut trusted = WmsState::clone(&state.load());
+    trusted.base_url = "http://127.0.0.1:8000".into();
+    trusted.trust_proxy_headers = true;
+    state.store(Arc::new(trusted));
+    let request = Request::builder()
+        .uri("/?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0")
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "gw.example.org")
+        .header("x-forwarded-prefix", prefix)
+        .body(Body::empty())
+        .unwrap();
+    let response = api_wms::router(state).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(body.to_vec()).unwrap()
+}
+
+/// Every `OnlineResource` (the service, each operation's DCPType and each
+/// style's LegendURL) is below the gateway's `/open` door.
+#[tokio::test]
+async fn capabilities_online_resources_keep_the_forwarded_prefix() {
+    let xml = capabilities_via_gateway("/open").await;
+    let hrefs: Vec<&str> = xml
+        .split("xlink:href=\"")
+        .skip(1)
+        .map(|rest| rest.split('"').next().unwrap())
+        .collect();
+    assert!(
+        hrefs.contains(&"https://gw.example.org/open/wms"),
+        "{hrefs:?}"
+    );
+    assert!(
+        hrefs.contains(&"https://gw.example.org/open/wms?"),
+        "{hrefs:?}"
+    );
+    assert!(
+        hrefs.iter().any(|h| h.starts_with(
+            "https://gw.example.org/open/wms?SERVICE=WMS&amp;REQUEST=GetLegendGraphic"
+        )),
+        "{hrefs:?}"
+    );
+    for href in hrefs {
+        assert!(
+            href.starts_with("https://gw.example.org/open/wms"),
+            "{href} lost the prefix"
+        );
+    }
+}
+
+/// A forged prefix is ignored: the links keep the forwarded origin, unprefixed.
+#[tokio::test]
+async fn capabilities_ignore_a_forged_forwarded_prefix() {
+    for forged in ["/../evil", "/a b"] {
+        let xml = capabilities_via_gateway(forged).await;
+        assert!(
+            xml.contains("xlink:href=\"https://gw.example.org/wms\""),
+            "{forged}"
+        );
+        assert!(!xml.contains("evil") && !xml.contains("/a b"), "{forged}");
+    }
+}

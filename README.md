@@ -526,6 +526,7 @@ Edit `config.toml` to configure the server and data collections:
 host = "0.0.0.0"
 port = 8000
 # base_url = "https://api.example.com"  # optional, for absolute links behind a proxy
+# trust_proxy_headers = true            # optional, per-request link base from the proxy's forwarding headers
 # collections_dir = "collections.d"     # optional, load per-collection .toml files from directory
 # metatile_cache_mb = 1024              # optional, global WMS meta-tile cache (MB); 0 disables meta-tiling
 # rendered_cache_mb = 256               # optional, global rendered-image cache (MB) shared by WMS/Maps/Tiles; 0 disables it
@@ -593,6 +594,7 @@ wis2_topic = "weather/surface-based-observations/weather-radar"
 | `host` | yes | — | Bind address |
 | `port` | yes | — | Bind port |
 | `base_url` | no | `http://{host}:{port}` | External base URL for absolute links (set when behind a reverse proxy) |
+| `trust_proxy_headers` | no | `false` | Build each request's absolute links from the reverse proxy's forwarding headers instead of `base_url`. The origin comes from RFC 7239 `Forwarded` (its last element), else `X-Forwarded-Proto` + `X-Forwarded-Host` (+ `X-Forwarded-Port`), else `base_url`. `X-Forwarded-Prefix` adds the path prefix a gateway stripped before proxying: with `X-Forwarded-Prefix: /open`, `/open/edr/collections` at the gateway links back under `https://<host>/open/`. The prefix replaces `base_url`'s own path rather than adding to it. It is used only when valid: the first value of a list, at most 128 bytes, starting with `/`, each segment unreserved characters (`A-Z a-z 0-9 - . _ ~`) and none empty, `.` or `..`; a trailing `/` is dropped, and anything else is ignored. Enable only behind a proxy that sets these headers, or removes a client's own, on every route, `X-Forwarded-Prefix` included, and that clients cannot bypass: otherwise a client chooses the links in its response, and a shared cache in front of the server could pass them on. |
 | `collections_dir` | no | — | Directory of per-collection `.toml` config files (see [Per-File Collection Configs](#per-file-collection-configs)) |
 | `colormaps_dir` | no | — | Directory of palette files loaded as named colormaps (one per file, name = file stem). Formats: `.toml` (colormap fields), GMT `.cpt`, GRLevelX/RadarScope `.pal` (Color/Color4/SolidColor[4] with per-bin gradients, values below the lowest entry render transparent per the GR display-threshold behavior, `Scale:`/`Offset:` inverted to data units, RadarScope mask tokens collapsed to one ramp, `ND:` → nodata color, `RF:` ignored), GDAL color-relief `.txt`/`.clr`, SLD `.sld` (ColorMap). Resolved relative to the config file's directory; re-read on reload. Missing directory is a hard error; other extensions are skipped (`.disabled` works). |
 | `watch_collections_dir` | no | `false` | Auto-reload when files in `collections_dir` are added, changed, or removed. Debounced; runs on the background runtime. See trust-model note in [Per-File Collection Configs](#per-file-collection-configs). |

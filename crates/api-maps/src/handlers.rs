@@ -838,6 +838,7 @@ pub(crate) fn openapi_components() -> serde_json::Value {
 pub async fn api_definition(
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
     let state = state.load_full();
     let m = mount.0;
@@ -885,6 +886,7 @@ pub async fn api_definition(
             "version": "1.0.0",
             "description": "OGC API - Maps implementation"
         },
+        "servers": api_common::openapi_servers(&request_base_url(&state, &headers)),
         "paths": paths,
         "components": openapi_components()
     });

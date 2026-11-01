@@ -1178,7 +1178,8 @@ one never implies the other.
 host = "0.0.0.0"
 port = 8000
 # base_url = "https://api.example.com"  # optional, static fallback for absolute links behind a proxy
-# trust_proxy_headers = true            # optional, per-request link base from proxy headers (default false)
+# trust_proxy_headers = true            # optional, per-request link base from proxy headers, incl. a
+                                        # stripped X-Forwarded-Prefix (default false)
 # collections_dir = "collections.d"     # optional, directory of per-collection .toml files
 # watch_collections_dir = true          # optional, auto-reload on collections_dir + colormaps_dir changes (default false)
 # watch_debounce_ms = 500               # optional, coalesce-window for the watcher (default 500)

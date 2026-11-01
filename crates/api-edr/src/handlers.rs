@@ -1234,7 +1234,10 @@ fn cube_operation(
     })
 }
 
-pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn api_definition(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
     let state = state.load_full();
     let mut collection_paths = json!({});
     for config in state.collections.values() {
@@ -2003,6 +2006,8 @@ pub async fn api_definition(State(state): State<AppState>) -> impl IntoResponse 
             }
         }
     });
+    // Outside the `json!` above, whose size is at the macro recursion limit.
+    openapi["servers"] = api_common::openapi_servers(&request_base_url(&state, &headers));
     // Items components (#928), named `items-*` so they cannot collide with
     // another query's parameters.
     if !state.feature_engines.is_empty() {

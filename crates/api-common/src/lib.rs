@@ -848,6 +848,16 @@ pub fn collection_parameters() -> Value {
     }).collect())
 }
 
+/// An OpenAPI document's `servers`: the request's external base URL, which
+/// its path keys continue (#1403). Without the member the server defaults to
+/// `/`, which a client resolves against the document's own URL to the
+/// origin's root, dropping a path prefix a gateway stripped
+/// (`X-Forwarded-Prefix`) or a configured `base_url` path.
+pub fn openapi_servers(base: &str) -> Value {
+    let url = if base.is_empty() { "/" } else { base };
+    json!([{"url": url}])
+}
+
 /// Shared collection operation, including representations and validation errors.
 pub fn collection_operation() -> Value {
     json!({

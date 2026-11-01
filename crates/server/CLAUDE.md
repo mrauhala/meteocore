@@ -184,14 +184,15 @@ registered id): a reused engine keeps its wrappers through `EngineReuse::wind`,
 so the registered `Arc` is the same after an incremental reload (a nowcast
 compares its source by identity) and the load log is not repeated.
 
-## Reverse-proxy base URL (`trust_proxy_headers`, #12)
+## Reverse-proxy base URL (`trust_proxy_headers`, #12, #1403)
 
 Absolute self-links (landing pages, `collections`, GeoJSON `links`, WMS
 GetCapabilities OnlineResource/legend URLs, 3D Tiles docs, …) are built from a
 base URL. By default it is resolved once at startup: `BASE_URL` env >
 `[server] base_url` > `http://{host}:{port}` — wrong behind a reverse proxy.
 
-With `[server] trust_proxy_headers = true`, the base is resolved per request:
+With `[server] trust_proxy_headers = true`, the base's origin is resolved per
+request:
 
 1. RFC 7239 `Forwarded` — `proto=`/`host=` of the **last** element (the
    closest trusted proxy; the first element is client-injectable via RFC 7239
@@ -199,9 +200,29 @@ With `[server] trust_proxy_headers = true`, the base is resolved per request:
 2. `X-Forwarded-Proto` + `X-Forwarded-Host` (+ optional `X-Forwarded-Port`),
 3. the static fallback above.
 
+A valid `X-Forwarded-Prefix` (#1403) is the base's path: the prefix a
+gateway stripped before proxying (`/open/edr/collections` at the gateway
+reaches `/edr/collections` here, and links go back under `/open`). It is
+appended to a forwarded origin and **replaces** the static fallback's own
+path, so `base_url = "https://gw.example.org/open"` plus the header `/open`
+is never `/open/open`. Without a valid prefix the base keeps its path: none
+after a forwarded origin, the fallback's otherwise. Validation
+(`sanitize_prefix`): the first value of a comma list, at most 128 bytes, a
+leading `/`, one trailing `/` trimmed (`/` alone is no prefix), and every
+segment non-empty, not `.`/`..`, unreserved characters only (`A-Za-z0-9-._~`,
+so no `%`-escapes). Anything else is ignored, never an error.
+
 The pure resolver is `ds_core::proxy::resolve_base_url` (framework-free; axum
 handlers pass header values via a closure). Each API crate calls it through a
-small `request_base_url` helper.
+small `request_base_url` helper. A server-built URL must come from it or be
+document-relative: a root-relative `/…` loses a stripped prefix. OpenAPI
+documents carry it as `servers` (`api_common::openapi_servers`); without
+that, clients resolve the default `/` to the origin's root. The static preview
+shell (`preview/index.html`) is templated per request: its `/preview/` asset
+URLs go below `ds_core::proxy::path_of(base)`, root-relative so its CSP's
+`'self'` holds, and `app.js` finds the manifest beside its own script URL.
+`tests/common_discovery.rs` (`forwarded_prefix_…`) crawls the shared root
+and EDR through a `/open` gateway; keep new link builders inside that crawl.
 
 **Security:** default false because forwarding headers are
 client-controllable. Even when enabled: host values are sanitised
@@ -211,6 +232,16 @@ through to the next source. Enable only when a trusted proxy sets/overwrites
 these headers, the proxy strips `Forwarded`/`X-Forwarded-*` on untrusted
 client requests, and clients cannot reach the backend directly — otherwise a
 client could spoof the emitted self-links (open-redirect risk downstream).
+`X-Forwarded-Prefix` is one of these headers: the proxy must set it, or
+remove a client's own, on every route, as for `Forwarded`. A client value
+that passes through changes only the links in that client's own response:
+no MeteoCore cache stores a link-bearing document. The server-side caches
+hold rendered images, MVT tiles and 3D Tiles binaries (tileset JSON links
+its content relatively and is rebuilt per request); metadata, HTML and
+GetCapabilities are built per request, and `caching::conditional_get`
+only hashes. Responses do carry `Cache-Control: public`, so a shared HTTP
+cache that sees unsanitised headers could hand one client's links to
+others — one more reason the proxy must own the header.
 
 ## Request log (`request_logging_middleware`)
 

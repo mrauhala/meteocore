@@ -530,9 +530,12 @@ fn document_tags(paths: &Map<String, Value>, titles: &BTreeMap<String, String>) 
         .collect()
 }
 
-/// GET {mount}/api — OpenAPI 3.0.3 definition
-async fn api_definition(State(api): State<AppState>) -> Response {
-    Json(openapi_document(&api)).into_response()
+/// GET {mount}/api — OpenAPI 3.0.3 definition, its `servers` the request's
+/// base URL.
+async fn api_definition(State(api): State<AppState>, headers: HeaderMap) -> Response {
+    let mut document = openapi_document(&api);
+    document["servers"] = crate::openapi_servers(&api.base(&headers));
+    Json(document).into_response()
 }
 
 /// GET {mount}/api/docs — Swagger UI

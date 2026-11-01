@@ -2743,3 +2743,247 @@ fn background_parameters_declared(parameter: &dyn Fn(&str) -> Option<Value>, pat
         assert_eq!(declared["required"], false, "{path}: {name}");
     }
 }
+
+// ── X-Forwarded-Prefix (#1403) ───────────────────────────────────────────
+
+/// The public base a gateway at `gw.example.org` exposes this server under:
+/// it strips `/open` and says so in `X-Forwarded-Prefix`.
+const GATEWAY: &str = "https://gw.example.org/open";
+
+/// The shared root (at `/`) and EDR (at `/edr`) as the server routes them,
+/// with `trust_proxy_headers` on and the static [`BASE`] as fallback.
+fn trusted_apps() -> (Router, Router) {
+    fn trust<T: Clone>(state: Arc<ArcSwap<T>>, set: impl FnOnce(&mut T)) -> Arc<ArcSwap<T>> {
+        let mut inner = T::clone(&state.load());
+        set(&mut inner);
+        state.store(Arc::new(inner));
+        state
+    }
+    let (configs, edr, maps, features) = catalog();
+    let shared = api_common::shared::SharedApi::new(
+        "",
+        vec![
+            Arc::new(api_maps::MapsBlock::new(trust(
+                maps_state(configs.clone(), maps.clone()),
+                |s| s.trust_proxy_headers = true,
+            ))),
+            Arc::new(api_tiles::TilesBlock::new(trust(
+                tiles_state(configs.clone(), maps, features.clone(), false),
+                |s| s.trust_proxy_headers = true,
+            ))),
+            Arc::new(api_features::FeaturesBlock::new(trust(
+                features_state(configs.clone(), features),
+                |s| s.trust_proxy_headers = true,
+            ))),
+        ],
+        vec![],
+    );
+    let edr = api_edr::router(Arc::new(ArcSwap::from_pointee(
+        api_edr::handlers::EdrState {
+            engines: edr,
+            feature_engines: HashMap::new(),
+            collections: configs,
+            discovery: discovery(),
+            styles: HashMap::new(),
+            base_url: BASE.into(),
+            trust_proxy_headers: true,
+        },
+    )));
+    (
+        api_common::shared::router(shared),
+        Router::new().nest("/edr", edr),
+    )
+}
+
+/// GET `path` as the gateway forwards it: `X-Forwarded-Proto: https`,
+/// `X-Forwarded-Host: gw.example.org` and `X-Forwarded-Prefix: prefix`.
+async fn via_gateway(apps: &(Router, Router), path: &str, prefix: &str) -> (StatusCode, String) {
+    let app = if path.starts_with("/edr") {
+        &apps.1
+    } else {
+        &apps.0
+    };
+    let request = Request::builder()
+        .uri(path)
+        .header("x-forwarded-proto", "https")
+        .header("x-forwarded-host", "gw.example.org")
+        .header("x-forwarded-prefix", prefix)
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+/// Every absolute URL in a JSON document, in any member.
+fn absolute_urls(doc: &Value, out: &mut Vec<String>) {
+    match doc {
+        Value::String(s) if s.starts_with("http://") || s.starts_with("https://") => {
+            out.push(s.clone())
+        }
+        Value::Array(values) => values.iter().for_each(|v| absolute_urls(v, out)),
+        Value::Object(map) => map.values().for_each(|v| absolute_urls(v, out)),
+        _ => {}
+    }
+}
+
+/// A server-built URL is under the gateway's prefix: neither the static
+/// fallback nor the gateway's host without `/open` leaks.
+fn assert_under_gateway(url: &str, context: &str) {
+    assert!(
+        !url.contains("example.test/base"),
+        "{context}: the static base leaked: {url}"
+    );
+    if url.starts_with("https://gw.example.org") {
+        assert!(
+            url.starts_with(&format!("{GATEWAY}/")) || url == GATEWAY,
+            "{context}: a self-link lost the prefix: {url}"
+        );
+    }
+}
+
+/// Behind a gateway that strips `/open` and sends `X-Forwarded-Prefix`,
+/// every link the shared root and EDR write — JSON links, URI templates
+/// (tilesets), the OpenAPI `servers`, HTML hrefs, forms and assets — is
+/// under `https://gw.example.org/open/`, and following them through the
+/// gateway reaches every Common resource.
+#[tokio::test]
+async fn forwarded_prefix_keeps_every_self_link_under_the_gateway_door() {
+    let apps = trusted_apps();
+    let mut queue = vec![format!("{GATEWAY}/"), format!("{GATEWAY}/edr/")];
+    let mut seen = std::collections::HashSet::new();
+    let mut templated = 0;
+    while let Some(url) = queue.pop() {
+        // The fixture's EDR engines answer metadata only.
+        if !seen.insert(url.clone()) || url.contains("/locations") {
+            continue;
+        }
+        // The gateway strips its door's prefix before proxying.
+        let path = routable(url.strip_prefix(GATEWAY).unwrap());
+        let path = if path.is_empty() {
+            "/".to_owned()
+        } else {
+            path
+        };
+        let (status, body) = via_gateway(&apps, &path, "/open").await;
+        assert_eq!(status, StatusCode::OK, "{url}: {body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        let mut urls = Vec::new();
+        absolute_urls(&doc, &mut urls);
+        // A conformance declaration carries no links.
+        assert!(
+            doc.get("links").is_none() || urls.iter().any(|u| u.starts_with(GATEWAY)),
+            "{url} has no self-link"
+        );
+        for u in &urls {
+            assert_under_gateway(u, &url);
+            if u.contains("{tileMatrix}") {
+                templated += 1;
+            }
+        }
+        if url.ends_with("/api") {
+            assert_eq!(doc["servers"], json!([{"url": GATEWAY}]), "{url}");
+        }
+        let mut links = Vec::new();
+        json_links_under(&doc, GATEWAY, &mut links);
+        queue.extend(links);
+    }
+    for resource in [
+        "/",
+        "/api",
+        "/conformance",
+        "/collections",
+        "/collections/c-match",
+        "/edr/",
+        "/edr/api",
+        "/edr/conformance",
+        "/edr/collections",
+        "/edr/collections/c-match",
+    ] {
+        assert!(
+            seen.iter()
+                .any(|u| u.split('?').next() == Some(&format!("{GATEWAY}{resource}"))),
+            "the crawl never reached {resource}; visited {seen:?}"
+        );
+    }
+    assert!(templated > 0, "no tile URL template was checked");
+
+    // The HTML pages: links, forms, scripts and stylesheets.
+    for path in [
+        "/?f=html",
+        "/collections?f=html",
+        "/collections/c-match?f=html",
+        "/edr?f=html",
+        "/edr/collections?f=html",
+        "/edr/collections/c-match?f=html",
+    ] {
+        let (status, html) = via_gateway(&apps, path, "/open").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {html}");
+        let mut absolute = 0;
+        for attr in ["href=\"", "src=\"", "action=\"", "data-copy=\""] {
+            for value in html.split(attr).skip(1) {
+                let value = value.split('"').next().unwrap();
+                assert!(
+                    !value.starts_with('/') || value.starts_with("//"),
+                    "{path}: root-relative {attr}{value}\" loses the prefix"
+                );
+                if value.starts_with("http") {
+                    assert_under_gateway(value, path);
+                    absolute += 1;
+                }
+            }
+        }
+        assert!(absolute > 0, "{path}: no absolute link checked");
+    }
+}
+
+/// Every advertised JSON link below `base` that is not a URI template.
+fn json_links_under(doc: &Value, base: &str, out: &mut Vec<String>) {
+    match doc {
+        Value::Array(values) => values.iter().for_each(|v| json_links_under(v, base, out)),
+        Value::Object(map) => {
+            if let (Some(href), Some(_)) = (map.get("href").and_then(Value::as_str), map.get("rel"))
+            {
+                let media = map.get("type").and_then(Value::as_str).unwrap_or("");
+                if href.starts_with(base)
+                    && media.contains("json")
+                    && map.get("templated") != Some(&json!(true))
+                {
+                    out.push(href.to_owned());
+                }
+            }
+            map.values().for_each(|v| json_links_under(v, base, out));
+        }
+        _ => {}
+    }
+}
+
+/// An invalid `X-Forwarded-Prefix` is ignored, never echoed: the links keep
+/// the forwarded origin with no prefix at all.
+#[tokio::test]
+async fn forged_forwarded_prefix_is_ignored() {
+    let apps = trusted_apps();
+    for forged in ["/../evil", "/a b", "//evil.example.com", "/open?x", "open"] {
+        for path in ["/", "/collections", "/edr", "/edr/collections"] {
+            let (status, body) = via_gateway(&apps, path, forged).await;
+            assert_eq!(status, StatusCode::OK, "{forged} {path}: {body}");
+            let doc: Value = serde_json::from_str(&body).unwrap();
+            let own = format!("https://gw.example.org{}", path.trim_end_matches('/'));
+            assert!(
+                link(&doc, "self").starts_with(&own),
+                "{forged} {path}: {}",
+                link(&doc, "self")
+            );
+            let mut urls = Vec::new();
+            absolute_urls(&doc, &mut urls);
+            for u in urls {
+                assert!(
+                    !u.contains("evil") && !u.contains("/open"),
+                    "{forged} {path}: {u}"
+                );
+                assert!(!u.contains("example.test/base"), "{forged} {path}: {u}");
+            }
+        }
+    }
+}

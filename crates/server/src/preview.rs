@@ -82,32 +82,85 @@ fn sha256_etag(hash: &[u8; 32]) -> String {
 }
 
 /// `GET /preview` — serve the SPA shell. Equivalent to `/preview/index.html`.
-pub async fn index_handler(headers: axum::http::HeaderMap) -> Response {
-    serve_asset("index.html", &headers)
+pub async fn index_handler(
+    State(state): State<AdminState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    serve_index(&state, &headers)
 }
 
 /// `GET /preview/{*path}` — serve any embedded asset by relative path.
-pub async fn asset_handler(Path(path): Path<String>, headers: axum::http::HeaderMap) -> Response {
+pub async fn asset_handler(
+    State(state): State<AdminState>,
+    Path(path): Path<String>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    if path == "index.html" {
+        return serve_index(&state, &headers);
+    }
     serve_asset(&path, &headers)
+}
+
+/// The SPA shell, its root-relative `/preview/` URLs moved below the path of
+/// the request's base URL (#1403). Behind a gateway that strips a prefix,
+/// `/preview/app.js` would reach another door of the gateway;
+/// `/open/preview/app.js` reaches this server. Root-relative, not absolute:
+/// the shell's CSP allows only `'self'`, and the base's host can differ from
+/// the one the browser used (`127.0.0.1` vs `localhost`). The ETag hashes
+/// the shell as sent, so a shared cache cannot answer one prefix's
+/// revalidation with another's body.
+fn serve_index(state: &AdminState, request_headers: &axum::http::HeaderMap) -> Response {
+    let tiles = state.tiles.load();
+    let base = ds_core::proxy::resolve_base_url(&tiles.base_url, tiles.trust_proxy_headers, |n| {
+        request_headers.get(n).and_then(|v| v.to_str().ok())
+    });
+    let Some(html) = index_html(ds_core::proxy::path_of(&base)) else {
+        return not_found();
+    };
+    let etag = ds_core::http_cache::etag_of(html.as_bytes());
+    respond("index.html", html.into_bytes(), etag, request_headers)
+}
+
+/// The embedded `index.html` with its `/preview/` URLs below `path`.
+fn index_html(path: &str) -> Option<String> {
+    let content = PreviewAssets::get("index.html")?;
+    let html = std::str::from_utf8(&content.data).ok()?;
+    let rooted = format!("\"{}/preview/", ds_core::html::escape(path));
+    Some(html.replace("\"/preview/", &rooted))
+}
+
+fn not_found() -> Response {
+    // Generic body — `path` is user-controlled. Reflecting it isn't an
+    // XSS vector here (`text/plain`) but matches the project's
+    // "no internal detail in client errors" guideline. `nosniff` on
+    // the 404 matches the 200 path so a browser can't sniff this
+    // `text/plain` response as something else under any edge case.
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(
+            header::HeaderName::from_static("x-content-type-options"),
+            "nosniff",
+        )
+        .body(Body::from("Not Found"))
+        .expect("static 404 response headers are valid")
 }
 
 fn serve_asset(path: &str, request_headers: &axum::http::HeaderMap) -> Response {
     let Some(content) = PreviewAssets::get(path) else {
-        // Generic body — `path` is user-controlled. Reflecting it isn't an
-        // XSS vector here (`text/plain`) but matches the project's
-        // "no internal detail in client errors" guideline. `nosniff` on
-        // the 404 matches the 200 path so a browser can't sniff this
-        // `text/plain` response as something else under any edge case.
-        return Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .header(
-                header::HeaderName::from_static("x-content-type-options"),
-                "nosniff",
-            )
-            .body(Body::from("Not Found"))
-            .expect("static 404 response headers are valid");
+        return not_found();
     };
+    let etag = sha256_etag(&content.metadata.sha256_hash());
+    respond(path, content.data.into_owned(), etag, request_headers)
+}
+
+/// An asset's 200, or its 304 when `If-None-Match` names `etag`.
+fn respond(
+    path: &str,
+    body: Vec<u8>,
+    etag: String,
+    request_headers: &axum::http::HeaderMap,
+) -> Response {
     let mime = mime_for(path);
     let is_html = mime.starts_with("text/html");
     // Cache strategy splits by asset class:
@@ -134,7 +187,6 @@ fn serve_asset(path: &str, request_headers: &axum::http::HeaderMap) -> Response 
     } else {
         "public, max-age=300, must-revalidate"
     };
-    let etag = sha256_etag(&content.metadata.sha256_hash());
     // Conditional GET: short-circuit to `304 Not Modified` when the client
     // already has the same body. Saves the full payload on every reload of
     // a `no-cache`-marked asset.
@@ -174,7 +226,7 @@ fn serve_asset(path: &str, request_headers: &axum::http::HeaderMap) -> Response 
         );
     }
     builder
-        .body(Body::from(content.data.into_owned()))
+        .body(Body::from(body))
         .expect("static preview response headers are valid")
 }
 
@@ -955,6 +1007,7 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use arc_swap::ArcSwap;
+    use axum::http::{HeaderMap, HeaderValue};
     use chrono::{DateTime, Utc};
     use ds_core::edr_engine::EdrEngine;
     use ds_core::error::DataServerError;
@@ -2885,9 +2938,112 @@ mod tests {
     // Static-asset handler tests
     // -----------------------------------------------------------------------
 
+    /// A server with nothing loaded, as the static-asset handlers need only
+    /// its base URL.
+    fn asset_state() -> AdminState {
+        make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            empty_tiles(),
+            empty_wms(),
+        )
+    }
+
+    async fn body_text(resp: Response) -> String {
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    /// The shell's asset URLs: every `href=` / `src=` value.
+    fn shell_urls(html: &str) -> Vec<&str> {
+        ["href=\"", "src=\""]
+            .iter()
+            .flat_map(|attr| html.split(attr).skip(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn index_urls_are_root_relative_without_a_prefix() {
+        let html = body_text(index_handler(State(asset_state()), HeaderMap::new()).await).await;
+        let urls = shell_urls(&html);
+        assert_eq!(urls.len(), 4, "{html}");
+        assert!(urls.iter().all(|u| u.starts_with("/preview/")), "{urls:?}");
+    }
+
+    /// Behind a gateway that strips `/open` (#1403), the shell loads its
+    /// assets below `/open`, root-relative so the CSP's `'self'` holds, and
+    /// `/preview/index.html` is the same shell. A forged prefix is ignored,
+    /// and each prefix's shell has its own ETag.
+    #[tokio::test]
+    async fn index_urls_follow_the_forwarded_prefix() {
+        let mut tiles = empty_tiles();
+        tiles.base_url = "http://127.0.0.1:8000".into();
+        tiles.trust_proxy_headers = true;
+        let state = make_state(
+            empty_edr(),
+            empty_features(),
+            empty_maps(),
+            tiles,
+            empty_wms(),
+        );
+        let request = |prefix: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+            headers.insert(
+                "x-forwarded-host",
+                HeaderValue::from_static("gw.example.org"),
+            );
+            headers.insert("x-forwarded-prefix", HeaderValue::from_static(prefix));
+            headers
+        };
+        let open = index_handler(State(state.clone()), request("/open")).await;
+        let open_etag = open.headers()[header::ETAG].clone();
+        let html = body_text(open).await;
+        let urls = shell_urls(&html);
+        assert_eq!(urls.len(), 4, "{html}");
+        assert!(
+            urls.iter().all(|u| u.starts_with("/open/preview/")),
+            "{urls:?}"
+        );
+        let named = asset_handler(
+            State(state.clone()),
+            Path("index.html".into()),
+            request("/open"),
+        )
+        .await;
+        assert_eq!(body_text(named).await, html);
+
+        let local = index_handler(State(state.clone()), request("/local")).await;
+        assert_ne!(local.headers()[header::ETAG], open_etag);
+        // The other door's ETag does not revalidate this door's shell.
+        let mut stale = request("/local");
+        stale.insert(header::IF_NONE_MATCH, open_etag);
+        let local = index_handler(State(state.clone()), stale).await;
+        assert_eq!(local.status(), StatusCode::OK);
+
+        for forged in ["/../evil", "/a b", "//evil.example.com"] {
+            let mut headers = request("/open");
+            headers.insert("x-forwarded-prefix", HeaderValue::from_str(forged).unwrap());
+            let html = body_text(index_handler(State(state.clone()), headers).await).await;
+            let urls = shell_urls(&html);
+            assert!(
+                urls.iter().all(|u| u.starts_with("/preview/")),
+                "{forged}: {urls:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn index_handler_returns_html() {
-        let resp = index_handler(axum::http::HeaderMap::new()).await;
+        let resp = index_handler(
+            axum::extract::State(asset_state()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -2907,7 +3063,11 @@ mod tests {
         // the new shell immediately. CSP is the SPA's only browser-side
         // safety net (defence in depth even though `app.js` only writes via
         // `textContent`).
-        let resp = index_handler(axum::http::HeaderMap::new()).await;
+        let resp = index_handler(
+            axum::extract::State(asset_state()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
         assert_eq!(
             resp.headers().get(header::CACHE_CONTROL).unwrap(),
             "no-cache"
@@ -2933,6 +3093,7 @@ mod tests {
     #[tokio::test]
     async fn vendored_maplibre_js_is_cacheable_but_not_immutable() {
         let resp = asset_handler(
+            axum::extract::State(asset_state()),
             axum::extract::Path("vendor/maplibre-gl.js".into()),
             axum::http::HeaderMap::new(),
         )
@@ -2969,6 +3130,7 @@ mod tests {
         // Non-fingerprinted JS bundled with the binary: short cache, must
         // revalidate. `immutable` would pin clients across deploys.
         let resp = asset_handler(
+            axum::extract::State(asset_state()),
             axum::extract::Path("app.js".into()),
             axum::http::HeaderMap::new(),
         )
@@ -3060,6 +3222,7 @@ mod tests {
         // *names*. Do NOT "fix" a failure by deleting an expected
         // substitution unless the manifest stopped emitting it.
         let resp = asset_handler(
+            axum::extract::State(asset_state()),
             axum::extract::Path("app.js".into()),
             axum::http::HeaderMap::new(),
         )
@@ -3099,6 +3262,7 @@ mod tests {
         // The title already appears in the sidebar (escaped via
         // `textContent`), so the source attribution is redundant.
         let resp = asset_handler(
+            axum::extract::State(asset_state()),
             axum::extract::Path("app.js".into()),
             axum::http::HeaderMap::new(),
         )
@@ -3121,6 +3285,7 @@ mod tests {
     #[tokio::test]
     async fn app_js_reads_the_default_parameter_and_page_url() {
         let resp = asset_handler(
+            axum::extract::State(asset_state()),
             axum::extract::Path("app.js".into()),
             axum::http::HeaderMap::new(),
         )
@@ -3141,6 +3306,7 @@ mod tests {
     async fn unknown_asset_returns_generic_404_body() {
         // User-supplied path must NOT be reflected (review feedback Phase 2).
         let resp = asset_handler(
+            axum::extract::State(asset_state()),
             axum::extract::Path("does-not-exist.txt".into()),
             axum::http::HeaderMap::new(),
         )
@@ -3158,7 +3324,11 @@ mod tests {
     #[tokio::test]
     async fn matching_if_none_match_yields_304_with_empty_body() {
         // First request — learn the ETag.
-        let first = index_handler(axum::http::HeaderMap::new()).await;
+        let first = index_handler(
+            axum::extract::State(asset_state()),
+            axum::http::HeaderMap::new(),
+        )
+        .await;
         let etag = first
             .headers()
             .get(header::ETAG)
@@ -3169,7 +3339,7 @@ mod tests {
         // reload of the `no-cache` shell.
         let mut req_headers = axum::http::HeaderMap::new();
         req_headers.insert(header::IF_NONE_MATCH, etag.clone());
-        let second = index_handler(req_headers).await;
+        let second = index_handler(axum::extract::State(asset_state()), req_headers).await;
         assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(second.headers().get(header::ETAG).unwrap(), &etag);
         // 304 must still carry Cache-Control so the browser refreshes its
@@ -3273,7 +3443,7 @@ mod tests {
             header::IF_NONE_MATCH,
             axum::http::HeaderValue::from_static("\"deadbeef\""),
         );
-        let resp = index_handler(req_headers).await;
+        let resp = index_handler(axum::extract::State(asset_state()), req_headers).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = axum::body::to_bytes(resp.into_body(), 16 * 1024)
             .await
