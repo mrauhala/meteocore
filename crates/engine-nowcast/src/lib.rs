@@ -6,7 +6,8 @@
 //! frames, [`advect`] extrapolates the latest frame along that field, and
 //! [`skill`] scores a hindcast against what actually happened (the phase-0
 //! gate: extrapolation must beat persistence, or the motion estimator is
-//! wrong — see `examples/skill_spike.rs`).
+//! wrong — see `examples/skill_spike.rs`), and [`lead_skill`] holds served
+//! forecasts until their valid time to score them in operation (#648).
 //!
 //! [`engine::NowcastEngine`] (phase 1, #522) wraps another collection's
 //! `MapEngine` and turns generations of extrapolated frames into an ordinary
@@ -24,6 +25,7 @@ pub mod advect;
 pub mod cells2d;
 pub mod engine;
 pub mod impact;
+pub mod lead_skill;
 pub mod motion;
 pub mod motion_grid;
 pub mod motion_pipeline;

@@ -2088,6 +2088,9 @@ struct CacheCounterState {
     /// pass1_matches, pass2_matches, velocity_clamps)` last-scraped values
     /// (#643).
     nowcast_tracks: HashMap<String, (u64, u64, u64, u64, u64)>,
+    /// Nowcast per-collection fixed-lead pair counts `[scored, no_analysis,
+    /// grid_mismatch]` per lead (#648), same scheme.
+    nowcast_leads: HashMap<String, Vec<[u64; 3]>>,
     /// WIS2 pipeline counters per collection (received, 7 drop reasons,
     /// reconnects, downloads, download failures, integrity unverified).
     wis2: HashMap<String, [u64; 12]>,
@@ -2129,6 +2132,7 @@ impl CacheCounterState {
             postgis,
             nowcast,
             nowcast_tracks,
+            nowcast_leads,
             wis2,
             cap,
             bufr,
@@ -2151,6 +2155,7 @@ impl CacheCounterState {
         drop_keys(postgis, removed);
         drop_keys(nowcast, removed);
         drop_keys(nowcast_tracks, removed);
+        drop_keys(nowcast_leads, removed);
         drop_keys(wis2, removed);
         drop_keys(cap, removed);
         drop_keys(bufr, removed);
@@ -2234,6 +2239,65 @@ static STATION_GRID_LOO_RESIDUALS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     .unwrap();
     per_collection(gauge)
 });
+
+/// Export one nowcast's fixed-lead skill (#648): the pair counters by the
+/// reload-rebaseline delta scheme, touched from boot, and the latest
+/// pair's gauges, removed while that pair had no echo at a threshold.
+fn update_nowcast_lead_skill(
+    collection: &str,
+    leads: &engine_nowcast::lead_skill::LeadSkills,
+    counter_state: &mut CacheCounterState,
+) {
+    use engine_nowcast::lead_skill::{SkipReason, SKILL_THRESHOLDS};
+    let counts: Vec<[u64; 3]> = leads
+        .iter()
+        .map(|l| {
+            [
+                l.scored_pairs,
+                l.skipped_no_analysis,
+                l.skipped_grid_mismatch,
+            ]
+        })
+        .collect();
+    let seen = counter_state
+        .nowcast_leads
+        .entry(collection.to_string())
+        .or_insert_with(|| vec![[0; 3]; counts.len()]);
+    let backward = seen.len() != counts.len()
+        || counts
+            .iter()
+            .zip(seen.iter())
+            .any(|(now, was)| now.iter().zip(was).any(|(n, w)| n < w));
+    for ((lead, now), was) in leads.iter().zip(&counts).zip(seen.iter()) {
+        let delta = |i: usize| if backward { 0 } else { now[i] - was[i] };
+        let lead_label = lead.lead_minutes.to_string();
+        NOWCAST_LEAD_SCORED_PAIRS
+            .with_label_values(&[collection, &lead_label])
+            .inc_by(delta(0));
+        for (i, reason) in [(1, SkipReason::NoAnalysis), (2, SkipReason::GridMismatch)] {
+            NOWCAST_LEAD_SKIPPED_PAIRS
+                .with_label_values(&[collection, &lead_label, reason.label()])
+                .inc_by(delta(i));
+        }
+        for (threshold, scored) in SKILL_THRESHOLDS.iter().zip(lead.csi_permille) {
+            let labels = [collection, lead_label.as_str(), &threshold.to_string()];
+            match scored {
+                Some((csi, persistence)) => {
+                    NOWCAST_LEAD_CSI.with_label_values(&labels).set(csi as i64);
+                    NOWCAST_LEAD_PERSISTENCE_CSI
+                        .with_label_values(&labels)
+                        .set(persistence as i64);
+                }
+                None => {
+                    // Err = never set: nothing to remove.
+                    let _ = NOWCAST_LEAD_CSI.remove_label_values(&labels);
+                    let _ = NOWCAST_LEAD_PERSISTENCE_CSI.remove_label_values(&labels);
+                }
+            }
+        }
+    }
+    *seen = counts;
+}
 
 /// Set the leave-one-out gauges from each engine's latest analyses,
 /// dropping the series of collections and parameters that have none.
@@ -2424,12 +2488,14 @@ static NOWCAST_FRAMES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     per_collection(gauge)
 });
 
-// The frames the retained generations hold (#1307): exact, width × height
-// × frames × 1 byte (u8 source) or 4 (f32 fallback).
+// The frames a nowcast holds (#1307): exact, width × height × frames × 1
+// byte (u8 source) or 4 (f32 fallback), over the retained generations and
+// the fixed-lead skill ring (#648).
 static NOWCAST_FRAME_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     collection_gauge(
         "nowcast_frame_bytes",
-        "Bytes of the frames a nowcast collection's retained generations hold",
+        "Bytes of the frames a nowcast collection holds: its retained generations and the \
+         forecasts its fixed-lead skill scoring holds until their valid time",
     )
 });
 
@@ -2457,6 +2523,63 @@ static NOWCAST_LEAD1_PERSISTENCE_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
     .unwrap();
     per_collection(gauge)
+});
+
+// Skill at fixed leads (#648): the forecast issued `lead` minutes before an
+// analysis, scored against it at `threshold` next to persistence at the
+// same lead. Bounded labels: two leads × two thresholds.
+static NOWCAST_LEAD_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "nowcast_lead_csi_permille",
+            "Realized skill at a fixed lead: CSI x1000 of the forecast issued `lead` minutes \
+             before an analysis, scored against it at `threshold` (source units, dBZ) over the \
+             pixels forecast, persistence and analysis all cover; latest pair, absent when it \
+             had no echo at that threshold (#648)",
+        ),
+        &["collection", "lead", "threshold"],
+    )
+    .unwrap();
+    per_collection(gauge)
+});
+
+static NOWCAST_LEAD_PERSISTENCE_CSI: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "nowcast_lead_persistence_csi_permille",
+            "Persistence baseline for nowcast_lead_csi_permille: CSI x1000 of the analysis the \
+             forecast was issued from, scored against the same analysis on the same pixels",
+        ),
+        &["collection", "lead", "threshold"],
+    )
+    .unwrap();
+    per_collection(gauge)
+});
+
+static NOWCAST_LEAD_SCORED_PAIRS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_lead_scored_pairs_total",
+            "Fixed-lead forecasts scored against the analysis at their valid time (#648); \
+             one per lead time while the source delivers every frame",
+        ),
+        &["collection", "lead"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+
+static NOWCAST_LEAD_SKIPPED_PAIRS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "nowcast_lead_skipped_pairs_total",
+            "Fixed-lead forecasts dropped unscored (#648): no_analysis = no generation at \
+             exactly their valid time, grid_mismatch = the working grid changed",
+        ),
+        &["collection", "lead", "reason"],
+    )
+    .unwrap();
+    per_collection(counter)
 });
 
 static RENDER_SEMAPHORE_AVAILABLE: LazyLock<IntGauge> = LazyLock::new(|| {
@@ -8952,6 +9075,7 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                     .with_label_values(&[collection])
                     .set(persistence as i64);
             }
+            update_nowcast_lead_skill(collection, &engine.lead_skill(), &mut counter_state);
         }
     }
 
@@ -12884,8 +13008,31 @@ prewarm_sweeps = 0
             !cap_series.keys().any(|l| l.contains("part=\"geocode\"")),
             "no lookup configured"
         );
+        let nowcast_series = series_of(&text, nowcast);
         let line = format!("nowcast_frame_bytes{{collection=\"{nowcast}\"}}");
-        assert!(series_of(&text, nowcast).contains_key(&line), "{line}");
+        assert!(nowcast_series.contains_key(&line), "{line}");
+        // #648: the fixed-lead pair counters exist at 0 before any pair, and
+        // no CSI gauge claims a score yet.
+        for lead in ["30", "60"] {
+            let scored = format!(
+                "nowcast_lead_scored_pairs_total{{collection=\"{nowcast}\",lead=\"{lead}\"}}"
+            );
+            assert_eq!(nowcast_series.get(&scored), Some(&0.0), "{scored}");
+            for reason in ["no_analysis", "grid_mismatch"] {
+                let skipped = format!(
+                    "nowcast_lead_skipped_pairs_total{{collection=\"{nowcast}\",lead=\"{lead}\",\
+                     reason=\"{reason}\"}}"
+                );
+                assert_eq!(nowcast_series.get(&skipped), Some(&0.0), "{skipped}");
+            }
+        }
+        assert!(
+            !nowcast_series
+                .keys()
+                .any(|l| l.starts_with("nowcast_lead_csi")
+                    || l.starts_with("nowcast_lead_persistence_csi")),
+            "{nowcast_series:?}"
+        );
         for family in [
             "process_start_time_seconds",
             "render_budget_reserved_peak_bytes",
