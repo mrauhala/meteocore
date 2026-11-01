@@ -205,6 +205,17 @@ impl TileCache {
     pub(crate) fn resize(&self, max_bytes: u64) {
         self.inner.set_capacity(max_bytes);
     }
+
+    /// The least size [`Self::resize`] takes the cache to now (#1312):
+    /// where its shards still hold 32 tiles each.
+    pub(crate) fn least_capacity(&self) -> u64 {
+        self.inner.least_capacity()
+    }
+
+    /// Drop every tile, keeping the capacity (#1312).
+    pub(crate) fn clear(&self) {
+        self.inner.clear();
+    }
 }
 
 #[cfg(test)]

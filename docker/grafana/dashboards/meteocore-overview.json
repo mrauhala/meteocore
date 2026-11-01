@@ -1432,6 +1432,19 @@
                                     "name": "panel-181"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 30,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-200"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -18319,7 +18332,7 @@
         "spec": {
           "id": 120,
           "title": "Cache plan",
-          "description": "Every cache and admission budget with where its size came from: default, env:<variable>, config:<[server] key>, collection:<collection key> or constant (/admin/cache-plan has the same list). Capacity is the configured size and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used. Demand is what the engines say the cache must hold for their data (cache_demand_bytes; a floor for PVOL pixels), empty for a cache without one; /admin/cache-plan has its inputs and the suggested size. Planned is the size the memory plan gives each one (cache_planned_bytes), fitted at boot and at each reload to the plan's total; 0 for a cache no collection can reach. A report: the configured size is unchanged. /admin/cache-plan says why each size.",
+          "description": "Every cache and admission budget with where its size came from: default, env:<variable>, config:<[server] key>, collection:<collection key>, derived:<key>, constant, or plan:auto while [memory] mode = \"auto\" gives it its planned size (/admin/cache-plan has the same list, with the configured size beside it). Capacity is the size it has and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used. Demand is what the engines say the cache must hold for their data (cache_demand_bytes; a floor for PVOL pixels), empty for a cache without one; /admin/cache-plan has its inputs and the suggested size. Planned is the size the memory plan gives each one (cache_planned_bytes), fitted at boot and at each reload to the plan's total; 0 for a cache no collection can reach. In report mode the configured size is unchanged; in auto mode every cache and budget no setting pins takes it, a warm cache at most a quarter smaller per reload. /admin/cache-plan says why each size.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -18748,7 +18761,7 @@
         "spec": {
           "id": 122,
           "title": "Memory outside caches",
-          "description": "RSS less every *_cache_bytes, stacked by where it is: stores = the in-memory stores that report their size (BUFR reports and snapshot, the WIS2 dedup and BUFR deletion indexes, CAP alerts, nowcast frames, PVOL catalogs, NetCDF open files; see Store memory), heap without a gauge = jemalloc allocated less the caches and the stores, allocator slack = active less allocated (fragmentation), dirty pages = resident less active (freed pages awaiting purge), outside jemalloc = RSS less jemalloc resident (thread stacks, mapped files). A growing heap without a gauge is memory no gauge explains yet. RSS is read on Linux only, so the top band is empty elsewhere.",
+          "description": "RSS less every *_cache_bytes, stacked by where it is: stores = the in-memory stores that report their size (BUFR reports and snapshot, the WIS2 dedup and BUFR deletion indexes, CAP alerts, nowcast frames, PVOL catalogs, NetCDF open files, Icechunk ranges fetched ahead; see Store memory), heap without a gauge = jemalloc allocated less the caches and the stores, allocator slack = active less allocated (fragmentation), dirty pages = resident less active (freed pages awaiting purge), outside jemalloc = RSS less jemalloc resident (thread stacks, mapped files). A growing heap without a gauge is memory no gauge explains yet. RSS is read on Linux only, so the top band is empty elsewhere.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -18767,7 +18780,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes\"}) or vector(0)",
+                        "expr": "sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)",
                         "legendFormat": "stores",
                         "range": true,
                         "instant": false,
@@ -18789,7 +18802,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes\"}) or vector(0)), 0)",
+                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)), 0)",
                         "legendFormat": "heap without a gauge",
                         "range": true,
                         "instant": false,
@@ -18942,7 +18955,7 @@
         "spec": {
           "id": 123,
           "title": "Store memory",
-          "description": "Heap the in-memory stores hold, per collection, stacked: estimates weighed like cache entries (buffer capacities, map tables and nodes), computed when the store changes. bufr_store and bufr_snapshot follow retention and max_stations; bufr_deletion_index and wis2_dedup grow to 200000 data_ids (about 145 and 130 MB); cap is the WIS2 accumulator, the published catalog and the geocode lookup; nowcast_frame is exact, max_pixels × frames × generations × 1 or 4 bytes; pvol_catalog is parsed volume metadata; netcdf_open_file the readers' parsed metadata, modelled per file.",
+          "description": "Heap the in-memory stores hold, per collection, stacked: estimates weighed like cache entries (buffer capacities, map tables and nodes), computed when the store changes. bufr_store and bufr_snapshot follow retention and max_stations; bufr_deletion_index and wis2_dedup grow to 200000 data_ids (about 145 and 130 MB); cap is the WIS2 accumulator, the published catalog and the geocode lookup; nowcast_frame is exact, max_pixels × frames × generations × 1 or 4 bytes; pvol_catalog is parsed volume metadata; netcdf_open_file the readers' parsed metadata, modelled per file; zarr_icechunk_staged the chunk ranges an Icechunk collection fetched ahead that no decode has taken yet, at most one payload cache shard.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -18961,7 +18974,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (store, collection) (label_replace({job=~\"$job\", __name__=~\"(bufr_store|bufr_snapshot|bufr_deletion_index|wis2_dedup|nowcast_frame|pvol_catalog|netcdf_open_file)_bytes\", collection=~\"$collection\"}, \"store\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
+                        "expr": "sum by (store, collection) (label_replace({job=~\"$job\", __name__=~\"(bufr_store|bufr_snapshot|bufr_deletion_index|wis2_dedup|nowcast_frame|pvol_catalog|netcdf_open_file|zarr_icechunk_staged)_bytes\", collection=~\"$collection\"}, \"store\", \"$1\", \"__name__\", \"(.+)_bytes\"))",
                         "legendFormat": "{{collection}} · {{store}}",
                         "range": true,
                         "instant": false,
@@ -19307,7 +19320,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes\"}) or vector(0)), 0)",
+                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)), 0)",
                         "legendFormat": "heap without a gauge",
                         "range": true,
                         "instant": false,
@@ -21935,7 +21948,7 @@
         "spec": {
           "id": 145,
           "title": "Demand by cache",
-          "description": "Each cache's demand over its own configured capacity (cache_demand_ratio): what the engines say a cache must hold for their data, a process-wide cache's summed over its collections, a per-collection cache's its collection's. Above 1, the red line, a cache is below its demand, and the server logged one WARN naming the inputs and the size to set. A disabled cache has no series. The PVOL pixel cache's demand is a floor, twice the pre-warm set: requests need more. /admin/cache-plan lists each demand's inputs and the suggested size; the Cache plan table has the demand in bytes.",
+          "description": "Each cache's demand over its own capacity, configured or the plan's in auto mode (cache_demand_ratio): what the engines say a cache must hold for their data, a process-wide cache's summed over its collections, a per-collection cache's its collection's. Above 1, the red line, a cache is below its demand, and the server logged one WARN naming the inputs and the size to set. A disabled cache has no series. The PVOL pixel cache's demand is a floor, twice the pre-warm set: requests need more. /admin/cache-plan lists each demand's inputs and the suggested size; the Cache plan table has the demand in bytes.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -22045,7 +22058,7 @@
         "spec": {
           "id": 180,
           "title": "Memory plan",
-          "description": "The memory the plan fits every cache and budget into (memory_plan_total_bytes: [memory] total_mb, else 80 % of a cgroup limit, else the smaller of half of MemTotal and 80 % of MemAvailable at boot), what the caches share of it after the reserves (memory_plan_pool_bytes: memory outside the caches, the render budget, the largest read budget and allocator slack), and how much more it needs with the pins kept and every other cache and budget at its floor (memory_plan_shortfall_bytes, red above 0). Fitted at boot and at each reload. A report: no size is changed. The server logs the plan with one WARN when it cuts a cache below its configured size; the Cache plan table has each planned size.",
+          "description": "The memory the plan fits every cache and budget into (memory_plan_total_bytes: [memory] total_mb, else 80 % of a cgroup limit, else the smaller of half of MemTotal and 80 % of MemAvailable at boot), what the caches share of it after the reserves (memory_plan_pool_bytes: memory outside the caches, the render budget, the largest read budget and allocator slack), and how much more it needs with the pins kept and every other cache and budget at its floor (memory_plan_shortfall_bytes, red above 0). Fitted at boot and at each reload, and applied there in [memory] mode = \"auto\". The server logs the plan with one WARN when it cuts a cache below its configured size; the Cache plan table has each planned size.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -22203,7 +22216,7 @@
         "spec": {
           "id": 181,
           "title": "Plan against memory",
-          "description": "Caches and budgets summed, as the memory plan sizes them (cache_planned_bytes) and as configured (memory_capacity_total_bytes), against the plan's total and cache pool, and RSS (Linux only). Sizes are ceilings: a cache allocates as it fills, so either sum can lie above the total while RSS stays below it. A step is a restart or reload that planned again.",
+          "description": "Caches and budgets summed, as the memory plan sizes them (cache_planned_bytes) and as they are (memory_capacity_total_bytes: configured, or the plan's in auto mode), against the plan's total and cache pool, and RSS (Linux only). Sizes are ceilings: a cache allocates as it fills, so either sum can lie above the total while RSS stays below it. A step is a restart or reload that planned again.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -24695,6 +24708,134 @@
                     ]
                   }
                 ]
+              }
+            }
+          }
+        }
+      },
+      "panel-200": {
+        "kind": "Panel",
+        "spec": {
+          "id": 200,
+          "title": "Plan not yet applied",
+          "description": "In [memory] mode = \"auto\": the capacity above the memory plan that applying it could not take away yet (memory_plan_unapplied_bytes): warm caches give up at most a quarter of what they hold per reload, and a shrink stops where a cache's shards still hold 32 entries or a GRIB cache's hot share still holds a 0.1° fill. The plan counts it and fits the other caches around it; what still does not fit is the shortfall (memory_plan_shortfall_bytes). Above 0 for long with no reload, it waits for the next reload; a cache held in place for good shrinks only when a setting pins it smaller. 0 in report mode.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max(memory_plan_unapplied_bytes{job=~\"$job\"})",
+                        "legendFormat": "not yet applied",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max(memory_plan_shortfall_bytes{job=~\"$job\"})",
+                        "legendFormat": "shortfall",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Last *",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 1
+                },
+                "overrides": []
               }
             }
           }

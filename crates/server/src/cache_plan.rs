@@ -28,7 +28,10 @@
 //!
 //! Each listing also carries the size the memory plan gives it (#1312,
 //! `crate::memory_plan`), fitted at boot and after each accepted reload to
-//! the memory the process may use. A report: nothing applies it either.
+//! the memory the process may use. `[memory] mode = "auto"` applies it to
+//! every entry no setting pins, through the resize each registration hands
+//! the plan; the listing then shows the source `plan:auto` and the
+//! configured size beside the capacity.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -37,11 +40,14 @@ use std::sync::{Arc, Mutex};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use ds_cache::plan::{self, Activity, Demand, Entry, Kind, Row, Scope, SizeSource, Usage};
+use ds_cache::plan::{
+    self, grant::pinned, Activity, Demand, Entry, Kind, Row, Scope, SizeSource, Usage,
+};
 use ds_cache::{Churn, MIB};
 use ds_core::config::{
-    CollectionConfig, GribConfig, ServerConfig, DEFAULT_GRID_CACHE_MB, DEFAULT_METATILE_CACHE_MB,
-    DEFAULT_POINT_INDEX_CACHE_MB, DEFAULT_TILE_CACHE_MB, DEFAULT_ZARR_CACHE_MB,
+    CollectionConfig, GeoTiffConfig, GribConfig, ServerConfig, DEFAULT_GRID_CACHE_MB,
+    DEFAULT_METATILE_CACHE_MB, DEFAULT_POINT_INDEX_CACHE_MB, DEFAULT_TILE_CACHE_MB,
+    DEFAULT_ZARR_CACHE_MB,
 };
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -77,8 +83,8 @@ impl RenderCacheSources {
 /// Enter the live render output caches in the plan: the meta-tile and
 /// rendered-image caches, sized by the accepted config, and the MVT cache
 /// and solid-image memo, constants. Again after every accepted load: a
-/// cache a reload keeps is entered again, with the source of the config
-/// that kept it.
+/// cache a reload keeps is entered again, with the source and size of the
+/// config that kept it, whatever size the plan gave it (#1312).
 pub(crate) fn register_render_caches(state: &ServerState) {
     let Some(accepted) = state
         .accepted_load
@@ -90,24 +96,21 @@ pub(crate) fn register_render_caches(state: &ServerState) {
     };
     let sources = accepted.render_cache_sources();
     let wms = state.wms.load();
-    wms.rendered_cache.register(sources.rendered.clone());
-    wms.tile_cache.register(sources.metatile.clone());
+    wms.rendered_cache
+        .register(sources.rendered.clone(), accepted.rendered_cache_mb());
+    wms.tile_cache
+        .register(sources.metatile.clone(), accepted.metatile_cache_mb());
     state
         .tiles
         .load()
         .vector_tile_cache
-        .register(SizeSource::Constant);
+        .register(SizeSource::Constant, crate::admin::VECTOR_TILE_CACHE_MB);
     ds_render::init_solid_image_cache();
 }
 
-/// A GeoTIFF collection's compressed tile cache. A local collection reads
-/// its files through the page cache and builds it empty, whatever
-/// `tile_cache_mb` says.
-pub(crate) fn register_geotiff(
-    collection: &CollectionConfig,
-    engine: &Arc<engine_geotiff::GeoTiffEngine>,
-) {
-    let source = if engine.reads_local_files() {
+/// Where a GeoTIFF collection's tile cache size came from.
+fn geotiff_source(collection: &CollectionConfig, local: bool) -> SizeSource {
+    if local {
         SizeSource::Constant
     } else {
         SizeSource::unless_default(
@@ -118,15 +121,99 @@ pub(crate) fn register_geotiff(
             DEFAULT_TILE_CACHE_MB,
             SizeSource::Collection("[geotiff] tile_cache_mb"),
         )
+    }
+}
+
+/// A GeoTIFF collection's compressed tile cache. A local collection reads
+/// its files through the page cache and builds it empty, whatever
+/// `tile_cache_mb` says.
+pub(crate) fn register_geotiff(
+    collection: &CollectionConfig,
+    engine: &Arc<engine_geotiff::GeoTiffEngine>,
+) {
+    let local = engine.reads_local_files();
+    let source = geotiff_source(collection, local);
+    let configured = if local {
+        0
+    } else {
+        collection
+            .geotiff
+            .as_ref()
+            .map_or(DEFAULT_TILE_CACHE_MB, |g| g.tile_cache_mb)
+            .saturating_mul(MIB)
     };
     let scope = Scope::Collection {
         engine: "geotiff",
         id: collection.id.clone(),
     };
-    plan::register(Entry::cache("tile_cache", scope, source), engine, |e| {
-        let entries = e.tile_cache_utilization().2 as u64;
-        Usage::cache(e.tile_cache_metrics(), Some(entries))
-    });
+    plan::register_sized(
+        Entry::cache("tile_cache", scope, source),
+        configured,
+        engine,
+        |e| {
+            let entries = e.tile_cache_utilization().2 as u64;
+            Usage::cache(e.tile_cache_metrics(), Some(entries))
+        },
+        plan::Resize {
+            to: |e, bytes| e.resize_tile_cache(bytes),
+            least: |e| e.least_tile_cache(),
+            clear: |e| e.clear_tile_cache(),
+        },
+    );
+}
+
+/// The sizes a reused GeoTIFF engine takes on a reload in `[memory] mode =
+/// "auto"`: `config`'s, but an unpinned tile cache keeps its live size, the
+/// plan's, for the plan to move after the reload (#1312).
+pub(crate) fn plan_kept_geotiff(
+    collection: &CollectionConfig,
+    engine: &engine_geotiff::GeoTiffEngine,
+) -> Option<GeoTiffConfig> {
+    let mut config = collection.geotiff.clone()?;
+    if !pinned(&geotiff_source(collection, engine.reads_local_files())) {
+        config.tile_cache_mb = engine.tile_cache_metrics().capacity_bytes.div_ceil(MIB);
+    }
+    Some(config)
+}
+
+/// Where a GRIB source's decoded-grid and compressed-message cache sizes
+/// came from.
+fn grib_sources(grib: &GribConfig) -> (SizeSource, SizeSource) {
+    (
+        SizeSource::unless_default(
+            grib.grid_cache_mb,
+            DEFAULT_GRID_CACHE_MB,
+            SizeSource::Collection("[grib] grid_cache_mb"),
+        ),
+        SizeSource::unless_default(
+            grib.message_cache_mb,
+            0,
+            SizeSource::Collection("[grib] message_cache_mb"),
+        ),
+    )
+}
+
+/// The sizes a reused GRIB engine takes on a reload in `[memory] mode =
+/// "auto"`: `grib`'s, but each unpinned cache keeps its live size, the
+/// plan's, for the plan to move after the reload (#1312).
+pub(crate) fn plan_kept_grib(grib: &GribConfig, engine: &engine_grib::GribEngine) -> GribConfig {
+    let (grid, message) = grib_sources(grib);
+    let mut kept = grib.clone();
+    if !pinned(&grid) {
+        kept.grid_cache_mb = engine.grid_cache_metrics().capacity_bytes.div_ceil(MIB);
+    }
+    if !pinned(&message) {
+        kept.message_cache_mb = engine.message_cache_metrics().capacity_bytes.div_ceil(MIB);
+    }
+    if !pinned(&point_index_source(grib)) {
+        kept.point_index_cache_mb = Some(
+            engine
+                .point_index_cache_metrics()
+                .capacity_bytes
+                .div_ceil(MIB),
+        );
+    }
+    kept
 }
 
 /// A GRIB source's decoded-grid, compressed-message and point-index
@@ -140,29 +227,42 @@ pub(crate) fn register_grib(collection: &CollectionConfig, engine: &Arc<engine_g
         engine: "grib",
         id: collection.id.clone(),
     };
-    let grid = SizeSource::unless_default(
-        grib.grid_cache_mb,
-        DEFAULT_GRID_CACHE_MB,
-        SizeSource::Collection("[grib] grid_cache_mb"),
+    let (grid, message) = grib_sources(grib);
+    plan::register_sized(
+        Entry::cache("grid_cache", scope(), grid),
+        grib.grid_cache_mb.saturating_mul(MIB),
+        engine,
+        |e| {
+            let entries = e.grid_cache_utilization().2 as u64;
+            Usage::cache(e.grid_cache_metrics(), Some(entries))
+        },
+        plan::Resize {
+            to: |e, bytes| e.resize_grid_cache(bytes),
+            least: |e| e.least_grid_cache(),
+            clear: |e| e.clear_grid_cache(),
+        },
     );
-    plan::register(Entry::cache("grid_cache", scope(), grid), engine, |e| {
-        let entries = e.grid_cache_utilization().2 as u64;
-        Usage::cache(e.grid_cache_metrics(), Some(entries))
-    });
-    let message = SizeSource::unless_default(
-        grib.message_cache_mb,
-        0,
-        SizeSource::Collection("[grib] message_cache_mb"),
-    );
-    plan::register(
+    plan::register_sized(
         Entry::cache("grib_message_cache", scope(), message),
+        grib.message_cache_mb.saturating_mul(MIB),
         engine,
         |e| Usage::cache(e.message_cache_metrics(), None),
+        plan::Resize {
+            to: |e, bytes| e.resize_message_cache(bytes),
+            least: |e| e.least_message_cache(),
+            clear: |e| e.clear_message_cache(),
+        },
     );
-    plan::register(
+    plan::register_sized(
         Entry::cache("grib_point_index_cache", scope(), point_index_source(grib)),
+        grib.effective_point_index_cache_mb().saturating_mul(MIB),
         engine,
         |e| Usage::cache(e.point_index_cache_metrics(), None),
+        plan::Resize {
+            to: |e, bytes| e.resize_point_index_cache(bytes),
+            least: |e| e.least_point_index_cache(),
+            clear: |e| e.clear_point_index_cache(),
+        },
     );
 }
 
@@ -190,51 +290,93 @@ pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_z
         engine: "zarr",
         id: collection.id.clone(),
     };
-    let decoded = match &zarr.icechunk {
-        Some(icechunk) => SizeSource::unless_default(
+    let (decoded, decoded_mb) = match &zarr.icechunk {
+        Some(icechunk) => (
+            SizeSource::unless_default(
+                icechunk.decoded_cache_mb,
+                DEFAULT_ZARR_CACHE_MB,
+                SizeSource::Collection("[zarr.icechunk] decoded_cache_mb"),
+            ),
             icechunk.decoded_cache_mb,
-            DEFAULT_ZARR_CACHE_MB,
-            SizeSource::Collection("[zarr.icechunk] decoded_cache_mb"),
         ),
-        None => SizeSource::Constant,
+        None => (SizeSource::Constant, 0),
     };
-    plan::register(
+    plan::register_sized(
         Entry::cache("zarr_decoded_cache", scope(), decoded),
+        decoded_mb.saturating_mul(MIB),
         engine,
         |e| Usage::cache(e.decoded_cache_metrics(), None),
+        plan::Resize {
+            to: |e, bytes| e.resize_decoded_cache(bytes),
+            least: |e| e.least_decoded_cache(),
+            clear: |e| e.clear_decoded_cache(),
+        },
     );
-    if engine.object_cache_metrics().is_some() {
-        let object = SizeSource::unless_default(
+    let cache_mb = zarr.cache_mb.saturating_mul(MIB);
+    let object_or_payload = || {
+        SizeSource::unless_default(
             zarr.cache_mb,
             DEFAULT_ZARR_CACHE_MB,
             SizeSource::Collection("[zarr] cache_mb"),
-        );
-        plan::register(
-            Entry::cache("zarr_object_cache", scope(), object),
+        )
+    };
+    if engine.object_cache_metrics().is_some() {
+        plan::register_sized(
+            Entry::cache("zarr_object_cache", scope(), object_or_payload()),
+            cache_mb,
             engine,
             |e| {
                 e.object_cache_metrics()
                     .map(|m| Usage::cache(m, None))
                     .unwrap_or_default()
             },
+            plan::Resize {
+                to: |e, bytes| e.resize_object_cache(bytes).unwrap_or(0),
+                least: |e| e.least_object_cache().unwrap_or(0),
+                clear: |e| e.clear_object_cache(),
+            },
         );
     }
     if engine.icechunk_payload_cache_metrics().is_some() {
-        let payload = SizeSource::unless_default(
-            zarr.cache_mb,
-            DEFAULT_ZARR_CACHE_MB,
-            SizeSource::Collection("[zarr] cache_mb"),
-        );
-        plan::register(
-            Entry::cache("zarr_icechunk_payload_cache", scope(), payload),
+        plan::register_sized(
+            Entry::cache("zarr_icechunk_payload_cache", scope(), object_or_payload()),
+            cache_mb,
             engine,
             |e| {
                 e.icechunk_payload_cache_metrics()
                     .map(|m| Usage::cache(m, None))
                     .unwrap_or_default()
             },
+            plan::Resize {
+                to: |e, bytes| e.resize_icechunk_payload_cache(bytes).unwrap_or(0),
+                least: |e| e.least_icechunk_payload_cache().unwrap_or(0),
+                clear: |e| e.clear_icechunk_payload_cache(),
+            },
         );
     }
+}
+
+/// The WARN for each `MC_…` variable of `rows` set to something that is
+/// not a whole number of MB: its cache keeps its default, pinned.
+pub(crate) fn unparsable_env(rows: &[Row]) -> Vec<String> {
+    let mut warnings: Vec<String> = rows
+        .iter()
+        .filter_map(|row| match row.entry.source {
+            SizeSource::Env(var) => {
+                let value = plan::env_unparsable(var)?;
+                Some(format!(
+                    "{var} = {value:?} is not a whole number of MB: {} keeps its default \
+                     {}, pinned, so the memory plan leaves it alone",
+                    row.entry.id,
+                    mib(row.usage.capacity_bytes)
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    warnings.sort();
+    warnings.dedup();
+    warnings
 }
 
 /// The plan's entries: the registry, less the caches of collections the
@@ -307,8 +449,10 @@ pub async fn handler(
 /// ([`demand_inputs_json`]); null otherwise. With the memory plan of the
 /// last boot or reload (#1312), every entry has its `planned_bytes`,
 /// `planned_reason` and `expected_bytes` (null for one entered since), and
-/// `plan` has the total, the reserves and the pool
-/// (`memory_plan::header_json`).
+/// `plan` has the total, the reserves and the pool, the mode and what it
+/// resized (`memory_plan::header_json`). Every entry has its
+/// `configured_bytes`, the size its settings give it; `source` is
+/// `plan:auto` while its capacity is the plan's.
 pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Report>) -> Value {
     let entries = |kind: Kind| -> Vec<Value> {
         rows.iter()
@@ -322,7 +466,8 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Repo
                     "engine": entry.scope.engine(),
                     "collection": entry.scope.collection(),
                     "capacity_bytes": usage.capacity_bytes,
-                    "source": entry.source.to_string(),
+                    "configured_bytes": row.configured_bytes,
+                    "source": row.source().to_string(),
                     "used_bytes": usage.used_bytes,
                     "entries": usage.entries,
                     "hits": usage.hits,
@@ -460,31 +605,43 @@ static LOGGED: Mutex<Option<Logged>> = Mutex::new(None);
 /// Log the plan as one INFO block. Process-wide caches and budgets enter the
 /// plan when first read, so this refreshes the `/metrics` families first:
 /// the block lists what `/metrics` reports. Fits the memory plan first
-/// (#1312), whose WARNs follow the block.
-pub(crate) fn log(state: &AdminState, occasion: Occasion) {
+/// (#1312), which `[memory] mode = "auto"` applies before the block lists
+/// the sizes: a second INFO block names each size it changed, old → new,
+/// and the plan's WARNs follow. Returns the report.
+pub(crate) fn log(state: &AdminState, occasion: Occasion) -> Arc<Report> {
     let memory = crate::admin::refresh_metrics(state);
-    let rows = snapshot(state);
+    let mut rows = snapshot(state);
     let report = memory_plan::replan(state, &rows, &memory);
+    if report.changes.iter().any(|c| c.to_bytes != c.from_bytes) {
+        rows = snapshot(state);
+    }
     let current: Logged = rows
         .iter()
         .map(|row| {
             (
                 (row.entry.kind, row.entry.id, row.entry.scope.clone()),
-                (row.usage.capacity_bytes, row.entry.source.clone()),
+                (row.usage.capacity_bytes, row.source()),
             )
         })
         .collect();
     let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
     if occasion == Occasion::Recovery && logged.as_ref() == Some(&current) {
-        return;
+        return report;
     }
     let heading = match occasion {
         Occasion::Boot => "at boot",
         Occasion::Reload | Occasion::Recovery => "after reload",
     };
     info!("{}", render(&rows, heading, logged.as_ref(), Some(&report)));
+    for warning in unparsable_env(&rows) {
+        warn!("{warning}");
+    }
+    if let Some(block) = memory_plan::changes_block(&report) {
+        info!("{block}");
+    }
     memory_plan::log_warnings(&report, &rows);
     *logged = Some(current);
+    report
 }
 
 /// `bytes` in MiB, whole when it is a whole number of them.
@@ -545,8 +702,11 @@ pub(crate) fn render(
             "\n    {:<width$}  {:>10}  {}",
             name(row),
             mib(row.usage.capacity_bytes),
-            entry.source
+            row.source()
         );
+        if row.planned {
+            let _ = write!(out, " (configured {})", mib(row.configured_bytes));
+        }
         let was = previous
             .and_then(|p| p.get(&(entry.kind, entry.id, entry.scope.clone())))
             .map(|(capacity, _)| *capacity)

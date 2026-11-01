@@ -26,7 +26,15 @@
 //!
 //! [`grant::plan`] fits every cache and budget to the memory the process
 //! may use (#1312): a pure function of a snapshot's rows and that total,
-//! which applies nothing.
+//! which applies nothing. An entry registered with [`Resize`] hooks
+//! ([`register_resizable`], [`register_sized`], every
+//! [`crate::ByteBoundedCache`] and budget) can be given its planned size
+//! ([`apply`]), back the size its settings give it ([`restore`]), or its
+//! entries dropped ([`clear`]). A row carries [`Row::configured_bytes`],
+//! what the plan reads as the cache's size today, [`Row::planned`],
+//! whether its capacity is the plan's ([`SizeSource::Planned`]), and
+//! [`Row::least_bytes`], the least it can take in place now, which the
+//! plan never goes below when it is applied.
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -105,8 +113,8 @@ impl Scope {
 
 /// Where a size came from, in the words `/admin/cache-plan` and the
 /// `cache_size_source` metric use: `default`, `env:MC_…`,
-/// `config:[server] …`, `collection:[grib] …`, `derived:[grib] …` or
-/// `constant`.
+/// `config:[server] …`, `collection:[grib] …`, `derived:[grib] …`,
+/// `constant` or `plan:auto`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SizeSource {
     /// The built-in default: nothing set this size.
@@ -122,6 +130,10 @@ pub enum SizeSource {
     Derived(&'static str),
     /// Fixed in code, with no setting.
     Constant,
+    /// The memory plan's size, which `[memory] mode = "auto"` gave a cache
+    /// or budget no setting pins (#1312). Never registered: a [`Row`]
+    /// reports it ([`Row::source`]) while the capacity is the plan's.
+    Planned,
 }
 
 impl SizeSource {
@@ -149,18 +161,32 @@ impl fmt::Display for SizeSource {
             SizeSource::Collection(key) => write!(f, "collection:{key}"),
             SizeSource::Derived(key) => write!(f, "derived:{key}"),
             SizeSource::Constant => f.write_str("constant"),
+            SizeSource::Planned => f.write_str("plan:auto"),
         }
     }
 }
 
 /// A size in MB from the environment and where it came from: `var` when it
 /// is set to a whole number (trimmed), else `default_mb` and
-/// [`SizeSource::Default`]. `0` conventionally disables a cache.
+/// [`SizeSource::Default`]. `0` conventionally disables a cache. A value
+/// set but not a whole number (`2G`) gives `default_mb`, as [`crate::env_mb`]
+/// does, but pins it ([`SizeSource::Env`]): the operator meant to size the
+/// cache, so the memory plan leaves it alone, and the server warns
+/// ([`env_unparsable`]).
 pub fn env_size(var: &'static str, default_mb: u64) -> (u64, SizeSource) {
     match crate::parse_env_mb(var) {
         Some(mb) => (mb, SizeSource::Env(var)),
+        None if env_unparsable(var).is_some() => (default_mb, SizeSource::Env(var)),
         None => (default_mb, SizeSource::Default),
     }
+}
+
+/// `var`'s value when it is set, not blank, and not a whole number of MB.
+pub fn env_unparsable(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|value| {
+        let value = value.trim();
+        !value.is_empty() && value.parse::<u64>().is_err()
+    })
 }
 
 /// [`env_size`] in bytes.
@@ -252,6 +278,28 @@ pub struct Row {
     /// engines last published it (#1309). `None` for a budget, and for a
     /// cache no engine publishes a demand for.
     pub demand: Option<Demand>,
+    /// The size its settings give it: the built-in default when nothing
+    /// pins it. Equal to `usage.capacity_bytes` unless the plan resized it
+    /// ([`Self::planned`]), or a shrink stopped short of it.
+    pub configured_bytes: u64,
+    /// Whether its capacity is the size the memory plan gave it
+    /// ([`apply`]), which it still has.
+    pub planned: bool,
+    /// The least capacity the plan can resize it to now ([`Resize::least`]):
+    /// its capacity when it cannot be resized, 0 for a budget.
+    pub least_bytes: u64,
+}
+
+impl Row {
+    /// Where its size came from: [`SizeSource::Planned`] while the
+    /// capacity is the plan's, else the source it was registered with.
+    pub fn source(&self) -> SizeSource {
+        if self.planned {
+            SizeSource::Planned
+        } else {
+            self.entry.source.clone()
+        }
+    }
 }
 
 /// How often [`snapshot`] samples a cache's counters, at most. `/metrics`
@@ -432,6 +480,49 @@ impl Activity {
 /// Reads an owner's figure while it lives.
 type Reader<V> = Box<dyn Fn() -> Option<V> + Send + Sync>;
 
+/// Resizes an owner while it lives, returning the capacity applied.
+type Resizer = Box<dyn Fn(u64) -> Option<u64> + Send + Sync>;
+
+/// How the memory plan resizes an owner (#1312): [`register_resizable`],
+/// [`register_sized`].
+pub struct Resize<T> {
+    /// Resize to the bytes given, keeping what fits; returns the capacity
+    /// applied, which a shrink can leave above them.
+    pub to: fn(&T, u64) -> u64,
+    /// The least capacity `to` reaches now: a shrink below it stops there.
+    /// The plan never gives the owner less.
+    pub least: fn(&T) -> u64,
+    /// Drop every entry and keep the capacity: what the plan does to a
+    /// cache no collection can reach that still holds entries.
+    pub clear: fn(&T),
+}
+
+impl<T> Clone for Resize<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for Resize<T> {}
+
+/// The registry's side of a [`Resize`], reading its owner while it lives.
+struct Resizing {
+    to: Resizer,
+    least: Reader<u64>,
+    clear: Reader<()>,
+}
+
+/// A cache's sizes beside its live capacity, kept with its history across
+/// registrations of the same owner.
+#[derive(Debug, Default)]
+struct Sizing {
+    /// The size its settings give it ([`Row::configured_bytes`]).
+    configured: u64,
+    /// The capacity the plan gave it ([`apply`]), until the cache has
+    /// another.
+    planned: Option<u64>,
+}
+
 struct Registered {
     seq: u64,
     entry: Entry,
@@ -442,8 +533,12 @@ struct Registered {
     read: Reader<Usage>,
     /// A budget's high-water mark, taken and restarted ([`take_peaks`]).
     take_peak: Option<Reader<u64>>,
+    /// Resizes the owner for the plan ([`apply`], [`restore`], [`clear`]).
+    resize: Option<Resizing>,
     /// Shared with the entry this one replaced, if any: the same cache.
     history: Arc<Mutex<History>>,
+    /// Shared with the entry this one replaced, as `history` is.
+    sizing: Arc<Mutex<Sizing>>,
 }
 
 static REGISTRY: Mutex<Vec<Arc<Registered>>> = Mutex::new(Vec::new());
@@ -451,21 +546,65 @@ static NEXT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Enter `owner` in the plan as `entry`, read by `usage` while `owner` is
 /// alive. Registering the same owner under the same id again replaces the
-/// entry (a reload that keeps a cache, or a changed size source).
+/// entry (a reload that keeps a cache, or a changed size source). The plan
+/// cannot resize it: [`register_resizable`] can.
 pub fn register<T: Send + Sync + 'static>(entry: Entry, owner: &Arc<T>, usage: fn(&T) -> Usage) {
-    insert(entry, owner, usage, None);
+    insert(entry, owner, usage, None, None, None);
 }
 
-/// [`register`] a budget whose high-water mark `take_peak` returns: the
-/// most it held at once since the previous call, which restarts the mark
-/// from what it holds now (#1307).
+/// [`register`] a cache or budget the plan can resize with `resize`, which
+/// returns the capacity it applied ([`apply`]). Its configured size
+/// ([`Row::configured_bytes`]) is its capacity now, or, registered again
+/// while it has the plan's size and no setting pins it, the configured
+/// size it had: an owner registered once, at build, is at the size its
+/// settings give it. One whose settings can change while it lives says
+/// what they give it: [`register_sized`].
+pub fn register_resizable<T: Send + Sync + 'static>(
+    entry: Entry,
+    owner: &Arc<T>,
+    usage: fn(&T) -> Usage,
+    resize: Resize<T>,
+) {
+    insert(entry, owner, usage, None, Some(resize), None);
+}
+
+/// [`register_resizable`] with the size its settings give it now,
+/// `configured_bytes`, whatever its capacity: a cache a reload keeps,
+/// whose capacity may be the plan's, or a setting's it no longer has.
+pub fn register_sized<T: Send + Sync + 'static>(
+    entry: Entry,
+    configured_bytes: u64,
+    owner: &Arc<T>,
+    usage: fn(&T) -> Usage,
+    resize: Resize<T>,
+) {
+    insert(
+        entry,
+        owner,
+        usage,
+        None,
+        Some(resize),
+        Some(configured_bytes),
+    );
+}
+
+/// [`register_resizable`] a budget whose high-water mark `take_peak`
+/// returns: the most it held at once since the previous call, which
+/// restarts the mark from what it holds now (#1307). `resize` sets its
+/// capacity, which any size takes; a budget holds no entries to clear.
 pub fn register_budget<T: Send + Sync + 'static>(
     entry: Entry,
     owner: &Arc<T>,
     usage: fn(&T) -> Usage,
     take_peak: fn(&T) -> u64,
+    resize: fn(&T, u64) -> u64,
 ) {
-    insert(entry, owner, usage, Some(take_peak));
+    let resize = Resize {
+        to: resize,
+        least: |_| 0,
+        clear: |_| {},
+    };
+    insert(entry, owner, usage, Some(take_peak), Some(resize), None);
 }
 
 fn insert<T: Send + Sync + 'static>(
@@ -473,6 +612,8 @@ fn insert<T: Send + Sync + 'static>(
     owner: &Arc<T>,
     usage: fn(&T) -> Usage,
     take_peak: Option<fn(&T) -> u64>,
+    resize: Option<Resize<T>>,
+    configured: Option<u64>,
 ) {
     let weak = Arc::downgrade(owner);
     let owner_addr = Arc::as_ptr(owner).cast::<()>() as usize;
@@ -481,13 +622,48 @@ fn insert<T: Send + Sync + 'static>(
         let weak = weak.clone();
         Box::new(move || weak.upgrade().map(|owner| take_peak(&owner))) as Reader<u64>
     });
+    let resize = resize.map(|resize| {
+        let (to, least, clear) = (weak.clone(), weak.clone(), weak.clone());
+        Resizing {
+            to: Box::new(move |bytes| to.upgrade().map(|owner| (resize.to)(&owner, bytes))),
+            least: Box::new(move || least.upgrade().map(|owner| (resize.least)(&owner))),
+            clear: Box::new(move || clear.upgrade().map(|owner| (resize.clear)(&owner))),
+        }
+    });
+    // Read outside the lock: a cache's usage takes its own shard locks.
+    let capacity = usage(owner).capacity_bytes;
     let mut registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     let same = |r: &Registered| r.owner_addr == owner_addr && r.entry.id == entry.id;
-    let history = registry
+    let previous = registry
         .iter()
         .find(|r| r.owner.strong_count() > 0 && same(r))
-        .map(|r| Arc::clone(&r.history))
-        .unwrap_or_default();
+        .map(|r| {
+            let unpinned = !grant::pinned(&r.entry.source);
+            (Arc::clone(&r.history), Arc::clone(&r.sizing), unpinned)
+        });
+    let (history, sizing) = match previous {
+        Some((history, sizing, was_unpinned)) => {
+            {
+                let mut s = sizing.lock().unwrap_or_else(|e| e.into_inner());
+                // The plan's size stays the plan's while no setting pins
+                // the cache, and the cache still has it.
+                let kept =
+                    was_unpinned && !grant::pinned(&entry.source) && s.planned == Some(capacity);
+                if !kept {
+                    s.planned = None;
+                }
+                s.configured = configured.unwrap_or(if kept { s.configured } else { capacity });
+            }
+            (history, sizing)
+        }
+        None => (
+            Arc::default(),
+            Arc::new(Mutex::new(Sizing {
+                configured: configured.unwrap_or(capacity),
+                planned: None,
+            })),
+        ),
+    };
     registry.retain(|r| r.owner.strong_count() > 0 && !same(r));
     registry.push(Arc::new(Registered {
         seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
@@ -495,9 +671,73 @@ fn insert<T: Send + Sync + 'static>(
         owner: any,
         read: Box::new(move || weak.upgrade().map(|owner| usage(&owner))),
         take_peak,
+        resize,
         entry,
         history,
+        sizing,
     }));
+}
+
+/// The newest live registration of `entry`'s kind, id and scope.
+fn newest(entry: &Entry) -> Option<Arc<Registered>> {
+    let registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+    registry
+        .iter()
+        .filter(|r| {
+            r.owner.strong_count() > 0
+                && r.entry.kind == entry.kind
+                && r.entry.id == entry.id
+                && r.entry.scope == entry.scope
+        })
+        .max_by_key(|r| r.seq)
+        .cloned()
+}
+
+/// Resize the cache or budget `entry` names, its newest live registration
+/// as [`snapshot`] lists it, to `bytes` for the memory plan (#1312), and
+/// mark the capacity it applied as the plan's ([`Row::planned`]) unless it
+/// is the configured size. Returns that capacity: a cache's shrink stops
+/// at its [`Resize::least`], and a hook can keep the size it has. `None`
+/// when no live registration of it can be resized, or its owner is gone.
+///
+/// No lock is held across the resize, which may run in steps: a
+/// [`snapshot`] meanwhile reports the capacity it reads, and the plan's
+/// mark only once it matches.
+pub fn apply(entry: &Entry, bytes: u64) -> Option<u64> {
+    let registered = newest(entry)?;
+    let resize = registered.resize.as_ref()?;
+    let applied = (resize.to)(bytes)?;
+    let mut sizing = registered.sizing.lock().unwrap_or_else(|e| e.into_inner());
+    sizing.planned = (applied != sizing.configured).then_some(applied);
+    Some(applied)
+}
+
+/// Give the cache or budget `entry` names the size its settings give it,
+/// when its capacity is the plan's: what `[memory] mode = "report"` does
+/// after `auto` resized it. Returns the capacity applied; `None` when the
+/// plan had not resized it, or it cannot be resized. One that stops short
+/// of its configured size stays marked the plan's, for the next restore.
+pub fn restore(entry: &Entry) -> Option<u64> {
+    let registered = newest(entry)?;
+    let resize = registered.resize.as_ref()?;
+    let configured = {
+        let sizing = registered.sizing.lock().unwrap_or_else(|e| e.into_inner());
+        sizing.planned?;
+        sizing.configured
+    };
+    let applied = (resize.to)(configured)?;
+    let mut sizing = registered.sizing.lock().unwrap_or_else(|e| e.into_inner());
+    sizing.planned = (applied != sizing.configured).then_some(applied);
+    Some(applied)
+}
+
+/// Drop every entry of the cache `entry` names and keep its capacity
+/// ([`Resize::clear`]): for a cache no collection can reach. `false` when
+/// no live registration of it can be cleared.
+pub fn clear(entry: &Entry) -> bool {
+    newest(entry)
+        .and_then(|registered| (registered.resize.as_ref()?.clear)())
+        .is_some()
 }
 
 /// Every live entry with its usage, caches before budgets, then by scope
@@ -522,6 +762,19 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
         .iter()
         .filter_map(|r| {
             let usage = (r.read)()?;
+            // The plan's while the capacity is the one it applied: one
+            // changed since, by a setting or a resize in progress, is not.
+            let (configured_bytes, planned) = {
+                let sizing = r.sizing.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    sizing.configured,
+                    sizing.planned == Some(usage.capacity_bytes),
+                )
+            };
+            let least_bytes = match &r.resize {
+                Some(resize) => (resize.least)().unwrap_or(usage.capacity_bytes),
+                None => usage.capacity_bytes,
+            };
             let window = r
                 .history
                 .lock()
@@ -538,6 +791,9 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
                     usage,
                     window,
                     demand,
+                    configured_bytes,
+                    planned,
+                    least_bytes,
                 },
             ))
         })
@@ -705,6 +961,7 @@ mod tests {
                 owner,
                 |_| Usage::budget(10, 0),
                 take,
+                |_, bytes| bytes,
             );
         }
         assert_eq!(taken(), [9], "the newest owner");
@@ -782,6 +1039,7 @@ mod tests {
             SizeSource::Collection("[grib] grid_cache_mb"),
             SizeSource::Derived("[grib] message_cache_mb"),
             SizeSource::Constant,
+            SizeSource::Planned,
         ]
         .iter()
         .map(ToString::to_string)
@@ -795,6 +1053,7 @@ mod tests {
                 "collection:[grib] grid_cache_mb",
                 "derived:[grib] message_cache_mb",
                 "constant",
+                "plan:auto",
             ]
         );
         let key = SizeSource::Collection("[grib] grid_cache_mb");
@@ -966,6 +1225,183 @@ mod tests {
         assert_eq!(later.label(), Some(Label::Healthy));
     }
 
+    /// A resizable owner: its capacity, which the plan moves.
+    struct Resizable(AtomicU64);
+
+    fn capacity(owner: &Resizable) -> Usage {
+        Usage::budget(owner.0.load(Ordering::Relaxed), 0)
+    }
+
+    /// Resizes to at least 10 bytes, as a cache's shrink stops short.
+    fn resize_to(owner: &Resizable, bytes: u64) -> u64 {
+        let applied = bytes.max(10);
+        owner.0.store(applied, Ordering::Relaxed);
+        applied
+    }
+
+    fn resize() -> Resize<Resizable> {
+        Resize {
+            to: resize_to,
+            least: |owner| owner.0.load(Ordering::Relaxed).min(10),
+            clear: |owner| {
+                owner
+                    .0
+                    .store(owner.0.load(Ordering::Relaxed) + 1, Ordering::Relaxed)
+            },
+        }
+    }
+
+    fn sized_row(id: &str) -> Row {
+        rows(id).pop().unwrap()
+    }
+
+    /// #1312 part 2: [`apply`] resizes a registered owner and marks its
+    /// capacity the plan's, the row then reading `plan:auto` with its
+    /// configured size beside it; [`restore`] gives it back that size. An
+    /// owner registered without a hook, or gone, cannot be resized.
+    #[test]
+    fn the_plan_resizes_through_the_registration_and_restores() {
+        let _serial = serial();
+        let owner = Arc::new(Resizable(AtomicU64::new(100)));
+        let entry = || Entry::cache("plan_test_apply", Scope::Process, SizeSource::Default);
+        register_resizable(entry(), &owner, capacity, resize());
+        let row = sized_row("plan_test_apply");
+        assert_eq!((row.configured_bytes, row.planned), (100, false));
+        assert_eq!(row.source(), SizeSource::Default);
+
+        assert_eq!(apply(&entry(), 300), Some(300));
+        let row = sized_row("plan_test_apply");
+        assert_eq!(row.usage.capacity_bytes, 300);
+        assert_eq!((row.configured_bytes, row.planned), (100, true));
+        assert_eq!(row.source(), SizeSource::Planned);
+        // The configured size again is not the plan's.
+        assert_eq!(apply(&entry(), 100), Some(100));
+        assert!(!sized_row("plan_test_apply").planned);
+        // A shrink that stops short applies what it can.
+        assert_eq!(apply(&entry(), 4), Some(10));
+        assert!(sized_row("plan_test_apply").planned);
+
+        assert_eq!(restore(&entry()), Some(100));
+        let row = sized_row("plan_test_apply");
+        assert_eq!((row.usage.capacity_bytes, row.planned), (100, false));
+        assert_eq!(restore(&entry()), None, "nothing to restore");
+        // A restore that stops short stays the plan's, for the next one.
+        let short = Arc::new(Resizable(AtomicU64::new(4)));
+        let short_entry =
+            || Entry::cache("plan_test_apply_short", Scope::Process, SizeSource::Default);
+        register_resizable(short_entry(), &short, capacity, resize());
+        assert_eq!(apply(&short_entry(), 50), Some(50));
+        assert_eq!(restore(&short_entry()), Some(10));
+        let row = sized_row("plan_test_apply_short");
+        assert_eq!((row.usage.capacity_bytes, row.configured_bytes), (10, 4));
+        assert!(row.planned);
+
+        let plain = Arc::new(Fixed(5));
+        register(
+            Entry::cache("plan_test_apply_plain", Scope::Process, SizeSource::Default),
+            &plain,
+            usage,
+        );
+        assert_eq!(
+            apply(
+                &Entry::cache("plan_test_apply_plain", Scope::Process, SizeSource::Default),
+                50
+            ),
+            None
+        );
+        drop(owner);
+        assert_eq!(apply(&entry(), 300), None, "gone");
+    }
+
+    /// A capacity changed since, by a setting or a resize in progress, is
+    /// not the plan's: the row reads it without the mark, keeping the
+    /// configured size, and a snapshot changes nothing. The least the plan
+    /// can give it and a clear go through the registration too.
+    #[test]
+    fn a_capacity_changed_since_is_not_the_plans() {
+        let _serial = serial();
+        let owner = Arc::new(Resizable(AtomicU64::new(100)));
+        let entry = || Entry::cache("plan_test_moved", Scope::Process, SizeSource::Default);
+        register_resizable(entry(), &owner, capacity, resize());
+        apply(&entry(), 300);
+        assert_eq!(sized_row("plan_test_moved").least_bytes, 10);
+        owner.0.store(200, Ordering::Relaxed);
+        let row = sized_row("plan_test_moved");
+        assert_eq!((row.configured_bytes, row.planned), (100, false));
+        owner.0.store(300, Ordering::Relaxed);
+        assert!(sized_row("plan_test_moved").planned);
+        assert!(clear(&entry()));
+        assert_eq!(owner.0.load(Ordering::Relaxed), 301, "the test's clear ran");
+        // Registered without a hook: its capacity is the least it takes.
+        let plain = Arc::new(Fixed(5));
+        let plain_entry =
+            || Entry::cache("plan_test_moved_plain", Scope::Process, SizeSource::Default);
+        register(plain_entry(), &plain, usage);
+        assert_eq!(sized_row("plan_test_moved_plain").least_bytes, 5);
+        assert!(!clear(&plain_entry()));
+    }
+
+    /// Registered again while it has the plan's size, a cache keeps its
+    /// configured size and the mark; a pin, or a capacity that is no longer
+    /// the plan's, starts over from its capacity; an explicit configured
+    /// size always wins.
+    #[test]
+    fn registering_again_keeps_the_configured_size_while_the_plan_sized_it() {
+        let _serial = serial();
+        let owner = Arc::new(Resizable(AtomicU64::new(100)));
+        let unpinned =
+            || Entry::cache("plan_test_again_sized", Scope::Process, SizeSource::Default);
+        let pinned = || {
+            Entry::cache(
+                "plan_test_again_sized",
+                Scope::Process,
+                SizeSource::Env("MC_PLAN_TEST_MB"),
+            )
+        };
+        register_resizable(unpinned(), &owner, capacity, resize());
+        apply(&unpinned(), 400);
+        register_resizable(unpinned(), &owner, capacity, resize());
+        let row = sized_row("plan_test_again_sized");
+        assert_eq!((row.configured_bytes, row.planned), (100, true));
+
+        // Pinned since: the pin is its size.
+        register_resizable(pinned(), &owner, capacity, resize());
+        let row = sized_row("plan_test_again_sized");
+        assert_eq!((row.configured_bytes, row.planned), (400, false));
+        assert_eq!(row.source(), SizeSource::Env("MC_PLAN_TEST_MB"));
+
+        // Unpinned again, at the old pin's capacity, with its default said.
+        register_sized(unpinned(), 100, &owner, capacity, resize());
+        let row = sized_row("plan_test_again_sized");
+        assert_eq!(
+            (row.usage.capacity_bytes, row.configured_bytes, row.planned),
+            (400, 100, false)
+        );
+        apply(&unpinned(), 250);
+        register_sized(unpinned(), 100, &owner, capacity, resize());
+        let row = sized_row("plan_test_again_sized");
+        assert_eq!((row.configured_bytes, row.planned), (100, true));
+    }
+
+    /// A budget registers its resize too.
+    #[test]
+    fn a_budget_is_resized_through_its_registration() {
+        let _serial = serial();
+        let owner = Arc::new(Resizable(AtomicU64::new(64)));
+        let entry = || {
+            Entry::budget(
+                "plan_test_budget_resize",
+                Scope::Process,
+                SizeSource::Default,
+            )
+        };
+        register_budget(entry(), &owner, capacity, |_| 0, resize_to);
+        assert_eq!(apply(&entry(), 128), Some(128));
+        let row = sized_row("plan_test_budget_resize");
+        assert_eq!((row.usage.capacity_bytes, row.configured_bytes), (128, 64));
+        assert!(row.planned);
+    }
+
     #[test]
     fn env_size_says_whether_the_variable_set_it() {
         assert_eq!(
@@ -982,11 +1418,23 @@ mod tests {
             env_bytes("DS_CACHE_PLAN_TEST_ZERO", 42),
             (0, SizeSource::Env("DS_CACHE_PLAN_TEST_ZERO"))
         );
-        // Unparseable: the default, as `env_mb` falls back.
-        std::env::set_var("DS_CACHE_PLAN_TEST_BAD", "lots");
+        // Unparseable: the default, as `env_mb` falls back, but pinned
+        // (#1312): the operator meant to size it.
+        std::env::set_var("DS_CACHE_PLAN_TEST_BAD", "2G");
         assert_eq!(
             env_bytes("DS_CACHE_PLAN_TEST_BAD", 1),
-            (MIB, SizeSource::Default)
+            (MIB, SizeSource::Env("DS_CACHE_PLAN_TEST_BAD"))
+        );
+        assert_eq!(
+            env_unparsable("DS_CACHE_PLAN_TEST_BAD").as_deref(),
+            Some("2G")
+        );
+        assert_eq!(env_unparsable("DS_CACHE_PLAN_TEST_SET"), None);
+        // Blank is unset.
+        std::env::set_var("DS_CACHE_PLAN_TEST_BLANK", " ");
+        assert_eq!(
+            env_size("DS_CACHE_PLAN_TEST_BLANK", 3),
+            (3, SizeSource::Default)
         );
     }
 }

@@ -206,6 +206,16 @@ impl PointIndex {
         self.cache.set_capacity(bytes);
     }
 
+    /// The least size [`Self::resize`] can take the cache to now (#1312).
+    pub(crate) fn least_capacity(&self) -> u64 {
+        self.cache.least_capacity()
+    }
+
+    /// Drop every index, keeping the capacity.
+    pub(crate) fn clear(&self) {
+        self.cache.clear();
+    }
+
     /// Whether `key`'s messages may be indexed: not yet seen, or the last
     /// one could be.
     pub(crate) fn may_read(&self, key: &ParameterKey) -> bool {

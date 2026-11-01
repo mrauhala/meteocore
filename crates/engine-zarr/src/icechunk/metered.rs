@@ -257,6 +257,23 @@ impl Meter {
         self.payload.metrics()
     }
 
+    /// Resize the payload cache in place, keeping the ranges that fit; the
+    /// capacity applied. The staging room follows its new shard
+    /// ([`Self::prefetch_room`]).
+    pub(crate) fn resize_payload(&self, bytes: u64) -> u64 {
+        self.payload.set_capacity(bytes)
+    }
+
+    /// The least size [`Self::resize_payload`] reaches now.
+    pub(crate) fn least_payload(&self) -> u64 {
+        self.payload.least_capacity()
+    }
+
+    /// Drop every cached range, keeping the capacity.
+    pub(crate) fn clear_payload(&self) {
+        self.payload.clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn take_log(&self) -> Vec<(String, Option<Range<u64>>)> {
         self.issued.lock().unwrap().clear();

@@ -303,10 +303,16 @@ impl TilePixelCache {
         self.cache.metrics()
     }
 
-    /// Enter this cache in the memory plan (#1306), sized from `source`.
-    pub fn register(&self, source: ds_cache::plan::SizeSource) {
-        self.cache
-            .register("metatile_cache", ds_cache::plan::Scope::Process, source);
+    /// Enter this cache in the memory plan (#1306), sized from `source`,
+    /// which gives it `configured_mb`: a reload keeps the cache, and in
+    /// `[memory] mode = "auto"` its capacity may be the plan's (#1312).
+    pub fn register(&self, source: ds_cache::plan::SizeSource, configured_mb: u64) {
+        self.cache.register_sized(
+            "metatile_cache",
+            ds_cache::plan::Scope::Process,
+            source,
+            configured_mb.saturating_mul(ds_cache::MIB),
+        );
     }
 
     /// Drop every cached tile belonging to `collection` — same match rule as

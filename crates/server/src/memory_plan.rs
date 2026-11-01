@@ -1,6 +1,6 @@
 //! The memory plan (#1312): every cache and admission budget fitted to the
-//! memory the process may use, shown next to its configured size. For now
-//! a report: nothing is resized.
+//! memory the process may use, shown next to its configured size, and in
+//! `[memory] mode = "auto"` applied ([`apply`]).
 //!
 //! The total comes from [`detect`]: `[memory] total_mb`, else a cgroup
 //! limit, else the host's memory, read once at boot ([`read_at_boot`]).
@@ -10,6 +10,15 @@
 //! ([`unreachable`]). `cache_plan::log` computes it at boot and after every
 //! accepted reload ([`replan`]); `/admin/cache-plan` and `/metrics` show
 //! the last one ([`last`], [`update_gauges`]).
+//!
+//! `auto` resizes every cache and budget no setting pins to its grant,
+//! through the resize its registration hands the plan
+//! (`ds_cache::plan::apply`), right after the plan is fitted: so at boot
+//! and after every accepted reload. A warm cache, one holding more than its
+//! grant, shrinks by at most a quarter at once (`grant::bounded`); a cache
+//! no collection can reach keeps its size while it holds nothing, and a
+//! budget no collection can reach keeps its size. `report` resizes nothing,
+//! but gives back its configured size to each one `auto` had resized.
 
 pub(crate) mod detect;
 
@@ -18,9 +27,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
-use ds_cache::plan::grant::{self, Baseline, Grant, Inputs, Plan, Reason};
-use ds_cache::plan::{Kind, Row, Scope, SizeSource};
-use ds_core::config::CollectionConfig;
+use ds_cache::plan::grant::{self, Baseline, Grant, Hold, Inputs, Plan, Reason};
+use ds_cache::plan::{Entry, Kind, Row, Scope, SizeSource};
+use ds_core::config::{CollectionConfig, MemoryMode};
 use prometheus::{IntGauge, IntGaugeVec, Opts};
 use serde_json::{json, Value};
 use tracing::warn;
@@ -47,7 +56,58 @@ pub(crate) struct Report {
     pub total: Option<Total>,
     /// The cgroup's `memory.low`: reported, not used.
     pub low_bytes: Option<u64>,
+    /// The plan: in `auto`, what applying it can do now, each cache no
+    /// lower than it can take now (`grant::Least`, `Reason::Held`) and the
+    /// rest fitted around that.
     pub plan: Option<Plan>,
+    /// In `auto`, the plan as if every size could be taken at once: what
+    /// `plan` holds back from. `None` in `report`, whose `plan` it is.
+    pub ideal: Option<Plan>,
+    /// `[memory] mode` of the accepted config.
+    pub mode: MemoryMode,
+    /// What [`apply`] resized, cleared or meant to, when the plan was
+    /// fitted.
+    pub changes: Vec<Change>,
+    /// In `auto`, the capacity above the ideal plan that applying it could
+    /// not take away yet ([`unapplied`]); 0 in `report`.
+    pub unapplied_bytes: u64,
+}
+
+/// Why a cache did not get its ideal size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Held {
+    /// The plan held it ([`Hold::Warm`]): it is warm, one resize evicts at
+    /// most a quarter of what it holds (`grant::bounded`), and the next
+    /// reload takes it further.
+    Warm,
+    /// The plan held it ([`Hold::InPlace`]): a GRIB cache whose hot share
+    /// would no longer hold a 0.1° fill, a shrink that stops where the
+    /// cache's shards still hold 32 entries each, the floor its engine
+    /// sets.
+    InPlace,
+    /// Its resize stopped short of the plan's size, which the plan did not
+    /// foresee.
+    Refused,
+    /// Its owner was gone before it could be resized.
+    Gone,
+}
+
+/// One size [`apply`] changed, cleared or meant to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Change {
+    pub entry: Entry,
+    /// The capacity before, and after.
+    pub from_bytes: u64,
+    pub to_bytes: u64,
+    /// Its ideal size, which `held` says why it does not have; its
+    /// configured size when `report` gives that back.
+    pub target_bytes: u64,
+    /// The plan's reason, or `configured` for a size given back.
+    pub reason: String,
+    pub held: Option<Held>,
+    /// No collection can reach it: its entries were dropped, its capacity
+    /// kept.
+    pub cleared: bool,
 }
 
 static LAST: Mutex<Option<Arc<Report>>> = Mutex::new(None);
@@ -69,35 +129,246 @@ const STORE_FAMILIES: &[&str] = &[
     "nowcast_frame_bytes",
     "pvol_catalog_bytes",
     "netcdf_open_file_bytes",
+    "zarr_icechunk_staged_bytes",
 ];
 
-/// Fit `rows` to the accepted config's total and keep the report. `memory`
-/// is what the `/metrics` refresh before it read.
+/// Fit `rows` to the accepted config's total, apply the plan as its
+/// `[memory] mode` says ([`apply`]), and keep the report. `memory` is what
+/// the `/metrics` refresh before it read.
 pub(crate) fn replan(state: &ServerState, rows: &[Row], memory: &MemoryReading) -> Arc<Report> {
     let baseline = baseline(memory);
-    let configured = state
+    let (configured, mode) = state
         .accepted_load
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .and_then(|accepted| accepted.memory_total_mb());
-    let collections = state
-        .last_collections
-        .read()
-        .unwrap_or_else(|e| e.into_inner());
-    let report = Arc::new(report(
-        configured,
-        read_at_boot(),
-        rows,
-        &collections,
-        baseline,
-    ));
+        .map_or((None, MemoryMode::Report), |accepted| {
+            (accepted.memory_total_mb(), accepted.memory_mode())
+        });
+    let mut report = {
+        let collections = state
+            .last_collections
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        report_for(
+            mode,
+            configured,
+            read_at_boot(),
+            rows,
+            &collections,
+            baseline,
+        )
+    };
+    report.changes = apply(&report, rows);
+    report.unapplied_bytes = unapplied(&report, rows);
+    let report = Arc::new(report);
     *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&report));
     report
 }
 
+/// Apply `report` to the caches and budgets of `rows`, as its mode says,
+/// and return what it resized, cleared or meant to (module docs). In
+/// `auto`, each entry no setting pins gets its grant, which the plan never
+/// sets below what it can take now; shrinks go first. A cache no
+/// collection can reach that still holds entries drops them and keeps its
+/// capacity. In `report`, or `auto` without a total, each one the plan had
+/// resized gets its configured size back.
+pub(crate) fn apply(report: &Report, rows: &[Row]) -> Vec<Change> {
+    let plan = match (report.mode, &report.plan) {
+        (MemoryMode::Auto, Some(plan)) => plan,
+        _ => return restore(rows),
+    };
+    let ideal = report.ideal.as_ref().unwrap_or(plan);
+    let mut changes = Vec::new();
+    let mut wanted: Vec<(&Row, &Grant)> = Vec::new();
+    for row in rows.iter().filter(|row| !grant::pinned(&row.entry.source)) {
+        let Some(grant) = plan.grant(&row.entry) else {
+            continue;
+        };
+        if let Reason::Unreachable(_) = grant.reason {
+            // What no collection can read goes, its capacity kept: a cache
+            // disabled and grown again would start over at quick_cache's
+            // default hot share and without its ghost ring. A budget
+            // holds nothing.
+            if row.entry.kind == Kind::Cache
+                && row.usage.used_bytes > 0
+                && ds_cache::plan::clear(&row.entry)
+            {
+                let live = row.usage.capacity_bytes;
+                changes.push(Change {
+                    entry: row.entry.clone(),
+                    from_bytes: live,
+                    to_bytes: live,
+                    target_bytes: 0,
+                    reason: grant.reason.to_string(),
+                    held: None,
+                    cleared: true,
+                });
+            }
+            continue;
+        }
+        if grant.bytes != row.usage.capacity_bytes {
+            wanted.push((row, grant));
+        }
+    }
+    // Shrinks first: what they free is there before anything grows.
+    wanted.sort_by_key(|(row, grant)| grant.bytes > row.usage.capacity_bytes);
+    for (row, grant) in wanted {
+        let from = row.usage.capacity_bytes;
+        let applied = ds_cache::plan::apply(&row.entry, grant.bytes);
+        let to = applied.unwrap_or(from);
+        let target = ideal.grant(&row.entry).map_or(grant.bytes, |g| g.bytes);
+        // Held above its ideal size; one held below it gave way to others.
+        let held = match (applied, &grant.reason) {
+            (None, _) => Some(Held::Gone),
+            (Some(to), _) if to != grant.bytes => Some(Held::Refused),
+            (Some(to), Reason::Held(Hold::Warm)) if to > target => Some(Held::Warm),
+            (Some(to), Reason::Held(Hold::InPlace)) if to > target => Some(Held::InPlace),
+            _ => None,
+        };
+        changes.push(Change {
+            entry: row.entry.clone(),
+            from_bytes: from,
+            to_bytes: to,
+            target_bytes: target,
+            reason: grant.reason.to_string(),
+            held,
+            cleared: false,
+        });
+    }
+    changes
+}
+
+/// The capacity above `report`'s ideal plan of the entries no setting pins
+/// once [`apply`] has run: what applying it could not take away yet, warm
+/// caches, shrinks that stop in place, resizes refused. 0 in `report` mode,
+/// and for what no collection can reach, whose entries are dropped.
+pub(crate) fn unapplied(report: &Report, rows: &[Row]) -> u64 {
+    let (MemoryMode::Auto, Some(ideal)) =
+        (report.mode, report.ideal.as_ref().or(report.plan.as_ref()))
+    else {
+        return 0;
+    };
+    rows.iter()
+        .filter(|row| !grant::pinned(&row.entry.source))
+        .filter_map(|row| {
+            let grant = ideal.grant(&row.entry)?;
+            if matches!(grant.reason, Reason::Unreachable(_)) {
+                return None;
+            }
+            let after = report
+                .changes
+                .iter()
+                .find(|c| c.entry.id == row.entry.id && c.entry.scope == row.entry.scope)
+                .map_or(row.usage.capacity_bytes, |c| c.to_bytes);
+            Some(after.saturating_sub(grant.bytes))
+        })
+        .fold(0u64, u64::saturating_add)
+}
+
+/// Give each entry of `rows` whose capacity is the plan's its configured
+/// size back.
+fn restore(rows: &[Row]) -> Vec<Change> {
+    rows.iter()
+        .filter(|row| row.planned)
+        .map(|row| {
+            let from = row.usage.capacity_bytes;
+            let restored = ds_cache::plan::restore(&row.entry);
+            let to = restored.unwrap_or(from);
+            let held = match restored {
+                None => Some(Held::Gone),
+                Some(to) if to != row.configured_bytes => Some(Held::Refused),
+                Some(_) => None,
+            };
+            Change {
+                entry: row.entry.clone(),
+                from_bytes: from,
+                to_bytes: to,
+                target_bytes: row.configured_bytes,
+                reason: "configured".into(),
+                held,
+                cleared: false,
+            }
+        })
+        .collect()
+}
+
+/// The INFO block of what [`apply`] changed: each size, old → new, and why;
+/// `None` when it changed nothing.
+pub(crate) fn changes_block(report: &Report) -> Option<String> {
+    if report.changes.is_empty() {
+        return None;
+    }
+    let resized = report
+        .changes
+        .iter()
+        .filter(|c| c.to_bytes != c.from_bytes || c.cleared)
+        .count();
+    let mut out = match report.mode {
+        MemoryMode::Auto => format!(
+            "Memory plan applied ([memory] mode = \"auto\"): {resized} of {} sizes changed",
+            report.changes.len()
+        ),
+        MemoryMode::Report => format!(
+            "Memory plan ([memory] mode = \"report\"): {resized} of {} sizes the plan had set \
+             are back at their configured sizes",
+            report.changes.len()
+        ),
+    };
+    if report.unapplied_bytes > 0 {
+        let _ = write!(
+            out,
+            "; {} above the plan until later reloads",
+            mib(report.unapplied_bytes)
+        );
+    }
+    for change in &report.changes {
+        let _ = write!(out, "\n  {}", change.entry.id);
+        if let Some(collection) = change.entry.scope.collection() {
+            let _ = write!(out, " {collection}");
+        }
+        if change.cleared {
+            let _ = write!(out, " cleared, kept at {}", mib(change.from_bytes));
+        } else if change.to_bytes == change.from_bytes {
+            let _ = write!(out, " kept at {}", mib(change.from_bytes));
+        } else {
+            let _ = write!(
+                out,
+                " {} → {}",
+                mib(change.from_bytes),
+                mib(change.to_bytes)
+            );
+        }
+        let _ = write!(out, " ({}", change.reason);
+        match change.held {
+            None => {}
+            // The reason, the plan's hold, says why.
+            Some(Held::Warm | Held::InPlace) => {
+                let _ = write!(out, "; toward {}", mib(change.target_bytes));
+            }
+            Some(Held::Refused) => {
+                let _ = write!(
+                    out,
+                    "; toward {}: its resize stopped short",
+                    mib(change.target_bytes)
+                );
+            }
+            Some(Held::Gone) => {
+                let _ = write!(
+                    out,
+                    "; toward {}: its owner is gone",
+                    mib(change.target_bytes)
+                );
+            }
+        }
+        out.push(')');
+    }
+    Some(out)
+}
+
 /// The plan of `rows` for `collections`, its total from `configured_mb`
-/// and `reading`.
+/// and `reading`, as `report` mode shows it.
+#[cfg(test)]
 pub(crate) fn report(
     configured_mb: Option<u64>,
     reading: &detect::Reading,
@@ -105,20 +376,50 @@ pub(crate) fn report(
     collections: &HashMap<String, CollectionConfig>,
     baseline: Baseline,
 ) -> Report {
+    report_for(
+        MemoryMode::Report,
+        configured_mb,
+        reading,
+        rows,
+        collections,
+        baseline,
+    )
+}
+
+/// [`report`] in `mode`: in `auto`, `plan` is what applying it can do now
+/// and `ideal` the plan it holds back from.
+pub(crate) fn report_for(
+    mode: MemoryMode,
+    configured_mb: Option<u64>,
+    reading: &detect::Reading,
+    rows: &[Row],
+    collections: &HashMap<String, CollectionConfig>,
+    baseline: Baseline,
+) -> Report {
     let total = detect::total(configured_mb, reading);
-    let plan = total.as_ref().map(|total| {
+    let plan_of = |total: &Total, applying: bool| {
         grant::plan(&Inputs::of_rows(
             total.bytes,
             collections.len() as u64,
             baseline,
             rows,
             |row| unreachable(row, collections),
+            applying,
         ))
-    });
+    };
+    let ideal = total.as_ref().map(|total| plan_of(total, false));
+    let (plan, ideal) = match (mode, &total) {
+        (MemoryMode::Auto, Some(total)) => (Some(plan_of(total, true)), ideal),
+        _ => (ideal, None),
+    };
     Report {
         total,
         low_bytes: reading.low_bytes,
         plan,
+        ideal,
+        mode,
+        changes: Vec::new(),
+        unapplied_bytes: 0,
     }
 }
 
@@ -189,6 +490,13 @@ pub(crate) fn unreachable(
     {
         return Some("built empty for its source".into());
     }
+    // An engine the config no longer has, still held by its poll task or
+    // a request in flight.
+    if let Some(id) = entry.scope.collection() {
+        if !collections.contains_key(id) {
+            return Some("its collection is no longer configured".into());
+        }
+    }
     match (entry.id, &entry.scope) {
         ("grib_message_cache", Scope::Source { id, .. }) => collections
             .get(id)
@@ -246,6 +554,29 @@ pub(crate) fn header_json(report: &Report) -> Value {
         "pinned_bytes": plan.pinned_bytes,
         "shortfall_bytes": plan.shortfall_bytes,
         "cut": plan.cut,
+        "mode": report.mode.as_str(),
+        "changes": report.changes.iter().map(change_json).collect::<Vec<_>>(),
+        "unapplied_bytes": report.unapplied_bytes,
+    })
+}
+
+/// A size [`apply`] changed or meant to, for `/admin/cache-plan`.
+fn change_json(change: &Change) -> Value {
+    json!({
+        "id": change.entry.id,
+        "kind": change.entry.kind.as_str(),
+        "collection": change.entry.scope.collection(),
+        "from_bytes": change.from_bytes,
+        "to_bytes": change.to_bytes,
+        "target_bytes": change.target_bytes,
+        "reason": change.reason,
+        "held": change.held.map(|held| match held {
+            Held::Warm => "warm",
+            Held::InPlace => "in place",
+            Held::Refused => "refused",
+            Held::Gone => "gone",
+        }),
+        "cleared": change.cleared,
     })
 }
 
@@ -285,7 +616,10 @@ pub(crate) fn header_line(report: &Report) -> String {
     if let Some(low) = report.low_bytes {
         let _ = write!(line, "; cgroup memory.low {} (not a limit)", gib(low));
     }
-    line.push_str(". A report: no size is changed");
+    line.push_str(match report.mode {
+        MemoryMode::Report => ". A report: no size is changed",
+        MemoryMode::Auto => ". [memory] mode = \"auto\": applied to what no setting pins",
+    });
     line
 }
 
@@ -324,6 +658,14 @@ pub(crate) fn warn_block(report: &Report, rows: &[Row]) -> Option<String> {
             out,
             ", short by {} even with those cut to their floors",
             gib(plan.shortfall_bytes)
+        );
+    }
+    if report.unapplied_bytes > 0 {
+        let _ = write!(
+            out,
+            "; {} of what caches hold is above the plan until they can shrink further, warm \
+             ones a quarter per reload",
+            gib(report.unapplied_bytes)
         );
     }
     if matches!(total.source, detect::Source::Host { .. }) {
@@ -366,10 +708,16 @@ pub(crate) fn warn_block(report: &Report, rows: &[Row]) -> Option<String> {
             );
         }
     }
-    out.push_str(
-        "\n  A report: no size is changed. [memory] total_mb sets the total; a pinned size is \
-         kept",
-    );
+    out.push_str(match report.mode {
+        MemoryMode::Report => {
+            "\n  A report: no size is changed. [memory] total_mb sets the total; a pinned size \
+             is kept"
+        }
+        MemoryMode::Auto => {
+            "\n  [memory] mode = \"auto\" applies these sizes, a warm cache shrinking by at most \
+             25 % at once. [memory] total_mb sets the total; a pinned size is kept"
+        }
+    });
     Some(out)
 }
 
@@ -415,7 +763,17 @@ static PLAN_SHORTFALL: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge(
         "memory_plan_shortfall_bytes",
         "How much more memory the plan needs with its pins kept and every other cache and \
-         budget cut to its floor; 0 when it fits. A report: no size is changed",
+         budget cut to its floor; 0 when it fits",
+    )
+});
+
+static PLAN_UNAPPLIED: LazyLock<IntGauge> = LazyLock::new(|| {
+    gauge(
+        "memory_plan_unapplied_bytes",
+        "In [memory] mode = \"auto\", the capacity above the memory plan that applying it \
+         could not take away yet: warm caches giving up a quarter of what they hold per \
+         reload, shrinks that stop in place. The plan fits the rest around it, its shortfall \
+         counting what does not fit; 0 in report mode",
     )
 });
 
@@ -425,7 +783,9 @@ static CACHE_PLANNED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
             Opts::new(
                 "cache_planned_bytes",
                 "The size the memory plan gives each cache and admission budget of \
-                 /admin/cache-plan, labelled as cache_size_source is. A report: the configured \
+                 /admin/cache-plan, labelled as cache_size_source is. In [memory] mode = \
+                 \"auto\" an entry no setting pins takes it (cache_size_source plan:auto), a \
+                 warm cache at most a quarter smaller at once; in report mode the configured \
                  size is unchanged",
             ),
             &["cache", "collection"],
@@ -454,6 +814,7 @@ pub(crate) fn update_gauges() {
     PLAN_TOTAL.set(clamp(total.map_or(0, |t| t.bytes)));
     PLAN_POOL.set(clamp(plan.map_or(0, |p| p.pool_bytes)));
     PLAN_SHORTFALL.set(clamp(plan.map_or(0, |p| p.shortfall_bytes)));
+    PLAN_UNAPPLIED.set(clamp(report.as_ref().map_or(0, |r| r.unapplied_bytes)));
     CACHE_PLANNED.reset();
     for g in plan.iter().flat_map(|p| p.caches.iter().chain(&p.budgets)) {
         let collection = g.entry.scope.collection().unwrap_or("");

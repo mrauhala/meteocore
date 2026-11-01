@@ -183,6 +183,8 @@ static BLOCKS: LazyLock<ByteBoundedCache<BlockKey, Bytes>> = LazyLock::new(|| {
         Tuning::DEFAULT.block,
         |key, bytes| bytes.len() as u64 + key.file.url.len() as u64 + 96,
     )
+    // The memory plan's resizes too (#1312).
+    .with_min_capacity(MIN_BLOCK_CACHE_MB.saturating_mul(ds_cache::MIB))
     .registered(
         "netcdf_block_cache",
         ds_cache::plan::Scope::Engine("netcdf"),

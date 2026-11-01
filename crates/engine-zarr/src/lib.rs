@@ -225,6 +225,53 @@ impl ZarrEngine {
         self.source.payload_cache_metrics()
     }
 
+    /// Resize the decoded-chunk cache to `bytes` for the memory plan
+    /// (#1312), keeping the chunks that fit. Returns the capacity applied
+    /// ([`ds_cache::ByteBoundedCache::set_capacity`]).
+    pub fn resize_decoded_cache(&self, bytes: u64) -> u64 {
+        self.decoded_cache.resize(bytes)
+    }
+
+    /// Resize a plain store's object cache to `bytes` for the memory plan
+    /// (#1312); `None` for an Icechunk repository.
+    pub fn resize_object_cache(&self, bytes: u64) -> Option<u64> {
+        self.source.resize_object_cache(bytes)
+    }
+
+    /// Resize an Icechunk repository's payload cache to `bytes` for the
+    /// memory plan (#1312); `None` for a plain store.
+    pub fn resize_icechunk_payload_cache(&self, bytes: u64) -> Option<u64> {
+        self.source.resize_payload_cache(bytes)
+    }
+
+    /// The least size each `resize_*` takes its cache to now (#1312): where
+    /// its shards still hold 32 entries each. `None` for a cache the
+    /// collection does not have.
+    pub fn least_decoded_cache(&self) -> u64 {
+        self.decoded_cache.least_capacity()
+    }
+
+    pub fn least_object_cache(&self) -> Option<u64> {
+        self.source.least_object_cache()
+    }
+
+    pub fn least_icechunk_payload_cache(&self) -> Option<u64> {
+        self.source.least_payload_cache()
+    }
+
+    /// Drop every entry of a cache, keeping its capacity (#1312).
+    pub fn clear_decoded_cache(&self) {
+        self.decoded_cache.clear();
+    }
+
+    pub fn clear_object_cache(&self) {
+        self.source.clear_object_cache();
+    }
+
+    pub fn clear_icechunk_payload_cache(&self) {
+        self.source.clear_payload_cache();
+    }
+
     /// An Icechunk repository's storage requests and the bytes their bodies
     /// yielded, cumulative since the engine opened it (#1353); `None` for a
     /// plain store.

@@ -12,6 +12,7 @@ fn cache(id: &'static str, scope: Scope, source: SizeSource, mb: u64) -> CacheIn
         demand: None,
         idle: false,
         unreachable: None,
+        least: None,
     }
 }
 
@@ -501,11 +502,11 @@ fn production_at_31_gib_keeps_every_size_and_shares_the_rest() {
         grant(&plan, "grid_cache", Some("global-c")).reason,
         Reason::Today
     );
-    // A remote source's message cache, off today, would get 64 MiB.
-    assert_eq!(
-        grant(&plan, "grib_message_cache", Some("global-c")).bytes,
-        64 * MB
-    );
+    // A remote source's message cache, off today, stays off and counts
+    // nothing: only its setting turns it on.
+    let off = grant(&plan, "grib_message_cache", Some("global-c"));
+    assert_eq!((off.bytes, off.expected_bytes), (0, 0));
+    assert_eq!(off.reason, Reason::Off);
     assert_eq!(mb(&plan, "tiles3d_content_cache"), 0);
 }
 
@@ -734,7 +735,7 @@ fn a_demand_cache_gets_its_demand_plus_15_percent() {
 /// today while that fits.
 #[test]
 fn working_sets_share_at_most_35_percent() {
-    let ws = |id: &str, mb| with_demand(default("grid_cache", source("grib", id), 0), mb, 25);
+    let ws = |id: &str, mb| with_demand(default("grid_cache", source("grib", id), 64), mb, 25);
     let caches = vec![ws("a", 1000), ws("b", 3000)];
     let plan = plan(&inputs(8.0, 2, Baseline::Estimated, caches, Vec::new()));
     let cap = plan.pool_bytes * 35 / 100;
@@ -809,7 +810,7 @@ fn cuts_follow_the_order() {
             default("metatile_cache", Scope::Process, 1024),
             default("grid_cache", source("grib", "a"), 1024),
             with_demand(
-                default("satellite_frame_cache", engine("satellite"), 0),
+                default("satellite_frame_cache", engine("satellite"), 16),
                 1024,
                 16,
             ),
@@ -897,6 +898,9 @@ fn reasons_print_for_the_report() {
         Reason::WorkingSet,
         Reason::Share(45),
         Reason::Today,
+        Reason::Off,
+        Reason::Held(Hold::Warm),
+        Reason::Held(Hold::InPlace),
         Reason::Scaled,
         Reason::Cut(Step::Traffic),
         Reason::Cut(Step::Demand),
@@ -915,10 +919,329 @@ fn reasons_print_for_the_report() {
             "working set",
             "share by weight 45",
             "size today",
+            "off: its setting turns it on",
+            "held: a warm cache gives up at most 25 % of what it holds at once",
+            "held: it shrinks no further in place",
             "scaled to the total",
             "cut: traffic",
             "cut: below its demand",
             "floor: total under 512 MiB",
         ]
     );
+}
+
+/// #1312 part 2: a warm cache, one holding more than its grant, gives up
+/// at most 25 % of what it holds at once, in whole MiB: a cache partly
+/// full goes to its grant when that evicts less; one holding no more than
+/// its grant, or nothing, goes there at once; a growth is never bounded.
+#[test]
+fn a_warm_cache_gives_up_at_most_a_quarter_of_what_it_holds() {
+    let gib = 1024 * MB;
+    // Holding 3 GiB of a 4 GiB cache granted 1 GiB: it keeps 2.25 GiB.
+    assert!(warm(3 * gib, Some(900), gib));
+    assert_eq!(bounded(4 * gib, gib, 3 * gib, Some(900)), 2304 * MB);
+    // Holding 1200 MiB of 4190 granted 1173: the grant evicts 27 MiB.
+    assert_eq!(bounded(4190 * MB, 1173 * MB, 1200 * MB, None), 1173 * MB);
+    // 3771 MiB held: 2829 MiB kept, a quarter of it evicted.
+    assert_eq!(bounded(4190 * MB, 1173 * MB, 3771 * MB, None), 2829 * MB);
+    // Never more than its size today.
+    assert_eq!(bounded(1000 * MB, 0, 1000 * MB, None), 750 * MB);
+    // Holding no more than the grant: nothing to evict.
+    assert!(!warm(gib, Some(300), gib));
+    assert_eq!(bounded(4 * gib, gib, gib, Some(300)), gib);
+    assert_eq!(bounded(4 * gib, gib, 0, Some(0)), gib);
+    // Counted entries, none held: never warm, whatever its weight says.
+    assert!(!warm(5 * MB, Some(0), 0));
+    // Rounded up to whole MiB: never more than a quarter evicted.
+    let odd = 1001 * MB + 7;
+    let kept = bounded(odd + MB, 0, odd, None);
+    assert_eq!(kept, 751 * MB);
+    assert!(kept * 4 >= odd * 3);
+    // A growth.
+    assert_eq!(bounded(gib, 4 * gib, gib, Some(10)), 4 * gib);
+    // The least applying the plan can give a cache: the larger of what
+    // its warmth and its shards allow, never above its size.
+    assert_eq!(
+        Least::of(4 * gib, 3 * gib, None, 496 * MB),
+        Some(Least {
+            bytes: 2304 * MB,
+            why: Hold::Warm,
+            in_place: 496 * MB,
+        })
+    );
+    assert_eq!(
+        Least::of(gib, 100 * MB, None, 496 * MB + 5),
+        Some(Least {
+            bytes: 497 * MB,
+            why: Hold::InPlace,
+            in_place: 497 * MB,
+        })
+    );
+    assert_eq!(Least::of(gib, 0, Some(0), 0), None);
+    assert_eq!(
+        Least::of(256 * MB, 0, Some(0), u64::MAX),
+        Some(Least {
+            bytes: 256 * MB,
+            why: Hold::InPlace,
+            in_place: 256 * MB,
+        }),
+        "a cache that cannot shrink"
+    );
+}
+
+/// Rows read at their configured size, not the plan's: an unpinned cache
+/// the plan resized plans as its built-in default, a pinned one at its
+/// capacity, so the same config gives the same plan after it is applied.
+/// Applying, a row carries the least it can take now.
+#[test]
+fn rows_plan_at_their_configured_size() {
+    use crate::plan::{Row, Usage};
+    let row = |source: SizeSource, capacity: u64, configured: u64, planned: bool| Row {
+        entry: Entry::cache("metatile_cache", Scope::Process, source),
+        usage: Usage {
+            capacity_bytes: capacity * MB,
+            used_bytes: 2048 * MB,
+            ..Usage::default()
+        },
+        window: None,
+        demand: None,
+        configured_bytes: configured * MB,
+        planned,
+        least_bytes: 496 * MB,
+    };
+    let input = |row: Row, applying: bool| {
+        Inputs::of_rows(8 * GIB, 1, Baseline::Estimated, &[row], |_| None, applying).caches[0]
+            .clone()
+    };
+    let unpinned = input(row(SizeSource::Default, 4096, 1024, true), false);
+    assert_eq!((unpinned.capacity_bytes / MB, unpinned.least), (1024, None));
+    assert_eq!(
+        input(row(SizeSource::Default, 4096, 1024, true), true).least,
+        Some(Least {
+            bytes: 1536 * MB,
+            why: Hold::Warm,
+            in_place: 496 * MB,
+        })
+    );
+    let pinned_row = row(
+        SizeSource::Config("[server] metatile_cache_mb"),
+        8192,
+        6144,
+        false,
+    );
+    assert_eq!(input(pinned_row, false).capacity_bytes / MB, 8192);
+    assert!(!pinned(&SizeSource::Planned));
+}
+
+/// A cache that can shrink no lower than `least_mb` in place.
+fn held(mut input: CacheInput, least_mb: u64) -> CacheInput {
+    input.least = Some(Least {
+        bytes: least_mb * MB,
+        why: Hold::InPlace,
+        in_place: least_mb * MB,
+    });
+    input
+}
+
+/// The issue's 4 GiB container, applying: the meta-tile and PVOL pixel
+/// caches stop where their shards still hold 32 entries (496 MiB), and the
+/// GRIB grid caches where their hot share still holds a 0.1° fill (their
+/// 256 MiB build size). Those holds last until a restart, so they count as
+/// pins: the plan never gives the caches less, and cuts everything else
+/// around them in the issue's order, the budgets toward 128 and 64 MiB and
+/// the demand caches last, until the total fits.
+#[test]
+fn holds_in_place_count_as_pins_and_the_rest_is_cut_in_order() {
+    let container = |least: bool| {
+        let (mut caches, budgets) = process_wide(&["3dtiles", "mvt", "csv", "odim", "zarr"]);
+        caches.extend(grib("global", 4));
+        caches.extend(grib("regional", 25));
+        caches.push(with_demand(
+            default("satellite_frame_cache", engine("satellite"), 1024),
+            650,
+            30,
+        ));
+        caches.retain(|c| !(c.entry.id == "satellite_frame_cache" && c.demand.is_none()));
+        if least {
+            caches = caches
+                .into_iter()
+                .map(|c| match c.entry.id {
+                    "metatile_cache" | "pvol_pixel_cache" => held(c, 496),
+                    "grid_cache" => held(c, 256),
+                    _ => c,
+                })
+                .collect();
+        }
+        inputs(3.2, 10, Baseline::Estimated, caches, budgets)
+    };
+    let ideal = plan(&container(false));
+    assert_fits(&ideal);
+    assert!(mb(&ideal, "metatile_cache") < 496, "the ideal plan cuts it");
+    let held_plan = plan(&container(true));
+    for (id, collection, least) in [
+        ("metatile_cache", None, 496),
+        ("pvol_pixel_cache", None, 496),
+        ("grid_cache", Some("global"), 256),
+        ("grid_cache", Some("regional"), 256),
+    ] {
+        let g = grant(&held_plan, id, collection);
+        assert_eq!(g.bytes, least * MB, "{id} {collection:?}");
+        assert_eq!(g.reason, Reason::Held(Hold::InPlace), "{id} {collection:?}");
+        assert_eq!(g.floor_bytes, least * MB);
+    }
+    // Everything else gives way, the budgets and the demand caches too:
+    // none more than in the ideal plan, and the budgets cut.
+    for g in held_plan.caches.iter().chain(&held_plan.budgets) {
+        if matches!(g.reason, Reason::Held(_)) {
+            continue;
+        }
+        let ideal = grant(&ideal, g.entry.id, g.entry.scope.collection());
+        assert!(g.bytes <= ideal.bytes, "{g:?} above {ideal:?}");
+    }
+    let render = grant(&held_plan, "render_budget", None);
+    assert_eq!(render.reason, Reason::Cut(Step::Budgets));
+    assert!(render.bytes < mb(&ideal, "render_budget") * MB);
+    assert!(render.bytes >= 128 * MB);
+    // And the plan fits: what applying it keeps never exceeds the pool.
+    assert_fits(&held_plan);
+}
+
+/// A warm cache's hold passes with the next reloads: the traffic-driven
+/// caches beside it give way, but the budgets and the demand caches keep
+/// their sizes, and what does not fit is the shortfall.
+#[test]
+fn a_warm_hold_never_cuts_budgets_or_demand_caches() {
+    let caches = |least: Option<Least>| {
+        let mut metatile = default("metatile_cache", Scope::Process, 1024);
+        metatile.least = least;
+        vec![
+            metatile,
+            default("rendered_cache", Scope::Process, 256),
+            with_demand(
+                default("satellite_frame_cache", engine("satellite"), 1024),
+                900,
+                30,
+            ),
+        ]
+    };
+    let budgets = || {
+        vec![
+            budget("render_budget", Scope::Process, SizeSource::Default, 1024),
+            budget(
+                "pvol_read",
+                engine("odim-volume"),
+                SizeSource::Default,
+                1024,
+            ),
+        ]
+    };
+    let ideal = plan(&inputs(
+        3.0,
+        1,
+        Baseline::Estimated,
+        caches(None),
+        budgets(),
+    ));
+    assert_fits(&ideal);
+    let least = Least {
+        bytes: 2400 * MB,
+        why: Hold::Warm,
+        in_place: 496 * MB,
+    };
+    let held_plan = plan(&inputs(
+        3.0,
+        1,
+        Baseline::Estimated,
+        caches(Some(least)),
+        budgets(),
+    ));
+    assert!(mb(&ideal, "metatile_cache") < 2400);
+    let g = grant(&held_plan, "metatile_cache", None);
+    assert_eq!((g.bytes, &g.reason), (2400 * MB, &Reason::Held(Hold::Warm)));
+    assert!(mb(&held_plan, "rendered_cache") <= mb(&ideal, "rendered_cache"));
+    for id in ["render_budget", "pvol_read", "satellite_frame_cache"] {
+        assert_eq!(mb(&held_plan, id), mb(&ideal, id), "{id} untouched");
+    }
+    assert!(held_plan.shortfall_bytes > 0, "the excess is reported");
+    // Its in-place part alone would fit, as a pin, by the cut order.
+    let mut lasting = least;
+    lasting.bytes = least.in_place;
+    lasting.why = Hold::InPlace;
+    let lasting_plan = plan(&inputs(
+        3.0,
+        1,
+        Baseline::Estimated,
+        caches(Some(lasting)),
+        budgets(),
+    ));
+    assert_eq!(lasting_plan.shortfall_bytes, 0);
+}
+
+/// #1312 part 2: a cache off by default (a GRIB source's message cache
+/// with `message_cache_mb` unset) stays off and counts nothing; one still
+/// holding entries goes as far as it can.
+#[test]
+fn a_cache_off_by_default_stays_off() {
+    let off = with_demand(
+        default("grib_message_cache", source("grib", "remote"), 0),
+        32,
+        2,
+    );
+    let plan_of = |c: CacheInput| plan(&inputs(8.0, 1, Baseline::Estimated, vec![c], Vec::new()));
+    let p = plan_of(off.clone());
+    let g = grant(&p, "grib_message_cache", Some("remote"));
+    assert_eq!((g.bytes, g.expected_bytes, &g.reason), (0, 0, &Reason::Off));
+    let p = plan_of(held(off, 300));
+    let g = grant(&p, "grib_message_cache", Some("remote"));
+    assert_eq!(
+        (g.bytes, &g.reason),
+        (300 * MB, &Reason::Held(Hold::InPlace))
+    );
+}
+
+/// #1312 acceptance: one 0.1° GRIB source and one 0.25° source get
+/// different grid caches from their field sizes, each grant carrying its
+/// field size for the cache's layout (rule 8). The 0.25° one's sixteen
+/// fields fit its 256 MiB default, which it keeps (rule 6); the 0.1° one's
+/// do not, and it gets them plus 15 %.
+#[test]
+fn a_0_1_and_a_0_25_degree_source_get_different_grid_caches() {
+    // The decoded field sizes of 3600 × 1801 and 1440 × 721 f32 grids.
+    let tenth = 3600 * 1801 * 4 + 160;
+    let quarter = 1440 * 721 * 4 + 160;
+    let field = |bytes: u64| {
+        let part = CacheDemand::demand(16 * bytes, "16 × decoded field bytes", "setting")
+            .input("field_bytes", bytes);
+        Demand {
+            bytes: part.bytes,
+            rule: part.rule,
+            floor: part.floor,
+            ahead: part.ahead,
+            setting: part.setting,
+            parts: vec![("c".into(), part)],
+        }
+    };
+    let source_cache = |id: &str, bytes: u64| CacheInput {
+        demand: Some(field(bytes)),
+        ..default("grid_cache", source("grib", id), 256)
+    };
+    for total in [3.2, 8.0, 31.0] {
+        let caches = vec![
+            source_cache("nwp-tenth", tenth),
+            source_cache("nwp-quarter", quarter),
+        ];
+        let plan = plan(&inputs(total, 2, Baseline::Estimated, caches, Vec::new()));
+        assert_fits(&plan);
+        let (a, b) = (
+            grant(&plan, "grid_cache", Some("nwp-tenth")),
+            grant(&plan, "grid_cache", Some("nwp-quarter")),
+        );
+        let suggested = (16 * tenth + (16 * tenth * 15).div_ceil(100)).div_ceil(MB) * MB;
+        assert_eq!(a.bytes, suggested, "{total}");
+        assert_eq!(a.bytes, 456 * MB);
+        assert_eq!(a.reason, Reason::WorkingSet);
+        assert_eq!(b.bytes, 256 * MB, "{total}");
+        assert_eq!(b.reason, Reason::Today);
+        assert_eq!((a.entry_bytes, b.entry_bytes), (Some(tenth), Some(quarter)));
+    }
 }

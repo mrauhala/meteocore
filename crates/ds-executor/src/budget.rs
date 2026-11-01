@@ -122,7 +122,8 @@ impl RenderBudget {
 
     /// Enter this budget in the memory plan (`ds_cache::plan`, #1306) as
     /// `id`, its `/metrics` family, sized from `source`, with its
-    /// high-water mark ([`Self::take_peak`]).
+    /// high-water mark ([`Self::take_peak`]). The plan resizes it through
+    /// [`Self::resize`] (#1312).
     pub fn register(
         self: &Arc<Self>,
         id: &'static str,
@@ -134,6 +135,10 @@ impl RenderBudget {
             self,
             |budget| plan::Usage::budget(budget.capacity(), budget.used.load(Ordering::Relaxed)),
             Self::take_peak,
+            |budget, bytes| {
+                budget.resize(bytes);
+                bytes
+            },
         );
     }
 
@@ -278,7 +283,8 @@ impl ByteBudget {
     /// Enter this budget in the memory plan (`ds_cache::plan`, #1306) as
     /// `id`, its `/metrics` family (`geotiff_decode` for
     /// `geotiff_decode_capacity_bytes`), sized from `source`, with its
-    /// high-water mark ([`Self::take_peak`]). Listed while the budget lives.
+    /// high-water mark ([`Self::take_peak`]). Listed while the budget lives;
+    /// the plan resizes it through [`Self::resize`] (#1312).
     pub fn register(
         self: &Arc<Self>,
         id: &'static str,
@@ -290,6 +296,10 @@ impl ByteBudget {
             self,
             |budget| plan::Usage::budget(budget.capacity(), budget.used.load(Ordering::Relaxed)),
             Self::take_peak,
+            |budget, bytes| {
+                budget.resize(bytes);
+                bytes
+            },
         );
     }
 
@@ -677,6 +687,34 @@ mod tests {
             .find(|row| row.entry.id == "budget_test_resized")
             .unwrap();
         assert_eq!(row.usage, plan::Usage::budget(70, 0));
+        // The memory plan resizes it through its registration (#1312),
+        // its configured size the capacity it was registered at.
+        let entry = plan::Entry::budget(
+            "budget_test_resized",
+            plan::Scope::Engine("test"),
+            plan::SizeSource::Default,
+        );
+        assert_eq!(plan::apply(&entry, 90), Some(90));
+        assert_eq!(budget.capacity(), 90);
+        let row = plan::snapshot()
+            .into_iter()
+            .find(|row| row.entry.id == "budget_test_resized")
+            .unwrap();
+        assert_eq!((row.configured_bytes, row.planned), (50, true));
+        let render = Arc::new(RenderBudget::new(10 * BYTES_PER_PIXEL));
+        render.register(
+            "budget_test_render_resized",
+            plan::Scope::Process,
+            plan::SizeSource::Default,
+        );
+        let entry = plan::Entry::budget(
+            "budget_test_render_resized",
+            plan::Scope::Process,
+            plan::SizeSource::Default,
+        );
+        let bytes = 4 * BYTES_PER_PIXEL;
+        assert_eq!(plan::apply(&entry, bytes), Some(bytes));
+        assert_eq!(render.capacity(), bytes);
     }
 
     /// A render waiting for memory is admitted when the budget grows, with

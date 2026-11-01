@@ -24,7 +24,8 @@
 //! #1308).
 //!
 //! Every cache can be resized in place ([`ByteBoundedCache::set_capacity`],
-//! #1311), keeping what still fits.
+//! #1311), keeping what still fits; a registered one by the memory plan
+//! too ([`plan::apply`], #1312).
 
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -90,6 +91,28 @@ pub fn holding_keeps(hot_allocation: f64, capacity_bytes: u64, entry_bytes: u64)
     // A byte of slack: the share `hot_allocation_holding` gives leaves the
     // cold ring exactly the room, up to rounding.
     hot_allocation * capacity >= entry && (1.0 - hot_allocation) * capacity + 1.0 >= 1.1 * entry
+}
+
+/// The least capacity of a one-shard cache whose hot ring targets
+/// `hot_allocation` of it at which [`holding_keeps`] holds for an entry of
+/// `entry_bytes`: how far a cache sized by [`hot_allocation_holding`],
+/// which keeps its share when resized, can shrink in place and still keep
+/// such a fill (#1312). `u64::MAX` when no capacity does.
+pub fn holding_floor(hot_allocation: f64, entry_bytes: u64) -> u64 {
+    if !(hot_allocation > 0.0 && hot_allocation < 1.0) {
+        return u64::MAX;
+    }
+    let entry = entry_bytes as f64;
+    let least = (entry / hot_allocation).max((1.1 * entry - 1.0) / (1.0 - hot_allocation));
+    let mut bytes = least.ceil().max(0.0) as u64;
+    // Up past the rounding of the two products.
+    for _ in 0..64 {
+        if holding_keeps(hot_allocation, bytes, entry_bytes) {
+            return bytes;
+        }
+        bytes = bytes.saturating_add(1 + bytes / (1 << 20));
+    }
+    u64::MAX
 }
 
 /// `var` trimmed and parsed as a whole number, if it is set to one.
@@ -191,6 +214,9 @@ struct Inner<K: Eq + Hash, V: Clone> {
     resizing: Mutex<()>,
     /// Built [`ByteBoundedCache::with_entry_floor`].
     entry_floor: AtomicBool,
+    /// Built [`ByteBoundedCache::with_min_capacity`]: no shrink but a
+    /// disable goes below it.
+    min_capacity: AtomicU64,
     hits: AtomicU64,
     misses: AtomicU64,
 }
@@ -323,6 +349,51 @@ impl<K: Eq + Hash, V: Clone> Inner<K, V> {
         self.counters()
             .resize(capacity_bytes, old_shard, self.cache.shard_capacity());
         self.capacity_bytes.store(capacity_bytes, Ordering::Relaxed);
+    }
+
+    /// [`ByteBoundedCache::least_capacity`].
+    fn least_capacity(&self) -> u64 {
+        let from = self.capacity_bytes();
+        let mut floor = self.shape.slice_floor(self.cache.num_shards());
+        if self.entry_floor.load(Ordering::Relaxed) {
+            floor = floor.max(FLOOR_ENTRIES.saturating_mul(self.counters().largest()));
+        }
+        floor
+            .max(self.min_capacity.load(Ordering::Relaxed))
+            .min(from)
+    }
+
+    /// [`ByteBoundedCache::set_capacity`], here so the memory plan can
+    /// resize a cache through its registration ([`plan::apply`]).
+    fn set_capacity(&self, capacity_bytes: u64) -> u64 {
+        let _resizing = self.resizing.lock().unwrap_or_else(|e| e.into_inner());
+        let from = self.capacity_bytes();
+        let mut target = capacity_bytes;
+        if target > 0 && target < from {
+            target = target.max(self.least_capacity());
+        }
+        if target > from {
+            if from == 0 {
+                // From its 1-byte clamp `quick_cache` would keep a hot
+                // share of 1 and scale its evicted-key list from one byte.
+                // From 0 it starts both again from its defaults.
+                self.resize_store(0, 0);
+            }
+            self.resize_store(target, target);
+        } else {
+            for step in shrink_steps(from, target) {
+                self.resize_store(step.max(1), step);
+            }
+        }
+        target
+    }
+
+    /// [`ByteBoundedCache::clear`].
+    fn clear(&self) {
+        // One entry per shard lock, each dropped once the lock is released.
+        for entry in self.cache.drain() {
+            drop(entry);
+        }
     }
 }
 
@@ -550,6 +621,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
                 capacity_bytes: AtomicU64::new(capacity_bytes),
                 resizing: Mutex::new(()),
                 entry_floor: AtomicBool::new(false),
+                min_capacity: AtomicU64::new(0),
                 hits: AtomicU64::new(0),
                 misses: AtomicU64::new(0),
             }),
@@ -590,31 +662,26 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// during one, an insert racing a step counted against the hot target
     /// before or after it.
     pub fn set_capacity(&self, capacity_bytes: u64) -> u64 {
-        let inner = &*self.inner;
-        let _resizing = inner.resizing.lock().unwrap_or_else(|e| e.into_inner());
-        let from = inner.capacity_bytes();
-        let mut target = capacity_bytes;
-        if target > 0 && target < from {
-            let mut floor = inner.shape.slice_floor(inner.cache.num_shards());
-            if inner.entry_floor.load(Ordering::Relaxed) {
-                floor = floor.max(FLOOR_ENTRIES.saturating_mul(inner.counters().largest()));
-            }
-            target = target.max(floor.min(from));
-        }
-        if target > from {
-            if from == 0 {
-                // From its 1-byte clamp `quick_cache` would keep a hot
-                // share of 1 and scale its evicted-key list from one byte.
-                // From 0 it starts both again from its defaults.
-                inner.resize_store(0, 0);
-            }
-            inner.resize_store(target, target);
-        } else {
-            for step in shrink_steps(from, target) {
-                inner.resize_store(step.max(1), step);
-            }
-        }
-        target
+        self.inner.set_capacity(capacity_bytes)
+    }
+
+    /// The least capacity [`Self::set_capacity`] can shrink the cache to
+    /// now, short of disabling it: where its shards' slices still hold 32
+    /// estimated entries each, [`FLOOR_ENTRIES`] of its heaviest entry for
+    /// a cache built [`Self::with_entry_floor`], [`Self::with_min_capacity`],
+    /// and never above its capacity. What the memory plan can take it to
+    /// in place (#1312).
+    pub fn least_capacity(&self) -> u64 {
+        self.inner.least_capacity()
+    }
+
+    /// Drop every entry, keeping the capacity, the hot share and the ghost
+    /// ring: for a cache whose entries no collection can read (#1312). A
+    /// cache disabled and grown again would take `quick_cache`'s defaults
+    /// instead ([`Self::set_capacity`]). Each entry is dropped outside its
+    /// shard's lock, and none counts as an eviction.
+    pub fn clear(&self) {
+        self.inner.clear();
     }
 
     /// Whether [`Self::set_capacity`] to `capacity_bytes` leaves a cache
@@ -639,6 +706,11 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         }
         if from == 0 {
             return false;
+        }
+        // Built with one shard, as one built at any size would be: no
+        // throwaway cache to ask (the memory plan asks per scrape, #1312).
+        if self.inner.shape.shards == Some(1) {
+            return true;
         }
         let shards = self.shards();
         let fresh = self.inner.shape.shards_at(capacity_bytes);
@@ -669,6 +741,14 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// read each one again on every request.
     pub fn with_entry_floor(self) -> Self {
         self.inner.entry_floor.store(true, Ordering::Relaxed);
+        self
+    }
+
+    /// Never shrink this cache below `bytes`, except to disable it: a
+    /// cache its engine needs at least that large (the NetCDF metadata
+    /// block cache). The memory plan's resizes respect it too.
+    pub fn with_min_capacity(self, bytes: u64) -> Self {
+        self.inner.min_capacity.store(bytes, Ordering::Relaxed);
         self
     }
 
@@ -1028,6 +1108,17 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     }
 }
 
+impl<K: Eq + Hash, V: Clone> Inner<K, V> {
+    /// How the memory plan resizes the cache ([`plan::Resize`]).
+    fn resize() -> plan::Resize<Self> {
+        plan::Resize {
+            to: Self::set_capacity,
+            least: Self::least_capacity,
+            clear: Self::clear,
+        }
+    }
+}
+
 impl<K, V> ByteBoundedCache<K, V>
 where
     K: Eq + Hash + Send + Sync + 'static,
@@ -1035,12 +1126,34 @@ where
 {
     /// Enter this cache in the memory plan ([`plan`]) as `id`, its
     /// `/metrics` family, sized from `source`. Listed while the cache lives;
-    /// registering it again replaces the entry.
+    /// registering it again replaces the entry. The plan can resize it
+    /// ([`plan::apply`], [`Self::set_capacity`]); its configured size is
+    /// its capacity at its first registration ([`plan::register_resizable`]).
     pub fn register(&self, id: &'static str, scope: plan::Scope, source: plan::SizeSource) {
-        plan::register(
+        plan::register_resizable(
             plan::Entry::cache(id, scope, source),
             &self.inner,
             Inner::usage,
+            Inner::<K, V>::resize(),
+        );
+    }
+
+    /// [`Self::register`] with the size its settings give it now,
+    /// `configured_bytes`: for a cache a reload keeps, whose capacity may be
+    /// the plan's ([`plan::register_sized`]).
+    pub fn register_sized(
+        &self,
+        id: &'static str,
+        scope: plan::Scope,
+        source: plan::SizeSource,
+        configured_bytes: u64,
+    ) {
+        plan::register_sized(
+            plan::Entry::cache(id, scope, source),
+            configured_bytes,
+            &self.inner,
+            Inner::usage,
+            Inner::<K, V>::resize(),
         );
     }
 
@@ -1648,6 +1761,85 @@ mod tests {
         assert_eq!(row.usage, plan::Usage::cache(cache.metrics(), Some(1)));
         drop(cache);
         assert!(listed().is_none());
+    }
+
+    fn weigh_value(_: &u64, value: &u64) -> u64 {
+        *value
+    }
+
+    /// A one-shard cache resizes in place to any size: one built at it has
+    /// one shard too. Only a disabled one grown does not.
+    #[test]
+    fn a_single_shard_cache_resizes_in_place_to_any_size() {
+        let cache = ByteBoundedCache::<u64, u64>::new_single_shard(256 * MIB, MIB, weigh_value);
+        for mb in [1, 64, 256, 4096] {
+            assert!(cache.resizes_in_place_to(mb * MIB), "{mb}");
+        }
+        let off = ByteBoundedCache::<u64, u64>::new_single_shard(0, MIB, weigh_value);
+        assert!(!off.resizes_in_place_to(64 * MIB));
+    }
+
+    /// #1312: `least_capacity` is exactly where a shrink stops: the slice
+    /// floor of a sharded cache, a floor its builder set, never above its
+    /// capacity; a disable still goes to 0.
+    #[test]
+    fn least_capacity_is_where_a_shrink_stops() {
+        let sharded = ByteBoundedCache::<u64, u64>::new(1024 * MIB, 256 * 1024, weigh_value);
+        let least = sharded.least_capacity();
+        assert!(least <= 1024 * MIB);
+        assert_eq!(sharded.set_capacity(MIB), least);
+        assert_eq!(sharded.capacity_bytes(), least);
+        assert_eq!(sharded.least_capacity(), least);
+        let single = ByteBoundedCache::<u64, u64>::new_single_shard(256 * MIB, MIB, weigh_value);
+        assert_eq!(single.least_capacity(), 0);
+        let floored = ByteBoundedCache::<u64, u64>::new_single_shard(64 * MIB, MIB, weigh_value)
+            .with_min_capacity(8 * MIB);
+        assert_eq!(floored.least_capacity(), 8 * MIB);
+        assert_eq!(floored.set_capacity(MIB), 8 * MIB);
+        assert_eq!(floored.set_capacity(0), 0, "a disable");
+    }
+
+    /// #1312: a clear drops every entry and keeps the capacity, the hot
+    /// share and the ghost ring, which a disable and a growth from 0 would
+    /// reset to quick_cache's defaults; the cache then fills as before.
+    #[test]
+    fn a_clear_keeps_the_capacity_and_the_hot_share() {
+        let cache =
+            ByteBoundedCache::<u64, u64>::new_with_hot_allocation(64 * MIB, MIB, weigh_value, 0.5)
+                .with_ghosts();
+        for key in 0..40 {
+            cache.insert(key, MIB);
+        }
+        let hot = cache.hot_allocation();
+        assert!((hot - 0.5).abs() < 0.01, "{hot}");
+        cache.clear();
+        assert_eq!((cache.len(), cache.weight()), (0, 0));
+        assert_eq!(cache.capacity_bytes(), 64 * MIB);
+        assert!((cache.hot_allocation() - hot).abs() < 1e-9);
+        // The ghost ring is still kept.
+        assert!(cache.churn().ghost_hits.is_some());
+        for key in 0..40 {
+            cache.insert(key, MIB);
+        }
+        assert_eq!(cache.len(), 40);
+        // A disable and a growth from 0 lose the share.
+        cache.set_capacity(0);
+        cache.set_capacity(64 * MIB);
+        assert!((cache.hot_allocation() - hot).abs() > 0.1);
+    }
+
+    /// `holding_floor` is the least capacity at which `holding_keeps` holds:
+    /// a cache sized by `hot_allocation_holding` holds its fill there and
+    /// above, and not below.
+    #[test]
+    fn holding_floor_is_where_a_fill_is_still_kept() {
+        let largest = 3600 * 1801 * 4 + 672;
+        let hot = hot_allocation_holding(256 * MIB, largest);
+        let floor = holding_floor(hot, largest);
+        assert!(holding_keeps(hot, floor, largest));
+        assert!(!holding_keeps(hot, floor - 1, largest));
+        assert!(floor <= 256 * MIB + 2 && floor > 250 * MIB, "{floor}");
+        assert_eq!(holding_floor(1.0, largest), u64::MAX);
     }
 
     /// #1311: the memory plan reads a resized cache's capacity live, as

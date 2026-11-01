@@ -651,8 +651,10 @@ static CACHE_SIZE_SOURCE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         Opts::new(
             "cache_size_source",
             "1 per cache and admission budget of /admin/cache-plan, labelled with where its size \
-             came from: default, env:<variable>, config:<key>, collection:<key> or constant. \
-             cache is the /metrics family, collection empty for a process-wide one",
+             came from: default, env:<variable>, config:<key>, collection:<key>, \
+             derived:<key>, constant, or plan:auto while [memory] mode = \"auto\" gives it the \
+             memory plan's size. cache is the /metrics family, collection empty for a \
+             process-wide one",
         ),
         &["cache", "collection", "source"],
     )
@@ -684,8 +686,9 @@ static CACHE_DEMAND_RATIO: LazyLock<GaugeVec> = LazyLock::new(|| {
     let gauge = GaugeVec::new(
         Opts::new(
             "cache_demand_ratio",
-            "cache_demand_bytes over the cache's configured capacity: above 1 the cache is below \
-             its demand and the server has logged a WARN. No series for a disabled cache",
+            "cache_demand_bytes over the cache's capacity, the configured one or the memory \
+             plan's in [memory] mode = \"auto\": above 1 the cache is below its demand and the \
+             server has logged a WARN. No series for a disabled cache",
         ),
         &["cache", "collection"],
     )
@@ -697,7 +700,7 @@ static MEMORY_CAPACITY_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
         Opts::new(
             "memory_capacity_total_bytes",
-            "Configured capacity of every cache (kind=cache) or admission budget (kind=budget) \
+            "Capacity of every cache (kind=cache) or admission budget (kind=budget) \
              of /admin/cache-plan, summed. Capacity, not memory: an unfilled cache holds less",
         ),
         &["kind"],
@@ -716,7 +719,7 @@ fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
     for row in rows {
         let collection = row.entry.scope.collection().unwrap_or("");
         CACHE_SIZE_SOURCE
-            .with_label_values(&[row.entry.id, collection, &row.entry.source.to_string()])
+            .with_label_values(&[row.entry.id, collection, &row.source().to_string()])
             .set(1);
         if let Some(demand) = &row.demand {
             let labels = [row.entry.id, collection];
@@ -2078,7 +2081,7 @@ static ZARR_ICECHUNK_PREFETCHED: LazyLock<IntCounterVec> = LazyLock::new(|| {
 });
 // Ranges an Icechunk collection fetched ahead and no decode has taken yet,
 // held outside its payload cache (#1353), like the store gauges of #1307.
-static ZARR_ICECHUNK_STAGED_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+pub(crate) static ZARR_ICECHUNK_STAGED_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     collection_gauge(
         "zarr_icechunk_staged_bytes",
         "Bytes of the chunk ranges an Icechunk collection fetched ahead of their decodes \
@@ -3038,7 +3041,39 @@ pub struct ReusableCaches {
     pub rendered: Option<Arc<ds_render::RenderedCache>>,
     pub tile: Option<Arc<ds_render::TilePixelCache>>,
     pub vector: Option<Arc<ds_mvt::VectorTileCache>>,
+    /// The caches whose size the memory plan sets (#1312).
+    pub plan_sized: PlanSized,
 }
+
+/// The render caches whose size the memory plan sets: in `[memory] mode =
+/// "auto"`, those no setting pins. A reload reuses each one as it is,
+/// stages no resize, and leaves its size to the plan fitted after the
+/// reload, which shrinks a warm cache by at most a quarter (#1312).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlanSized {
+    pub rendered: bool,
+    pub tile: bool,
+    pub vector: bool,
+}
+
+impl PlanSized {
+    /// What `config` leaves to the plan.
+    fn of(config: &AcceptedLoad) -> Self {
+        if config.memory_mode() != ds_core::config::MemoryMode::Auto {
+            return Self::default();
+        }
+        let sources = config.render_cache_sources();
+        let unpinned = |source| !ds_cache::plan::grant::pinned(source);
+        PlanSized {
+            rendered: unpinned(&sources.rendered),
+            tile: unpinned(&sources.metatile),
+            vector: true,
+        }
+    }
+}
+
+/// The vector-tile (MVT) cache's size, a constant: no setting sizes it.
+pub(crate) const VECTOR_TILE_CACHE_MB: u64 = 128;
 
 /// A live engine, keyed by collection id in [`LoadResult::engines_by_id`] /
 /// [`ServerState::engine_handles`], so an incremental reload (#574) can hand
@@ -3182,6 +3217,10 @@ pub struct EngineReuse {
     /// nowcast's source identity), and the once-per-candidate load log is
     /// not repeated.
     pub wind: WindHandles,
+    /// `[memory] mode = "auto"` (#1312): a reused GRIB or GeoTIFF engine
+    /// takes the sizes its config pins, and each other cache keeps its
+    /// live size for the plan fitted after the reload to move.
+    pub plan_sized: bool,
 }
 
 macro_rules! reuse_take {
@@ -3492,6 +3531,7 @@ pub fn load_collections(
     reuse: ReusableCaches,
     mut engine_reuse: EngineReuse,
 ) -> LoadResult {
+    let plan_sized = engine_reuse.plan_sized;
     let bundle_index: HashMap<&str, &StyleBundle> =
         style_bundles.iter().map(|b| (b.id.as_str(), b)).collect();
     // The single config→style resolution path (phase 2 of the styling
@@ -3882,7 +3922,12 @@ pub fn load_collections(
                         );
                         let (engine, config) = (e.clone(), collection.clone());
                         cache_resizes.push(Box::new(move || {
-                            if let Some(geotiff) = &config.geotiff {
+                            let sizes = if plan_sized {
+                                crate::cache_plan::plan_kept_geotiff(&config, &engine)
+                            } else {
+                                config.geotiff.clone()
+                            };
+                            if let Some(geotiff) = &sizes {
                                 engine.apply_cache_sizes(geotiff);
                             }
                             crate::cache_plan::register_geotiff(&config, &engine);
@@ -4196,7 +4241,12 @@ pub fn load_collections(
                         let (engine, config) = (e.clone(), collection.clone());
                         cache_resizes.push(Box::new(move || {
                             if let Some(grib) = &config.grib {
-                                engine.apply_cache_sizes(grib);
+                                if plan_sized {
+                                    let kept = crate::cache_plan::plan_kept_grib(grib, &engine);
+                                    engine.apply_cache_sizes(&kept);
+                                } else {
+                                    engine.apply_cache_sizes(grib);
+                                }
                             }
                             crate::cache_plan::register_grib(&config, &engine);
                         }));
@@ -6192,7 +6242,11 @@ pub fn load_collections(
     // then age out via LRU), and a changed colormap re-colors as new
     // timesteps render (the cache key carries `time`); a hard guarantee for
     // an in-place colormap swap still needs a restart.
+    // In `[memory] mode = "auto"` a cache no setting pins is the plan's to
+    // size (#1312, `PlanSized`): reused as it is, no resize staged.
+    let plan_sized_caches = reuse.plan_sized;
     let rendered_cache = match reuse.rendered {
+        Some(c) if plan_sized_caches.rendered => c,
         Some(c) if c.resizes_in_place_to(rendered_cache_mb) => {
             let cache = c.clone();
             cache_resizes.push(Box::new(move || cache.resize(rendered_cache_mb)));
@@ -6201,6 +6255,7 @@ pub fn load_collections(
         _ => Arc::new(ds_render::RenderedCache::new(rendered_cache_mb)),
     };
     let tile_cache = match reuse.tile {
+        Some(c) if plan_sized_caches.tile => c,
         Some(c) if c.resizes_in_place_to(metatile_cache_mb) => {
             let cache = c.clone();
             cache_resizes.push(Box::new(move || cache.resize(metatile_cache_mb)));
@@ -6211,8 +6266,8 @@ pub fn load_collections(
     // Vector-tile (MVT) cache is independent of the raster cache because the
     // workloads differ (1–50 KB vs 30–200 KB per tile). Fixed size, kept in a
     // single constant; reused across reloads like the raster caches.
-    const VECTOR_TILE_CACHE_MB: u64 = 128;
     let vector_tile_cache = match reuse.vector {
+        Some(c) if plan_sized_caches.vector => c,
         Some(c) if c.resizes_in_place_to(VECTOR_TILE_CACHE_MB) => {
             let cache = c.clone();
             cache_resizes.push(Box::new(move || cache.resize(VECTOR_TILE_CACHE_MB)));
@@ -7159,6 +7214,8 @@ pub struct AcceptedLoad {
     render_cache_sources: crate::cache_plan::RenderCacheSources,
     /// `[memory] total_mb`, the memory plan's total when set (#1312).
     memory_total_mb: Option<u64>,
+    /// `[memory] mode`: whether the plan resizes anything (#1312).
+    memory_mode: ds_core::config::MemoryMode,
     mcp_enabled: bool,
     fingerprint: u64,
 }
@@ -7183,6 +7240,7 @@ impl AcceptedLoad {
             rendered_cache_mb: config.rendered_cache_mb().0,
             render_cache_sources: crate::cache_plan::RenderCacheSources::of(config),
             memory_total_mb: config.memory.as_ref().and_then(|m| m.total_mb),
+            memory_mode: config.memory.as_ref().map(|m| m.mode).unwrap_or_default(),
             mcp_enabled: config.mcp.as_ref().is_some_and(|m| m.enabled),
             fingerprint,
         }
@@ -7194,6 +7252,18 @@ impl AcceptedLoad {
 
     pub(crate) fn memory_total_mb(&self) -> Option<u64> {
         self.memory_total_mb
+    }
+
+    pub(crate) fn memory_mode(&self) -> ds_core::config::MemoryMode {
+        self.memory_mode
+    }
+
+    pub(crate) fn metatile_cache_mb(&self) -> u64 {
+        self.metatile_cache_mb
+    }
+
+    pub(crate) fn rendered_cache_mb(&self) -> u64 {
+        self.rendered_cache_mb
     }
 }
 
@@ -7397,6 +7467,7 @@ fn apply_load(
             rendered: (!styles_changed).then(|| wms.rendered_cache.clone()),
             tile: (!styles_changed).then(|| wms.tile_cache.clone()),
             vector: Some(state.tiles.load().vector_tile_cache.clone()),
+            plan_sized: PlanSized::of(&config),
         }
     };
 
@@ -7437,6 +7508,7 @@ fn apply_load(
             .filter(|(id, _)| reusable.contains(id.as_str()))
             .map(|(id, w)| (id.clone(), w.clone()))
             .collect(),
+        plan_sized: config.memory_mode() == ds_core::config::MemoryMode::Auto,
     };
     info!(
         "Incremental reload: {} of {} configured collection(s) unchanged — reusing their live engines",
@@ -10169,6 +10241,7 @@ mod tests {
             super::EngineReuse {
                 engines: result.engines_by_id.clone(),
                 wind: result.wind_by_id.clone(),
+                plan_sized: false,
             },
         );
         let ptr = |e: &Arc<dyn ds_core::map_engine::MapEngine>| Arc::as_ptr(e) as *const ();
@@ -10691,6 +10764,7 @@ mod tests {
         let reused = load(super::EngineReuse {
             engines: result.engines_by_id.clone(),
             wind: result.wind_by_id.clone(),
+            plan_sized: false,
         });
         assert!(Arc::ptr_eq(
             &reused.grib_engines[0],
@@ -11452,6 +11526,7 @@ prewarm_sweeps = 0
             rendered: Some(result.wms_state.rendered_cache.clone()),
             tile: Some(result.wms_state.tile_cache.clone()),
             vector: Some(result.tiles_state.vector_tile_cache.clone()),
+            plan_sized: super::PlanSized::default(),
         }
     }
 
@@ -11590,6 +11665,7 @@ prewarm_sweeps = 0
                 .map(|(id, e)| (id.clone(), e.clone()))
                 .collect(),
             wind: HashMap::new(),
+            plan_sized: false,
         }
     }
 

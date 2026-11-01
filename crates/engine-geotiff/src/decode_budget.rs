@@ -11,21 +11,38 @@ pub(crate) use ds_executor::budget::{ByteBudget as Budget, BytePermit as Permit}
 /// reservation that does not fit fails at once with `ResourceExhausted`:
 /// HTTP 503 in WMS/Maps/Tiles/EDR.
 pub(crate) static BUDGET: LazyLock<Arc<Budget>> = LazyLock::new(|| {
-    const VAR: &str = "MC_GEOTIFF_DECODE_MEMORY_MB";
-    let set = std::env::var(VAR)
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .and_then(|v| v.checked_mul(1024 * 1024));
-    let source = match set {
-        Some(_) => SizeSource::Env(VAR),
-        None => SizeSource::Default,
-    };
-    let budget = Arc::new(Budget::new(set.unwrap_or(1024 * 1024 * 1024) as u64));
+    let (bytes, source) = size("MC_GEOTIFF_DECODE_MEMORY_MB");
+    let budget = Arc::new(Budget::new(bytes));
     budget.register("geotiff_decode", Scope::Engine("geotiff"), source);
     budget
 });
 
+/// The budget's size from `var`, in MiB, and where it came from: as every
+/// `MC_…` size, a value that is not a whole number keeps the 1024 MiB
+/// default but pins it, which the plan log warns about
+/// ([`ds_cache::plan::env_size`]).
+fn size(var: &'static str) -> (u64, SizeSource) {
+    ds_cache::plan::env_bytes(var, 1024)
+}
+
 /// (reserved bytes, capacity bytes, rejected admissions).
 pub fn metrics() -> (u64, u64, u64) {
     BUDGET.metrics()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1312: a size that is not a whole number pins the default, as every
+    /// `MC_…` cache size does; a whole number, trimmed, sizes it.
+    #[test]
+    fn an_unparsable_size_pins_the_default() {
+        const VAR: &str = "MC_TEST_GEOTIFF_DECODE_MEMORY_MB";
+        assert_eq!(size(VAR), (1024 << 20, SizeSource::Default));
+        std::env::set_var(VAR, "2G");
+        assert_eq!(size(VAR), (1024 << 20, SizeSource::Env(VAR)));
+        std::env::set_var(VAR, " 512 ");
+        assert_eq!(size(VAR), (512 << 20, SizeSource::Env(VAR)));
+    }
 }

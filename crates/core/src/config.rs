@@ -52,6 +52,32 @@ pub struct MemoryConfig {
     /// [`MIN_MEMORY_TOTAL_MB`].
     #[serde(default)]
     pub total_mb: Option<u64>,
+    /// Whether the plan only reports its sizes or applies them.
+    #[serde(default)]
+    pub mode: MemoryMode,
+}
+
+/// `[memory] mode` (#1312): what the memory plan does with its sizes.
+/// Any other value is a load error.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MemoryMode {
+    /// Show each planned size next to the configured one; resize nothing.
+    #[default]
+    Report,
+    /// Resize every cache and budget no setting pins to its planned size,
+    /// at boot and after every accepted reload.
+    Auto,
+}
+
+impl MemoryMode {
+    /// `report` or `auto`, as the config spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryMode::Report => "report",
+            MemoryMode::Auto => "auto",
+        }
+    }
 }
 
 /// The least `[memory] total_mb`: under it the process would not hold its
@@ -7860,8 +7886,9 @@ colormap = "radar_dbz"
             .contains("unknown field `catalogue`"),);
     }
 
-    /// `[memory]` (#1312): `total_mb` loads; under 256, an unknown key, or
-    /// the table in a collection file is a load error.
+    /// `[memory]` (#1312): `total_mb` and `mode` load, `mode` `report`
+    /// unless set; `total_mb` under 256, an unknown mode or key, or the
+    /// table in a collection file is a load error.
     #[test]
     fn memory_settings_load_and_validate() {
         let tmp = TempDir::new().unwrap();
@@ -7890,7 +7917,8 @@ colormap = "radar_dbz"
         assert_eq!(
             config.memory,
             Some(MemoryConfig {
-                total_mb: Some(4096)
+                total_mb: Some(4096),
+                mode: MemoryMode::Report,
             })
         );
         assert_eq!(load("", "").unwrap().memory, None);
@@ -7898,14 +7926,28 @@ colormap = "radar_dbz"
             load("[memory]\n", "").unwrap().memory,
             Some(MemoryConfig::default())
         );
+        assert_eq!(MemoryConfig::default().mode, MemoryMode::Report);
         assert!(load("[memory]\ntotal_mb = 256\n", "").is_ok());
         let low = error("[memory]\ntotal_mb = 255\n", "");
         assert!(
             low.contains("[memory] total_mb must be at least 256 (got 255)"),
             "{low}"
         );
-        let unknown = error("[memory]\nmode = \"auto\"\n", "");
-        assert!(unknown.contains("unknown field `mode`"), "{unknown}");
+        for (mode, expected) in [("report", MemoryMode::Report), ("auto", MemoryMode::Auto)] {
+            let config = load(&format!("[memory]\nmode = \"{mode}\"\n"), "").unwrap();
+            assert_eq!(config.memory.unwrap().mode, expected, "{mode}");
+            assert_eq!(expected.as_str(), mode);
+        }
+        for mode in ["Auto", "apply", ""] {
+            let unknown = error(&format!("[memory]\nmode = \"{mode}\"\n"), "");
+            assert!(
+                unknown.contains(&format!("unknown variant `{mode}`"))
+                    && unknown.contains("expected `report` or `auto`"),
+                "{unknown}"
+            );
+        }
+        let unknown = error("[memory]\napply = true\n", "");
+        assert!(unknown.contains("unknown field `apply`"), "{unknown}");
         let per_collection = error("", "[memory]\ntotal_mb = 4096\n");
         assert!(
             per_collection.contains("nwp.toml: [memory] is not allowed in per-collection files"),

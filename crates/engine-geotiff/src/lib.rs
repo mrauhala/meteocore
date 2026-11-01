@@ -775,6 +775,29 @@ impl GeoTiffEngine {
         }
     }
 
+    /// Resize the tile cache to `bytes` for the memory plan (#1312),
+    /// keeping the tiles that fit. A local collection's stays empty: its
+    /// files go through the page cache. Returns the capacity it has: a
+    /// shrink stops where its shards still hold 32 tiles each
+    /// ([`ds_cache::ByteBoundedCache::set_capacity`]).
+    pub fn resize_tile_cache(&self, bytes: u64) -> u64 {
+        if !self.reads_local_files() {
+            self.tile_cache.resize(bytes);
+        }
+        self.tile_cache.capacity()
+    }
+
+    /// The least size [`Self::resize_tile_cache`] takes the tile cache to
+    /// now: where its shards still hold 32 tiles each.
+    pub fn least_tile_cache(&self) -> u64 {
+        self.tile_cache.least_capacity()
+    }
+
+    /// Drop every tile, keeping the capacity (#1312).
+    pub fn clear_tile_cache(&self) {
+        self.tile_cache.clear();
+    }
+
     /// Return current tile cache utilization as (bytes_used, capacity_bytes, entries).
     pub fn tile_cache_utilization(&self) -> (u64, u64, usize) {
         (
