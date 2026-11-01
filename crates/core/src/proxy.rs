@@ -9,9 +9,10 @@
 //!
 //! This module is **framework-free**: the HTTP layer passes header values in
 //! through a closure, so ds-core never depends on `axum`/`http` (see the
-//! "ds-core has no framework dependencies" rule). The axum handlers call
-//! [`resolve_base_url`] with `|name| headers.get(name).and_then(|v|
-//! v.to_str().ok())`.
+//! "ds-core has no framework dependencies" rule). The closure returns
+//! **every** line of a header, since which one counts differs by header
+//! (#1403); the axum handlers call [`resolve_base_url`] through
+//! `api_common::request_base_url`, which passes `headers.get_all(name)`.
 //!
 //! # Security
 //!
@@ -20,7 +21,7 @@
 //! to set/overwrite these headers). Even then, host values are sanitised
 //! (whitespace, slashes, `@`, non-ASCII and other authority-breaking characters
 //! are rejected), the scheme is restricted to `http`/`https`, and a prefix is
-//! unreserved-character path segments only (see [`sanitize_prefix`]). A
+//! one value of unreserved-character path segments (see [`sanitize_prefix`]). A
 //! malformed or suspicious header never produces a broken or attacker-chosen
 //! URL: resolution simply falls through to the next source, ultimately the
 //! static fallback, and an invalid prefix is dropped.
@@ -51,6 +52,11 @@ pub const MAX_PREFIX_LEN: usize = 128;
 ///     /open` is `https://gw.example.org/open`, never `/open/open`. The header
 ///     is the per-request statement of the public path, as a forwarded host is
 ///     of the public host; Spring and ASP.NET Core treat it the same way.
+///     Replaced, not nested: with `base_url = "https://host/meteocore"`
+///     behind an outer proxy that strips `/meteocore` and forwards no host,
+///     an inner door sending `/open` yields `https://host/open`, not
+///     `https://host/meteocore/open`. Such a chain must forward the full
+///     public prefix (or a host, so the fallback's path is not involved).
 ///
 /// Without a valid prefix the base keeps the path it had: none after a
 /// forwarded origin (as before #1403), the fallback's own otherwise. An
@@ -61,24 +67,32 @@ pub const MAX_PREFIX_LEN: usize = 128;
 /// every forwarding header, `X-Forwarded-Prefix` included, is ignored, so
 /// there is no behaviour change without the flag.
 ///
-/// `header` returns the raw value of a header by its lowercase name (or `None`
-/// when absent). For headers that may legitimately carry a comma-separated list
-/// of proxy hops, only the **first** value is used.
+/// `header` returns every line of a header by its lowercase name, in the
+/// order received (empty when absent; a line that is not text as `""`).
+/// Which value counts differs by header:
+///   - `Forwarded`: the **last** element across all lines, the closest
+///     proxy's, since proxies append (RFC 7239 §4) and may append a line of
+///     their own after the client's;
+///   - `X-Forwarded-Proto/Host/Port`: the **first** value of the first line,
+///     on the trust that the proxy overwrites them;
+///   - `X-Forwarded-Prefix`: the one value of exactly one line, or none (see
+///     [`sanitize_prefix`]).
 pub fn resolve_base_url<'h>(
     fallback: &str,
     trust: bool,
-    header: impl Fn(&str) -> Option<&'h str>,
+    header: impl Fn(&str) -> Vec<&'h str>,
 ) -> String {
     let fallback = fallback.trim_end_matches('/');
     if !trust {
         return fallback.to_string();
     }
-    let prefix = header("x-forwarded-prefix").and_then(sanitize_prefix);
-    let origin = from_forwarded(header("forwarded"), fallback).or_else(|| {
+    let first = |name: &str| header(name).first().copied();
+    let prefix = sanitize_prefix(&header("x-forwarded-prefix"));
+    let origin = from_forwarded(header("forwarded").last().copied(), fallback).or_else(|| {
         from_x_forwarded(
-            header("x-forwarded-proto"),
-            header("x-forwarded-host"),
-            header("x-forwarded-port"),
+            first("x-forwarded-proto"),
+            first("x-forwarded-host"),
+            first("x-forwarded-port"),
             fallback,
         )
     });
@@ -90,10 +104,16 @@ pub fn resolve_base_url<'h>(
     }
 }
 
-/// Validate an `X-Forwarded-Prefix` value, returning the prefix to append
-/// (leading `/`, no trailing `/`) or `None` when there is none to apply.
+/// Validate the `X-Forwarded-Prefix` lines of a request, returning the prefix
+/// to append (leading `/`, no trailing `/`) or `None` when there is none to
+/// apply.
 ///
-/// - Only the first value of a comma-separated list counts, trimmed.
+/// - Exactly one line with exactly one value, trimmed. Two lines or a comma
+///   list are ignored: proxies that strip a prefix differ in whether they
+///   overwrite the header or add to it (Traefik's StripPrefix and Spring
+///   Cloud Gateway add), so the first value can be the client's own and the
+///   last is the client's whenever a proxy passes it through, and nested
+///   strips have no agreed order to join in.
 /// - At most [`MAX_PREFIX_LEN`] bytes.
 /// - It starts with `/`; one trailing `/` is trimmed, and `/` alone is no
 ///   prefix.
@@ -102,9 +122,12 @@ pub fn resolve_base_url<'h>(
 ///   fragment, nothing that needs escaping in a URL, an HTML attribute or XML.
 ///
 /// Anything else is `None`: the header is ignored, never an error.
-fn sanitize_prefix(value: &str) -> Option<&str> {
-    let prefix = first_value(value);
-    if prefix.len() > MAX_PREFIX_LEN || !prefix.starts_with('/') {
+fn sanitize_prefix<'h>(lines: &[&'h str]) -> Option<&'h str> {
+    let [line] = lines else {
+        return None;
+    };
+    let prefix = line.trim();
+    if prefix.contains(',') || prefix.len() > MAX_PREFIX_LEN || !prefix.starts_with('/') {
         return None;
     }
     let prefix = prefix.strip_suffix('/').unwrap_or(prefix);
@@ -140,8 +163,10 @@ fn origin_of(url: &str) -> &str {
     }
 }
 
-/// Parse an RFC 7239 `Forwarded` header, using the **last** forwarded element.
-/// The `host` directive already includes any port, so it is used verbatim.
+/// Parse an RFC 7239 `Forwarded` header's last line, using its **last**
+/// forwarded element: the last element across all lines, as a header split
+/// over lines is one comma list (RFC 9110 §5.3). The `host` directive already
+/// includes any port, so it is used verbatim.
 ///
 /// RFC 7239 §4 requires each proxy to *append* its entry to a comma-separated
 /// list, so the **first** element is the oldest hop — which a client can
@@ -310,15 +335,22 @@ mod tests {
     use super::*;
 
     /// Build a closure mimicking the axum `HeaderMap` lookup from a static map.
+    /// A repeated name is a header sent on several lines, in order.
     fn hdrs<'p>(
         pairs: &'p [(&'static str, &'static str)],
-    ) -> impl Fn(&str) -> Option<&'static str> + 'p {
+    ) -> impl Fn(&str) -> Vec<&'static str> + 'p {
         move |name: &str| {
             pairs
                 .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .filter(|(k, _)| k.eq_ignore_ascii_case(name))
                 .map(|(_, v)| *v)
+                .collect()
         }
+    }
+
+    /// [`sanitize_prefix`] of a header sent on one line.
+    fn one(value: &str) -> Option<&str> {
+        sanitize_prefix(&[value])
     }
 
     #[test]
@@ -760,51 +792,145 @@ mod tests {
         }
     }
 
+    /// A proxy that adds its prefix to a client's (Traefik's StripPrefix,
+    /// Spring Cloud Gateway) makes a list whose first value is the client's;
+    /// one that passes the client's through leaves its own value anywhere.
+    /// Neither end is safe, so a list is no prefix at all.
     #[test]
-    fn prefix_first_value_of_comma_list() {
+    fn prefix_comma_list_is_ignored() {
+        for list in [
+            "/local, /open",
+            " /open , /local",
+            "/open,",
+            ",/open",
+            "/../evil, /open",
+        ] {
+            let url = resolve_base_url(
+                "http://127.0.0.1:8000",
+                true,
+                hdrs(&[
+                    ("x-forwarded-host", "gw.example.org"),
+                    ("x-forwarded-proto", "https"),
+                    ("x-forwarded-prefix", list),
+                ]),
+            );
+            assert_eq!(url, "https://gw.example.org", "{list:?}");
+        }
+    }
+
+    /// The same, sent as two lines: a client's line and the proxy's.
+    #[test]
+    fn prefix_on_two_lines_is_ignored() {
+        for lines in [["/local", "/open"], ["/open", "/open"], ["/open", ""]] {
+            let url = resolve_base_url(
+                "https://gw.example.org/static",
+                true,
+                hdrs(&[
+                    ("x-forwarded-host", "gw.example.org"),
+                    ("x-forwarded-proto", "https"),
+                    ("x-forwarded-prefix", lines[0]),
+                    ("x-forwarded-prefix", lines[1]),
+                ]),
+            );
+            assert_eq!(url, "https://gw.example.org", "{lines:?}");
+        }
+        // With no forwarded origin the fallback keeps its own path.
+        let url = resolve_base_url(
+            "https://gw.example.org/static",
+            true,
+            hdrs(&[("x-forwarded-prefix", "/a"), ("x-forwarded-prefix", "/b")]),
+        );
+        assert_eq!(url, "https://gw.example.org/static");
+    }
+
+    #[test]
+    fn single_prefix_value_is_trimmed_and_used() {
         let url = resolve_base_url(
             "http://127.0.0.1:8000",
             true,
             hdrs(&[
                 ("x-forwarded-host", "gw.example.org"),
                 ("x-forwarded-proto", "https"),
-                ("x-forwarded-prefix", " /open , /local"),
+                ("x-forwarded-prefix", "  /open/ "),
             ]),
         );
         assert_eq!(url, "https://gw.example.org/open");
-        // An invalid first value is not skipped for a later valid one.
-        assert_eq!(sanitize_prefix("/../evil, /open"), None);
+        assert_eq!(sanitize_prefix(&[]), None);
+    }
+
+    /// A proxy may append its `Forwarded` entry as a line of its own after
+    /// the client's: the last element across all lines is the proxy's.
+    #[test]
+    fn forwarded_uses_the_last_element_across_lines() {
+        let url = resolve_base_url(
+            "http://127.0.0.1:8000",
+            true,
+            hdrs(&[
+                (
+                    "forwarded",
+                    "host=evil.example.com;proto=http, host=evil2.example.com",
+                ),
+                ("forwarded", "host=gw.example.org;proto=https"),
+            ]),
+        );
+        assert_eq!(url, "https://gw.example.org");
+        // An empty last line has no host: on to `X-Forwarded-*`, never back
+        // to the client's line.
+        let url = resolve_base_url(
+            "http://127.0.0.1:8000",
+            true,
+            hdrs(&[
+                ("forwarded", "host=evil.example.com;proto=https"),
+                ("forwarded", ""),
+                ("x-forwarded-host", "gw.example.org"),
+            ]),
+        );
+        assert_eq!(url, "http://gw.example.org");
+    }
+
+    /// `X-Forwarded-Host/Proto/Port` keep the first value of the first line:
+    /// the proxy is trusted to overwrite them.
+    #[test]
+    fn x_forwarded_uses_the_first_line() {
+        let url = resolve_base_url(
+            "http://127.0.0.1:8000",
+            true,
+            hdrs(&[
+                ("x-forwarded-host", "gw.example.org"),
+                ("x-forwarded-host", "other.example.org"),
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-proto", "http"),
+            ]),
+        );
+        assert_eq!(url, "https://gw.example.org");
     }
 
     #[test]
     fn prefix_must_start_with_slash() {
         for bad in ["open", "open/", "", " ", "./open", "~/open"] {
-            assert_eq!(sanitize_prefix(bad), None, "{bad:?}");
+            assert_eq!(one(bad), None, "{bad:?}");
         }
     }
 
     #[test]
     fn prefix_trailing_slash_trimmed_and_root_is_none() {
-        assert_eq!(sanitize_prefix("/open/"), Some("/open"));
-        assert_eq!(sanitize_prefix("/a/b/"), Some("/a/b"));
-        assert_eq!(sanitize_prefix("/"), None);
+        assert_eq!(one("/open/"), Some("/open"));
+        assert_eq!(one("/a/b/"), Some("/a/b"));
+        assert_eq!(one("/"), None);
         // Only one trailing slash is trimmed; the rest is an empty segment.
-        assert_eq!(sanitize_prefix("/open//"), None);
-        assert_eq!(sanitize_prefix("//"), None);
+        assert_eq!(one("/open//"), None);
+        assert_eq!(one("//"), None);
     }
 
     #[test]
     fn prefix_segments_are_unreserved_characters() {
-        assert_eq!(
-            sanitize_prefix("/Az09-._~/x.y_z~1"),
-            Some("/Az09-._~/x.y_z~1")
-        );
-        assert_eq!(sanitize_prefix("/a..b/.c/d."), Some("/a..b/.c/d."));
+        assert_eq!(one("/Az09-._~/x.y_z~1"), Some("/Az09-._~/x.y_z~1"));
+        assert_eq!(one("/a..b/.c/d."), Some("/a..b/.c/d."));
         for bad in [
             "/a b", "/a%2Fb", "/%2e%2e", "/a?b", "/a#b", "/a;b", "/a:b", "/a@b", "/a+b", "/a=b",
             "/a\\b", "/a\"b", "/a<b>", "/a'b", "/a&b", "/naïve", "/a\tb",
         ] {
-            assert_eq!(sanitize_prefix(bad), None, "{bad:?}");
+            assert_eq!(one(bad), None, "{bad:?}");
         }
     }
 
@@ -822,18 +948,18 @@ mod tests {
             "/a/..",
             "/../",
         ] {
-            assert_eq!(sanitize_prefix(bad), None, "{bad:?}");
+            assert_eq!(one(bad), None, "{bad:?}");
         }
     }
 
     #[test]
     fn prefix_length_cap() {
         let at_cap = format!("/{}", "a".repeat(MAX_PREFIX_LEN - 1));
-        assert_eq!(sanitize_prefix(&at_cap), Some(at_cap.as_str()));
+        assert_eq!(one(&at_cap), Some(at_cap.as_str()));
         let over = format!("/{}", "a".repeat(MAX_PREFIX_LEN));
-        assert_eq!(sanitize_prefix(&over), None);
+        assert_eq!(one(&over), None);
         // The cap counts the value as sent, before its trailing slash goes.
-        assert_eq!(sanitize_prefix(&format!("{at_cap}/")), None);
+        assert_eq!(one(&format!("{at_cap}/")), None);
     }
 
     #[test]

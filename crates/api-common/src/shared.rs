@@ -530,11 +530,11 @@ fn document_tags(paths: &Map<String, Value>, titles: &BTreeMap<String, String>) 
         .collect()
 }
 
-/// GET {mount}/api — OpenAPI 3.0.3 definition, its `servers` the request's
-/// base URL.
+/// GET {mount}/api — OpenAPI 3.0.3 definition, with the request's base URL
+/// as `servers` when it has a path.
 async fn api_definition(State(api): State<AppState>, headers: HeaderMap) -> Response {
     let mut document = openapi_document(&api);
-    document["servers"] = crate::openapi_servers(&api.base(&headers));
+    crate::set_openapi_servers(&mut document, &api.base(&headers));
     Json(document).into_response()
 }
 

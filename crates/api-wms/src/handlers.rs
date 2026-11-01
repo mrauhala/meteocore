@@ -187,9 +187,7 @@ pub type AppState = Arc<ArcSwap<WmsState>>;
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
 fn request_base_url(state: &WmsState, headers: &HeaderMap) -> String {
-    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
-        headers.get(name).and_then(|v| v.to_str().ok())
-    })
+    api_common::request_base_url(&state.base_url, state.trust_proxy_headers, headers)
 }
 
 /// A GetMap render's outcome: the encoded image, `None` for an all-nodata

@@ -967,9 +967,7 @@ async fn serve(cli: CliArgs) {
     let edr_state = server_state.edr.clone();
     let app = with_not_found(public.merge(admin_routes), move |headers| {
         let edr = edr_state.load();
-        ds_core::proxy::resolve_base_url(&edr.base_url, edr.trust_proxy_headers, |name| {
-            headers.get(name).and_then(|v| v.to_str().ok())
-        })
+        api_common::request_base_url(&edr.base_url, edr.trust_proxy_headers, headers)
     })
     .layer(middleware::from_fn(admin::metrics_middleware))
     .layer(middleware::from_fn(admin::request_logging_middleware))

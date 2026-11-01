@@ -233,9 +233,7 @@ pub type AppState = Arc<ArcSwap<TilesState3d>>;
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
 fn request_base_url(state: &TilesState3d, headers: &HeaderMap) -> String {
-    ds_core::proxy::resolve_base_url(&state.base_url, state.trust_proxy_headers, |name| {
-        headers.get(name).and_then(|v| v.to_str().ok())
-    })
+    api_common::request_base_url(&state.base_url, state.trust_proxy_headers, headers)
 }
 
 /// Look up a collection's volume engine + config, 404 if absent.

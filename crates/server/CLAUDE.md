@@ -194,10 +194,12 @@ base URL. By default it is resolved once at startup: `BASE_URL` env >
 With `[server] trust_proxy_headers = true`, the base's origin is resolved per
 request:
 
-1. RFC 7239 `Forwarded` — `proto=`/`host=` of the **last** element (the
-   closest trusted proxy; the first element is client-injectable via RFC 7239
-   §4 append semantics),
-2. `X-Forwarded-Proto` + `X-Forwarded-Host` (+ optional `X-Forwarded-Port`),
+1. RFC 7239 `Forwarded` — `proto=`/`host=` of the **last** element across
+   **all** header lines (the closest trusted proxy; proxies append, RFC 7239
+   §4, possibly as a line of their own after a client's),
+2. `X-Forwarded-Proto` + `X-Forwarded-Host` (+ optional `X-Forwarded-Port`):
+   the first value of the first line, on the trust that the proxy overwrites
+   them,
 3. the static fallback above.
 
 A valid `X-Forwarded-Prefix` (#1403) is the base's path: the prefix a
@@ -205,43 +207,63 @@ gateway stripped before proxying (`/open/edr/collections` at the gateway
 reaches `/edr/collections` here, and links go back under `/open`). It is
 appended to a forwarded origin and **replaces** the static fallback's own
 path, so `base_url = "https://gw.example.org/open"` plus the header `/open`
-is never `/open/open`. Without a valid prefix the base keeps its path: none
-after a forwarded origin, the fallback's otherwise. Validation
-(`sanitize_prefix`): the first value of a comma list, at most 128 bytes, a
-leading `/`, one trailing `/` trimmed (`/` alone is no prefix), and every
-segment non-empty, not `.`/`..`, unreserved characters only (`A-Za-z0-9-._~`,
-so no `%`-escapes). Anything else is ignored, never an error.
+is never `/open/open`. Replaced, not nested: with `base_url =
+"https://host/meteocore"` behind an outer proxy that strips `/meteocore` and
+forwards no host, an inner door sending `/open` gives `https://host/open/…`.
+Without a valid prefix the base keeps its path: none after a forwarded
+origin, the fallback's otherwise. Validation (`sanitize_prefix`): exactly one
+header line with exactly one value — two lines or a comma list are ignored,
+because proxies that strip a prefix disagree on overwrite versus add
+(Traefik's StripPrefix and Spring Cloud Gateway add, leaving a client's value
+first) and nested strips have no agreed order — at most 128 bytes, a leading
+`/`, one trailing `/` trimmed (`/` alone is no prefix), and every segment
+non-empty, not `.`/`..`, unreserved characters only (`A-Za-z0-9-._~`, so no
+`%`-escapes). Anything else is ignored, never an error.
 
-The pure resolver is `ds_core::proxy::resolve_base_url` (framework-free; axum
-handlers pass header values via a closure). Each API crate calls it through a
-small `request_base_url` helper. A server-built URL must come from it or be
+The pure resolver is `ds_core::proxy::resolve_base_url` (framework-free; its
+closure returns every line of a header). Every HTTP caller goes through
+`api_common::request_base_url`, which passes `headers.get_all(name)`; never
+call the resolver with `headers.get` (first line only), or a client's own
+`Forwarded` line decides the links. Each API crate wraps it in a small
+`request_base_url`. A server-built URL must come from it or be
 document-relative: a root-relative `/…` loses a stripped prefix. OpenAPI
-documents carry it as `servers` (`api_common::openapi_servers`); without
-that, clients resolve the default `/` to the origin's root. The static preview
-shell (`preview/index.html`) is templated per request: its `/preview/` asset
-URLs go below `ds_core::proxy::path_of(base)`, root-relative so its CSP's
-`'self'` holds, and `app.js` finds the manifest beside its own script URL.
-`tests/common_discovery.rs` (`forwarded_prefix_…`) crawls the shared root
-and EDR through a `/open` gateway; keep new link builders inside that crawl.
+documents get `servers` (`api_common::set_openapi_servers`) only when the
+base has a path — the one case where the default `/`, resolved to the
+origin's root, is wrong; without a path `/` resolves against the address the
+client used, where the static base may be `http://0.0.0.0:8000`. The static
+preview shell (`preview/index.html`) is templated per request: its
+`/preview/` asset URLs go below `ds_core::proxy::path_of(base)`,
+root-relative so its CSP's `'self'` holds, and `app.js` finds the manifest
+beside its own script URL. Both follow a `base_url` path even with
+`trust_proxy_headers` off, as every absolute link already does: direct
+internal access to a server whose `base_url` has a path loads the preview
+from that path. `tests/common_discovery.rs` (`forwarded_prefix_…`) crawls
+the shared root, EDR and the per-API services through a `/open` gateway;
+keep new link builders inside that crawl.
 
 **Security:** default false because forwarding headers are
 client-controllable. Even when enabled: host values are sanitised
 (whitespace/slashes/`@`/non-ASCII rejected), scheme restricted to
-http/https, only the first value of a comma list used; malformed headers fall
-through to the next source. Enable only when a trusted proxy sets/overwrites
-these headers, the proxy strips `Forwarded`/`X-Forwarded-*` on untrusted
-client requests, and clients cannot reach the backend directly — otherwise a
-client could spoof the emitted self-links (open-redirect risk downstream).
-`X-Forwarded-Prefix` is one of these headers: the proxy must set it, or
-remove a client's own, on every route, as for `Forwarded`. A client value
-that passes through changes only the links in that client's own response:
-no MeteoCore cache stores a link-bearing document. The server-side caches
-hold rendered images, MVT tiles and 3D Tiles binaries (tileset JSON links
-its content relatively and is rebuilt per request); metadata, HTML and
-GetCapabilities are built per request, and `caching::conditional_get`
-only hashes. Responses do carry `Cache-Control: public`, so a shared HTTP
-cache that sees unsanitised headers could hand one client's links to
-others — one more reason the proxy must own the header.
+http/https; malformed headers fall through to the next source. Enable only
+when a trusted proxy sets/overwrites these headers, the proxy strips
+`Forwarded`/`X-Forwarded-*` on untrusted client requests, and clients cannot
+reach the backend directly — otherwise a client could spoof the emitted
+self-links (open-redirect risk downstream). `X-Forwarded-Prefix` is one of
+these headers: the proxy must set it, or remove a client's own, on every
+route, as for `Forwarded`. **Upgrade note:** a deployment that already had
+`trust_proxy_headers = true` starts honouring it, and many proxies pass a
+client's value through by default — nginx `proxy_pass`, ingress-nginx
+without its annotation, Caddy, Traefik before 2.11.14 / 3.2.1 (which then
+started dropping an untrusted one). There is no separate flag. A client
+value that passes through changes only the links in that client's own
+response: no MeteoCore cache stores a link-bearing document. The
+server-side caches hold rendered images, MVT tiles and 3D Tiles binaries
+(tileset JSON links its content relatively and is rebuilt per request);
+metadata, HTML and GetCapabilities are built per request, and
+`caching::conditional_get` only hashes. Responses do carry
+`Cache-Control: public`, so a URL-keyed shared HTTP cache that sees
+unsanitised headers could hand one client's links to others — the proxy
+must own the header.
 
 ## Request log (`request_logging_middleware`)
 

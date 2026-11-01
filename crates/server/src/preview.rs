@@ -111,9 +111,8 @@ pub async fn asset_handler(
 /// revalidation with another's body.
 fn serve_index(state: &AdminState, request_headers: &axum::http::HeaderMap) -> Response {
     let tiles = state.tiles.load();
-    let base = ds_core::proxy::resolve_base_url(&tiles.base_url, tiles.trust_proxy_headers, |n| {
-        request_headers.get(n).and_then(|v| v.to_str().ok())
-    });
+    let base =
+        api_common::request_base_url(&tiles.base_url, tiles.trust_proxy_headers, request_headers);
     let Some(html) = index_html(ds_core::proxy::path_of(&base)) else {
         return not_found();
     };
@@ -289,9 +288,7 @@ pub async fn manifest_handler(
     // reverse-proxy forwarding headers (#12), matching the OGC API handlers.
     let tiles = state.tiles.load_full();
     let base_url =
-        ds_core::proxy::resolve_base_url(&tiles.base_url, tiles.trust_proxy_headers, |name| {
-            headers.get(name).and_then(|v| v.to_str().ok())
-        });
+        api_common::request_base_url(&tiles.base_url, tiles.trust_proxy_headers, &headers);
     let manifest = build_manifest_with_base(&state, &base_url, offset, limit);
 
     // Size guard — log only, never reject; pagination defaults already prevent
@@ -3025,7 +3022,7 @@ mod tests {
         let local = index_handler(State(state.clone()), stale).await;
         assert_eq!(local.status(), StatusCode::OK);
 
-        for forged in ["/../evil", "/a b", "//evil.example.com"] {
+        for forged in ["/../evil", "/a b", "//evil.example.com", "/local, /open"] {
             let mut headers = request("/open");
             headers.insert("x-forwarded-prefix", HeaderValue::from_str(forged).unwrap());
             let html = body_text(index_handler(State(state.clone()), headers).await).await;
@@ -3035,6 +3032,24 @@ mod tests {
                 "{forged}: {urls:?}"
             );
         }
+        // A client's line before the proxy's: no prefix.
+        let mut two_lines = request("/local");
+        two_lines.append("x-forwarded-prefix", HeaderValue::from_static("/open"));
+        let html = body_text(index_handler(State(state.clone()), two_lines).await).await;
+        assert!(shell_urls(&html).iter().all(|u| u.starts_with("/preview/")));
+    }
+
+    /// `app.js` finds the manifest beside its own script URL, so behind a
+    /// stripped prefix it fetches `/open/preview/manifest.json` (#1403); a
+    /// root-relative `/preview/…` would reach another door of the gateway.
+    #[test]
+    fn app_js_fetches_no_root_relative_url() {
+        let js = PreviewAssets::get("app.js").unwrap();
+        let js = std::str::from_utf8(&js.data).unwrap();
+        assert!(!js.contains("'/preview/manifest.json'"));
+        assert!(!js.contains("fetch('/") && !js.contains("fetch(\"/"));
+        assert!(js.contains("new URL('manifest.json', document.currentScript.src)"));
+        assert!(js.contains("fetch(manifestUrl)"));
     }
 
     #[tokio::test]

@@ -221,8 +221,13 @@ it.
 `trust_proxy_headers = true` when the proxy sends `Forwarded` or
 `X-Forwarded-Proto` and `X-Forwarded-Host`,
 so that links in responses point at the public address. A route that strips a
-path prefix also sends it as `X-Forwarded-Prefix`; the proxy must set or
-remove that header on every route, as it does the others.
+path prefix must also send it as `X-Forwarded-Prefix`. Neither a Gateway API
+`URLRewrite` filter nor ingress-nginx's `rewrite-target` does that on its own:
+add it with a `RequestHeaderModifier` filter (`set`, name
+`X-Forwarded-Prefix`, value `/open`) next to the rewrite, or with ingress-nginx's
+`nginx.ingress.kubernetes.io/x-forwarded-prefix: "/open"` annotation. Every
+route must set or remove the header, as for the others, since a client's own
+value otherwise passes through.
 
 Every path is routed, `/metrics` and `/admin/*` included. The admin endpoints
 answer 403 without `ADMIN_TOKEN` and need its bearer token with it.

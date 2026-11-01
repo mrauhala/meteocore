@@ -155,7 +155,7 @@ collection.
 | **Part 1 — Core** | | | | |
 | Landing page with API, documentation, conformance and data links (§9) | Yes | Yes | Yes | Yes |
 | `/conformance` resource (§9.3) | Yes | Yes | Yes | Yes |
-| Machine-readable API definition (§9.2, §11) | Yes — `/api`, OpenAPI 3.0.3, `servers` the request's base URL | Yes — same | Yes — same | Yes — same |
+| Machine-readable API definition (§9.2, §11) | Yes — `/api`, OpenAPI 3.0.3, `servers` the request's base URL when it has a path | Yes — same | Yes — same | Yes — same |
 | Human-readable API documentation (§9.2) | Yes — `/api/docs` | Yes — same | Yes — same | Yes — same |
 | JSON metadata representations (§10.3) | Yes | Yes | Yes | Yes |
 | HTML metadata representations (§10.2) | Yes | Yes | Yes | Yes |
