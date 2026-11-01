@@ -387,8 +387,10 @@ need no reload pruning.
   time, and a forecast's newest valid time lies in the future. BUFR: the
   newest report. Satellite: the newest scan start. NetCDF: the newest run's
   reference time, or the newest valid time of files without runs. Nowcast:
-  the latest generation's anchor frame. Other engines report none. Negative when the
-  newest data lies in the future.
+  the latest generation's anchor frame. PVOL (#193): each radar site
+  collection `{base}-{nod}` that has a Ready health entry, from its newest
+  volume; the base id, the site inventory, has none. Other engines report
+  none. Negative when the newest data lies in the future.
 - Never the time since a poll. A stalled feeder leaves its files in place,
   every poll still finds them, and a poll-stamped age stayed near the poll
   interval while the served latest got minutes older. An engine gaining a
@@ -397,7 +399,24 @@ need no reload pruning.
   (`ds_core::health::expected_interval`), a line in `admin.rs`'s
   `data_timeline!` and `data_timelines`, and its type in
   `ds_core::config::DATA_AGE_ENGINES`; `/health`, the gauges and the
-  delivery delay follow.
+  delivery delay follow. One the alerts must leave out reports
+  `alerting: false` instead, from outside the timelines, and stays out of
+  `DATA_AGE_ENGINES`, as PVOL does (next bullet).
+- **Radar sites never alert (#193).** Another service runs the radars and
+  takes them down for maintenance, so `admin::radar_site_ages` adds each
+  radar site's `DataAge` with `alerting: false`, aged at
+  `collection_data_ages`' one `now`. It is no `DataTimeline`, so a site has
+  no delivery delay. Its age, has-data and interval series live in
+  `DATA_AGE_UNALERTED`, labelled `collection` and `alerting="false"`, and
+  every age, interval and has-data selector of `CollectionStale` and
+  `CollectionEmpty` has `alerting!="false"`. The series of one site keep one
+  label set, so the rule's joins still match; every other collection's
+  series have `collection` alone. The registry refuses a second family of
+  one name with other labels, so an unchecked collector (`UnalertedDataAge`,
+  no descriptors) hands them to the gather, which merges families by name;
+  its help strings are the registered families'. `odim-volume` is not in
+  `DATA_AGE_ENGINES`, which gates only the `expected_interval` key: an
+  interval override has no use without the alert.
 - `poll_age_secs` (GeoTIFF, QueryData): time since the engine loaded or a
   poll last found data. It grows while the source is unreachable, empty or
   unloadable, the old data kept. Both growing: the source fails. Only

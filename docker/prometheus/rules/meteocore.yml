@@ -65,10 +65,14 @@ groups:
       # expected_interval) never matches. Nor does a collection a reload
       # removed, whose delay history lingers for a day; re-added under the
       # same id within that day, it takes the history up again.
+      #
+      # Series labelled alerting="false" are left out here and in
+      # CollectionEmpty: radar sites (#193), whose radars another service
+      # runs and takes down for maintenance. They have no delay series.
       - alert: CollectionStale
         expr: |
-          collection_data_age_seconds{job="meteocore"}
-            >= 3 * collection_expected_interval_seconds{job="meteocore"}
+          collection_data_age_seconds{job="meteocore", alerting!="false"}
+            >= 3 * collection_expected_interval_seconds{job="meteocore", alerting!="false"}
               + on (job, collection) group_left ()
               (
                   clamp_min(
@@ -78,11 +82,11 @@ groups:
                     0
                   )
                 or
-                  max by (job, collection) (collection_expected_interval_seconds{job="meteocore"} * 0)
+                  max by (job, collection) (collection_expected_interval_seconds{job="meteocore", alerting!="false"} * 0)
               )
           and
-          collection_data_age_seconds{job="meteocore"}
-            >= collection_expected_interval_seconds{job="meteocore"} + 900
+          collection_data_age_seconds{job="meteocore", alerting!="false"}
+            >= collection_expected_interval_seconds{job="meteocore", alerting!="false"} + 900
               + on (job, collection) group_left ()
               (
                   clamp_min(
@@ -92,7 +96,7 @@ groups:
                     0
                   )
                 or
-                  max by (job, collection) (collection_expected_interval_seconds{job="meteocore"} * 0)
+                  max by (job, collection) (collection_expected_interval_seconds{job="meteocore", alerting!="false"} * 0)
               )
         for: 10m
         labels:
@@ -104,7 +108,7 @@ groups:
       # A collection that never loaded data, or whose data all aged out of
       # its window, has no data age series: collection_has_data says so.
       - alert: CollectionEmpty
-        expr: collection_has_data{job="meteocore"} == 0
+        expr: collection_has_data{job="meteocore", alerting!="false"} == 0
         for: 15m
         labels:
           severity: warning

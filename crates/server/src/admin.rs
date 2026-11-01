@@ -763,22 +763,18 @@ static COLLECTIONS_FAILED: LazyLock<IntGauge> = LazyLock::new(|| {
 
 // Freshness per collection (#1007): `/health`'s `data_age_secs`, set each
 // scrape by `refresh_data_age_gauge` from the same `collection_data_ages`.
-static COLLECTION_DATA_AGE_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    collection_gauge(
-        "collection_data_age_seconds",
-        "Seconds since the newest data a collection serves (its /health data_age_secs)",
-    )
-});
+static COLLECTION_DATA_AGE_SECONDS: LazyLock<IntGaugeVec> =
+    LazyLock::new(|| collection_gauge("collection_data_age_seconds", DATA_AGE_HELP));
+const DATA_AGE_HELP: &str =
+    "Seconds since the newest data a collection serves (its /health data_age_secs)";
 
 // Whether a collection whose engine reports a data age holds data (#1055):
 // a series for each such collection, data or not, so an alert sees one that
 // never loaded or whose data all aged out, which has no age series.
-static COLLECTION_HAS_DATA: LazyLock<IntGaugeVec> = LazyLock::new(|| {
-    collection_gauge(
-        "collection_has_data",
-        "1 while a collection whose engine reports a data age holds data, 0 when it holds none",
-    )
-});
+static COLLECTION_HAS_DATA: LazyLock<IntGaugeVec> =
+    LazyLock::new(|| collection_gauge("collection_has_data", HAS_DATA_HELP));
+const HAS_DATA_HELP: &str =
+    "1 while a collection whose engine reports a data age holds data, 0 when it holds none";
 
 // How often a collection's data arrives (#1375), what a staleness alert
 // compares the data age with: measured on the timeline the age is, or the
@@ -786,11 +782,58 @@ static COLLECTION_HAS_DATA: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 static COLLECTION_EXPECTED_INTERVAL_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     collection_gauge(
         "collection_expected_interval_seconds",
-        "Seconds between a collection's timesteps, which its data age is measured on: the \
-         median spacing of the newest timesteps or runs, or the collection's \
-         expected_interval. No series below two timesteps without expected_interval",
+        EXPECTED_INTERVAL_HELP,
     )
 });
+const EXPECTED_INTERVAL_HELP: &str =
+    "Seconds between a collection's timesteps, which its data age is measured on: the median \
+     spacing of the newest timesteps or runs, or the collection's expected_interval. No series \
+     below two timesteps without expected_interval";
+
+/// The three data age families' series of the collections the freshness
+/// alerts leave out (#193): radar sites, each series labelled
+/// `alerting="false"`, so the rules' selectors can exclude them and the age,
+/// interval and has-data series of one site still join. In the order of
+/// [`refresh_data_age_gauge_locked`]'s families. Every other collection's
+/// series keep the `collection` label alone.
+static DATA_AGE_UNALERTED: LazyLock<[IntGaugeVec; 3]> = LazyLock::new(|| {
+    let families = [
+        unalerted_gauge("collection_data_age_seconds", DATA_AGE_HELP),
+        unalerted_gauge("collection_has_data", HAS_DATA_HELP),
+        unalerted_gauge(
+            "collection_expected_interval_seconds",
+            EXPECTED_INTERVAL_HELP,
+        ),
+    ];
+    REGISTRY
+        .register(Box::new(UnalertedDataAge(families.clone())))
+        .unwrap();
+    families
+});
+
+/// A gauge family `name` labelled `collection` and `alerting`, left
+/// unregistered: [`UnalertedDataAge`] gathers it.
+fn unalerted_gauge(name: &str, help: &str) -> IntGaugeVec {
+    IntGaugeVec::new(Opts::new(name, help), &["collection", "alerting"]).unwrap()
+}
+
+/// Gathers [`DATA_AGE_UNALERTED`] into the registered data age families of
+/// the same names, which the registry merges by name. It describes nothing,
+/// an unchecked collector: the registry refuses a second family of one name
+/// with other labels, and a label on every series would change the series of
+/// the collections the alerts watch. The help strings match, as the merged
+/// family keeps one of them.
+struct UnalertedDataAge([IntGaugeVec; 3]);
+
+impl Collector for UnalertedDataAge {
+    fn desc(&self) -> Vec<&prometheus::core::Desc> {
+        Vec::new()
+    }
+
+    fn collect(&self) -> Vec<prometheus::proto::MetricFamily> {
+        self.0.iter().flat_map(Collector::collect).collect()
+    }
+}
 
 // How late a collection's data arrives (#1389), which a staleness alert adds
 // to its threshold: the median, over the newest observed arrivals, of when
@@ -1543,6 +1586,50 @@ static PVOL_CATALOG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
          and sites",
     )
 });
+// What each odim-volume source's scans do (#193): the construction scan and
+// every poll, by the source's (base) collection id.
+static PVOL_SCANS: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "pvol_scans_total",
+        "PVOL source scans, the construction scan included, by result: ok, or failed (the \
+         source could not be listed; the previous catalog is kept)",
+        &["collection", "result"],
+    )
+});
+static PVOL_LAST_SCAN_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    per_collection(
+        GaugeVec::new(
+            Opts::new(
+                "pvol_last_scan_duration_seconds",
+                "Duration of a PVOL source's most recent scan, failed or not: listing, \
+                 downloads, parses and the pixel pre-warm",
+            ),
+            &["collection"],
+        )
+        .unwrap(),
+    )
+});
+static PVOL_SCAN_VOLUMES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    pg_int_counter(
+        "pvol_scan_volumes_total",
+        "Volumes PVOL scans went through, by outcome: cached (taken from the parse cache, \
+         nothing read), parsed (read and parsed), read_failed, parse_failed. All but cached \
+         are parse-cache misses; a failed volume is read again by the next scan",
+        &["collection", "outcome"],
+    )
+});
+static PVOL_CATALOG_VOLUMES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "pvol_catalog_volumes",
+        "Volumes a PVOL source's catalog holds, every one in its parse cache",
+    )
+});
+static PVOL_CATALOG_SITES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "pvol_catalog_sites",
+        "Radar sites a PVOL source's catalog holds",
+    )
+});
 static PVOL_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "pvol_read_reserved_bytes",
@@ -2105,6 +2192,9 @@ struct CacheCounterState {
     bufr: HashMap<String, [u64; engine_bufr::health::COUNTERS]>,
     /// Station-grid per-collection `[analyses, failures]` (#1082).
     station_grid: HashMap<String, [u64; 2]>,
+    /// PVOL scan `[ok, failed, cached, parsed, read failures, parse
+    /// failures]` per source (#193).
+    pvol_scans: HashMap<String, [u64; 6]>,
     /// The 429s each rate-limited remote host has answered (#1290). They
     /// count from process start and never reset; the same delta scheme
     /// as the others all the same.
@@ -2140,6 +2230,7 @@ impl CacheCounterState {
             cap,
             bufr,
             station_grid,
+            pvol_scans,
             storage_host_throttled: _,
         } = self;
         drop_keys(tile, removed);
@@ -2163,6 +2254,7 @@ impl CacheCounterState {
         drop_keys(cap, removed);
         drop_keys(bufr, removed);
         drop_keys(station_grid, removed);
+        drop_keys(pvol_scans, removed);
     }
 }
 
@@ -2720,6 +2812,18 @@ fn update_budget_peaks() {
         if let Some(gauge) = budget_peak_gauge(entry.id) {
             gauge.set(peak.min(i64::MAX as u64) as i64);
         }
+    }
+}
+
+/// Set `collection`'s `storage_bytes_read_total` series to the `bytes` its
+/// `engine_type` engine has read from remote storage since it was built. A
+/// rebuilt engine counts from 0 again, which Prometheus reads as a counter
+/// reset. No series before the first byte, so local sources have none.
+fn feed_storage_bytes(collection: &str, engine_type: &str, bytes: u64) {
+    if bytes > 0 {
+        let series = STORAGE_BYTES_READ.with_label_values(&[collection, engine_type]);
+        series.reset();
+        series.inc_by(bytes);
     }
 }
 
@@ -8058,6 +8162,7 @@ pub(crate) fn refresh_health_gauges(state: &ServerState) -> HealthCounts {
 /// - NetCDF: the newest run's reference time, or the newest valid time of
 ///   files without runs.
 /// - Nowcast: the latest generation's anchor frame.
+/// - PVOL: each radar site collection's newest volume (#193).
 ///
 /// Every collection of these engines is listed, with `None` while it holds
 /// no data: it never loaded any, or all of it aged out of a satellite
@@ -8091,9 +8196,74 @@ pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<DataAge> {
                 age: timeline.newest().map(|newest| (now - newest).num_seconds()),
                 expected_interval: interval.map(|interval| interval.num_seconds()),
                 expected_delay: delays.get(id).copied(),
+                alerting: true,
             }
         })
+        .chain(radar_site_ages(state, now))
         .collect()
+}
+
+/// The PVOL part of [`collection_data_ages`] (#193): each radar site
+/// collection `{base}-{nod}` the last load registered, its Ready health
+/// entry, aged from its newest volume at `now`, with no age once its
+/// volumes have all left the catalog. The base id is the network's site
+/// inventory and has none. A NOD is ASCII alphanumeric, so `{base}-` with no
+/// further `-` belongs to this source and no other site. A configured id is
+/// never a site, whose id is derived: so another source's base id
+/// (`pvol-fi` beside `pvol`) is not read as a site `fi` of the first.
+///
+/// Not alerting, and so not a [`crate::delivery_delay::DataTimeline`]
+/// either: a radar another service runs and takes down for maintenance is
+/// not this server's to fix. Hence no delivery delay, and `odim-volume`
+/// takes no `expected_interval`.
+fn radar_site_ages(state: &ServerState, now: chrono::DateTime<chrono::Utc>) -> Vec<DataAge> {
+    let configured: HashSet<String> = state
+        .last_collections
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
+    let registered: Vec<String> = state
+        .health
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|h| h.engine_type == "odim-volume" && h.status == CollectionStatus::Ready)
+        .filter(|h| !configured.contains(&h.id))
+        .map(|h| h.id.clone())
+        .collect();
+    let mut ages = Vec::new();
+    for e in state
+        .odim_volume_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        let base = e.collection_id();
+        let sites = e.site_timelines();
+        for id in &registered {
+            let Some(nod) = id
+                .strip_prefix(base)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .filter(|nod| !nod.is_empty() && nod.chars().all(|c| c.is_ascii_alphanumeric()))
+            else {
+                continue;
+            };
+            let (newest, interval) = match sites.get(nod) {
+                Some(&(newest, interval)) => (Some(newest), interval),
+                None => (None, None),
+            };
+            ages.push(DataAge {
+                id: id.clone(),
+                age: newest.map(|newest| (now - newest).num_seconds()),
+                expected_interval: interval.map(|interval| interval.num_seconds()),
+                expected_delay: None,
+                alerting: false,
+            });
+        }
+    }
+    ages
 }
 
 /// Each engine type that reports a data age, as [`collection_data_ages`]
@@ -8185,6 +8355,10 @@ pub(crate) struct DataAge {
     /// How late its data arrives (#1389); `None` until an arrival was
     /// observed.
     pub expected_delay: Option<i64>,
+    /// Whether the freshness alerts watch it. `false` for a radar site
+    /// (#193), whose series carry `alerting="false"` ([`DATA_AGE_UNALERTED`])
+    /// and which has no delay.
+    pub alerting: bool,
 }
 
 /// Set `collection_data_age_seconds`, `collection_has_data`,
@@ -8195,8 +8369,9 @@ pub(crate) struct DataAge {
 /// interval series (#1375), one without an observed arrival no delay series
 /// (#1389); a collection a reload removed has none. Only
 /// those series are removed, never the whole family, so a concurrent scrape
-/// cannot gather it half filled. Every `/metrics` scrape calls this; returns
-/// what it set.
+/// cannot gather it half filled. A collection the alerts leave out has its
+/// series in [`DATA_AGE_UNALERTED`] instead (#193). Every `/metrics` scrape
+/// calls this; returns what it set.
 pub(crate) fn refresh_data_age_gauge(state: &ServerState) -> Vec<DataAge> {
     // Read the ages under the lock: two scrapes racing a reload must not let
     // the older read set a removed collection's series again after the newer
@@ -8207,9 +8382,10 @@ pub(crate) fn refresh_data_age_gauge(state: &ServerState) -> Vec<DataAge> {
 
 /// The collections with an age series, with a `collection_has_data` series,
 /// with an expected interval series and with an expected delay series, as
-/// the last [`refresh_data_age_gauge`] set them. Its lock serializes the
+/// the last [`refresh_data_age_gauge`] set them, each with whether the
+/// alerts watch it: the family its series is in. Its lock serializes the
 /// refreshes.
-static DATA_AGE_REPORTED: Mutex<[std::collections::BTreeSet<String>; 4]> = Mutex::new([
+static DATA_AGE_REPORTED: Mutex<[std::collections::BTreeSet<(String, bool)>; 4]> = Mutex::new([
     std::collections::BTreeSet::new(),
     std::collections::BTreeSet::new(),
     std::collections::BTreeSet::new(),
@@ -8219,14 +8395,14 @@ static DATA_AGE_REPORTED: Mutex<[std::collections::BTreeSet<String>; 4]> = Mutex
 /// [`refresh_data_age_gauge`] under its lock, `reported` the guarded sets.
 fn refresh_data_age_gauge_locked(
     state: &ServerState,
-    reported: &mut [std::collections::BTreeSet<String>; 4],
+    reported: &mut [std::collections::BTreeSet<(String, bool)>; 4],
 ) -> Vec<DataAge> {
     use std::collections::BTreeSet;
     let ages = collection_data_ages(state);
-    let ids = |keep: fn(&DataAge) -> bool| -> BTreeSet<String> {
+    let ids = |keep: fn(&DataAge) -> bool| -> BTreeSet<(String, bool)> {
         ages.iter()
             .filter(|a| keep(a))
-            .map(|a| a.id.clone())
+            .map(|a| (a.id.clone(), a.alerting))
             .collect()
     };
     let now = [
@@ -8241,29 +8417,41 @@ fn refresh_data_age_gauge_locked(
         &*COLLECTION_EXPECTED_INTERVAL_SECONDS,
         &*COLLECTION_EXPECTED_DELAY_SECONDS,
     ];
-    for ((before, after), family) in reported.iter().zip(&now).zip(families) {
-        for gone in before.difference(after) {
+    let unalerted = &*DATA_AGE_UNALERTED;
+    // The series of `id` in family `i`, in the family the alerts watch or
+    // the one they leave out, which has no delay family: a collection the
+    // alerts leave out has no delay.
+    let series = |i: usize, id: &str, alerting: bool| match alerting {
+        true => Some(families[i].with_label_values(&[id])),
+        false => unalerted
+            .get(i)
+            .map(|f| f.with_label_values(&[id, "false"])),
+    };
+    for (i, (before, after)) in reported.iter().zip(&now).enumerate() {
+        for (gone, alerting) in before.difference(after) {
             // Err = no such series.
-            let _ = family.remove_label_values(&[gone.as_str()]);
+            let _ = match alerting {
+                true => families[i].remove_label_values(&[gone.as_str()]),
+                false => match unalerted.get(i) {
+                    Some(family) => family.remove_label_values(&[gone.as_str(), "false"]),
+                    None => Ok(()),
+                },
+            };
         }
     }
     for a in &ages {
-        let id = [a.id.as_str()];
-        if let Some(age) = a.age {
-            COLLECTION_DATA_AGE_SECONDS.with_label_values(&id).set(age);
-        }
-        COLLECTION_HAS_DATA
-            .with_label_values(&id)
-            .set(i64::from(a.age.is_some()));
-        if let Some(interval) = a.expected_interval {
-            COLLECTION_EXPECTED_INTERVAL_SECONDS
-                .with_label_values(&id)
-                .set(interval);
-        }
-        if let Some(delay) = a.expected_delay {
-            COLLECTION_EXPECTED_DELAY_SECONDS
-                .with_label_values(&id)
-                .set(delay);
+        let values = [
+            a.age,
+            Some(i64::from(a.age.is_some())),
+            a.expected_interval,
+            a.expected_delay,
+        ];
+        for (i, value) in values.into_iter().enumerate() {
+            // A series only for a value: no age without data, and so on.
+            let Some(value) = value else { continue };
+            if let Some(series) = series(i, &a.id, a.alerting) {
+                series.set(value);
+            }
         }
     }
     *reported = now;
@@ -8601,9 +8789,49 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
             .unwrap_or_else(|e| e.into_inner())
             .iter()
         {
+            let collection = engine.collection_id();
             PVOL_CATALOG_BYTES
-                .with_label_values(&[engine.collection_id()])
+                .with_label_values(&[collection])
                 .set(engine.catalog_bytes().min(i64::MAX as u64) as i64);
+            // Scans (#193): every series touched, so each exists from boot.
+            let scans = engine.scan_metrics();
+            let [ok, failed, cached, parsed, read_failed, parse_failed] = delta_counts(
+                &mut counter_state.pvol_scans,
+                collection,
+                [
+                    scans.scans_ok,
+                    scans.scans_failed,
+                    scans.cached,
+                    scans.parsed,
+                    scans.read_failures,
+                    scans.parse_failures,
+                ],
+            );
+            for (result, delta) in [("ok", ok), ("failed", failed)] {
+                PVOL_SCANS
+                    .with_label_values(&[collection, result])
+                    .inc_by(delta);
+            }
+            for (outcome, delta) in [
+                ("cached", cached),
+                ("parsed", parsed),
+                ("read_failed", read_failed),
+                ("parse_failed", parse_failed),
+            ] {
+                PVOL_SCAN_VOLUMES
+                    .with_label_values(&[collection, outcome])
+                    .inc_by(delta);
+            }
+            PVOL_LAST_SCAN_SECONDS
+                .with_label_values(&[collection])
+                .set(scans.last_scan.as_secs_f64());
+            PVOL_CATALOG_VOLUMES
+                .with_label_values(&[collection])
+                .set(scans.volumes.min(i64::MAX as u64) as i64);
+            PVOL_CATALOG_SITES
+                .with_label_values(&[collection])
+                .set(scans.sites.min(i64::MAX as u64) as i64);
+            feed_storage_bytes(collection, "odim-volume", engine.storage_bytes_read());
         }
     }
 
@@ -8618,6 +8846,14 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
         .is_empty();
     if has_comp {
         ODIM_COMPOSITE_CACHE_METRICS.update(engine_odim::composite_cache_metrics(), None);
+        for engine in state
+            .odim_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            feed_storage_bytes(engine.collection_id(), "odim", engine.storage_bytes_read());
+        }
     }
 
     // 3D Tiles encoded-content cache: process-global, like the PVOL caches.
@@ -8769,16 +9005,7 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                 counter_state.tile.entry(collection.to_owned()).or_default(),
             );
 
-            // Update per-collection storage bytes
-            let bytes = engine.storage_bytes_read();
-            if bytes > 0 {
-                STORAGE_BYTES_READ
-                    .with_label_values(&[collection, "geotiff"])
-                    .reset();
-                STORAGE_BYTES_READ
-                    .with_label_values(&[collection, "geotiff"])
-                    .inc_by(bytes);
-            }
+            feed_storage_bytes(collection, "geotiff", engine.storage_bytes_read());
         }
     }
 
@@ -8982,15 +9209,7 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                 counter_state.grid.entry(collection.to_owned()).or_default(),
             );
 
-            let bytes = engine.storage_bytes_read();
-            if bytes > 0 {
-                STORAGE_BYTES_READ
-                    .with_label_values(&[collection, "grib"])
-                    .reset();
-                STORAGE_BYTES_READ
-                    .with_label_values(&[collection, "grib"])
-                    .inc_by(bytes);
-            }
+            feed_storage_bytes(collection, "grib", engine.storage_bytes_read());
         }
     }
 
@@ -15425,3 +15644,8 @@ colormap = "no_such_map"
 #[cfg(test)]
 #[path = "station_grid_corrections_tests.rs"]
 mod station_grid_corrections_tests;
+
+/// PVOL source observability (#193), in a file of its own.
+#[cfg(test)]
+#[path = "pvol_metrics_tests.rs"]
+mod pvol_metrics_tests;

@@ -78,6 +78,8 @@ tests:
   #     ahead, 42 hours ahead as the next run is due. With its -48 h delay
   #     it would be stale from 45 hours ahead; a negative delay counts as
   #     none, so not stale.
+  #   radar-site: as stale as radar, but labelled alerting="false" (a
+  #     radar site, #193): never matched.
   #   other job: never matched.
   - name: CollectionStale
     interval: 1m
@@ -126,6 +128,10 @@ tests:
         values: '3600x20'
       - series: 'collection_expected_delay_seconds{job="meteocore", instance="a:8000", collection="forecast"}'
         values: '-172800x20'
+      - series: 'collection_data_age_seconds{job="meteocore", instance="a:8000", collection="radar-site", alerting="false"}'
+        values: '1200x40'
+      - series: 'collection_expected_interval_seconds{job="meteocore", instance="a:8000", collection="radar-site", alerting="false"}'
+        values: '300x40'
       - series: 'collection_data_age_seconds{job="other", instance="x:8000", collection="radar"}'
         values: '99999x20'
       - series: 'collection_expected_interval_seconds{job="other", instance="x:8000", collection="radar"}'
@@ -461,6 +467,10 @@ tests:
       # Empty for 10 minutes after a start, then filled: never fires.
       - series: 'collection_has_data{job="meteocore", instance="a:8000", collection="wis2"}'
         values: '0x10 1x10'
+      # A radar site (#193), empty all along: labelled alerting="false",
+      # never matched.
+      - series: 'collection_has_data{job="meteocore", instance="a:8000", collection="radar-site", alerting="false"}'
+        values: '0x20'
     alert_rule_test:
       - eval_time: 10m
         alertname: CollectionEmpty
