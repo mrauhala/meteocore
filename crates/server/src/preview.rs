@@ -1215,6 +1215,7 @@ mod tests {
             last_collections: RwLock::new(HashMap::new()),
             engine_handles: RwLock::new(HashMap::new()),
             wind_handles: RwLock::new(HashMap::new()),
+            delivery_delays: Default::default(),
         })
     }
 

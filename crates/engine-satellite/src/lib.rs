@@ -355,8 +355,14 @@ impl SatelliteEngine {
 
     /// Age of the newest scan, for `/health`'s `data_age_secs`.
     pub fn data_age(&self) -> Option<chrono::Duration> {
-        let newest = self.catalog.load().info.times.last().copied()?;
-        Some(Utc::now() - newest)
+        self.newest_time().map(|newest| Utc::now() - newest)
+    }
+
+    /// The newest scan start over every product, which [`Self::data_age`]
+    /// is measured from; the server times its arrival for the
+    /// `collection_expected_delay_seconds` gauge (#1389).
+    pub fn newest_time(&self) -> Option<DateTime<Utc>> {
+        self.catalog.load().info.times.last().copied()
     }
 
     /// The spacing of the newest scan starts, over every product as

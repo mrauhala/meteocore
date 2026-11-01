@@ -789,6 +789,20 @@ static COLLECTION_EXPECTED_INTERVAL_SECONDS: LazyLock<IntGaugeVec> = LazyLock::n
     )
 });
 
+// How late a collection's data arrives (#1389), which a staleness alert adds
+// to its threshold: the median, over the newest observed arrivals, of when
+// the server first served a timestep minus its timestamp
+// (`crate::delivery_delay`).
+static COLLECTION_EXPECTED_DELAY_SECONDS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "collection_expected_delay_seconds",
+        "Seconds between a timestep's timestamp and when the server first served it, on the \
+         timeline the data age is measured on: the median over the newest arrivals the server \
+         observed. Negative for data that arrives ahead of its timestamp. No series until a \
+         timestep arrives after boot",
+    )
+});
+
 static HTTP_RESPONSE_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
@@ -2764,6 +2778,8 @@ pub struct ServerState {
     pub config_path: String,
     /// Last accepted config/styles, used by recovery without reading config files.
     pub accepted_load: RwLock<Option<Arc<AcceptedLoad>>>,
+    /// Stops the server's own background loops at shutdown: the radar
+    /// recovery loop and [`delivery_delay_loop`].
     pub recovery_shutdown: ds_poll::Shutdown,
     pub health: RwLock<Vec<CollectionHealth>>,
     pub geotiff_engines: RwLock<Vec<Arc<engine_geotiff::GeoTiffEngine>>>,
@@ -2814,6 +2830,9 @@ pub struct ServerState {
     /// Live derived-parameter wrappers (#897, #948), keyed like
     /// [`LoadResult::wind_by_id`]: a reused engine keeps its wrapper.
     pub wind_handles: RwLock<WindHandles>,
+    /// How late each collection's data arrives (#1389), observed by
+    /// [`delivery_delay_loop`]; reloads keep it.
+    pub delivery_delays: crate::delivery_delay::DeliveryDelays,
 }
 
 pub type AdminState = Arc<ServerState>;
@@ -7975,6 +7994,8 @@ pub(crate) fn refresh_health_gauges(state: &ServerState) -> HealthCounts {
 /// when the newest data lies in the future. Each comes with the interval
 /// its data is expected at (#1375), from the same engine timeline: the
 /// collection's `expected_interval`, else the engine's measured spacing.
+/// The collection's delivery delay comes with them (#1389), the median the
+/// delay tracker last published ([`crate::delivery_delay`]).
 /// One function so the endpoint and the gauges cannot drift:
 /// O(collections) snapshot reads, no I/O, each lock taken and released on
 /// its own.
@@ -7987,68 +8008,97 @@ pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<DataAge> {
         .iter()
         .filter_map(|(id, config)| Some((id.clone(), config.expected_interval_override()?)))
         .collect();
-    let mut ages = Vec::new();
-    let mut push = |id: &str, age: Option<chrono::Duration>, interval: Option<chrono::Duration>| {
-        let interval = overrides.get(id).copied().or(interval);
-        ages.push(DataAge {
-            id: id.to_owned(),
-            age: age.map(|age| age.num_seconds()),
-            expected_interval: interval.map(|interval| interval.num_seconds()),
-        });
-    };
-    for e in state
-        .geotiff_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
+    let delays = state.delivery_delays.medians();
+    data_timelines(state)
         .iter()
-    {
-        push(e.collection_id(), e.data_age(), e.expected_interval());
+        .map(|timeline| {
+            let id = timeline.id();
+            let interval = overrides.get(id).copied().or_else(|| timeline.interval());
+            DataAge {
+                id: id.to_owned(),
+                age: timeline.newest().map(|newest| (now - newest).num_seconds()),
+                expected_interval: interval.map(|interval| interval.num_seconds()),
+                expected_delay: delays.get(id).copied(),
+            }
+        })
+        .collect()
+}
+
+/// Each engine type that reports a data age, as [`collection_data_ages`]
+/// and the delivery delay read it: the timestamp its age is measured from
+/// (listed at [`collection_data_ages`]) and the spacing of that timeline.
+macro_rules! data_timeline {
+    ($($engine:ty => $newest:ident),* $(,)?) => {$(
+        impl crate::delivery_delay::DataTimeline for $engine {
+            fn id(&self) -> &str {
+                self.collection_id()
+            }
+            fn newest(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+                self.$newest()
+            }
+            fn interval(&self) -> Option<chrono::Duration> {
+                self.expected_interval()
+            }
+        }
+    )*};
+}
+
+data_timeline!(
+    engine_geotiff::GeoTiffEngine => newest_time,
+    engine_querydata::QueryDataEngine => newest_time,
+    engine_bufr::BufrEngine => latest_report,
+    engine_satellite::SatelliteEngine => newest_time,
+    engine_netcdf::NetcdfEngine => newest_time,
+    engine_nowcast::NowcastEngine => newest_time,
+);
+
+/// Every collection whose engine reports a data age
+/// (`ds_core::config::DATA_AGE_ENGINES`), in this order, its engine `Arc`
+/// cloned out of the registry lists, each lock released at once.
+fn data_timelines(state: &ServerState) -> Vec<Arc<dyn crate::delivery_delay::DataTimeline>> {
+    let mut timelines: Vec<Arc<dyn crate::delivery_delay::DataTimeline>> = Vec::new();
+    macro_rules! extend {
+        ($($field:ident),* $(,)?) => {$(
+            timelines.extend(
+                state
+                    .$field
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .map(|e| e.clone() as Arc<dyn crate::delivery_delay::DataTimeline>),
+            );
+        )*};
     }
-    for e in state
-        .querydata_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-    {
-        push(e.collection_id(), e.data_age(), e.expected_interval());
+    extend!(
+        geotiff_engines,
+        querydata_engines,
+        bufr_engines,
+        satellite_engines,
+        netcdf_engines,
+        nowcast_engines,
+    );
+    timelines
+}
+
+/// Time each collection's arrivals for `collection_expected_delay_seconds`
+/// (#1389): [`observe_delivery`] every [`crate::delivery_delay::TICK`] on
+/// the poll runtime, from boot until the server shuts down. The first
+/// observation is every collection's baseline.
+pub(crate) async fn delivery_delay_loop(state: AdminState) {
+    let mut ticker = state
+        .recovery_shutdown
+        .ticker(crate::delivery_delay::TICK, ds_poll::FirstTick::Immediate);
+    while ticker.tick().await {
+        observe_delivery(&state);
     }
-    for e in state
-        .bufr_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-    {
-        push(
-            e.collection_id(),
-            e.latest_report().map(|t| now - t),
-            e.expected_interval(),
-        );
-    }
-    for e in state
-        .satellite_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-    {
-        push(e.collection_id(), e.data_age(), e.expected_interval());
-    }
-    for e in state
-        .netcdf_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-    {
-        push(e.collection_id(), e.data_age(), e.expected_interval());
-    }
-    for e in state
-        .nowcast_engines
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-    {
-        push(e.collection_id(), e.catalog_age(), e.expected_interval());
-    }
-    ages
+}
+
+/// One observation of the delay tracker over the live registry: snapshot
+/// reads, no I/O.
+pub(crate) fn observe_delivery(state: &ServerState) {
+    state
+        .delivery_delays
+        .observe(chrono::Utc::now(), &data_timelines(state));
 }
 
 /// One collection of [`collection_data_ages`], in whole seconds.
@@ -8060,13 +8110,18 @@ pub(crate) struct DataAge {
     /// The spacing its data is expected at; `None` without
     /// `expected_interval` and below two timesteps.
     pub expected_interval: Option<i64>,
+    /// How late its data arrives (#1389); `None` until an arrival was
+    /// observed.
+    pub expected_delay: Option<i64>,
 }
 
-/// Set `collection_data_age_seconds`, `collection_has_data` and
-/// `collection_expected_interval_seconds` from [`collection_data_ages`], the
+/// Set `collection_data_age_seconds`, `collection_has_data`,
+/// `collection_expected_interval_seconds` and
+/// `collection_expected_delay_seconds` from [`collection_data_ages`], the
 /// `/health` source. A collection holding no data has `collection_has_data`
 /// 0 and no age series (#1055), one without an expected interval no
-/// interval series (#1375); a collection a reload removed has none. Only
+/// interval series (#1375), one without an observed arrival no delay series
+/// (#1389); a collection a reload removed has none. Only
 /// those series are removed, never the whole family, so a concurrent scrape
 /// cannot gather it half filled. Every `/metrics` scrape calls this; returns
 /// what it set.
@@ -8078,10 +8133,12 @@ pub(crate) fn refresh_data_age_gauge(state: &ServerState) -> Vec<DataAge> {
     refresh_data_age_gauge_locked(state, &mut reported)
 }
 
-/// The collections with an age series, with a `collection_has_data` series
-/// and with an expected interval series, as the last
-/// [`refresh_data_age_gauge`] set them. Its lock serializes the refreshes.
-static DATA_AGE_REPORTED: Mutex<[std::collections::BTreeSet<String>; 3]> = Mutex::new([
+/// The collections with an age series, with a `collection_has_data` series,
+/// with an expected interval series and with an expected delay series, as
+/// the last [`refresh_data_age_gauge`] set them. Its lock serializes the
+/// refreshes.
+static DATA_AGE_REPORTED: Mutex<[std::collections::BTreeSet<String>; 4]> = Mutex::new([
+    std::collections::BTreeSet::new(),
     std::collections::BTreeSet::new(),
     std::collections::BTreeSet::new(),
     std::collections::BTreeSet::new(),
@@ -8090,7 +8147,7 @@ static DATA_AGE_REPORTED: Mutex<[std::collections::BTreeSet<String>; 3]> = Mutex
 /// [`refresh_data_age_gauge`] under its lock, `reported` the guarded sets.
 fn refresh_data_age_gauge_locked(
     state: &ServerState,
-    reported: &mut [std::collections::BTreeSet<String>; 3],
+    reported: &mut [std::collections::BTreeSet<String>; 4],
 ) -> Vec<DataAge> {
     use std::collections::BTreeSet;
     let ages = collection_data_ages(state);
@@ -8104,11 +8161,13 @@ fn refresh_data_age_gauge_locked(
         ids(|a| a.age.is_some()),
         ids(|_| true),
         ids(|a| a.expected_interval.is_some()),
+        ids(|a| a.expected_delay.is_some()),
     ];
     let families = [
         &*COLLECTION_DATA_AGE_SECONDS,
         &*COLLECTION_HAS_DATA,
         &*COLLECTION_EXPECTED_INTERVAL_SECONDS,
+        &*COLLECTION_EXPECTED_DELAY_SECONDS,
     ];
     for ((before, after), family) in reported.iter().zip(&now).zip(families) {
         for gone in before.difference(after) {
@@ -8128,6 +8187,11 @@ fn refresh_data_age_gauge_locked(
             COLLECTION_EXPECTED_INTERVAL_SECONDS
                 .with_label_values(&id)
                 .set(interval);
+        }
+        if let Some(delay) = a.expected_delay {
+            COLLECTION_EXPECTED_DELAY_SECONDS
+                .with_label_values(&id)
+                .set(delay);
         }
     }
     *reported = now;
@@ -14996,8 +15060,8 @@ colormap = "no_such_map"
     ];
 
     /// The series of the per-collection gauge `family` in `/metrics` of
-    /// [`DATA_AGE_IDS`], by collection.
-    fn collection_series(family: &str) -> std::collections::BTreeMap<String, i64> {
+    /// `ids`, by collection.
+    fn collection_series(family: &str, ids: &[&str]) -> std::collections::BTreeMap<String, i64> {
         use super::Encoder as _;
         let mut text = Vec::new();
         super::TextEncoder::new()
@@ -15010,24 +15074,34 @@ colormap = "no_such_map"
             .filter_map(|line| {
                 let rest = line.strip_prefix(prefix.as_str())?;
                 let (id, value) = rest.split_once("\"} ")?;
-                DATA_AGE_IDS
-                    .contains(&id)
+                ids.contains(&id)
                     .then(|| (id.to_owned(), value.parse().unwrap()))
             })
             .collect()
     }
 
     /// The data age gauges as a refresh from `state` sets them: what it
-    /// returns, and the `collection_data_age_seconds`, `collection_has_data`
-    /// and `collection_expected_interval_seconds` series of
-    /// [`DATA_AGE_IDS`]. Under the refresh lock: another test's refresh
-    /// (each scrape and reload runs one) from its own state would remove
-    /// these collections' series before they were read.
+    /// returns, and the `collection_data_age_seconds`, `collection_has_data`,
+    /// `collection_expected_interval_seconds` and
+    /// `collection_expected_delay_seconds` series of [`DATA_AGE_IDS`].
     fn refreshed(
         state: &super::AdminState,
     ) -> (
         Vec<super::DataAge>,
-        [std::collections::BTreeMap<String, i64>; 3],
+        [std::collections::BTreeMap<String, i64>; 4],
+    ) {
+        refreshed_of(state, &DATA_AGE_IDS)
+    }
+
+    /// [`refreshed`] for the series of `ids`. Under the refresh lock:
+    /// another test's refresh (each scrape and reload runs one) from its own
+    /// state would remove these collections' series before they were read.
+    fn refreshed_of(
+        state: &super::AdminState,
+        ids: &[&str],
+    ) -> (
+        Vec<super::DataAge>,
+        [std::collections::BTreeMap<String, i64>; 4],
     ) {
         let mut reported = super::DATA_AGE_REPORTED
             .lock()
@@ -15037,8 +15111,9 @@ colormap = "no_such_map"
             "collection_data_age_seconds",
             "collection_has_data",
             "collection_expected_interval_seconds",
+            "collection_expected_delay_seconds",
         ]
-        .map(collection_series);
+        .map(|family| collection_series(family, ids));
         (set, series)
     }
 
@@ -15061,7 +15136,7 @@ colormap = "no_such_map"
 
         let before = chrono::Utc::now();
         let json = health_json(&state).await;
-        let (set, [series, has_data, intervals]) = refreshed(&state);
+        let (set, [series, has_data, intervals, _]) = refreshed(&state);
         let after = chrono::Utc::now();
 
         for (id, time) in newest {
@@ -15133,7 +15208,7 @@ colormap = "no_such_map"
         // A reload removes the GeoTIFF collections: their series go with
         // them, the others stay.
         state.geotiff_engines.write().unwrap().clear();
-        let (set, [series, has_data, intervals]) = refreshed(&state);
+        let (set, [series, has_data, intervals, _]) = refreshed(&state);
         assert_eq!(
             set.iter().map(|a| a.id.as_str()).collect::<Vec<_>>(),
             ["age-querydata", "interval-netcdf"]
@@ -15150,6 +15225,123 @@ colormap = "no_such_map"
             ]
             .into()
         );
+    }
+
+    /// #1389: `collection_expected_delay_seconds` times only the arrivals
+    /// the server observed. What every engine held at the first observation
+    /// is a baseline, so no collection has a series after boot; each run a
+    /// NetCDF poll finds is an arrival, its delay the observation minus its
+    /// reference time, and the gauge is their median from the first on; a
+    /// GeoTIFF engine rebuilt over a newer file is a new baseline; a
+    /// collection a reload removed loses its series.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delivery_delay_counts_only_observed_arrivals() {
+        let testdata = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata");
+        let dir = tempfile::tempdir().unwrap();
+        let (meps, radar) = (dir.path().join("meps"), dir.path().join("radar"));
+        std::fs::create_dir(&meps).unwrap();
+        std::fs::create_dir(&radar).unwrap();
+        let copy = |from: &str, to: std::path::PathBuf| {
+            std::fs::copy(format!("{testdata}/{from}"), to).unwrap();
+        };
+        let run = |hour: &str| format!("meps_sfc_00_20261015T{hour}Z.nc");
+        copy(&format!("meps-netcdf/{}", run("06")), meps.join(run("06")));
+        let frame = "radar-tm35fin/radar_tm35_20260406T0640Z.tif";
+        copy(frame, radar.join("radar_tm35_20260406T0630Z.tif"));
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [[collections]]\nid = \"delay-netcdf\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"netcdf\"\napis = [\"edr\"]\n\
+                 [collections.netcdf]\ndata_path = \"{}\"\n\
+                 filename_template = \"meps_sfc_{{lead}}_%Y%m%dT{{run}}Z.nc\"\n\
+                 [[collections]]\nid = \"delay-geotiff\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{}\"\nengine_type = \"geotiff\"\napis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n",
+                meps.display(),
+                radar.display()
+            ),
+        )
+        .unwrap();
+        const IDS: [&str; 2] = ["delay-netcdf", "delay-geotiff"];
+        let delays = |state: &super::AdminState| {
+            let (set, [.., series]) = refreshed_of(state, &IDS);
+            let listed: std::collections::BTreeMap<String, i64> = set
+                .into_iter()
+                .filter_map(|a| Some((a.id, a.expected_delay?)))
+                .collect();
+            assert_eq!(listed, series, "the gauge is what the refresh lists");
+            series
+        };
+        let state = crate::watcher::tests::build_state(&config_path);
+
+        // Boot: what the engines hold was not seen arriving.
+        super::observe_delivery(&state);
+        super::observe_delivery(&state);
+        assert_eq!(delays(&state), std::collections::BTreeMap::new());
+
+        // Runs 07Z to 11Z arrive, an hour apart, each found by a poll: the
+        // fixture's 06Z lead 00 with its reference and valid time moved, the
+        // two f64 seconds the file stores them as.
+        let fixture = std::fs::read(format!("{testdata}/meps-netcdf/{}", run("06"))).unwrap();
+        let six = chrono::DateTime::parse_from_rfc3339("2026-10-15T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let netcdf = state.netcdf_engines.read().unwrap()[0].clone();
+        let arrivals = 5;
+        let mut timed = Vec::new();
+        for hours in 1..=arrivals {
+            let reference_time = six + chrono::Duration::hours(hours);
+            let (from, to) = (
+                (six.timestamp() as f64).to_le_bytes(),
+                (reference_time.timestamp() as f64).to_le_bytes(),
+            );
+            let mut bytes = fixture.clone();
+            let stored: Vec<usize> = (0..bytes.len() - 8)
+                .filter(|&i| bytes[i..i + 8] == from)
+                .collect();
+            assert_eq!(stored.len(), 2, "the run and the valid time");
+            for i in stored {
+                bytes[i..i + 8].copy_from_slice(&to);
+            }
+            let name = run(&format!("{:02}", 6 + hours));
+            std::fs::write(meps.join(name), bytes).unwrap();
+            netcdf.poll_once();
+            let before = chrono::Utc::now();
+            super::observe_delivery(&state);
+            let after = chrono::Utc::now();
+            timed.push(
+                (before - reference_time).num_seconds()..=(after - reference_time).num_seconds(),
+            );
+            // Each later run is an hour less late, so the median, the
+            // larger middle one, is the delay of the run ⌈n/2⌉ of the n.
+            let observed = delays(&state);
+            let delay = observed["delay-netcdf"];
+            let median = &timed[(timed.len() - 1) / 2];
+            assert!(
+                median.contains(&delay),
+                "{hours}: {delay} not in {median:?}"
+            );
+            assert_eq!(observed.len(), 1, "{observed:?}");
+        }
+        let delay = delays(&state)["delay-netcdf"];
+
+        // A reload rebuilds the GeoTIFF collection, whose new engine scans a
+        // frame that arrived meanwhile: a baseline, not a delay.
+        copy(frame, radar.join("radar_tm35_20260406T0635Z.tif"));
+        let rebuilt = crate::watcher::tests::build_state(&config_path);
+        let geotiff = std::mem::take(&mut *rebuilt.geotiff_engines.write().unwrap());
+        *state.geotiff_engines.write().unwrap() = geotiff;
+        super::observe_delivery(&state);
+        assert_eq!(delays(&state), [("delay-netcdf".to_owned(), delay)].into());
+
+        // A reload removes the NetCDF collection.
+        state.netcdf_engines.write().unwrap().clear();
+        super::observe_delivery(&state);
+        assert_eq!(delays(&state), std::collections::BTreeMap::new());
     }
 }
 

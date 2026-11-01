@@ -206,8 +206,14 @@ impl QueryDataEngine {
     /// It keeps growing while the feeder is stalled, even though every poll
     /// still finds the old files.
     pub fn data_age(&self) -> Option<chrono::Duration> {
-        let newest = *self.runs.load().runs.keys().next_back()?;
-        Some(Utc::now() - newest)
+        self.newest_time().map(|newest| Utc::now() - newest)
+    }
+
+    /// The newest run's origin time, which [`Self::data_age`] is measured
+    /// from; the server times its arrival for the
+    /// `collection_expected_delay_seconds` gauge (#1389).
+    pub fn newest_time(&self) -> Option<DateTime<Utc>> {
+        self.runs.load().runs.keys().next_back().copied()
     }
 
     /// The spacing of the newest runs' origin times, the timeline
