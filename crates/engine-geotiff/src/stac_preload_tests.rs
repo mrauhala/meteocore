@@ -46,10 +46,11 @@ struct MockOptions {
     range_fault: Option<RangeFault>,
     /// Hold each asset request at this gate ([`pass`]).
     gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Hold the `failing` item's asset requests at this gate instead of
+    /// `gate`.
+    failing_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Hold each `/items` page request at this gate ([`pass`]).
     items_gate: Option<Arc<tokio::sync::Semaphore>>,
-    /// Answer every `/items` page request with 503.
-    failing_items: bool,
 }
 
 /// Wait at a mock's gate until a permit is added, one per request, or the
@@ -148,8 +149,8 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         sized,
         range_fault,
         gate,
+        failing_gate,
         items_gate,
-        failing_items,
     } = options;
     let arrived = Arc::new(tokio::sync::Notify::new());
     let fixture_size = std::fs::metadata(FIXTURE).unwrap().len();
@@ -195,11 +196,6 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
             if let Some(gate) = &items_gate {
                 pass(gate).await;
             }
-            if failing_items {
-                return axum::response::IntoResponse::into_response(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                );
-            }
             let window = query
                 .get("datetime")
                 .filter(|_| filter_datetime)
@@ -228,11 +224,11 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
                 }
                 features = features.into_iter().skip(offset).take(limit).collect();
             }
-            axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
+            axum::Json(serde_json::json!({
                 "type": "FeatureCollection",
                 "features": features,
                 "links": links,
-            })))
+            }))
         }
     };
     let missing = missing.map(|i| format!("/data/item-{i}.tif"));
@@ -258,6 +254,7 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
                 let load = Arc::clone(&load);
                 let arrived = Arc::clone(&asset_arrived);
                 let gate = gate.clone();
+                let failing_gate = failing_gate.clone();
                 let missing = missing.clone();
                 let failing = failing.clone();
                 let ranged = request.headers().contains_key(axum::http::header::RANGE);
@@ -277,10 +274,15 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
                     let now = load.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     load.max_in_flight.fetch_max(now, Ordering::SeqCst);
                     tokio::time::sleep(delay).await;
-                    if let Some(gate) = &gate {
+                    let path = Some(request.uri().path());
+                    let gate = if failing.as_deref() == path {
+                        &failing_gate
+                    } else {
+                        &gate
+                    };
+                    if let Some(gate) = gate {
                         pass(gate).await;
                     }
-                    let path = Some(request.uri().path());
                     let response = if missing.as_deref() == path {
                         axum::response::IntoResponse::into_response(
                             axum::http::StatusCode::NOT_FOUND,
@@ -1052,7 +1054,7 @@ async fn a_query_waits_for_a_held_item_no_longer_than_its_deadline() {
         .expect("unclaimed");
     let window = Some((times[0], times[2]));
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
     let query = query_position_at(&engine, window, Some(deadline));
     let err = failure(
         tokio::time::timeout(Duration::from_secs(5), query)
@@ -1128,7 +1130,8 @@ async fn a_render_waits_for_another_stac_load_no_longer_than_its_deadline() {
 /// #18: past its deadline a query starts no further cold load, while the
 /// loads it has in flight, claims other requests may be waiting on, run to
 /// their end and install. Before, the first load it did not start dropped
-/// them. The query is the 504, and a retry finds those items loaded.
+/// them. The client has its 504 from the EDR executor by then; the worker
+/// returns the deadline once they end, and a retry finds the items loaded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cold_loads_in_flight_at_the_deadline_finish_for_the_retry() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1180,14 +1183,16 @@ async fn cold_loads_in_flight_at_the_deadline_finish_for_the_retry() {
     assert!(engine.loading_in_flight.paths.lock().unwrap().is_empty());
 }
 
-/// #18: an on-demand listing requests no page once the query's deadline has
-/// passed. The first page, held at the gate until then, is answered; the
-/// listing stops before the next, installs nothing and counts no failure
-/// against the STAC API.
+/// #18: an on-demand listing that started within the query's deadline
+/// pages to its end past it, as a load in flight does, and is installed for
+/// the retry. The query is past its deadline then and loads nothing; the
+/// retry finds every item listed and answers without listing again. Cut at
+/// the deadline, every retry of a long listing would start from the first
+/// page and never get past it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_on_demand_listing_stops_paging_at_the_deadline() {
+async fn a_listing_past_the_deadline_is_installed_for_the_retry() {
     let items_gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let count = 3 * stac::STAC_PAGE_LIMIT as usize;
+    let count = 2 * stac::STAC_PAGE_LIMIT as usize + 1;
     let options = MockOptions {
         filter_datetime: true,
         paged: true,
@@ -1199,7 +1204,8 @@ async fn an_on_demand_listing_stops_paging_at_the_deadline() {
     let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
     let window = Some((times[0], times[count - 1]));
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    // The first page is held at the gate until the deadline has passed.
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
     let query = tokio::spawn({
         let engine = Arc::clone(&engine);
         async move { query_position_at(&engine, window, Some(deadline)).await }
@@ -1210,46 +1216,79 @@ async fn an_on_demand_listing_stops_paging_at_the_deadline() {
 
     let err = failure(query.await.unwrap());
     assert!(matches!(err, DataServerError::DeadlineExceeded), "{err:?}");
-    assert_eq!(pages(&mock), 1, "no page past the deadline");
-    assert!(engine.catalog.load().entries.is_empty());
-    assert_eq!(asset_requests(&mock), 0);
+    assert_eq!(pages(&mock), 3, "the listing pages to its end");
+    assert_eq!(engine.catalog.load().entries.len(), count, "installed");
+    assert_eq!(asset_requests(&mock), 0, "no load past the deadline");
     assert_eq!(
         engine.stac_consecutive_failures.load(Ordering::SeqCst),
         0,
         "the STAC API did not fail"
     );
+
+    let response = query_position_at(&engine, window, None)
+        .await
+        .expect("the retry loads what the listing installed");
+    assert_eq!(series_times(response), times);
+    assert_eq!(pages(&mock), 3, "without listing again");
 }
 
-/// #18: a page request that fails is not retried past the deadline. The
-/// first, held at the gate until then, answers 503; the listing stops there
-/// with that failure, which the circuit breaker counts, instead of three
-/// more attempts.
+/// #18: past its deadline, a failed load in flight is logged and ends none
+/// of the others: they run to their end and install, as the loads in flight
+/// do without a failure. Before, that failure returned at once and dropped
+/// the other loads' claims mid-fetch. The answer is the deadline's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_failed_page_is_not_retried_past_the_deadline() {
-    let items_gate = Arc::new(tokio::sync::Semaphore::new(0));
+async fn a_load_failing_past_the_deadline_drops_no_other_load() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let failing_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let count = 2 * STAC_PRELOAD_CONCURRENCY;
+    // Newest first: the second-newest item is among the first loads.
+    let failing = count - 2;
     let options = MockOptions {
-        failing_items: true,
-        items_gate: Some(Arc::clone(&items_gate)),
+        sized: true,
+        failing: Some(failing),
+        gate: Some(Arc::clone(&gate)),
+        failing_gate: Some(Arc::clone(&failing_gate)),
         ..MockOptions::default()
     };
-    let mock = mock_stac_with(3, options).await;
+    let mock = mock_stac_with(count, options).await;
     let times = mock.times.clone();
     let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
-    let window = Some((times[0], times[2]));
+    let window = Some((times[0], times[count - 1]));
 
-    let deadline = std::time::Instant::now() + Duration::from_millis(300);
-    let query = tokio::spawn({
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let mut query = tokio::spawn({
         let engine = Arc::clone(&engine);
         async move { query_position_at(&engine, window, Some(deadline)).await }
     });
-    until_requests(&mock, 1, pages).await;
+    until_requests(&mock, STAC_PRELOAD_CONCURRENCY, asset_requests).await;
+    assert_eq!(item_requests(&mock, failing), 1);
     tokio::time::sleep_until(deadline.into()).await;
-    items_gate.close();
 
+    // The failing item's header read answers 503 past the deadline.
+    failing_gate.close();
+    let started = tokio::time::Instant::now();
+    while mock.assets.in_flight.load(Ordering::SeqCst) == STAC_PRELOAD_CONCURRENCY {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the 503 is sent"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut query)
+            .await
+            .is_err(),
+        "the query waits for its other loads in flight"
+    );
+
+    gate.close();
     let err = failure(query.await.unwrap());
-    assert!(matches!(err, DataServerError::Engine(_)), "{err:?}");
-    assert_eq!(pages(&mock), 1, "no retry past the deadline");
-    assert_eq!(engine.stac_consecutive_failures.load(Ordering::SeqCst), 1);
+    assert!(matches!(err, DataServerError::DeadlineExceeded), "{err:?}");
+    let mut loaded = times[count - STAC_PRELOAD_CONCURRENCY..].to_vec();
+    loaded.retain(|time| *time != times[failing]);
+    assert_eq!(loaded_times(&engine), loaded, "the other loads installed");
+    assert_eq!(asset_requests(&mock), STAC_PRELOAD_CONCURRENCY);
+    assert!(engine.loading_in_flight.paths.lock().unwrap().is_empty());
 }
 
 /// A rectangle over the whole fixture grid, 480 × 360 cells: six timesteps

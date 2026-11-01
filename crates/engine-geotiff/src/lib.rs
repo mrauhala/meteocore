@@ -500,8 +500,8 @@ impl GeoTiffEngine {
     }
 
     /// Record a failed on-demand STAC listing for the circuit breaker,
-    /// unless the request's deadline stopped it between pages (#18): that
-    /// says nothing of the STAC API.
+    /// unless the request's deadline kept it from starting (#18): that says
+    /// nothing of the STAC API.
     fn record_stac_listing_error(&self, e: &DataServerError) {
         if !matches!(e, DataServerError::DeadlineExceeded) {
             self.record_stac_failure();
@@ -1566,16 +1566,17 @@ impl GeoTiffEngine {
     /// load `STAC_PRELOAD_CONCURRENCY` at a time through the shared async
     /// loader, under one `block_on` of the STAC bridge, never as N sequential
     /// round trips (root Critical Rule 9). No load starts once the request's
-    /// deadline (`ds_core::deadline`) has passed: the query is then the
-    /// 504. The loads already in flight run to their end first (#18): other
-    /// requests may be waiting for them, and what loaded stays loaded for a
-    /// retry. An item the poll preload or another request is loading is
-    /// waited for afterwards, when this query holds no claim, so two loaders
-    /// never wait on each other, and no longer than the deadline. The first
-    /// failed load fails the query, as the sequential loop did; the loads
-    /// still in flight are dropped and release their claims. A load that
-    /// finds its asset gone is no failure: the item leaves the catalog, so
-    /// the query answers without it (#1119).
+    /// deadline (`ds_core::deadline`) has passed; the EDR executor has
+    /// answered the client's 504 by then. The worker still waits for the
+    /// loads in flight to end, a failed one included, before it returns
+    /// (#18): other requests may be waiting for them, and what loaded stays
+    /// loaded for a retry. An item the poll preload or another request is
+    /// loading is waited for afterwards, when this query holds no claim, so
+    /// two loaders never wait on each other, and no longer than the deadline.
+    /// Within the deadline the first failed load fails the query, as the
+    /// sequential loop did; the loads still in flight are dropped and release
+    /// their claims. A load that finds its asset gone is no failure: the item
+    /// leaves the catalog, so the query answers without it (#1119).
     fn load_cold_stac_entries(
         &self,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -1612,12 +1613,23 @@ impl GeoTiffEngine {
             let mut held_elsewhere = Vec::new();
             let mut expired = false;
             // Past the deadline the loads left start nothing, while the ones
-            // in flight, claims other requests may wait on, finish (#18).
+            // in flight, claims other requests may wait on, all end (#18):
+            // a failed one is logged, not a reason to drop the others.
             while let Some(load) = loads.next().await {
-                match load? {
-                    Some((timestamp, StacLoad::HeldElsewhere)) => held_elsewhere.push(timestamp),
-                    Some(_) => {}
-                    None => expired = true,
+                match load {
+                    Ok(Some((timestamp, StacLoad::HeldElsewhere))) => {
+                        held_elsewhere.push(timestamp)
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => expired = true,
+                    Err(e) if check_deadline().is_err() => {
+                        expired = true;
+                        tracing::warn!(
+                            "[{}] STAC metadata load failed past the query deadline: {e}",
+                            self.collection_id
+                        );
+                    }
+                    Err(e) => return Err(e),
                 }
             }
             Ok((held_elsewhere, expired))

@@ -261,11 +261,12 @@ impl StacClient {
     /// ends there as [`StacListing::Stopped`], without following the `next`
     /// link. On the last page the listing is complete whatever it returns.
     ///
-    /// On a request path, under its `ds_core::deadline` (#18), no page is
-    /// requested and no failed request retried once the deadline has
-    /// passed: the listing is then `DeadlineExceeded`, or the failure the
-    /// last attempt met. A request already sent is answered. A poll has no
-    /// deadline and lists as before.
+    /// On a request path, under its `ds_core::deadline` (#18), a listing does
+    /// not start once the deadline has passed: `DeadlineExceeded`. One that
+    /// started pages to its end within the limits above, as a load in flight
+    /// does, so the caller installs it for the retry: cut at the deadline,
+    /// every retry would list from the first page again and never get past
+    /// it. A poll has no deadline and lists as before.
     pub fn fetch_items_until(
         &self,
         time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -276,14 +277,9 @@ impl StacClient {
         let mut url = self.build_initial_url(time_filter, max_items);
         let mut pages = 0;
         let start_time = Instant::now();
-        let deadline = ds_core::deadline::current();
-        let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        ds_core::deadline::check()?;
 
         loop {
-            if expired() {
-                return Err(DataServerError::DeadlineExceeded);
-            }
-
             if pages >= STAC_MAX_PAGES {
                 tracing::warn!(
                     "STAC pagination limit reached ({} pages), stopping",
@@ -314,11 +310,6 @@ impl StacClient {
 
                 let mut last_err = None;
                 for attempt in 0..max_attempts {
-                    // No retry past the deadline: the failure stands, for
-                    // the circuit breaker to count.
-                    if attempt > 0 && expired() {
-                        break;
-                    }
                     let result = http.get(&url_str).send().await;
                     match result {
                         Ok(response) => {
