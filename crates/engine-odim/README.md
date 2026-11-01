@@ -24,6 +24,18 @@ available.
   skipped, and so are remote objects over 64 MiB. A polar source's catalog
   holds each volume's parsed metadata, never its pixels;
   `pvol_catalog_bytes` estimates its heap.
+- **Observability.** `/metrics` counts a polar source's scans
+  (`pvol_scans_total{result}`, `pvol_last_scan_duration_seconds`), the
+  volumes they take from the parse cache, parse, or fail to read or parse
+  (`pvol_scan_volumes_total{outcome}`), and the catalog's volumes and sites
+  (`pvol_catalog_volumes`, `pvol_catalog_sites`). Each radar site
+  collection reports its newest volume as its data age
+  (`collection_data_age_seconds`, `/health` `data_age_secs`), so a radar
+  that stops publishing shows on the dashboards. Its data age series carry
+  `alerting="false"`: the stale and empty alerts leave radar sites out,
+  since another service runs the radars and takes them down for
+  maintenance, and a source takes no `expected_interval`. Remote polar and
+  composite sources count their bytes in `storage_bytes_read_total`.
 - **Composites (`OdimEngine`).** The filename template (or regex) gives
   each file's time. The newest file is decoded at startup for the grid, CRS
   and extent, so a source with no matching file fails to load. That grid is

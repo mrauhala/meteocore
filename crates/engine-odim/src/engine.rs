@@ -704,6 +704,22 @@ impl OdimEngine {
         self.shutdown.shutdown();
     }
 
+    /// The collection id, for `/metrics` labels.
+    pub fn collection_id(&self) -> &str {
+        &self.collection_id
+    }
+
+    /// The bytes read from the remote store since the engine was built: the
+    /// seed composite, the composites decoded on a cache miss (#193). 0 for
+    /// a local source. The catalog entries' locations share the source's
+    /// store, and with it its byte counter.
+    pub fn storage_bytes_read(&self) -> u64 {
+        match &self.source {
+            Source::Remote { store, .. } | Source::TemplateHttp { store, .. } => store.bytes_read(),
+            Source::Local { .. } => 0,
+        }
+    }
+
     fn poll_once(&self) {
         let prev = self.catalog.load_full();
         // Direct (not `spawn_blocking`) so a remote scan's `ds-storage`
@@ -1652,6 +1668,50 @@ mod tests {
         let source =
             build_source("local-test", Some("/var/lib/radar"), &config).expect("local source");
         assert!(matches!(source, Source::Local { .. }));
+    }
+
+    /// #193: a remote composite source counts the bytes it reads, the seed
+    /// composite at construction and each composite a cache miss decodes,
+    /// for `storage_bytes_read_total`; a cache hit reads nothing, and a
+    /// local source reports none.
+    #[test]
+    fn remote_composites_count_the_bytes_they_read() {
+        let fixture = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/odim-dmi-fixture.h5"),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // A prefix of its own: the composite cache is process-wide and keyed
+        // by the object key, which another test's key must not match.
+        let prefix = dir.path().join("storage-bytes-193");
+        std::fs::create_dir(&prefix).unwrap();
+        for name in ["20260120T1125_radar.h5", "20260120T1130_radar.h5"] {
+            std::fs::write(prefix.join(name), &fixture).unwrap();
+        }
+        let (store, _) =
+            ds_storage::build_store(dir.path().canonicalize().unwrap().to_str().unwrap()).unwrap();
+        let config = config_with(None, None, None, None);
+        let engine = OdimEngine::new_remote_for_test(
+            "comp-bytes",
+            store,
+            "storage-bytes-193/",
+            "reflectivity",
+            "dBZ",
+            &config,
+        )
+        .unwrap();
+        assert_eq!(engine.collection_id(), "comp-bytes");
+        let len = fixture.len() as u64;
+        assert_eq!(engine.storage_bytes_read(), len, "the seed composite");
+
+        let older = engine.catalog.load().first().unwrap().location.clone();
+        engine.load_composite(&older).unwrap();
+        assert_eq!(engine.storage_bytes_read(), 2 * len, "a cache miss");
+        engine.load_composite(&older).unwrap();
+        assert_eq!(engine.storage_bytes_read(), 2 * len, "a cache hit");
+
+        let local = OdimEngine::new("comp-local", prefix.to_str(), &config).unwrap();
+        assert_eq!(local.storage_bytes_read(), 0);
     }
 
     /// `shutdown()` called before `poll_loop()` ever starts must still

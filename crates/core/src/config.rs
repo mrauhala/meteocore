@@ -417,7 +417,9 @@ pub struct CollectionConfig {
 
 /// The engine types whose collections report a data age (`/health`
 /// `data_age_secs`, `collection_data_age_seconds`, #1007) and the
-/// interval their data is expected at (#1375).
+/// interval their data is expected at (#1375). PVOL radar sites report
+/// both too, but the freshness alerts leave them out (#193), so
+/// `odim-volume` takes no `expected_interval` and is not listed.
 pub const DATA_AGE_ENGINES: [&str; 6] = [
     "geotiff",
     "querydata",

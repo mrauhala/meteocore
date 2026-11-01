@@ -1733,6 +1733,58 @@
                                     "name": "panel-73"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 16,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-210"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 16,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-211"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 24,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-212"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 24,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-213"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -10017,7 +10069,7 @@
         "spec": {
           "id": 5,
           "title": "Stale feeds",
-          "description": "Collections whose newest data is older than 1.5 times their own peak age of the day before, and older than 15 min. Data age is a sawtooth with each feed's cadence, so a fixed threshold cannot fit a radar and a model run; yesterday's peak can. Collections younger than a day are not counted. Also counted: collections that hold no data at all (collection_has_data 0), which have no data age: one that never loaded any, or whose data all aged out of its window.",
+          "description": "Collections whose newest data is older than 1.5 times their own peak age of the day before, and older than 15 min. Data age is a sawtooth with each feed's cadence, so a fixed threshold cannot fit a radar and a model run; yesterday's peak can. Collections younger than a day are not counted. Also counted: collections that hold no data at all (collection_has_data 0), which have no data age: one that never loaded any, or whose data all aged out of its window. Radar sites count here too, though the CollectionStale and CollectionEmpty alerts leave them out.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -10629,7 +10681,7 @@
         "spec": {
           "id": 45,
           "title": "Data age by collection",
-          "description": "Seconds since the newest data each collection serves (/health data_age_secs): GeoTIFF newest timestep, QueryData and NetCDF newest run, BUFR newest report, satellite newest scan, nowcast anchor frame. A sawtooth with the feed's cadence is normal. Bad: a line climbing past its usual peak. Negative = the newest data lies in the future. Click a series to filter the dashboard to it. A collection holding no data has no line; the Stale feeds stat counts it.",
+          "description": "Seconds since the newest data each collection serves (/health data_age_secs): GeoTIFF newest timestep, QueryData and NetCDF newest run, BUFR newest report, satellite newest scan, nowcast anchor frame, radar site newest volume. A sawtooth with the feed's cadence is normal. Bad: a line climbing past its usual peak. Negative = the newest data lies in the future. Click a series to filter the dashboard to it. A collection holding no data has no line; the Stale feeds stat counts it.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -22345,7 +22397,7 @@
         "spec": {
           "id": 150,
           "title": "Data age vs expected interval",
-          "description": "Each collection's data age next to the interval its data arrives at (collection_expected_interval_seconds: the median spacing of its newest timesteps or runs, or its expected_interval), how late its data arrives now (collection_expected_delay_seconds: the median of its newest observed arrivals, – until one is observed), the age at which the CollectionStale alert's condition holds and the age over it. The alert counts the lower quartile, over the past day, of the delay merged across instances, so a pod restart keeps its history, so a feed that falls behind and stays behind keeps alerting for about 18 hours, while a few hours of prompt deliveries do not make it stricter: stale at that delay plus 3 intervals, and at least that delay plus an interval + 15 min; no delay in the day, or a negative one, counts as 0. Red from 100 %: the alert fires once that has held for 10 min. A collection with no interval (one timestep and no expected_interval) shows – and is never stale.",
+          "description": "Each collection's data age next to the interval its data arrives at (collection_expected_interval_seconds: the median spacing of its newest timesteps or runs, or its expected_interval), how late its data arrives now (collection_expected_delay_seconds: the median of its newest observed arrivals, – until one is observed), the age at which the CollectionStale alert's condition holds and the age over it. The alert counts the lower quartile, over the past day, of the delay merged across instances, so a pod restart keeps its history, so a feed that falls behind and stays behind keeps alerting for about 18 hours, while a few hours of prompt deliveries do not make it stricter: stale at that delay plus 3 intervals, and at least that delay plus an interval + 15 min; no delay in the day, or a negative one, counts as 0. Red from 100 %: the alert fires once that has held for 10 min. A collection with no interval (one timestep and no expected_interval) shows – and is never stale. Radar sites (alerting=\"false\" series) are drawn too, but the alert leaves them out: another service runs those radars.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -22693,7 +22745,7 @@
         "spec": {
           "id": 151,
           "title": "Data age over stale threshold",
-          "description": "Each collection's data age over the age at which the CollectionStale alert's condition holds: the lower quartile of its delivery delay over the past day, merged across instances, plus 3 times its expected interval, and at least that delay plus the interval + 15 min. A sawtooth below the red line is normal; above it for 10 min the alert fires. Collections without an expected interval have no line. Click a series to filter the dashboard to it.",
+          "description": "Each collection's data age over the age at which the CollectionStale alert's condition holds: the lower quartile of its delivery delay over the past day, merged across instances, plus 3 times its expected interval, and at least that delay plus the interval + 15 min. A sawtooth below the red line is normal; above it for 10 min the alert fires. Collections without an expected interval have no line. Click a series to filter the dashboard to it. Radar sites (alerting=\"false\" series) are drawn too, but the alert leaves them out: another service runs those radars.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -24023,6 +24075,626 @@
                   ]
                 },
                 "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-210": {
+        "kind": "Panel",
+        "spec": {
+          "id": 210,
+          "title": "PVOL scans",
+          "description": "Per polar-volume source, in the trailing hour: scans that built a catalog, its construction scan included, and scans that could not list the source, which keep the previous catalog, so its sites go stale (see the data age). Right axis: the last scan's duration, listing, downloads, parses and the pixel pre-warm. A duration that approaches the poll interval delays every new volume: bound the source with time_window.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (increase(pvol_scans_total{job=~\"$job\", collection=~\"$collection\", result=\"ok\"}[1h]))",
+                        "legendFormat": "{{collection}} scans",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (increase(pvol_scans_total{job=~\"$job\", collection=~\"$collection\", result=\"failed\"}[1h]))",
+                        "legendFormat": "{{collection}} failed scans",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "C",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (collection) (pvol_last_scan_duration_seconds{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}} last scan",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byRegexp",
+                      "options": "/failed scans$/"
+                    },
+                    "properties": [
+                      {
+                        "id": "color",
+                        "value": {
+                          "mode": "fixed",
+                          "fixedColor": "red"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byRegexp",
+                      "options": "/last scan$/"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.axisPlacement",
+                        "value": "right"
+                      },
+                      {
+                        "id": "unit",
+                        "value": "s"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "panel-211": {
+        "kind": "Panel",
+        "spec": {
+          "id": 211,
+          "title": "PVOL parse cache — hit ratio",
+          "description": "Share of the volumes the polar-volume scans go through that the parse cache already holds, so nothing is read: near 1 in steady state, each poll reading only its new volumes. A ratio that stays low means every scan reads volumes again: files that fail to read or parse, or more volumes in the window than max_files keeps, which the cache drops and every scan downloads again (bound the source with time_window). A gap is a time with no scan.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(pvol_scan_volumes_total{job=~\"$job\", collection=~\"$collection\", outcome=\"cached\"}[$__rate_interval])) / (sum by (collection) (rate(pvol_scan_volumes_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval])) > 0)",
+                        "legendFormat": "{{collection}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "percentunit",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 1,
+                  "max": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-212": {
+        "kind": "Panel",
+        "spec": {
+          "id": 212,
+          "title": "PVOL volume reads",
+          "description": "Volumes per minute the polar-volume scans read and parsed, the parse cache's misses, and those whose read failed (a local read error or a failed download) or whose metadata did not parse; a failed volume is read again by every scan. Right axis: bytes per second read from a remote polar-volume source (storage_bytes_read_total, engine_type odim-volume): the scans' downloads with the request-time pixel reads and the CELLS warm-ups.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(pvol_scan_volumes_total{job=~\"$job\", collection=~\"$collection\", outcome=\"parsed\"}[$__rate_interval])) * 60",
+                        "legendFormat": "{{collection}} parsed",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection, outcome) (rate(pvol_scan_volumes_total{job=~\"$job\", collection=~\"$collection\", outcome=~\"read_failed|parse_failed\"}[$__rate_interval])) * 60",
+                        "legendFormat": "{{collection}} {{outcome}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "C",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (rate(storage_bytes_read_total{job=~\"$job\", collection=~\"$collection\", engine_type=\"odim-volume\"}[$__rate_interval]))",
+                        "legendFormat": "{{collection}} remote reads",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "suffix:/min",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 2
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byRegexp",
+                      "options": "/_failed$/"
+                    },
+                    "properties": [
+                      {
+                        "id": "color",
+                        "value": {
+                          "mode": "fixed",
+                          "fixedColor": "red"
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byRegexp",
+                      "options": "/remote reads$/"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.axisPlacement",
+                        "value": "right"
+                      },
+                      {
+                        "id": "unit",
+                        "value": "binBps"
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      "panel-213": {
+        "kind": "Panel",
+        "spec": {
+          "id": 213,
+          "title": "PVOL catalog",
+          "description": "Volumes and radar sites each polar-volume source's catalog holds. The parse cache holds exactly these volumes; their heap is pvol_catalog_bytes (Memory tab). Volumes per site is the animation window, bounded by max_files and time_window.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (collection) (pvol_catalog_volumes{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}} volumes",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (collection) (pvol_catalog_sites{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}} sites",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": [
+                  {
+                    "matcher": {
+                      "id": "byRegexp",
+                      "options": "/sites$/"
+                    },
+                    "properties": [
+                      {
+                        "id": "custom.axisPlacement",
+                        "value": "right"
+                      },
+                      {
+                        "id": "unit",
+                        "value": "short"
+                      }
+                    ]
+                  }
+                ]
               }
             }
           }
