@@ -3772,14 +3772,13 @@ impl PolarVolumeEngine {
         }
     }
 
-    /// Each radar site's data age and expected interval, keyed by `nod`,
-    /// from one catalog snapshot (#193): now minus the site's newest volume
-    /// time, and the spacing of its newest volume times
+    /// Each radar site's data timeline, keyed by `nod`, from one catalog
+    /// snapshot (#193): its newest volume time, which its data age is
+    /// measured from, and the spacing of its newest volume times
     /// ([`ds_core::health::expected_interval`], `None` below two). A site
     /// whose volumes all left the catalog is absent: its collection holds
     /// no data.
-    pub fn site_data_ages(&self) -> HashMap<String, (chrono::Duration, Option<chrono::Duration>)> {
-        let now = Utc::now();
+    pub fn site_timelines(&self) -> HashMap<String, (DateTime<Utc>, Option<chrono::Duration>)> {
         self.catalog
             .load()
             .by_site_meta
@@ -3787,7 +3786,7 @@ impl PolarVolumeEngine {
             .filter_map(|(nod, meta)| {
                 let newest = *meta.times.last()?;
                 let interval = ds_core::health::expected_interval(meta.times.iter().rev().copied());
-                Some((nod.clone(), (now - newest, interval)))
+                Some((nod.clone(), (newest, interval)))
             })
             .collect()
     }
@@ -13352,11 +13351,11 @@ mod tests {
         assert!(engine.storage_bytes_read() >= 2 * len + 16);
     }
 
-    /// #193: each site's data age is now minus its newest volume, with the
-    /// spacing of its newest volumes as its expected interval, `None` for a
-    /// single volume.
+    /// #193: each site's timeline is its newest volume, with the spacing of
+    /// its newest volumes as its expected interval, `None` for a single
+    /// volume.
     #[test]
-    fn site_data_ages_are_each_sites_newest_volume_and_spacing() {
+    fn site_timelines_are_each_sites_newest_volume_and_spacing() {
         let now = Utc::now();
         let at = |minutes_ago: i64, lon: f64, id: &str| {
             let mut volume = synthetic_volume(lon, 60.0);
@@ -13374,15 +13373,12 @@ mod tests {
         );
         by_site.insert("fikor".to_string(), vec![at(30, 21.0, "ages-d")]);
         let engine = engine_for(by_site, "pvol-ages-193");
-        let ages = engine.site_data_ages();
-        assert_eq!(ages.len(), 2, "{ages:?}");
-        let (age, interval) = ages["fivih"];
-        assert!(
-            (chrono::Duration::minutes(10)..chrono::Duration::minutes(11)).contains(&age),
-            "{age}"
-        );
+        let sites = engine.site_timelines();
+        assert_eq!(sites.len(), 2, "{sites:?}");
+        let (newest, interval) = sites["fivih"];
+        assert_eq!(newest, now - chrono::Duration::minutes(10));
         assert_eq!(interval, Some(chrono::Duration::minutes(5)));
-        assert_eq!(ages["fikor"].1, None, "one volume has no spacing");
+        assert_eq!(sites["fikor"].1, None, "one volume has no spacing");
         let metrics = engine.scan_metrics();
         assert_eq!((metrics.volumes, metrics.sites), (4, 2));
     }

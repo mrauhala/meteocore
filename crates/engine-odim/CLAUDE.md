@@ -56,9 +56,10 @@ around `ds-storage` calls (Critical Rules 6–7).
   reads them again and counts them as `parsed`. `storage_bytes_read()` is
   the source store's counter, shared by every clone of the store (pixel
   reads, cell warm-ups), and COMP's `OdimEngine::storage_bytes_read` the
-  same over its catalog's locations. `site_data_ages()` gives each site's
-  data age and measured interval; `admin::collection_data_ages` lists every
-  Ready `{base}-{nod}` health entry, so a site whose volumes all left the
+  same over its catalog's locations. `site_timelines()` gives each site's
+  newest volume time and measured interval; `admin::radar_site_ages` ages
+  them at `collection_data_ages`' one `now` and lists every Ready
+  `{base}-{nod}` health entry, so a site whose volumes all left the
   catalog reports `collection_has_data` 0. Radar sites never alert: their
   data age series carry `alerting="false"` and the rules exclude it, so
   `odim-volume` is not in `DATA_AGE_ENGINES` and takes no

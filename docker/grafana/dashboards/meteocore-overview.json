@@ -1537,6 +1537,19 @@
                                     "name": "panel-151"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 26,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-190"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -22384,7 +22397,7 @@
         "spec": {
           "id": 150,
           "title": "Data age vs expected interval",
-          "description": "Each collection's data age next to the interval its data arrives at (collection_expected_interval_seconds: the median spacing of its newest timesteps or runs, or its expected_interval), the age at which the CollectionStale alert's condition holds (3 intervals, and at least an interval + 15 min) and the age over it. Red from 100 %: the alert fires once that has held for 10 min. A collection with no interval (one timestep and no expected_interval) shows – and is never stale. Radar sites (alerting=\"false\" series) are drawn too, but the alert leaves them out: another service runs those radars.",
+          "description": "Each collection's data age next to the interval its data arrives at (collection_expected_interval_seconds: the median spacing of its newest timesteps or runs, or its expected_interval), how late its data arrives now (collection_expected_delay_seconds: the median of its newest observed arrivals, – until one is observed), the age at which the CollectionStale alert's condition holds and the age over it. The alert counts the lower quartile, over the past day, of the delay merged across instances, so a pod restart keeps its history, so a feed that falls behind and stays behind keeps alerting for about 18 hours, while a few hours of prompt deliveries do not make it stricter: stale at that delay plus 3 intervals, and at least that delay plus an interval + 15 min; no delay in the day, or a negative one, counts as 0. Red from 100 %: the alert fires once that has held for 10 min. A collection with no interval (one timestep and no expected_interval) shows – and is never stale. Radar sites (alerting=\"false\" series) are drawn too, but the alert leaves them out: another service runs those radars.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -22439,6 +22452,29 @@
                 {
                   "kind": "PanelQuery",
                   "spec": {
+                    "refId": "E",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (collection) (collection_expected_delay_seconds{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "",
+                        "format": "table",
+                        "range": false,
+                        "instant": true,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
                     "refId": "C",
                     "hidden": false,
                     "query": {
@@ -22449,7 +22485,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "max by (collection) ((3 * collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} > collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900) or (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900))",
+                        "expr": "max by (collection) (((3 * collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} > collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900) or (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900)) + on (job, collection) group_left () (clamp_min(quantile_over_time(0.25, max by (job, collection) (collection_expected_delay_seconds{job=~\"$job\", collection=~\"$collection\"})[1d:5m]), 0) or max by (job, collection) (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} * 0)))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -22472,7 +22508,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "max by (collection) (collection_data_age_seconds{job=~\"$job\", collection=~\"$collection\"}) / max by (collection) ((3 * collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} > collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900) or (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900))",
+                        "expr": "max by (collection) (collection_data_age_seconds{job=~\"$job\", collection=~\"$collection\"}) / max by (collection) (((3 * collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} > collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900) or (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900)) + on (job, collection) group_left () (clamp_min(quantile_over_time(0.25, max by (job, collection) (collection_expected_delay_seconds{job=~\"$job\", collection=~\"$collection\"})[1d:5m]), 0) or max by (job, collection) (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} * 0)))",
                         "legendFormat": "",
                         "format": "table",
                         "range": false,
@@ -22506,13 +22542,15 @@
                         "collection": 0,
                         "Value #A": 1,
                         "Value #B": 2,
-                        "Value #C": 3,
-                        "Value #D": 4
+                        "Value #E": 3,
+                        "Value #C": 4,
+                        "Value #D": 5
                       },
                       "renameByName": {
                         "collection": "Collection",
                         "Value #A": "Age",
                         "Value #B": "Expected interval",
+                        "Value #E": "Expected delay",
                         "Value #C": "Stale at",
                         "Value #D": "vs stale"
                       }
@@ -22625,6 +22663,22 @@
                   {
                     "matcher": {
                       "id": "byName",
+                      "options": "Expected delay"
+                    },
+                    "properties": [
+                      {
+                        "id": "unit",
+                        "value": "s"
+                      },
+                      {
+                        "id": "decimals",
+                        "value": 1
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
                       "options": "Stale at"
                     },
                     "properties": [
@@ -22691,7 +22745,7 @@
         "spec": {
           "id": 151,
           "title": "Data age over stale threshold",
-          "description": "Each collection's data age over the age at which the CollectionStale alert's condition holds: 3 times its expected interval, and at least the interval + 15 min. A sawtooth below the red line is normal; above it for 10 min the alert fires. Collections without an expected interval have no line. Click a series to filter the dashboard to it. Radar sites (alerting=\"false\" series) are drawn too, but the alert leaves them out: another service runs those radars.",
+          "description": "Each collection's data age over the age at which the CollectionStale alert's condition holds: the lower quartile of its delivery delay over the past day, merged across instances, plus 3 times its expected interval, and at least that delay plus the interval + 15 min. A sawtooth below the red line is normal; above it for 10 min the alert fires. Collections without an expected interval have no line. Click a series to filter the dashboard to it. Radar sites (alerting=\"false\" series) are drawn too, but the alert leaves them out: another service runs those radars.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -22710,7 +22764,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "max by (collection) (collection_data_age_seconds{job=~\"$job\", collection=~\"$collection\"}) / max by (collection) ((3 * collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} > collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900) or (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900))",
+                        "expr": "max by (collection) (collection_data_age_seconds{job=~\"$job\", collection=~\"$collection\"}) / max by (collection) (((3 * collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} > collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900) or (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} + 900)) + on (job, collection) group_left () (clamp_min(quantile_over_time(0.25, max by (job, collection) (collection_expected_delay_seconds{job=~\"$job\", collection=~\"$collection\"})[1d:5m]), 0) or max by (job, collection) (collection_expected_interval_seconds{job=~\"$job\", collection=~\"$collection\"} * 0)))",
                         "legendFormat": "{{collection}}",
                         "range": true,
                         "instant": false,
@@ -23912,6 +23966,115 @@
                     ]
                   }
                 ]
+              }
+            }
+          }
+        }
+      },
+      "panel-190": {
+        "kind": "Panel",
+        "spec": {
+          "id": 190,
+          "title": "Delivery delay by collection",
+          "description": "How late each collection's data arrives (collection_expected_delay_seconds): the median, over the newest 24 arrivals the server observed, of the time it first served a timestep minus that timestep's timestamp, the engine's poll included. CollectionStale adds its lower quartile over the past day, merged across instances, to its threshold, so a feed published half an hour late is not stale for being half an hour old, while one that falls further behind keeps alerting for about 18 hours though this line follows it. No line until a timestep arrives after the server starts; a rebuilt engine keeps the collection's earlier arrivals. Flat through an outage, since only arrivals move it; a step up means the feed now arrives later. Negative: data that arrives ahead of its timestamp, which the alert counts as no delay. Click a series to filter the dashboard to it.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (collection) (collection_expected_delay_seconds{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "lastNotNull",
+                    "max"
+                  ],
+                  "sortBy": "Last *",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "s",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [
+                    {
+                      "title": "Filter dashboard to ${__field.labels.collection}",
+                      "url": "/d/meteocore-overview/meteocore?${__url_time_range}&${job:queryparam}&${api:queryparam}&${cache:queryparam}&var-collection=${__field.labels.collection}&dtab=storage-sources"
+                    }
+                  ]
+                },
+                "overrides": []
               }
             }
           }

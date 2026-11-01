@@ -547,12 +547,18 @@ impl NetcdfEngine {
     /// Age of the newest data, for `/health`'s `data_age_secs`: the newest
     /// run's reference time, or the newest valid time without runs.
     pub fn data_age(&self) -> Option<chrono::Duration> {
+        self.newest_time().map(|newest| Utc::now() - newest)
+    }
+
+    /// The instant [`Self::data_age`] is measured from; the server times
+    /// its arrival for the `collection_expected_delay_seconds` gauge
+    /// (#1389).
+    pub fn newest_time(&self) -> Option<DateTime<Utc>> {
         let catalog = self.catalog.load();
-        let newest = match catalog.runs.last_key_value()? {
-            (Some(reference_time), _) => *reference_time,
-            (None, run) => *run.steps.last_key_value()?.0,
-        };
-        Some(Utc::now() - newest)
+        match catalog.runs.last_key_value()? {
+            (Some(reference_time), _) => Some(*reference_time),
+            (None, run) => run.steps.last_key_value().map(|(time, _)| *time),
+        }
     }
 
     /// The spacing of the timeline [`Self::data_age`] is measured on, for

@@ -241,7 +241,9 @@ public.
   something else scrapes the pods. Add the labels your Prometheus selects
   rules on in `prometheusRule.labels`. To change a threshold, leave this off
   and deploy an edited copy of the file. Routing the alerts is up to your
-  Alertmanager.
+  Alertmanager. `CollectionStale` allows for the lower quartile of each
+  collection's delivery delay over the past day, merged across pods, so
+  a restarted pod's new `instance` label keeps that history.
 - `grafanaDashboard.enabled` puts the repository's dashboard,
   `docker/grafana/dashboards/meteocore-overview.json`, in a ConfigMap
   labelled `grafana_dashboard: "1"` for the Grafana sidecar. It is a

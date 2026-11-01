@@ -41,26 +41,69 @@ groups:
     rules:
       # The data age is now minus the newest data a collection serves; the
       # expected interval is the spacing of its newest timesteps or runs, or
-      # its expected_interval. Stale: 3 intervals old, and at least 15
-      # minutes past one interval, so a feed every minute is not stale after
-      # three. A collection with no interval series (a single timestep and
-      # no expected_interval) never matches. Series labelled
-      # alerting="false" are left out here and in CollectionEmpty: radar
-      # sites, whose radars another service runs and takes down for
-      # maintenance.
+      # its expected_interval; the expected delay is how late its data
+      # arrives, the median over the newest arrivals the server saw (#1389).
+      # The age includes that delay, so a feed published half an hour late
+      # is half an hour old when it lands. Stale: the delay plus 3 intervals
+      # old, and at least the delay plus an interval plus 15 minutes, so a
+      # feed every minute is not stale after three.
+      #
+      # The delay counted is the lower quartile, over the past day, of the
+      # gauge merged across instances (the highest at each 5 minutes): one
+      # feed's delay, whichever pod or replica measured it, so a restart
+      # under a new instance label keeps the history. The median follows
+      # the newest arrivals, so a feed that keeps delivering but later and
+      # later would teach it the new delay and go quiet while behind. The
+      # day's lower quartile keeps such a feed alerting for about 18 hours,
+      # until three quarters of the day saw the new delay, and keeps a
+      # backlog trickling in after an outage from loosening the threshold.
+      # Unlike the day's minimum, it ignores a spell of prompt deliveries
+      # shorter than about 6 hours, which would otherwise make the next day
+      # stricter. With no delay series in the day, the rule counts no
+      # delay, nor for data that arrives ahead of its timestamp. A
+      # collection with no interval series (a single timestep and no
+      # expected_interval) never matches. Nor does a collection a reload
+      # removed, whose delay history lingers for a day; re-added under the
+      # same id within that day, it takes the history up again.
+      #
+      # Series labelled alerting="false" are left out here and in
+      # CollectionEmpty: radar sites (#193), whose radars another service
+      # runs and takes down for maintenance. They have no delay series.
       - alert: CollectionStale
         expr: |
           collection_data_age_seconds{job="meteocore", alerting!="false"}
             >= 3 * collection_expected_interval_seconds{job="meteocore", alerting!="false"}
+              + on (job, collection) group_left ()
+              (
+                  clamp_min(
+                    quantile_over_time(0.25,
+                      max by (job, collection) (collection_expected_delay_seconds{job="meteocore"})[1d:5m]
+                    ),
+                    0
+                  )
+                or
+                  max by (job, collection) (collection_expected_interval_seconds{job="meteocore", alerting!="false"} * 0)
+              )
           and
           collection_data_age_seconds{job="meteocore", alerting!="false"}
             >= collection_expected_interval_seconds{job="meteocore", alerting!="false"} + 900
+              + on (job, collection) group_left ()
+              (
+                  clamp_min(
+                    quantile_over_time(0.25,
+                      max by (job, collection) (collection_expected_delay_seconds{job="meteocore"})[1d:5m]
+                    ),
+                    0
+                  )
+                or
+                  max by (job, collection) (collection_expected_interval_seconds{job="meteocore", alerting!="false"} * 0)
+              )
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Collection {{ $labels.collection }} is stale"
-          description: "The newest data {{ $labels.collection }} serves is {{ $value | humanizeDuration }} old, over 3 times the interval its data arrives at."
+          description: "The newest data {{ $labels.collection }} serves is {{ $value | humanizeDuration }} old, over its usual delivery delay plus 3 times the interval its data arrives at."
 
       # A collection that never loaded data, or whose data all aged out of
       # its window, has no data age series: collection_has_data says so.

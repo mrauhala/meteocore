@@ -2,6 +2,7 @@ mod admin;
 mod auto;
 mod cache_plan;
 mod colormaps;
+mod delivery_delay;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc;
 mod memory_plan;
@@ -804,6 +805,7 @@ async fn serve(cli: CliArgs) {
         ),
         engine_handles: RwLock::new(result.engines_by_id),
         wind_handles: RwLock::new(result.wind_by_id),
+        delivery_delays: Default::default(),
     });
 
     // The memory plan (#1306): what every cache and budget holds and why.
@@ -813,6 +815,12 @@ async fn serve(cli: CliArgs) {
     let recovery_state = server_state.clone();
     poll_runtime().spawn(async move {
         admin::radar_recovery_loop(recovery_state).await;
+    });
+    // Each collection's delivery delay (#1389): its first observation, now
+    // that every engine is loaded, is the baseline.
+    let delay_state = server_state.clone();
+    poll_runtime().spawn(async move {
+        admin::delivery_delay_loop(delay_state).await;
     });
 
     // Start the config-directory watcher (issues #318, #571) if enabled.
