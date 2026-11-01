@@ -288,11 +288,17 @@ pub fn parse_wgrib2_step(desc: &str) -> Option<(u32, StepKind)> {
 /// Returns `None` if the input is empty, if no messages could be parsed, or
 /// if the reference times across records are inconsistent.
 ///
-/// On success, messages are sorted by ascending byte offset, and all but the
-/// last record have a concrete length computed from the next-record offset.
+/// On success, messages are sorted by ascending byte offset, and each has a
+/// concrete length running to the next record's offset, skipped records
+/// included; only a message at the index's last offset has none.
 pub fn parse_wgrib2(content: &str) -> Option<WgribIndexResult> {
     let mut reference_time: Option<DateTime<Utc>> = None;
     let mut records: Vec<(u32, ParsedMessage)> = Vec::new();
+    // Where every record starts, kept or skipped: a message ends where the
+    // next record in the file starts. Measured to the next KEPT record, a
+    // message followed by skipped ones spans them too: GFS GUST:surface,
+    // followed by the fractional-mb levels, became 65 MB instead of 0.6 MB.
+    let mut starts: Vec<u64> = Vec::new();
 
     for (line_no, raw) in content.lines().enumerate() {
         let line = raw.trim();
@@ -350,6 +356,7 @@ pub fn parse_wgrib2(content: &str) -> Option<WgribIndexResult> {
                 continue;
             }
         };
+        starts.push(byte_offset);
 
         let parsed_ref = match parse_wgrib2_ref_time(ref_time_token) {
             Some(t) => t,
@@ -424,8 +431,7 @@ pub fn parse_wgrib2(content: &str) -> Option<WgribIndexResult> {
     records.sort_by_key(|(_, m)| m.offset);
 
     // Deduplicate by offset: if two records share the same offset, keep the
-    // first and warn. This also prevents zero-length entries from appearing
-    // in the length-computation step.
+    // first and warn.
     let mut deduped: Vec<(u32, ParsedMessage)> = Vec::with_capacity(records.len());
     for rec in records.into_iter() {
         if let Some(last) = deduped.last() {
@@ -446,20 +452,20 @@ pub fn parse_wgrib2(content: &str) -> Option<WgribIndexResult> {
         return None;
     }
 
-    // Compute lengths from successive offsets.
-    let n = deduped.len();
-    for i in 0..n.saturating_sub(1) {
-        let this_offset = deduped[i].1.offset;
-        let next_offset = deduped[i + 1].1.offset;
-        let length = next_offset.saturating_sub(this_offset);
-        if length == 0 {
-            // Should have been caught by dedup, but guard anyway.
-            tracing::warn!(
-                "wgrib2_index: zero-length message at offset {}, rejecting file",
-                this_offset
-            );
-            return None;
-        }
+    // Compute lengths from the next record's offset, skipped records
+    // included.
+    starts.sort_unstable();
+    starts.dedup();
+    for (_, message) in deduped.iter_mut() {
+        let this_offset = message.offset;
+        let next = starts.partition_point(|&start| start <= this_offset);
+        let Some(&next_offset) = starts.get(next) else {
+            // The index's last record: its length stays None and is
+            // resolved later by the engine via a HEAD request on the data
+            // file.
+            continue;
+        };
+        let length = next_offset - this_offset;
         if length > MAX_MESSAGE_LEN {
             tracing::warn!(
                 "wgrib2_index: implausible message length {} at offset {}, rejecting file",
@@ -468,10 +474,8 @@ pub fn parse_wgrib2(content: &str) -> Option<WgribIndexResult> {
             );
             return None;
         }
-        deduped[i].1.length = Some(length);
+        message.length = Some(length);
     }
-    // The last record's length stays None and will be resolved later by
-    // the engine via a HEAD request on the data file.
 
     let messages: Vec<ParsedMessage> = deduped.into_iter().map(|(_, m)| m).collect();
 
@@ -786,6 +790,58 @@ mod tests {
         assert_eq!(result.messages[3].length, None);
     }
 
+    #[test]
+    fn skipped_records_end_the_message_before_them() {
+        // GFS pgrb2.0p25 f006 (testdata/gfs): GUST:surface is followed by the
+        // fractional-mb levels, which the parser skips. GUST ends where the
+        // next record starts, 0.6 MB on, not at the next record kept, 68 MB
+        // on.
+        let input = "\
+13:5496266:d=2026040800:VRATE:planetary boundary layer:6 hour fcst:
+14:5816976:d=2026040800:GUST:surface:6 hour fcst:
+15:6442587:d=2026040800:HGT:0.01 mb:6 hour fcst:
+16:7422488:d=2026040800:TMP:0.01 mb:6 hour fcst:
+95:73634506:d=2026040800:HGT:1 mb:6 hour fcst:
+";
+        let result = parse_wgrib2(input).expect("should parse");
+        let names: Vec<_> = result
+            .messages
+            .iter()
+            .map(|m| m.short_name.as_str())
+            .collect();
+        assert_eq!(names, ["VRATE", "GUST", "HGT"]);
+        assert_eq!(result.messages[0].length, Some(5816976 - 5496266));
+        assert_eq!(result.messages[1].length, Some(6442587 - 5816976));
+        assert_eq!(result.messages[2].length, None);
+    }
+
+    #[test]
+    fn last_kept_record_before_skipped_ones_has_a_length() {
+        // GFS ends with PV-surface records, which the parser skips: the last
+        // record kept ends where they start, and no record is left without
+        // a length.
+        let input = "\
+731:522794567:d=2026040800:ICETMP:surface:6 hour fcst:
+732:522990002:d=2026040800:UGRD:PV=2e-06 (Km^2/kg/s) surface:6 hour fcst:
+733:523655849:d=2026040800:VGRD:PV=2e-06 (Km^2/kg/s) surface:6 hour fcst:
+";
+        let result = parse_wgrib2(input).expect("should parse");
+        assert_eq!(result.messages.len(), 1);
+        assert_eq!(result.messages[0].length, Some(522990002 - 522794567));
+
+        // A record skipped for its time descriptor bounds the one before it
+        // the same way.
+        let input = "\
+1:0:d=2026040800:TMP:2 m above ground:6 hour fcst:
+2:1000:d=2026040800:TMP:2 m above ground:7 day fcst:
+3:5000:d=2026040800:RH:2 m above ground:6 hour fcst:
+";
+        let result = parse_wgrib2(input).expect("should parse");
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0].length, Some(1000));
+        assert_eq!(result.messages[1].length, None);
+    }
+
     // ---------- Aggregate mixing ----------
 
     #[test]
@@ -958,8 +1014,8 @@ garbage line with no colons
         assert_eq!(result.messages.len(), 2);
         assert_eq!(result.messages[0].short_name, "TMP");
         assert_eq!(result.messages[1].short_name, "TMP");
-        // Because the middle record was dropped, the first TMP spans from
-        // 0 to 2000.
-        assert_eq!(result.messages[0].length, Some(2000));
+        // The middle record is dropped, but the first TMP still ends where
+        // it starts.
+        assert_eq!(result.messages[0].length, Some(1000));
     }
 }

@@ -76,26 +76,36 @@ fn parses_real_gfs_fixture() {
         .iter()
         .any(|m| matches!(m.step_kind, StepKind::Average { .. })));
 
-    // Lengths are consistent: all but the last record must have a concrete
-    // length, and all concrete lengths are strictly positive.
-    let mut unset_count = 0;
+    // Every message ends where the next record of the index starts, the
+    // records the parser skips included (fractional-mb levels, PV
+    // surfaces): measured to the next record kept, GUST:surface spanned the
+    // 0.01-0.7 mb levels after it, 68 MB instead of 0.6 MB. Only a message
+    // at the index's last offset has no length.
+    let mut starts: Vec<u64> = content
+        .lines()
+        .filter_map(|line| line.split(':').nth(1)?.parse().ok())
+        .collect();
+    starts.sort_unstable();
     for m in &parsed.messages {
-        match m.length {
-            Some(l) => assert!(l > 0, "length must be positive"),
-            None => unset_count += 1,
-        }
+        let next = starts.iter().copied().find(|&start| start > m.offset);
+        assert_eq!(
+            m.length,
+            next.map(|next| next - m.offset),
+            "{} {:?} {:?} at offset {}",
+            m.short_name,
+            m.levtype,
+            m.level,
+            m.offset
+        );
     }
-    assert_eq!(
-        unset_count, 1,
-        "exactly one record (the last) should have an unresolved length"
-    );
-    // The unresolved record must be the one with the largest offset.
-    let max_offset_idx = parsed
+    let gust = parsed
         .messages
         .iter()
-        .enumerate()
-        .max_by_key(|(_, m)| m.offset)
-        .map(|(i, _)| i)
-        .unwrap();
-    assert!(parsed.messages[max_offset_idx].length.is_none());
+        .find(|m| m.short_name == "GUST" && m.levtype == "sfc")
+        .expect("GUST at the surface must be present");
+    assert!(
+        gust.length.is_some_and(|l| l < 2_000_000),
+        "GUST:surface is about 0.6 MB, got {:?}",
+        gust.length
+    );
 }

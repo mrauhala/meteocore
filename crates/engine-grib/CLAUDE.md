@@ -37,7 +37,11 @@ unlike GeoTIFF's one band per collection.
 - **Index formats** via `index_format`: `"ecmwf-json"` (default, JSON-lines
   as shipped by ECMWF open data) and `"wgrib2"` (colon-separated text as
   shipped by NOAA GFS).
-- Wgrib2 indexes carry only byte offsets — the last record's length is
+- Wgrib2 indexes carry only byte offsets. A message ends where the next
+  record of the index starts, a record the parser skips (fractional-mb
+  levels, PV surfaces) included: measured to the next record kept, GFS
+  GUST:surface was 68 MB instead of 0.6 MB, and every cold GUST tile
+  missed its deadline (#1390). The last record's length is
   resolved via `DataStore::head()` on a full-field fetch. A failed HEAD/read is not cached
   and remains retryable; scanning does not issue a HEAD per index.
 - Fetch new indexes through `DataStore::get_many` in chunks of at most eight.
