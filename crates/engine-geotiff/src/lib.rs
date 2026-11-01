@@ -771,8 +771,18 @@ impl GeoTiffEngine {
     /// when the newest timestep lies in the future; `None` while the
     /// catalog is empty.
     pub fn data_age(&self) -> Option<chrono::Duration> {
-        let newest = *self.catalog.load().live().next_back()?.0;
-        Some(Utc::now() - newest)
+        self.newest_time().map(|newest| Utc::now() - newest)
+    }
+
+    /// The newest timestamp in the catalog, which [`Self::data_age`] is
+    /// measured from; the server times its arrival for the
+    /// `collection_expected_delay_seconds` gauge (#1389).
+    pub fn newest_time(&self) -> Option<DateTime<Utc>> {
+        self.catalog
+            .load()
+            .live()
+            .next_back()
+            .map(|(time, _)| *time)
     }
 
     /// The spacing of the newest timesteps [`Self::data_age`] is measured

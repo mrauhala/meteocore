@@ -41,23 +41,39 @@ groups:
     rules:
       # The data age is now minus the newest data a collection serves; the
       # expected interval is the spacing of its newest timesteps or runs, or
-      # its expected_interval. Stale: 3 intervals old, and at least 15
-      # minutes past one interval, so a feed every minute is not stale after
-      # three. A collection with no interval series (a single timestep and
-      # no expected_interval) never matches.
+      # its expected_interval; the expected delay is how late its data
+      # arrives, the median over the newest arrivals the server saw (#1389).
+      # The age includes that delay, so a feed published half an hour late
+      # is half an hour old when it lands. Stale: the delay plus 3 intervals
+      # old, and at least the delay plus an interval plus 15 minutes, so a
+      # feed every minute is not stale after three. A collection with no
+      # delay series (no arrival seen since the server started) counts no
+      # delay, nor does data that arrives ahead of its timestamp. A
+      # collection with no interval series (a single timestep and no
+      # expected_interval) never matches.
       - alert: CollectionStale
         expr: |
           collection_data_age_seconds{job="meteocore"}
             >= 3 * collection_expected_interval_seconds{job="meteocore"}
+              + (
+                  clamp_min(collection_expected_delay_seconds{job="meteocore"}, 0)
+                or
+                  collection_expected_interval_seconds{job="meteocore"} * 0
+              )
           and
           collection_data_age_seconds{job="meteocore"}
             >= collection_expected_interval_seconds{job="meteocore"} + 900
+              + (
+                  clamp_min(collection_expected_delay_seconds{job="meteocore"}, 0)
+                or
+                  collection_expected_interval_seconds{job="meteocore"} * 0
+              )
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "Collection {{ $labels.collection }} is stale"
-          description: "The newest data {{ $labels.collection }} serves is {{ $value | humanizeDuration }} old, over 3 times the interval its data arrives at."
+          description: "The newest data {{ $labels.collection }} serves is {{ $value | humanizeDuration }} old, over its usual delivery delay plus 3 times the interval its data arrives at."
 
       # A collection that never loaded data, or whose data all aged out of
       # its window, has no data age series: collection_has_data says so.
