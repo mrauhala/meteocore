@@ -441,9 +441,11 @@ fn changed_coordinates_and_apis_reuse_messages_when_decoded_grids_do_not_fit() {
         // One global decoded field is already larger than this grid cache.
         let (_source, owner, observed) = forecast(6, 1, message_mb, index_mb, Duration::ZERO);
         let engine = owner.level_collections().remove(0);
+        let mut gets = Vec::new();
         for (lon, lat) in [(25.0, 60.0), (28.0, 63.0)] {
             let samples = sample(&engine, &format!("POINT({lon} {lat})"));
             assert_eq!(samples, vec![expected.bilinear_value(lon, lat); 6]);
+            gets.push(take_gets(&observed));
         }
         assert_eq!(engine.grid_cache_utilization().0, 0);
         // The full decode reads each field around the grid cache: a bypass,
@@ -459,11 +461,39 @@ fn changed_coordinates_and_apis_reuse_messages_when_decoded_grids_do_not_fit() {
         let read = owner.storage_bytes_read();
         let message = ECMWF.len() as u64;
         if message_mb == 0 && index_mb > 0 {
-            // Without a message cache the second coordinate fetches only the
-            // RSIs it needs, one range GET per field (#1301).
+            // Without a message cache each field is one GET per coordinate
+            // (#1301), of a file holding `q` first. The first coordinate
+            // finds nothing indexed: a field reads its whole message until
+            // another notes its index, then a prefix predicted from that
+            // index. How many of the six concurrent fields read whole
+            // depends on the order they start and finish in (#1387); the
+            // first to start finds no index, so at least one does. Every
+            // prefix is predicted from that complete index of an identical
+            // message: all are one length, and none needs a continuation.
+            let [mut first, second] = <[_; 2]>::try_from(gets).unwrap();
+            first.sort_by_key(|range| range.end);
+            let whole = first.iter().filter(|&range| *range == (0..message)).count();
+            assert!(whole >= 1, "{first:?}");
+            let prefix = first[0].end;
+            let mut fetched = vec![0..prefix; 6 - whole];
+            fetched.extend(vec![0..message; whole]);
+            assert_eq!(first, fetched);
+            // The second fetches only the RSIs it needs, one range GET per
+            // field, the same however the first read the field: a prefix
+            // through 60°N indexes 63°N, which the north-to-south scan
+            // reaches first.
+            let rsis = second[0].clone();
+            assert_eq!(second, vec![rsis.clone(); 6]);
             assert!(
-                read > 6 * message && read < 6 * message + 6 * 16384,
-                "{read}"
+                !rsis.is_empty() && rsis.end <= prefix && rsis.end - rsis.start < 16384,
+                "{rsis:?}"
+            );
+            // Whatever the order: one whole message and five prefixes at
+            // the least, six whole messages at the most, then the RSIs.
+            let whole = whole as u64;
+            assert_eq!(
+                read,
+                whole * message + (6 - whole) * prefix + 6 * (rsis.end - rsis.start)
             );
         } else {
             assert_eq!(read, downloads * message);
@@ -513,6 +543,17 @@ fn changed_coordinates_and_apis_reuse_messages_when_decoded_grids_do_not_fit() {
             assert!(metrics.bytes <= metrics.capacity_bytes);
         }
     }
+}
+
+/// The byte range of each GET `observed` served since the last call.
+fn take_gets(observed: &TestStore) -> Vec<std::ops::Range<u64>> {
+    std::mem::take(&mut observed.reads.lock().unwrap().ranges)
+        .into_iter()
+        .map(|(path, range)| match range {
+            Some(ds_storage::object_store::GetRange::Bounded(range)) => range,
+            range => panic!("{path}: {range:?}"),
+        })
+        .collect()
 }
 
 #[test]

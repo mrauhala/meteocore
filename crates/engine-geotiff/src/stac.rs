@@ -260,6 +260,13 @@ impl StacClient {
     /// items; when it returns `true` and another page is left, the listing
     /// ends there as [`StacListing::Stopped`], without following the `next`
     /// link. On the last page the listing is complete whatever it returns.
+    ///
+    /// On a request path, under its `ds_core::deadline` (#18), a listing does
+    /// not start once the deadline has passed: `DeadlineExceeded`. One that
+    /// started pages to its end within the limits above, as a load in flight
+    /// does, so the caller installs it for the retry: cut at the deadline,
+    /// every retry would list from the first page again and never get past
+    /// it. A poll has no deadline and lists as before.
     pub fn fetch_items_until(
         &self,
         time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -270,6 +277,7 @@ impl StacClient {
         let mut url = self.build_initial_url(time_filter, max_items);
         let mut pages = 0;
         let start_time = Instant::now();
+        ds_core::deadline::check()?;
 
         loop {
             if pages >= STAC_MAX_PAGES {

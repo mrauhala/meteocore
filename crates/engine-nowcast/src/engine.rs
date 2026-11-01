@@ -522,9 +522,14 @@ impl NowcastEngine {
 
     /// Age of the latest generation's anchor frame (health `data_age_secs`).
     pub fn catalog_age(&self) -> Option<chrono::Duration> {
-        let state = self.state.load();
-        let (&latest, _) = state.generations.iter().next_back()?;
-        Some(Utc::now() - latest)
+        self.newest_time().map(|latest| Utc::now() - latest)
+    }
+
+    /// The latest generation's anchor frame, which [`Self::catalog_age`]
+    /// is measured from; the server times its arrival for the
+    /// `collection_expected_delay_seconds` gauge (#1389).
+    pub fn newest_time(&self) -> Option<DateTime<Utc>> {
+        self.state.load().generations.keys().next_back().copied()
     }
 
     /// The spacing of the newest generations' anchor frames, the timeline

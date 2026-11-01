@@ -156,6 +156,24 @@ apply here.
   scan only for the same object (`Catalog::keep_loads_from`: href and
   `file:size`); a stub of another item at that timestep stays a stub and
   loads afresh (#1055).
+- **Request deadlines (#18):** a wait on another loader's claim
+  (`InFlightLoads::wait_then_claim`, from `ensure_metadata`) ends at the
+  request's `ds_core::deadline` with `DeadlineExceeded` and no claim, so
+  that load goes on and installs for the retry; without a deadline it waits
+  up to `CONCURRENT_LOAD_WAIT` as before. A render's deadline (3 s by
+  default) is shorter than that 10 s, so a render never takes over a stuck
+  load: its frame is a 503 until the loader's own HTTP timeouts (30 s per
+  request) end the load; an EDR query's 30 s still takes over at 10 s. Past the
+  deadline nothing new starts: no load is claimed and no on-demand listing
+  begins (`StacClient::fetch_items_until`), which counts no circuit-breaker
+  failure. What started runs to its end within its own limits and installs
+  for the retry: a claimed load (the metadata fetch has no deadline), a
+  query's cold loads in flight, which one failing does not drop, and a
+  listing that began. Never cut a listing at the deadline: each retry would list
+  from the first page again and never get past it. The client has its 504
+  or 503 from the executor at the deadline; this only holds the worker. EDR
+  position and area check the deadline before each file and a render before
+  it decodes: a local read checks none of its own.
 
 ## Decode admission
 

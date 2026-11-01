@@ -453,6 +453,7 @@ pub(crate) mod tests {
             ),
             engine_handles: RwLock::new(result.engines_by_id),
             wind_handles: RwLock::new(result.wind_by_id),
+            delivery_delays: Default::default(),
         });
         crate::cache_plan::register_render_caches(&state);
         state
