@@ -1,7 +1,7 @@
-//! The retained frames' bytes (`NowcastEngine::frame_bytes`, the
+//! The held frames' bytes (`NowcastEngine::frame_bytes`, the
 //! `nowcast_frame_bytes` gauge, #1307) against the heap the retained
-//! generations hold, measured with a counting allocator. One test: every
-//! thread's allocations count.
+//! generations and the skill ring (#648) hold, measured with a counting
+//! allocator. One test: every thread's allocations count.
 
 use std::sync::{Arc, RwLock};
 
@@ -120,12 +120,14 @@ fn frame_bytes_match_the_heap_the_generations_hold() {
     let held = (Counting::live() - before) as f64;
     let (_, failures, _, _, retained, frames) = engine.metrics();
     assert_eq!((failures, retained), (0, 3));
-    // Exact: 1 byte per pixel, the analysis frame and 12 leads, three times.
+    // Exact: 1 byte per pixel, the analysis frame and 12 leads, three times,
+    // plus the skill ring (#648): the first generation's +30 and +60 frames
+    // and the analysis both were issued from, held until 12:35 and 13:05.
     assert_eq!(frames, 13);
-    assert_eq!(engine.frame_bytes(), 3 * 13 * u64::from(W * H));
+    assert_eq!(engine.frame_bytes(), (3 * 13 + 3) * u64::from(W * H));
 
-    // The frames are what the retained state holds; motion fields, cells
-    // and metadata are the rest.
+    // The frames are what the retained state and the ring hold; motion
+    // fields, cells and metadata are the rest.
     let estimate = engine.frame_bytes() as f64;
     println!(
         "nowcast: held {held} bytes, frames {estimate} ({:+.1} %)",

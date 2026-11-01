@@ -2931,7 +2931,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `wis2_dedup_entries` | gauge | collection | data_ids a WIS2 subscription's duplicate filter remembers, at most 200 000 |
 | `wis2_dedup_bytes` | gauge | collection | Estimated heap of the duplicate filter |
 | `cap_alert_bytes` | gauge | collection, part | Estimated heap of a CAP collection: `accumulator` (WIS2 mode), `catalog`, `geocode` (with `geocode_geometry`) |
-| `nowcast_frame_bytes` | gauge | collection | Bytes of the frames the retained nowcast generations hold, exact |
+| `nowcast_frame_bytes` | gauge | collection | Bytes of the frames a nowcast collection holds, exact: its retained generations and the forecasts waiting to be scored at fixed leads |
 | `pvol_catalog_bytes` | gauge | collection | Estimated heap of a PVOL source's catalog of parsed volume metadata |
 | `netcdf_open_file_bytes` | gauge | collection | Estimated heap of a NetCDF collection's open file handles, modelled per file |
 | `process_start_time_seconds` | gauge | — | Start time of the process since the Unix epoch |

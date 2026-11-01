@@ -78,8 +78,9 @@ reason `MapEngine::resolve_reference_time` exists (#521).
 
 ## Memory sizing (retention multiplies!)
 
-Resident bytes ≈ `max_pixels × (leads + 1) × max_generations × bytes/px`
-(1 B/px for the U8 path, 4 B/px for the f32 fallback). At the defaults
+Resident bytes ≈ `max_pixels × ((leads + 1) × max_generations + 4) × bytes/px`
+(1 B/px for the U8 path, 4 B/px for the f32 fallback; the `+ 4` is the
+fixed-lead skill ring, below). At the defaults
 (4 Mpx, 24 leads, 6 generations) that is ~600 MB per U8 collection and
 ~2.4 GB for an f32-fallback source — PVOL-max_files territory (#493).
 Old generations are read only by an explicit pin — WMS `DIM_REFERENCE_TIME`
@@ -90,8 +91,9 @@ make it expensive to HAVE). Until the generation-thinning follow-up in #523
 in production configs.
 
 `frame_bytes()` is that formula measured from the frame buffers'
-capacities, set when a generation is swapped in, exported as
-`nowcast_frame_bytes` (#1307).
+capacities, ring included, set when a generation is swapped in, exported as
+`nowcast_frame_bytes` (#1307). `tests/heap_gauges.rs` checks it against a
+counting allocator.
 
 ## Verification (V2.1, #542)
 
@@ -106,6 +108,45 @@ capacities, set when a generation is swapped in, exported as
   exported as `nowcast_lead1_csi_permille` /
   `nowcast_lead1_persistence_csi_permille`. A persistent gap collapse in
   prod = motion or data regression; check before blaming the client.
+  At 5 min and 10 dBZ persistence already scores ~0.8, so this is a
+  heartbeat; the fixed leads below are the diagnostic.
+
+### Skill at fixed leads (`lead_skill.rs`, #648)
+
+- `SkillRing` holds ONE forecast in flight per lead (`SKILL_LEADS_MIN` =
+  +30, +60), independent of `max_generations`: the lead frame, the analysis
+  it was issued from (persistence for the same valid time, an `Arc` shared
+  by the slots one generation fills) and its `GridGeom`. Frames stay
+  `FrameData` (1 B/px raw), cloned once at issue; ≤ 4 frames, 3 when both
+  leads were issued together. Every generation's +60 would be 12 frames at
+  a 5-min cadence — the one-in-flight design is why a lead is scored once
+  per lead time (+60 hourly), not every generation.
+- `poll_once` → `score_leads` after the lead-1 scoring, on the poll
+  runtime: an analysis at EXACTLY a slot's valid time scores it; a passed
+  valid time drops it (`no_analysis`); a different grid drops it at once
+  (`grid_mismatch`, it can never verify). Then empty slots refill from
+  the new generation. A lead no frame lands on (horizon < lead, or a step
+  that does not divide it) warns once and is never scored.
+- `skill::score_with_reference` scores nowcast and persistence over ONE
+  mask — pixels all three frames cover. The advected frame is nodata in
+  the inflow strip, wider at +60; separate masks compare two samples.
+  Lead 1 keeps its separate-mask `skill::score` (numbers unchanged).
+- Pixel CSI at `SKILL_THRESHOLDS` = 20 and 35 dBZ (source units, like
+  `min_echo`). Gauges carry the LATEST pair; a pair with an undefined CSI
+  on either side clears both (absent series) instead of holding a stale
+  score — at 35 dBZ a dry week would otherwise serve the last storm.
+- `/metrics`: `nowcast_lead_csi_permille` / `nowcast_lead_persistence_csi_permille`
+  `{lead="30|60", threshold="20|35"}`, `nowcast_lead_scored_pairs_total{lead}`,
+  `nowcast_lead_skipped_pairs_total{lead, reason="no_analysis|grid_mismatch"}`
+  (reload-rebaseline deltas, series from boot), Grafana Engines → Nowcast →
+  "Skill at fixed leads". Leads and thresholds are constants: each lead
+  costs two frames and four series per collection.
+- **Object CSI is NOT wired** (follow-up): the tracker segments only the
+  analysis (`Generation.cells`), never a forecast frame, and production
+  segmentation (`segment_cells_physical`, 2.5 km², `PixelScale::lonlat`)
+  differs from the harness's (`segment_cells`, 5 px, uniform scale, 20 km
+  gate). Wiring it means segmenting the held forecast frames and choosing
+  which segmentation and gate are canonical.
 
 ### Estimator parity (#640)
 

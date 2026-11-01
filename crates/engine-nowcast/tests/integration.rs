@@ -1026,6 +1026,110 @@ fn skipped_generation_does_not_mislabel_lead1_skill() {
     );
 }
 
+/// CSI x1000 of persisting the truth frame at `issued` to `valid`: the
+/// intersection over the union of the two discs.
+fn persistence_permille(issued: DateTime<Utc>, valid: DateTime<Utc>) -> u64 {
+    let (a, b) = (truth_frame(issued), truth_frame(valid));
+    let (mut both, mut either) = (0u64, 0u64);
+    for (x, y) in a.iter().zip(&b) {
+        let (x, y) = (*x == ECHO_RAW, *y == ECHO_RAW);
+        both += u64::from(x && y);
+        either += u64::from(x || y);
+    }
+    (both as f64 / either as f64 * 1000.0).round() as u64
+}
+
+/// Skill at fixed leads (#648): the +30 and +60 min forecasts outlive
+/// their generation's retention and are scored when their analysis
+/// arrives, next to persistence at the SAME lead: the analysis they were
+/// issued from, which on the moving disc is exactly the truth frames'
+/// overlap. The extrapolation must beat it at both leads and thresholds.
+#[test]
+fn deeper_leads_are_scored_against_persistence_at_the_same_lead() {
+    let first = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT1H", &[t0(), first]);
+    engine.poll_once();
+    let unscored = *engine.lead_skill();
+    assert!(unscored
+        .iter()
+        .all(|l| l.scored_pairs == 0 && l.csi_permille == [None, None]));
+    for m in (10..=65).step_by(5) {
+        source
+            .times
+            .write()
+            .unwrap()
+            .push(t0() + Duration::minutes(m));
+        engine.poll_once();
+    }
+    let (_, failures, _, _, retained, frames) = engine.metrics();
+    assert_eq!((failures, retained, frames), (0, 4, 13));
+
+    let [lead30, lead60] = *engine.lead_skill();
+    assert_eq!((lead30.lead_minutes, lead60.lead_minutes), (30, 60));
+    // +30 issued at 12:05 and 12:35, verified at 12:35 and 13:05; +60
+    // issued at 12:05 — eight generations before the four retained ones.
+    assert_eq!((lead30.scored_pairs, lead60.scored_pairs), (2, 1));
+    let valid = t0() + Duration::minutes(65);
+    for (lead, issued) in [(lead30, valid - Duration::minutes(30)), (lead60, first)] {
+        assert_eq!(
+            (lead.skipped_no_analysis, lead.skipped_grid_mismatch),
+            (0, 0)
+        );
+        let expected = persistence_permille(issued, valid);
+        // The disc is 40 dBZ on a -30 dBZ background: both thresholds see
+        // the same event.
+        for (i, scored) in lead.csi_permille.iter().enumerate() {
+            let (nowcast, persistence) = scored.expect("the disc is an event at both thresholds");
+            assert_eq!(
+                persistence, expected,
+                "+{} min persistence at threshold {i}",
+                lead.lead_minutes
+            );
+            assert!(
+                nowcast > 800 && nowcast > persistence + 300,
+                "+{} min nowcast CSI {nowcast} vs persistence {persistence}",
+                lead.lead_minutes
+            );
+        }
+    }
+    assert!(
+        lead60.csi_permille[0].unwrap().1 < lead30.csi_permille[0].unwrap().1,
+        "persistence decays with the lead"
+    );
+
+    // The ring's frames count with the retained ones: both leads were
+    // issued by the 13:05 generation, so two forecasts and one analysis.
+    assert_eq!(engine.frame_bytes(), (4 * 13 + 3) * u64::from(W * H));
+}
+
+/// A valid time the source never delivers drops that lead's pair as
+/// skipped (`no_analysis`), and the lead is issued again at once.
+#[test]
+fn a_missing_verifying_analysis_counts_a_skipped_pair() {
+    let (source, engine) = build("PT1H", &[t0(), t0() + Duration::minutes(5)]);
+    engine.poll_once();
+    // The source skips 12:35, the +30 forecast's valid time.
+    for m in [10, 15, 20, 25, 30, 40, 45] {
+        source
+            .times
+            .write()
+            .unwrap()
+            .push(t0() + Duration::minutes(m));
+        engine.poll_once();
+    }
+    let [lead30, lead60] = *engine.lead_skill();
+    assert_eq!(
+        (
+            lead30.scored_pairs,
+            lead30.skipped_no_analysis,
+            lead30.skipped_grid_mismatch
+        ),
+        (0, 1, 0)
+    );
+    assert_eq!(lead30.csi_permille, [None, None]);
+    assert_eq!((lead60.scored_pairs, lead60.skipped_no_analysis), (0, 0));
+}
+
 /// The skill gauges update as a pair from one frame comparison (#543 round
 /// 4): a scene with no scoreable echo must leave both unset — never one
 /// updated against the other's stale value.
