@@ -260,6 +260,12 @@ impl StacClient {
     /// items; when it returns `true` and another page is left, the listing
     /// ends there as [`StacListing::Stopped`], without following the `next`
     /// link. On the last page the listing is complete whatever it returns.
+    ///
+    /// On a request path, under its `ds_core::deadline` (#18), no page is
+    /// requested and no failed request retried once the deadline has
+    /// passed: the listing is then `DeadlineExceeded`, or the failure the
+    /// last attempt met. A request already sent is answered. A poll has no
+    /// deadline and lists as before.
     pub fn fetch_items_until(
         &self,
         time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -270,8 +276,14 @@ impl StacClient {
         let mut url = self.build_initial_url(time_filter, max_items);
         let mut pages = 0;
         let start_time = Instant::now();
+        let deadline = ds_core::deadline::current();
+        let expired = || deadline.is_some_and(|deadline| Instant::now() >= deadline);
 
         loop {
+            if expired() {
+                return Err(DataServerError::DeadlineExceeded);
+            }
+
             if pages >= STAC_MAX_PAGES {
                 tracing::warn!(
                     "STAC pagination limit reached ({} pages), stopping",
@@ -302,6 +314,11 @@ impl StacClient {
 
                 let mut last_err = None;
                 for attempt in 0..max_attempts {
+                    // No retry past the deadline: the failure stands, for
+                    // the circuit breaker to count.
+                    if attempt > 0 && expired() {
+                        break;
+                    }
                     let result = http.get(&url_str).send().await;
                     match result {
                         Ok(response) => {

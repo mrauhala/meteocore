@@ -156,6 +156,19 @@ apply here.
   scan only for the same object (`Catalog::keep_loads_from`: href and
   `file:size`); a stub of another item at that timestep stays a stub and
   loads afresh (#1055).
+- **Request deadlines (#18):** a wait on another loader's claim
+  (`InFlightLoads::wait_then_claim`, from `ensure_metadata`) ends at the
+  request's `ds_core::deadline` with `DeadlineExceeded` and no claim, so
+  that load goes on and installs for the retry; without a deadline it waits
+  up to `CONCURRENT_LOAD_WAIT` as before. Past the deadline no load is
+  claimed, no listing page requested and no failed page retried
+  (`StacClient::fetch_items_until`); a listing the deadline stops counts no
+  circuit-breaker failure. A claimed load is never cut by the deadline (the
+  metadata fetch has none): others may be waiting for it. So a query past
+  its deadline lets its cold loads in flight finish before it answers; never
+  drop them at the first load it does not start. EDR position and area
+  check the deadline before each file and a render before it decodes: a
+  local read checks none of its own.
 
 ## Decode admission
 
