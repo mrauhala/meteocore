@@ -690,6 +690,26 @@ pub struct GridCache {
     cache: ByteBoundedCache<GridKey, Arc<DecodedGrid>>,
 }
 
+/// The least capacity in whole MiB a one-shard cache built with a hot
+/// share holding an entry of `largest` takes in place, `in_place` its own
+/// check: its capacity when it cannot shrink at all (#1312).
+pub(crate) fn least_holding<K: Eq + std::hash::Hash, V: Clone>(
+    cache: &ByteBoundedCache<K, V>,
+    largest: u64,
+    in_place: impl Fn(u64) -> bool,
+) -> u64 {
+    let capacity = cache.capacity_bytes();
+    let floor = ds_cache::holding_floor(cache.hot_allocation(), largest)
+        .max(cache.least_capacity())
+        .div_ceil(ds_cache::MIB)
+        .saturating_mul(ds_cache::MIB);
+    if floor < capacity && in_place(floor) {
+        floor
+    } else {
+        capacity
+    }
+}
+
 impl GridCache {
     /// Create a new grid cache with the given size limit in MB.
     /// Returns None if size_mb is 0 (cache disabled).
@@ -792,6 +812,22 @@ impl GridCache {
     /// [`Self::resizes_in_place_to`].
     pub(crate) fn resize(&self, bytes: u64) {
         self.cache.set_capacity(bytes);
+    }
+
+    /// The least size [`Self::resize`] can take the cache to in place now
+    /// (#1312): where its hot share, kept from its build, still holds a
+    /// 0.1° fill ([`ds_cache::holding_floor`]), in whole MiB. Its capacity
+    /// when it cannot shrink at all.
+    pub(crate) fn least_capacity(&self) -> u64 {
+        let largest = Self::estimated_weight(LARGEST_GRID_NODES);
+        least_holding(&self.cache, largest, |bytes| {
+            self.resizes_in_place_to(bytes)
+        })
+    }
+
+    /// Drop every grid, keeping the capacity ([`ByteBoundedCache::clear`]).
+    pub(crate) fn clear(&self) {
+        self.cache.clear();
     }
 
     /// Whether `fields` decoded grids of `nodes` values each fit this

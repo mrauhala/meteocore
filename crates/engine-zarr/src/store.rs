@@ -141,6 +141,16 @@ impl DsStore {
         self.shared.cache.set_capacity(bytes)
     }
 
+    /// The least size [`Self::resize_cache`] reaches now.
+    pub(crate) fn least_cache(&self) -> u64 {
+        self.shared.cache.least_capacity()
+    }
+
+    /// Drop every cached object, keeping the capacity.
+    pub(crate) fn clear_cache(&self) {
+        self.shared.cache.clear();
+    }
+
     pub(crate) fn fresh(&self) -> Self {
         Self {
             shared: self.shared.clone(),

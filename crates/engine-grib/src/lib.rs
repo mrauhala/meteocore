@@ -467,10 +467,27 @@ impl GribEngine {
         let Some(cache) = &self.source.grid_cache else {
             return 0;
         };
-        if cache.resizes_in_place_to(bytes) {
+        let bytes = bytes.max(cache.least_capacity());
+        if bytes != cache.capacity() && cache.resizes_in_place_to(bytes) {
             cache.resize(bytes);
         }
         cache.capacity()
+    }
+
+    /// The least size [`Self::resize_grid_cache`] takes the grid cache to
+    /// now: where its hot share still holds a 0.1° fill; 0 without one.
+    pub fn least_grid_cache(&self) -> u64 {
+        self.source
+            .grid_cache
+            .as_ref()
+            .map_or(0, GridCache::least_capacity)
+    }
+
+    /// Drop every decoded grid, keeping the capacity (#1312).
+    pub fn clear_grid_cache(&self) {
+        if let Some(cache) = &self.source.grid_cache {
+            cache.clear();
+        }
     }
 
     /// [`Self::resize_grid_cache`] for the compressed-message cache: 0
@@ -479,10 +496,51 @@ impl GribEngine {
         let Some(cache) = &self.source.message_cache else {
             return 0;
         };
-        if cache.resizes_in_place_to(bytes) {
+        let bytes = bytes.max(cache.least_capacity());
+        if bytes != cache.capacity_bytes() && cache.resizes_in_place_to(bytes) {
             cache.resize(bytes);
         }
         cache.capacity_bytes()
+    }
+
+    /// [`Self::least_grid_cache`] for the compressed-message cache.
+    pub fn least_message_cache(&self) -> u64 {
+        self.source
+            .message_cache
+            .as_ref()
+            .map_or(0, message_cache::MessageCache::least_capacity)
+    }
+
+    /// Drop every compressed message, keeping the capacity (#1312).
+    pub fn clear_message_cache(&self) {
+        if let Some(cache) = &self.source.message_cache {
+            cache.clear();
+        }
+    }
+
+    /// Resize the point-index cache to `bytes` for the memory plan
+    /// (#1312), keeping the indexes that fit; 0 without one.
+    pub fn resize_point_index_cache(&self, bytes: u64) -> u64 {
+        let Some(index) = &self.source.point_index else {
+            return 0;
+        };
+        index.resize(bytes);
+        index.metrics().capacity_bytes
+    }
+
+    /// The least size [`Self::resize_point_index_cache`] takes it to now.
+    pub fn least_point_index_cache(&self) -> u64 {
+        self.source
+            .point_index
+            .as_ref()
+            .map_or(0, point_index::PointIndex::least_capacity)
+    }
+
+    /// Drop every point index, keeping the capacity (#1312).
+    pub fn clear_point_index_cache(&self) {
+        if let Some(index) = &self.source.point_index {
+            index.clear();
+        }
     }
 
     /// Compressed-message cache counters and resident byte budget, per source.

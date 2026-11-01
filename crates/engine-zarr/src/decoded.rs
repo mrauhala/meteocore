@@ -67,6 +67,16 @@ impl DecodedCache {
     pub(crate) fn resize(&self, bytes: u64) -> u64 {
         self.0.set_capacity(bytes)
     }
+
+    /// The least size [`Self::resize`] reaches now.
+    pub(crate) fn least_capacity(&self) -> u64 {
+        self.0.least_capacity()
+    }
+
+    /// Drop every chunk, keeping the capacity.
+    pub(crate) fn clear(&self) {
+        self.0.clear();
+    }
 }
 
 pub(crate) struct DecodedArray {

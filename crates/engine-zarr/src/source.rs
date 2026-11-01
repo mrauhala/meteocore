@@ -56,6 +56,42 @@ impl Source {
         }
     }
 
+    /// The least size [`Self::resize_object_cache`] reaches now, and a
+    /// clear of the object cache; `None` and nothing for Icechunk.
+    pub(crate) fn least_object_cache(&self) -> Option<u64> {
+        match self {
+            Self::Plain(source) => Some(source.store.least_cache()),
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(_) => None,
+        }
+    }
+
+    pub(crate) fn clear_object_cache(&self) {
+        match self {
+            Self::Plain(source) => source.store.clear_cache(),
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(_) => {}
+        }
+    }
+
+    /// The least size [`Self::resize_payload_cache`] reaches now, and a
+    /// clear of the payload cache; `None` and nothing for a plain store.
+    pub(crate) fn least_payload_cache(&self) -> Option<u64> {
+        match self {
+            Self::Plain(_) => None,
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(source) => Some(source.meter().least_payload()),
+        }
+    }
+
+    pub(crate) fn clear_payload_cache(&self) {
+        match self {
+            Self::Plain(_) => {}
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(source) => source.meter().clear_payload(),
+        }
+    }
+
     /// Resize an Icechunk repository's payload cache in place; the capacity
     /// applied, `None` for a plain store.
     pub(crate) fn resize_payload_cache(&self, bytes: u64) -> Option<u64> {

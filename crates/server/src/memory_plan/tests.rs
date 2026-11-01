@@ -334,6 +334,7 @@ fn row(id: &'static str, scope: Scope, source: SizeSource, capacity: u64) -> Row
         demand: None,
         configured_bytes: capacity,
         planned: false,
+        least_bytes: 0,
     }
 }
 
@@ -407,6 +408,15 @@ fn unreachable_caches_follow_the_config() {
         Some("built empty for its source")
     );
     assert_eq!(tile(SizeSource::Default), None, "disabled, not unreachable");
+    // An engine of a collection the config no longer has, still alive.
+    let gone = Scope::Collection {
+        engine: "geotiff",
+        id: "gone".into(),
+    };
+    assert_eq!(
+        why("tile_cache", gone, SizeSource::Default, MIB).as_deref(),
+        Some("its collection is no longer configured")
+    );
 }
 
 /// A plan that cuts logs one WARN block: the total and its source, the
@@ -611,14 +621,14 @@ fn grid_rows(ids: &[&str]) -> (Vec<Row>, HashMap<String, CollectionConfig>) {
 /// The plan of `ids` at 16 GiB, in `mode`.
 fn grid_report(ids: &[&str], mode: MemoryMode) -> (Report, Vec<Row>) {
     let (rows, collections) = grid_rows(ids);
-    let mut report = report(
+    let report = report_for(
+        mode,
         Some(16 * 1024),
         &Reading::default(),
         &rows,
         &collections,
         Baseline::Estimated,
     );
-    report.mode = mode;
     (report, rows)
 }
 
@@ -679,6 +689,7 @@ fn auto_applies_the_plan_to_unpinned_caches_and_report_to_none() {
             target_bytes: 456 * MIB,
             reason: "working set".into(),
             held: None,
+            cleared: false,
         }]
     );
     let report = Report { changes, ..report };
@@ -718,11 +729,12 @@ fn auto_applies_the_plan_to_unpinned_caches_and_report_to_none() {
     );
 }
 
-/// #1312 part 2: a warm cache, one holding more than its grant, shrinks by
-/// at most a quarter each time the plan is applied, logged with its old and
-/// new size; a cold one goes to its grant at once.
+/// #1312 part 2: a warm cache, one holding more than its grant, gives up
+/// at most a quarter of what it holds each time the plan is applied, the
+/// plan holding it there; logged with its old and new size. A cold one
+/// goes to its grant at once.
 #[test]
-fn a_warm_cache_shrinks_by_at_most_a_quarter_each_time() {
+fn a_warm_cache_gives_up_at_most_a_quarter_of_what_it_holds_each_time() {
     let ids = ["mp-warm", "mp-cold"];
     let warm = grid_source(ids[0], SizeSource::Default, 256, TENTH_FIELD);
     let cold = grid_source(ids[1], SizeSource::Default, 256, TENTH_FIELD);
@@ -736,15 +748,41 @@ fn a_warm_cache_shrinks_by_at_most_a_quarter_each_time() {
     }
     assert_eq!(warm.cache.weight(), 800 * MIB);
 
-    let (report, rows) = grid_report(&ids, MemoryMode::Auto);
-    let changes = apply(&report, &rows);
-    assert_eq!((capacity_mb(&warm), capacity_mb(&cold)), (768, 456));
-    let report = Report { changes, ..report };
+    let (mut report, rows) = grid_report(&ids, MemoryMode::Auto);
+    let entry = |id: &str| Entry::cache("grid_cache", grid_scope(id), SizeSource::Default);
+    let held = report.plan.as_ref().unwrap().grant(&entry(ids[0])).unwrap();
+    assert_eq!(
+        (held.bytes, &held.reason),
+        (600 * MIB, &Reason::Held(Hold::Warm))
+    );
+    let ideal = report
+        .ideal
+        .as_ref()
+        .unwrap()
+        .grant(&entry(ids[0]))
+        .unwrap();
+    assert_eq!(ideal.bytes, 456 * MIB);
+    report.changes = apply(&report, &rows);
+    report.unapplied_bytes = unapplied(&report, &rows);
+    assert_eq!((capacity_mb(&warm), capacity_mb(&cold)), (600, 456));
+    assert_eq!(
+        warm.cache.weight(),
+        600 * MIB,
+        "a quarter of 800 MiB evicted"
+    );
+    assert_eq!(report.unapplied_bytes, 144 * MIB);
     let block = changes_block(&report).unwrap();
     assert!(
+        block.starts_with(
+            "Memory plan applied ([memory] mode = \"auto\"): 2 of 2 sizes changed; 144 MiB \
+             above the plan until later reloads"
+        ),
+        "{block}"
+    );
+    assert!(
         block.contains(
-            "\n  grid_cache mp-warm 1024 MiB → 768 MiB (working set; toward 456 MiB: a warm \
-             cache shrinks by at most 25 % at once)"
+            "\n  grid_cache mp-warm 1024 MiB → 600 MiB (held: a warm cache gives up at most 25 % \
+             of what it holds at once; toward 456 MiB)"
         ),
         "{block}"
     );
@@ -760,14 +798,11 @@ fn a_warm_cache_shrinks_by_at_most_a_quarter_each_time() {
         change.unwrap().held
     };
     assert_eq!((held(ids[0]), held(ids[1])), (Some(Held::Warm), None));
-    // Each later plan takes it a quarter further, until its grant.
-    let mut steps = vec![capacity_mb(&warm)];
-    for _ in 0..3 {
-        let (report, rows) = grid_report(&ids, MemoryMode::Auto);
-        apply(&report, &rows);
-        steps.push(capacity_mb(&warm));
-    }
-    assert_eq!(steps, [768, 576, 456, 456]);
+    // The next plan takes it to its grant: a quarter of 600 MiB would
+    // leave 450, under it.
+    let (report, rows) = grid_report(&ids, MemoryMode::Auto);
+    apply(&report, &rows);
+    assert_eq!(capacity_mb(&warm), 456);
     assert!(warm.cache.weight() <= 456 * MIB);
 }
 
@@ -786,26 +821,38 @@ fn an_unreachable_cache_keeps_its_size_while_it_holds_nothing() {
             .into_iter()
             .filter(|row| row.entry.scope == scope)
             .collect();
-        let mut report = report(
+        let report = report_for(
+            MemoryMode::Auto,
             Some(16 * 1024),
             &Reading::default(),
             &rows,
             &collections(toml),
             Baseline::Estimated,
         );
-        report.mode = MemoryMode::Auto;
         (report, rows)
     };
     let (report, rows) = plan_of();
     assert_eq!(report.plan.as_ref().unwrap().caches[0].bytes, 0);
     assert_eq!(apply(&report, &rows), Vec::new());
     assert_eq!(message.capacity_bytes(), 64 * MIB);
-    // Holding entries no collection can read, it lets them go.
+    // Holding entries no collection can read, it drops them and keeps its
+    // capacity and hot share: never through 0, which would reset both.
     message.insert(1, MIB);
+    let hot = message.hot_allocation();
     let (report, rows) = plan_of();
     let changes = apply(&report, &rows);
-    assert_eq!(message.capacity_bytes(), 0);
-    assert_eq!((changes[0].from_bytes, changes[0].to_bytes), (64 * MIB, 0));
+    assert_eq!((message.capacity_bytes(), message.len()), (64 * MIB, 0));
+    assert!((message.hot_allocation() - hot).abs() < 1e-9);
+    assert!(changes[0].cleared);
+    let report = Report { changes, ..report };
+    assert!(
+        changes_block(&report).unwrap().contains(
+            "\n  grib_message_cache mp-local cleared, kept at 64 MiB (unreachable: a local \
+             source reads through the page cache)"
+        ),
+        "{:?}",
+        changes_block(&report)
+    );
 }
 
 /// #1312 part 2: the bytes an Icechunk collection fetched ahead, held
@@ -851,27 +898,28 @@ fn the_changes_block_says_why_a_size_was_not_set() {
         target_bytes: target * MIB,
         reason: "working set".into(),
         held,
+        cleared: false,
     };
-    let mut report = report(
+    let mut report = report_for(
+        MemoryMode::Auto,
         None,
         &Reading::default(),
         &[],
         &HashMap::new(),
         Baseline::Estimated,
     );
-    report.mode = MemoryMode::Auto;
     assert_eq!(changes_block(&report), None);
     report.changes = vec![
-        change("grib_message_cache", 0, 0, 64, Some(Held::InPlace)),
-        change("grid_cache", 256, 256, 16, Some(Held::InPlace)),
+        change("grib_message_cache", 64, 64, 32, Some(Held::Gone)),
+        change("grid_cache", 256, 250, 16, Some(Held::Refused)),
     ];
     assert_eq!(
         changes_block(&report).unwrap(),
-        "Memory plan applied ([memory] mode = \"auto\"): 0 of 2 sizes changed\n  \
-         grib_message_cache mp-block kept at 0 MiB (working set; toward 64 MiB: it is off, and \
-         only its setting turns it on)\n  \
-         grid_cache mp-block kept at 256 MiB (working set; toward 16 MiB: it cannot take that \
-         size in place)"
+        "Memory plan applied ([memory] mode = \"auto\"): 1 of 2 sizes changed\n  \
+         grib_message_cache mp-block kept at 64 MiB (working set; toward 32 MiB: its owner is \
+         gone)\n  \
+         grid_cache mp-block 256 MiB → 250 MiB (working set; toward 16 MiB: its resize stopped \
+         short)"
     );
     report.mode = MemoryMode::Report;
     report.changes = vec![Change {

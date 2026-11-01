@@ -289,21 +289,26 @@ need no reload pruning.
   is a process-wide static that `/admin/cache-plan` (`planned_bytes`,
   `plan`) and the `/metrics` plan gauges read.
 - `[memory] mode` (`AcceptedLoad::memory_mode`): `report`, the default,
-  applies nothing; `auto` makes `memory_plan::replan` call `apply`, which
-  resizes each row no setting pins through `ds_cache::plan::apply`, the
-  hook its registration handed over: `ByteBoundedCache::set_capacity`, a
-  budget's `resize`, the GRIB/GeoTIFF/Zarr engines' `resize_*` (the GRIB
-  ones refuse a size whose hot share would not hold a 0.1° fill, and a
-  cache built off stays off). Shrinks go first. A warm cache, holding more
-  than its grant, goes at most a quarter down per apply
-  (`grant::bounded`). An unreachable cache that holds nothing, and an
-  unreachable budget, keep their size: a cache disabled and grown again
-  restarts at quick_cache's default hot share (the PVOL pixel cache's
-  pre-warm share would go). `report` after `auto` gives each plan-sized
-  entry its configured size back (`restore`). `cache_plan::log` snapshots
-  again after an apply, so the block lists the new sizes, then logs
-  `changes_block` (old → new per entry). `Report::changes` is the
-  endpoint's `plan.changes`.
+  applies nothing; `auto` makes `memory_plan::replan` fit two plans
+  (`report_for`): `ideal`, as `report` shows it, and `plan`, with each
+  cache's `grant::Least` from its row (what `bounded` keeps of a warm
+  cache's bytes, and `Resize::least`, where a shrink stops in place). The
+  planner never grants below `least`, and splits by how long a hold lasts
+  (`grant::plan`): an in-place hold (`Least::in_place`, until a restart)
+  counts as a pin, and the full cut order runs around it, budgets toward
+  128/64 MiB and demand caches last, so the plan fits where it can; a warm
+  hold, which passes, makes the traffic-driven and working-set caches give
+  way but keeps budgets and demand caches at the in-place-only plan's
+  grants, the rest being the shortfall. `apply` then resizes each unpinned row to
+  `plan` through `ds_cache::plan::apply` (shrinks first), clears an
+  unreachable cache that holds entries (`plan::clear`: never through 0,
+  which resets the hot share and the ghost ring), and leaves unreachable
+  empty caches and budgets alone. `unapplied` sums the capacity above
+  `ideal`: `memory_plan_unapplied_bytes`, the Plan not yet applied panel.
+  `report` after `auto` gives each plan-sized entry its configured size
+  back (`restore`, which keeps the mark when it stops short).
+  `cache_plan::log` snapshots again after an apply, so the block lists the
+  new sizes, then logs `changes_block` (old → new per entry).
 - The plan reads an unpinned entry at its configured size
   (`Row::configured_bytes`), never at the size it applied, or rule 6 and
   the 8× ceiling would ratchet on every reload. Every server registration
@@ -311,9 +316,24 @@ need no reload pruning.
   the render caches' `register(source, configured_mb)`) from the accepted
   config; process-wide statics, registered once at build, take their
   capacity then. A row whose capacity is the plan's reads source
-  `plan:auto` (`Row::source`); a capacity anything else changed since
-  drops the mark.
-- A new resizable cache: register it with a resize hook, or the plan can
+  `plan:auto` (`Row::source`). The snapshot reads the mark without
+  locking out a resize: a capacity anything else changed, or a resize in
+  progress, reads without it.
+- The GRIB grid and message caches' `least` is where their hot share
+  still holds a 0.1° fill (`ds_cache::holding_floor`): about their build
+  size, so a default 256 MiB one never shrinks in place; pinning a smaller
+  key rebuilds it. The point-index cache has hooks too, so a removed pin
+  goes back to its default through the plan.
+- An `MC_…` variable that is not a whole number pins its cache at its
+  default (`plan::env_size`), and `cache_plan::unparsable_env` warns from
+  the plan log. A collection key equal to its default does not pin until
+  #1313.
+- A cache off by default (`[grib] message_cache_mb` unset) plans
+  `Reason::Off`, 0, and counts nothing.
+- `memory_plan::unreachable` treats a Collection- or Source-scoped entry
+  whose id the config no longer has as unreachable; `cache_plan::snapshot`
+  drops those rows already, so this only guards other callers.
+- A new resizable cache: register it with `Resize` hooks, or the plan can
   only report it. A cache the reload path resizes needs the auto
   exception too (`PlanSized`, `plan_kept_*`).
 - Detection (`memory_plan/detect.rs`) reads `/proc` and `/sys` under a

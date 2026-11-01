@@ -377,12 +377,15 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   `*_cache_bytes` or `*_capacity_bytes` family has no entry: a new engine
   type adds its fixture collection there.
   `[memory] mode = "auto"` resizes an entry no setting pins through the
-  hook its registration hands over (`.registered`/`.register` and the
-  budgets' `.register` do; `plan::register_sized` for a per-collection
+  hooks its registration hands over (`plan::Resize`: resize, the least it
+  takes in place now, clear; `.registered`/`.register` and the budgets'
+  `.register` give them, `plan::register_sized` for a per-collection
   cache, with the size its config gives it) and plans it at that
-  configured size, never the one it applied. A reload path that resizes a
-  cache must leave an unpinned one to the plan in `auto`
-  (`crates/server/CLAUDE.md`).
+  configured size, never the one it applied. A cache that cannot shrink
+  freely in place (a hot share that must hold a fill, an engine's floor:
+  `with_min_capacity`) says so through `least`, or the plan cuts it to a
+  size it never reaches. A reload path that resizes a cache must leave an
+  unpinned one to the plan in `auto` (`crates/server/CLAUDE.md`).
   An engine whose data fixes what a cache must hold (a time window, a
   pre-warm set, a grid) publishes it as a `plan::CacheDemand` through its
   own `plan::DemandSlot`, under the cache id and scope the plan lists the
@@ -780,7 +783,7 @@ one never implies the other.
 |---|---|---|---|
 | `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms `params.rs`; `api_common::map_frame` for Maps and map tiles) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps/Tiles `BadRequest`): "… must not exceed 8000" |
 | `api_tiles::params::TILE_SIZE` | output, a map tile's default (`width`/`height`/`scale-denominator` resize it within the caps above) | 256 × 256 | never |
-| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`); a WMS GetMap of several layers adds 4 B for the image below, once (`acquire_layered_raster`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
+| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`); a WMS GetMap of several layers adds 4 B for the image below, once (`acquire_layered_raster`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px; unset in `[memory] mode = "auto"`, the plan's 10 % of the total, 128 MiB–4 GiB (128 MiB ⇒ 4 194 304 px) | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
 | `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
 | `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
 | engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
@@ -804,7 +807,10 @@ one never implies the other.
 - At the default `MC_RENDER_MEMORY_MB` the API caps' full 64 M px is
   unreachable: anything over 33 554 432 output px (e.g. 5793 × 5793) is a 503
   on every retry. To serve larger images, raise the budget (README "Sizing
-  render memory").
+  render memory"). In `[memory] mode = "auto"` the plan sizes it unless the
+  variable pins it: under a 10 GiB total it falls below 1 GiB (819 MiB at
+  8 GiB), and on a 2 GiB VM to 128 MiB, below the 4–6 Mpx frames clients
+  request; rule 6 does not protect budgets.
 - The GeoTIFF source cap only trips on a full-resolution read: over it,
   `get_raster_tile` switches to the finest overview under it, else the
   coarsest, so in practice only COGs without overviews hit it.

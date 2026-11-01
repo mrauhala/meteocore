@@ -264,6 +264,16 @@ impl Meter {
         self.payload.set_capacity(bytes)
     }
 
+    /// The least size [`Self::resize_payload`] reaches now.
+    pub(crate) fn least_payload(&self) -> u64 {
+        self.payload.least_capacity()
+    }
+
+    /// Drop every cached range, keeping the capacity.
+    pub(crate) fn clear_payload(&self) {
+        self.payload.clear();
+    }
+
     #[cfg(test)]
     pub(crate) fn take_log(&self) -> Vec<(String, Option<Range<u64>>)> {
         self.issued.lock().unwrap().clear();

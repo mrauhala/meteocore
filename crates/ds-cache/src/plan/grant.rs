@@ -38,9 +38,15 @@
 //! the pool, so the grants may sum to more, as configured sizes do today:
 //! a cache allocates only as it fills.
 //!
-//! The server applies the grants in `[memory] mode = "auto"`, each through
-//! [`bounded`]: a warm cache, one holding more than its grant, shrinks by
-//! at most [`WARM_SHRINK_PERCENT`] at once.
+//! The server applies the grants in `[memory] mode = "auto"`. A plan to
+//! be applied carries each cache's [`Least`]: what a warm cache keeps of
+//! what it holds ([`bounded`], [`WARM_SHRINK_PERCENT`]) and where a shrink
+//! stops in place. The plan never grants less ([`Reason::Held`]) and
+//! counts what it keeps. A hold in place lasts until a restart and counts
+//! as a pin: everything else, budgets included, is cut around it in
+//! [`Step`] order. A warm hold passes with the next reloads: the
+//! traffic-driven and working-set caches give way, the budgets and demand
+//! caches do not, and what does not fit is the shortfall.
 
 use std::fmt;
 
@@ -178,8 +184,8 @@ pub fn pinned(source: &SizeSource) -> bool {
     )
 }
 
-/// The most one resize by the plan shrinks a warm cache, in percent of its
-/// size: a reload's new plan evicts at most this share of a cache in use
+/// The most one resize by the plan evicts of what a warm cache holds, in
+/// percent: a reload's new plan takes at most this share of a cache in use
 /// at once, and the next reload takes it further (#1312).
 pub const WARM_SHRINK_PERCENT: u64 = 25;
 
@@ -192,16 +198,74 @@ pub fn warm(used_bytes: u64, entries: Option<u64>, to_bytes: u64) -> bool {
     entries != Some(0) && used_bytes > to_bytes
 }
 
-/// The size the plan resizes a cache of `from_bytes`, holding `used_bytes`
-/// in `entries`, to for a grant of `to_bytes`: the grant, but a warm cache
-/// ([`warm`]) shrinks by at most [`WARM_SHRINK_PERCENT`] of `from_bytes`,
-/// to whole MiB. A growth is never bounded.
+/// The size the plan can resize a cache of `from_bytes`, holding
+/// `used_bytes` in `entries`, to for a grant of `to_bytes`: the grant, but
+/// a warm cache ([`warm`]) keeps all but [`WARM_SHRINK_PERCENT`] of what it
+/// holds, in whole MiB up, and never grows for it. A growth is never
+/// bounded.
 pub fn bounded(from_bytes: u64, to_bytes: u64, used_bytes: u64, entries: Option<u64>) -> u64 {
     if to_bytes >= from_bytes || !warm(used_bytes, entries, to_bytes) {
         return to_bytes;
     }
-    let least = mib_up(from_bytes - percent(from_bytes, WARM_SHRINK_PERCENT)).min(from_bytes);
-    to_bytes.max(least)
+    let kept = mib_up(used_bytes - percent(used_bytes, WARM_SHRINK_PERCENT));
+    to_bytes.max(kept).min(from_bytes)
+}
+
+/// Why the plan can take a cache no lower than [`Least::bytes`] now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// It is warm: one resize evicts at most [`WARM_SHRINK_PERCENT`] of
+    /// what it holds ([`bounded`]).
+    Warm,
+    /// A shrink stops there in place: where its shards still hold 32
+    /// entries each, where its hot share still holds a GRIB 0.1° fill, or
+    /// at the floor its engine sets.
+    InPlace,
+}
+
+/// The least size applying the plan can give a cache now, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Least {
+    pub bytes: u64,
+    pub why: Hold,
+    /// The part a shrink in place cannot go below, which lasts until a
+    /// restart: `bytes` when `why` is [`Hold::InPlace`], at most it when
+    /// the cache's warmth holds it higher for now.
+    pub in_place: u64,
+}
+
+impl Least {
+    /// The least of a cache of `live_bytes`, holding `used_bytes` in
+    /// `entries`, that resizes in place to no less than `in_place_bytes`;
+    /// `None` when nothing stops it short of 0.
+    pub fn of(
+        live_bytes: u64,
+        used_bytes: u64,
+        entries: Option<u64>,
+        in_place_bytes: u64,
+    ) -> Option<Self> {
+        let warm = bounded(live_bytes, 0, used_bytes, entries);
+        let in_place = mib_up(in_place_bytes.min(live_bytes)).min(live_bytes);
+        let (bytes, why) = if warm > in_place {
+            (warm, Hold::Warm)
+        } else {
+            (in_place, Hold::InPlace)
+        };
+        (bytes > 0).then_some(Least {
+            bytes,
+            why,
+            in_place,
+        })
+    }
+
+    /// Only the hold that lasts: the in-place part, if any.
+    fn lasting(self) -> Option<Least> {
+        (self.in_place > 0).then_some(Least {
+            bytes: self.in_place,
+            why: Hold::InPlace,
+            in_place: self.in_place,
+        })
+    }
 }
 
 /// A cache as the plan reads it.
@@ -219,6 +283,10 @@ pub struct CacheInput {
     pub idle: bool,
     /// Why no collection can reach it, when none can.
     pub unreachable: Option<String>,
+    /// The least size applying the plan can give it now (`[memory] mode =
+    /// "auto"`): never planned below, so the plan counts what it cannot
+    /// take away yet. `None` in a plan only reported.
+    pub least: Option<Least>,
 }
 
 impl CacheInput {
@@ -273,13 +341,15 @@ impl Inputs {
     /// The inputs of a snapshot's `rows`, `unreachable` saying why no
     /// collection can reach an entry, when none can. An unpinned entry is
     /// read at its configured size, not the plan's: the same config plans
-    /// the same, whatever the plan applied before.
+    /// the same, whatever the plan applied before. `applying`: the plan is
+    /// to be applied, so each cache carries the [`Least`] it can take now.
     pub fn of_rows(
         total_bytes: u64,
         collections: u64,
         baseline: Baseline,
         rows: &[Row],
         unreachable: impl Fn(&Row) -> Option<String>,
+        applying: bool,
     ) -> Self {
         let mut inputs = Inputs {
             total_bytes,
@@ -306,6 +376,16 @@ impl Inputs {
                         .as_ref()
                         .is_some_and(|w| w.label() == Some(Label::Idle)),
                     unreachable: unreachable(row),
+                    least: applying
+                        .then(|| {
+                            Least::of(
+                                row.usage.capacity_bytes,
+                                row.usage.used_bytes,
+                                row.usage.entries,
+                                row.least_bytes,
+                            )
+                        })
+                        .flatten(),
                 }),
                 Kind::Budget => inputs.budgets.push(BudgetInput {
                     entry: row.entry.clone(),
@@ -362,6 +442,10 @@ pub enum Reason {
     Share(u64),
     /// Its size today, which its rule would lower (rule 6).
     Today,
+    /// Off: its configured size is 0, and only its setting turns it on.
+    Off,
+    /// The least applying the plan can give it now ([`Least`]).
+    Held(Hold),
     /// A budget scaled to the total.
     Scaled,
     /// Cut toward its floor in this step.
@@ -380,6 +464,11 @@ impl fmt::Display for Reason {
             Reason::WorkingSet => f.write_str("working set"),
             Reason::Share(weight) => write!(f, "share by weight {weight}"),
             Reason::Today => f.write_str("size today"),
+            Reason::Off => f.write_str("off: its setting turns it on"),
+            Reason::Held(Hold::Warm) => {
+                f.write_str("held: a warm cache gives up at most 25 % of what it holds at once")
+            }
+            Reason::Held(Hold::InPlace) => f.write_str("held: it shrinks no further in place"),
             Reason::Scaled => f.write_str("scaled to the total"),
             Reason::Cut(step) => write!(f, "cut: {}", step.as_str()),
             Reason::Floor => f.write_str("floor: total under 512 MiB"),
@@ -523,6 +612,8 @@ struct Planned {
     /// The least size worth having above its floor: a working set's
     /// [`WORKING_SET_MIN`] or four of its entries.
     useful: u64,
+    /// The least applying the plan can give it now; never planned below.
+    least: Option<Least>,
 }
 
 impl Planned {
@@ -543,7 +634,7 @@ impl Planned {
     }
 }
 
-fn of_cache(input: &CacheInput, floors_only: bool) -> Planned {
+fn of_cache(input: &CacheInput, floors_only: bool, keep: Option<&Plan>) -> Planned {
     let today = input.capacity_bytes;
     let demand = input.demand.as_ref();
     let need = demand.map(|d| d.bytes.max(input.used_bytes));
@@ -568,6 +659,7 @@ fn of_cache(input: &CacheInput, floors_only: bool) -> Planned {
         ceiling: today,
         demand_bytes: demand.map(|d| d.bytes),
         useful: 0,
+        least: input.least,
     };
     if pinned(&input.entry.source) {
         planned.grant.reason = Reason::Pinned;
@@ -586,9 +678,22 @@ fn of_cache(input: &CacheInput, floors_only: bool) -> Planned {
         planned.set(0);
         return planned;
     }
+    // Never below what applying the plan can take it to now.
+    let least = input.least.map_or(0, |l| l.bytes);
+    if today == 0 {
+        // Off: its setting turns it on, never the plan. What it still
+        // holds goes as it can.
+        planned.grant.floor_bytes = least;
+        planned.want = least;
+        planned.grant.reason = Reason::Off;
+        planned.set(least);
+        return planned;
+    }
     let (want, floor, reason) = match class {
         Class::Fixed => {
-            planned.set(today);
+            planned.grant.floor_bytes = today.max(least);
+            planned.want = today.max(least);
+            planned.set(today.max(least));
             return planned;
         }
         Class::Demand => {
@@ -597,7 +702,12 @@ fn of_cache(input: &CacheInput, floors_only: bool) -> Planned {
             let rule = demand.map(Demand::suggested_bytes);
             let want = rule.unwrap_or(today).max(today);
             let entries = entry_bytes.unwrap_or(0).saturating_mul(FLOOR_ENTRIES);
-            let floor = mib_up(entries.max(MIN_FLOOR)).min(want);
+            // A warm cache's passing hold never cuts one below the plan
+            // without it: below its demand an engine degrades.
+            let kept = keep
+                .and_then(|keep| keep.grant(&input.entry))
+                .map_or(0, |g| g.bytes);
+            let floor = mib_up(entries.max(MIN_FLOOR)).max(kept).min(want);
             let reason = match rule {
                 Some(rule) if rule >= today => Reason::Demand,
                 _ => Reason::Today,
@@ -634,10 +744,11 @@ fn of_cache(input: &CacheInput, floors_only: bool) -> Planned {
                 .map_or(0, Demand::suggested_bytes);
             let floor = mib_up((today / TRAFFIC_RANGE).max(MIN_FLOOR)).max(planned.base);
             let want = floor.max(today);
-            planned.ceiling = today.saturating_mul(TRAFFIC_RANGE).max(want);
+            planned.ceiling = today.saturating_mul(TRAFFIC_RANGE).max(want).max(least);
             (want, floor, Reason::Share(weight))
         }
     };
+    let (want, floor) = (want.max(least), floor.max(least));
     planned.want = want;
     planned.grant.floor_bytes = floor;
     planned.grant.reason = if floors_only { Reason::Floor } else { reason };
@@ -656,7 +767,12 @@ struct PlannedBudget {
     want: u64,
 }
 
-fn of_budget(input: &BudgetInput, total: u64, floors_only: bool) -> PlannedBudget {
+fn of_budget(
+    input: &BudgetInput,
+    total: u64,
+    floors_only: bool,
+    keep: Option<&Plan>,
+) -> PlannedBudget {
     let render = input.entry.id == RENDER_BUDGET_ID;
     let today = input.capacity_bytes;
     let mut planned = PlannedBudget {
@@ -693,6 +809,11 @@ fn of_budget(input: &BudgetInput, total: u64, floors_only: bool) -> PlannedBudge
         scale.of(total).min(today)
     };
     planned.grant.floor_bytes = scale.min.min(planned.want);
+    // A warm cache's passing hold never cuts a budget below the plan
+    // without it.
+    if let Some(grant) = keep.and_then(|keep| keep.grant(&input.entry)) {
+        planned.grant.floor_bytes = planned.grant.floor_bytes.max(grant.bytes).min(planned.want);
+    }
     if floors_only {
         planned.grant.reason = Reason::Floor;
         planned.set(scale.min);
@@ -847,21 +968,55 @@ fn cut_toward_floors(caches: &mut [Planned], group: Group, excess: u64) {
     }
 }
 
-/// The plan for `inputs` (module docs).
+/// The plan for `inputs` (module docs). A cache with a [`Least`] is never
+/// given less, and the plan counts what it keeps, two ways:
+///
+/// - A hold in place lasts until a restart: it counts as a pin, and the
+///   other caches and the budgets are cut around it in [`Step`] order, so
+///   the plan still fits where it can.
+/// - A warm cache's hold passes with the next reloads: the traffic-driven
+///   and working-set caches give way, but no budget or demand cache goes
+///   below the plan without it, and what does not fit is the shortfall.
 pub fn plan(inputs: &Inputs) -> Plan {
+    if inputs.caches.iter().all(|c| c.least.is_none()) {
+        return fit(inputs, None, None);
+    }
+    let with = |least: fn(Least) -> Option<Least>| {
+        let mut inputs = inputs.clone();
+        for c in inputs.caches.iter_mut() {
+            c.least = c.least.and_then(least);
+        }
+        inputs
+    };
+    let ideal = fit(&with(|_| None), None, None);
+    let lasting = fit(&with(Least::lasting), None, Some(&ideal));
+    if inputs
+        .caches
+        .iter()
+        .all(|c| c.least.is_none_or(|l| l.why == Hold::InPlace))
+    {
+        return lasting;
+    }
+    fit(inputs, Some(&lasting), Some(&ideal))
+}
+
+/// [`plan`]: `keep` the plan whose budget and demand-cache sizes a warm
+/// hold never cuts below, `ideal` the plan without holds, which a held
+/// cache is granted above.
+fn fit(inputs: &Inputs, keep: Option<&Plan>, ideal: Option<&Plan>) -> Plan {
     let total = inputs.total_bytes;
     let floors_only = total < MIN_TOTAL;
     let key = |e: &Entry| (e.id, e.scope.clone());
     let mut caches: Vec<Planned> = inputs
         .caches
         .iter()
-        .map(|c| of_cache(c, floors_only))
+        .map(|c| of_cache(c, floors_only, keep))
         .collect();
     caches.sort_by(|a, b| key(&a.grant.entry).cmp(&key(&b.grant.entry)));
     let mut budgets: Vec<PlannedBudget> = inputs
         .budgets
         .iter()
-        .map(|b| of_budget(b, total, floors_only))
+        .map(|b| of_budget(b, total, floors_only, keep))
         .collect();
     budgets.sort_by(|a, b| key(&a.grant.entry).cmp(&key(&b.grant.entry)));
     let collections = inputs.collections;
@@ -983,6 +1138,20 @@ pub fn plan(inputs: &Inputs) -> Plan {
         }
     }
 
+    // At the least applying it can give it now, above what the plan
+    // without holds gives it: held there, the rest fitted around it. One
+    // below that gave way to the holds of others.
+    if let Some(ideal) = ideal {
+        for c in caches.iter_mut() {
+            let Some(least) = c.least else { continue };
+            let above = ideal
+                .grant(&c.grant.entry)
+                .is_some_and(|g| c.grant.bytes > g.bytes);
+            if c.grant.bytes == least.bytes && above {
+                c.grant.reason = Reason::Held(least.why);
+            }
+        }
+    }
     let (pool, slack) = pool_of(total, baseline, &budgets);
     let (render, read, read_budget) = reserve(&budgets);
     let expected_bytes = expected(&caches);

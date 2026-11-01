@@ -686,8 +686,9 @@ static CACHE_DEMAND_RATIO: LazyLock<GaugeVec> = LazyLock::new(|| {
     let gauge = GaugeVec::new(
         Opts::new(
             "cache_demand_ratio",
-            "cache_demand_bytes over the cache's configured capacity: above 1 the cache is below \
-             its demand and the server has logged a WARN. No series for a disabled cache",
+            "cache_demand_bytes over the cache's capacity, the configured one or the memory \
+             plan's in [memory] mode = \"auto\": above 1 the cache is below its demand and the \
+             server has logged a WARN. No series for a disabled cache",
         ),
         &["cache", "collection"],
     )

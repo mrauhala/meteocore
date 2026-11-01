@@ -355,6 +355,21 @@ impl MessageCache {
         self.cache.set_capacity(bytes);
     }
 
+    /// The least size [`Self::resize`] can take the cache to in place now
+    /// (#1312), as [`GridCache::least_capacity`].
+    pub(crate) fn least_capacity(&self) -> u64 {
+        let largest = GridCache::estimated_weight(LARGEST_GRID_NODES);
+        crate::cache::least_holding(&self.cache, largest, |bytes| {
+            self.resizes_in_place_to(bytes)
+        })
+    }
+
+    /// Drop every message, keeping the capacity: for the memory plan, and
+    /// for tests of what follows an eviction.
+    pub(crate) fn clear(&self) {
+        self.cache.clear();
+    }
+
     /// Whether `key` is resident, without touching its recency or a counter.
     pub(crate) fn is_resident(&self, key: &MessageKey) -> bool {
         self.cache.contains_key(key)
@@ -782,12 +797,6 @@ impl MessageCache {
         self.filling
             .signal(key)
             .map_or(0, |filled| filled.waiters.load(Ordering::SeqCst))
-    }
-
-    /// Evict every message, for tests of what follows an eviction.
-    #[cfg(test)]
-    pub(crate) fn clear(&self) {
-        self.cache.retain(|_, _| false);
     }
 }
 

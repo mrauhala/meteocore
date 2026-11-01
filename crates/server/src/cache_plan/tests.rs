@@ -642,6 +642,7 @@ fn row(id: &'static str, scope: Scope, kind: Kind, source: SizeSource, capacity:
         demand: None,
         configured_bytes: capacity,
         planned: false,
+        least_bytes: 0,
     }
 }
 
@@ -1227,18 +1228,22 @@ async fn auto_resizes_at_boot_and_a_reload_shrinks_a_warm_metatile_cache_by_a_qu
     assert!(Arc::ptr_eq(&tiles, &wms.tile_cache), "the reload kept it");
     let after = tiles.capacity();
     let entry = Entry::cache("metatile_cache", Scope::Process, SizeSource::Default);
-    let grant = reload.plan.as_ref().unwrap().grant(&entry).unwrap().bytes;
-    assert!(
-        grant < before / 4 * 3,
-        "the plan wants more than a quarter off"
+    let ideal = reload.ideal.as_ref().unwrap().grant(&entry).unwrap().bytes;
+    let plan = reload.plan.as_ref().unwrap();
+    let grant = plan.grant(&entry).unwrap();
+    // All but a quarter of what it holds, in whole MiB.
+    let kept = plan::grant::bounded(before, 0, held, None);
+    assert_eq!(kept, (held - held / 4).div_ceil(MIB) * MIB);
+    assert!(ideal < kept, "the plan wants more off than a quarter");
+    assert_eq!(
+        (grant.bytes, &grant.reason),
+        (kept, &plan::grant::Reason::Held(plan::grant::Hold::Warm))
     );
-    assert!(
-        after < before && after * 4 >= before * 3,
-        "{} → {}",
-        mib(before),
-        mib(after)
-    );
-    assert_eq!(after, (before / 4 * 3).div_ceil(MIB) * MIB);
+    assert_eq!(after, kept, "{} → {}", mib(before), mib(after));
+    // A quarter of what it held, and the little more each shard's slice
+    // takes where the keys' hashes filled it unevenly.
+    let evicted = held - tiles.weight();
+    assert!(evicted <= held / 4 + after / 100, "{}", mib(evicted));
     let change = reload
         .changes
         .iter()
@@ -1251,19 +1256,25 @@ async fn auto_resizes_at_boot_and_a_reload_shrinks_a_warm_metatile_cache_by_a_qu
             change.target_bytes,
             change.held
         ),
-        (before, after, grant, Some(memory_plan::Held::Warm))
+        (before, after, ideal, Some(memory_plan::Held::Warm))
     );
     let block = memory_plan::changes_block(&reload).unwrap();
     assert!(
         block.contains(&format!(
-            "\n  metatile_cache {} → {} (share by weight 45; toward {}: a warm cache shrinks by \
-             at most 25 % at once)",
+            "\n  metatile_cache {} → {} (held: a warm cache gives up at most 25 % of what it \
+             holds at once; toward {})",
             mib(before),
             mib(after),
-            mib(grant)
+            mib(ideal)
         )),
         "{block}"
     );
+    // The plan counts what the cache keeps: the rest gives way, and what
+    // does not fit is its shortfall.
+    assert!(reload.unapplied_bytes >= after - ideal);
+    if plan.shortfall_bytes == 0 {
+        assert!(plan.expected_bytes <= plan.pool_bytes);
+    }
     // The shrink kept what fits.
     assert!(tiles.weight() <= after && tiles.weight() > after / 10 * 9);
     // The new collection's pinned cache keeps its size.
@@ -1280,8 +1291,8 @@ async fn auto_resizes_at_boot_and_a_reload_shrinks_a_warm_metatile_cache_by_a_qu
 /// "auto"`: its config's pins, and the live size, the plan's, of every
 /// cache no setting pins, so the reload resizes nothing the plan sized.
 /// The plan resizes its grid cache through the hook its registration
-/// hands over, but never to a size whose hot share would not hold a 0.1°
-/// fill; a message cache built off stays off.
+/// hands over, but never below the size where its hot share still holds a
+/// 0.1° fill, its 256 MiB build size; a message cache built off stays off.
 #[test]
 fn a_reused_grib_engine_keeps_the_plans_sizes() {
     let config = |toml: &str| -> GribConfig {
@@ -1302,8 +1313,163 @@ fn a_reused_grib_engine_keeps_the_plans_sizes() {
     // A pin wins.
     let pinned_grid = config("grid_cache_mb = 512\n");
     assert_eq!(plan_kept_grib(&pinned_grid, &engine).grid_cache_mb, 512);
-    // Built off, the message cache stays off; and the grid cache keeps
-    // its size rather than take one whose hot share holds no 0.1° fill.
+    // Built off, the message cache stays off; and the grid cache stops
+    // where its hot share still holds a 0.1° fill.
     assert_eq!(engine.resize_message_cache(64 * MIB), 0);
-    assert_eq!(engine.resize_grid_cache(16 * MIB), 456 * MIB);
+    assert_eq!(engine.least_grid_cache(), 256 * MIB);
+    assert_eq!(engine.resize_grid_cache(16 * MIB), 256 * MIB);
+    // A pin removed from the point-index cache: the plan moves it back.
+    assert_eq!(engine.resize_point_index_cache(64 * MIB), 64 * MIB);
+    assert_eq!(
+        plan_kept_grib(&grib, &engine).point_index_cache_mb,
+        Some(64)
+    );
+    assert_eq!(engine.resize_point_index_cache(16 * MIB), 16 * MIB);
+}
+
+/// #1312 part 2: shrinks a cache cannot take in place count in the plan.
+/// A sharded cache stops where its shards still hold 32 entries, and a
+/// default GRIB grid cache where its hot share still holds a 0.1° fill,
+/// its 256 MiB build size. Under a cut, `auto` plans each no lower than
+/// that, the rest of the plan fitted around it with its shortfall what
+/// does not fit; every size it plans is the one applied, and what stays
+/// above the ideal plan is `unapplied_bytes`.
+#[test]
+fn shrinks_a_cache_cannot_take_in_place_count_in_the_plan() {
+    let grib: GribConfig = toml::from_str(&format!(
+        "data_path = {:?}\n",
+        testdata("grib-local").to_str().unwrap()
+    ))
+    .unwrap();
+    let engine = Arc::new(engine_grib::GribEngine::new("mp-held-grib", &grib).unwrap());
+    let collection: CollectionConfig = toml::from_str(&format!(
+        "id = \"mp-held-grib\"\ntitle = \"t\"\ndescription = \"d\"\nengine_type = \"grib\"\n\
+         apis = [\"edr\"]\n[grib]\ndata_path = {:?}\n",
+        testdata("grib-local").to_str().unwrap()
+    ))
+    .unwrap();
+    register_grib(&collection, &engine);
+    // A remote GeoTIFF collection's tile cache, sharded: 4 MiB tiles.
+    let tiles = ds_cache::ByteBoundedCache::<u64, u64>::new(1024 * MIB, 4 * MIB, |_, v| *v);
+    let tiles_scope = Scope::Collection {
+        engine: "geotiff",
+        id: "mp-held-tiles".into(),
+    };
+    tiles.register_sized(
+        "tile_cache",
+        tiles_scope.clone(),
+        SizeSource::Default,
+        1024 * MIB,
+    );
+    let config: ServerConfig = toml::from_str(&format!(
+        "[server]\nhost = \"h\"\nport = 1\n\
+         [[collections]]\nid = \"mp-held-tiles\"\ntitle = \"t\"\ndescription = \"d\"\n\
+         engine_type = \"geotiff\"\napis = [\"wms\"]\n\
+         [[collections]]\nid = \"mp-held-grib\"\ntitle = \"t\"\ndescription = \"d\"\n\
+         engine_type = \"grib\"\napis = [\"edr\"]\n[collections.grib]\ndata_path = {:?}\n",
+        testdata("grib-local").to_str().unwrap()
+    ))
+    .unwrap();
+    let collections: HashMap<String, CollectionConfig> = config
+        .collections
+        .into_iter()
+        .map(|c| (c.id.clone(), c))
+        .collect();
+    let rows = || -> Vec<Row> {
+        plan::snapshot()
+            .into_iter()
+            .filter(|row| {
+                row.entry
+                    .scope
+                    .collection()
+                    .is_some_and(|id| id.starts_with("mp-held-"))
+            })
+            .collect()
+    };
+    let grid_least = engine.least_grid_cache();
+    let tiles_least = tiles.least_capacity();
+    assert_eq!(grid_least, 256 * MIB, "no lower than its build size");
+    assert!(tiles_least >= 400 * MIB, "{}", mib(tiles_least));
+
+    let before = rows();
+    let report = memory_plan::report_for(
+        ds_core::config::MemoryMode::Auto,
+        Some(1024),
+        &memory_plan::detect::Reading::default(),
+        &before,
+        &collections,
+        ds_cache::plan::grant::Baseline::Estimated,
+    );
+    let (ideal, held) = (report.ideal.clone().unwrap(), report.plan.clone().unwrap());
+    let grid = Entry::cache(
+        "grid_cache",
+        Scope::Source {
+            engine: "grib",
+            id: "mp-held-grib".into(),
+        },
+        SizeSource::Default,
+    );
+    let tile = Entry::cache("tile_cache", tiles_scope, SizeSource::Default);
+    for (entry, least) in [(&grid, grid_least), (&tile, tiles_least)] {
+        assert!(
+            ideal.grant(entry).unwrap().bytes < least,
+            "the ideal plan cuts it"
+        );
+        let g = held.grant(entry).unwrap();
+        assert_eq!(g.bytes, least, "{}", entry.id);
+        assert_eq!(
+            g.reason,
+            plan::grant::Reason::Held(plan::grant::Hold::InPlace),
+            "{}",
+            entry.id
+        );
+    }
+    // The plan counts them: what does not fit is its shortfall.
+    assert!(held.shortfall_bytes > ideal.shortfall_bytes);
+    let r = &held.reserves;
+    let needed = r.baseline_bytes()
+        + r.render_bytes
+        + r.read_bytes
+        + held.expected_bytes
+        + held.expected_bytes / 10;
+    assert!(needed.abs_diff(held.total_bytes + held.shortfall_bytes) <= MIB);
+
+    // Applied: every size is the one planned, none refused.
+    let changes = memory_plan::apply(&report, &before);
+    assert!(changes
+        .iter()
+        .all(|c| c.held != Some(memory_plan::Held::Refused)));
+    assert_eq!(engine.grid_cache_metrics().capacity_bytes, grid_least);
+    assert_eq!(tiles.capacity_bytes(), tiles_least);
+    let report = memory_plan::Report { changes, ..report };
+    let unapplied = memory_plan::unapplied(&report, &before);
+    let above = |entry: &Entry, bytes: u64| bytes - ideal.grant(entry).unwrap().bytes;
+    assert_eq!(
+        unapplied,
+        above(&grid, grid_least) + above(&tile, tiles_least)
+    );
+}
+
+/// #1312 part 2: an `MC_…` variable set to something that is not a whole
+/// number of MB pins its cache at its default, and the plan log warns.
+#[test]
+fn an_unparsable_cache_variable_pins_and_warns() {
+    std::env::set_var("MC_TEST_UNPARSABLE_CACHE_MB", "2G");
+    let (bytes, source) = plan::env_bytes("MC_TEST_UNPARSABLE_CACHE_MB", 512);
+    assert_eq!(source, SizeSource::Env("MC_TEST_UNPARSABLE_CACHE_MB"));
+    let rows = [row(
+        "pvol_pixel_cache",
+        Scope::Engine("odim-volume"),
+        Kind::Cache,
+        source,
+        bytes,
+    )];
+    assert_eq!(
+        unparsable_env(&rows),
+        [
+            "MC_TEST_UNPARSABLE_CACHE_MB = \"2G\" is not a whole number of MB: pvol_pixel_cache \
+          keeps its default 512 MiB, pinned, so the memory plan leaves it alone"
+        ]
+    );
+    assert!(plan::grant::pinned(&rows[0].entry.source));
 }

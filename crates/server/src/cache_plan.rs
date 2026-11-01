@@ -154,7 +154,11 @@ pub(crate) fn register_geotiff(
             let entries = e.tile_cache_utilization().2 as u64;
             Usage::cache(e.tile_cache_metrics(), Some(entries))
         },
-        |e, bytes| e.resize_tile_cache(bytes),
+        plan::Resize {
+            to: |e, bytes| e.resize_tile_cache(bytes),
+            least: |e| e.least_tile_cache(),
+            clear: |e| e.clear_tile_cache(),
+        },
     );
 }
 
@@ -232,19 +236,33 @@ pub(crate) fn register_grib(collection: &CollectionConfig, engine: &Arc<engine_g
             let entries = e.grid_cache_utilization().2 as u64;
             Usage::cache(e.grid_cache_metrics(), Some(entries))
         },
-        |e, bytes| e.resize_grid_cache(bytes),
+        plan::Resize {
+            to: |e, bytes| e.resize_grid_cache(bytes),
+            least: |e| e.least_grid_cache(),
+            clear: |e| e.clear_grid_cache(),
+        },
     );
     plan::register_sized(
         Entry::cache("grib_message_cache", scope(), message),
         grib.message_cache_mb.saturating_mul(MIB),
         engine,
         |e| Usage::cache(e.message_cache_metrics(), None),
-        |e, bytes| e.resize_message_cache(bytes),
+        plan::Resize {
+            to: |e, bytes| e.resize_message_cache(bytes),
+            least: |e| e.least_message_cache(),
+            clear: |e| e.clear_message_cache(),
+        },
     );
-    plan::register(
+    plan::register_sized(
         Entry::cache("grib_point_index_cache", scope(), point_index_source(grib)),
+        grib.effective_point_index_cache_mb().saturating_mul(MIB),
         engine,
         |e| Usage::cache(e.point_index_cache_metrics(), None),
+        plan::Resize {
+            to: |e, bytes| e.resize_point_index_cache(bytes),
+            least: |e| e.least_point_index_cache(),
+            clear: |e| e.clear_point_index_cache(),
+        },
     );
 }
 
@@ -288,7 +306,11 @@ pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_z
         decoded_mb.saturating_mul(MIB),
         engine,
         |e| Usage::cache(e.decoded_cache_metrics(), None),
-        |e, bytes| e.resize_decoded_cache(bytes),
+        plan::Resize {
+            to: |e, bytes| e.resize_decoded_cache(bytes),
+            least: |e| e.least_decoded_cache(),
+            clear: |e| e.clear_decoded_cache(),
+        },
     );
     let cache_mb = zarr.cache_mb.saturating_mul(MIB);
     let object_or_payload = || {
@@ -308,7 +330,11 @@ pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_z
                     .map(|m| Usage::cache(m, None))
                     .unwrap_or_default()
             },
-            |e, bytes| e.resize_object_cache(bytes).unwrap_or(0),
+            plan::Resize {
+                to: |e, bytes| e.resize_object_cache(bytes).unwrap_or(0),
+                least: |e| e.least_object_cache().unwrap_or(0),
+                clear: |e| e.clear_object_cache(),
+            },
         );
     }
     if engine.icechunk_payload_cache_metrics().is_some() {
@@ -321,9 +347,36 @@ pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_z
                     .map(|m| Usage::cache(m, None))
                     .unwrap_or_default()
             },
-            |e, bytes| e.resize_icechunk_payload_cache(bytes).unwrap_or(0),
+            plan::Resize {
+                to: |e, bytes| e.resize_icechunk_payload_cache(bytes).unwrap_or(0),
+                least: |e| e.least_icechunk_payload_cache().unwrap_or(0),
+                clear: |e| e.clear_icechunk_payload_cache(),
+            },
         );
     }
+}
+
+/// The WARN for each `MC_…` variable of `rows` set to something that is
+/// not a whole number of MB: its cache keeps its default, pinned.
+pub(crate) fn unparsable_env(rows: &[Row]) -> Vec<String> {
+    let mut warnings: Vec<String> = rows
+        .iter()
+        .filter_map(|row| match row.entry.source {
+            SizeSource::Env(var) => {
+                let value = plan::env_unparsable(var)?;
+                Some(format!(
+                    "{var} = {value:?} is not a whole number of MB: {} keeps its default \
+                     {}, pinned, so the memory plan leaves it alone",
+                    row.entry.id,
+                    mib(row.usage.capacity_bytes)
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    warnings.sort();
+    warnings.dedup();
+    warnings
 }
 
 /// The plan's entries: the registry, less the caches of collections the
@@ -580,6 +633,9 @@ pub(crate) fn log(state: &AdminState, occasion: Occasion) -> Arc<Report> {
         Occasion::Reload | Occasion::Recovery => "after reload",
     };
     info!("{}", render(&rows, heading, logged.as_ref(), Some(&report)));
+    for warning in unparsable_env(&rows) {
+        warn!("{warning}");
+    }
     if let Some(block) = memory_plan::changes_block(&report) {
         info!("{block}");
     }

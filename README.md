@@ -620,7 +620,8 @@ Each cache's and budget's size comes from the first of:
 1. **A setting**, which pins it: an `MC_…` variable, a `[server]` key, a
    collection key, or a key it follows (`point_index_cache_mb` from
    `message_cache_mb`). Neither mode changes a pinned size, and `0` set
-   this way keeps a cache off.
+   this way keeps a cache off. A key set to exactly its default does not
+   pin yet ([below](#auto-mode)).
 2. **The plan**, in `auto` mode.
 3. **Its built-in default.**
 
@@ -728,30 +729,54 @@ With `mode = "auto"` the plan is applied where it is fitted: at boot, once
 the engines are built, and after every accepted reload, including the
 recovery loop's. Each cache and budget no setting pins is resized in place
 to its planned size, keeping the entries that fit, while requests go on
-reading it:
+reading it. The plan only gives a cache a size it can take now, and counts
+what it cannot take away yet:
 
-- **A warm cache shrinks by at most 25 % at once.** Warm means it holds
-  more than its new planned size, so a shrink to it would evict entries
-  requests may still ask for. Each later reload takes it a quarter further,
-  until it reaches its planned size. A cache holding no more than its
-  planned size goes there at once, and a growth is never held back. Until
-  it gets there, it may hold more than the plan counts it at.
+- **A warm cache gives up at most 25 % of what it holds at once.** Warm
+  means it holds more than its planned size, so a shrink to it would evict
+  entries requests may still ask for. The plan holds it at what it holds
+  less a quarter, in whole MiB; each later reload takes it a quarter
+  further, until its planned size. A cache holding no more than its
+  planned size goes there at once, and a growth is never held back.
+- **A shrink stops in place** where a sharded cache's shards still hold 32
+  entries each (about 500 MiB for a meta-tile cache built at 1 GiB, by CPU
+  count), where a GRIB grid or message cache's hot share still holds a 0.1°
+  field (its build size, 256 MiB by default), and at the 8 MiB the NetCDF
+  metadata block cache needs. The plan never gives a cache less than that.
+  To go lower, pin the size: a changed key rebuilds the cache at it.
+- **What a held cache keeps, the plan counts**, by how long the hold
+  lasts:
+  - A shrink stopped in place lasts until a restart, so it counts as a
+    pin: everything else is cut around it in the order above, the
+    budgets toward 128 and 64 MiB and the demand caches last, and the
+    plan still fits where the total allows.
+  - A warm cache's hold passes with the next reloads: the other
+    traffic-driven and working-set caches give way, down to their floors,
+    but the budgets and the demand caches keep their sizes, so a passing
+    hold never slashes the render budget or a satellite cache's scans.
+    What does not fit is the shortfall, with its WARN, until a later
+    reload lets the cache shrink further.
+
+  The capacity above the plan without holds is
+  `memory_plan_unapplied_bytes`.
 - **A reload leaves a reused cache no setting pins at its size**: the plan
   fitted after the reload moves it. The render caches, and a reused GRIB or
   GeoTIFF engine's caches, take only the sizes their keys pin.
-- **What no collection can reach** keeps its size while it holds nothing:
-  an empty cache costs nothing, and one disabled and grown again would
-  start over with `quick_cache`'s default hot share. One still holding
-  entries no collection can read goes to 0. A budget no collection can
-  reach keeps its size.
-- **A size a cache cannot take in place** is not applied, and the log says
-  so: a GRIB grid or message cache whose hot share would no longer hold a
-  0.1° field, a GRIB message cache built off (`message_cache_mb` unset),
-  and a shrink of a sharded cache that stops where its shards still hold
-  32 entries each.
-- The budgets take their scaled sizes: the render budget 10 % of the total
-  between 128 MiB and 4 GiB, each read budget 5 % between 64 MiB and its
-  default.
+- **What no collection can reach** keeps its size: an empty cache costs
+  nothing. One still holding entries no collection can read drops them and
+  keeps its capacity, hot share and ghost ring; it never goes through 0,
+  which would reset both until a restart. A budget no collection can reach
+  keeps its size.
+- **A cache off by default stays off**: a GRIB source's message cache with
+  `message_cache_mb` unset plans 0 and counts nothing. Only its key turns
+  it on.
+- **The budgets take their scaled sizes**: the render budget 10 % of the
+  total between 128 MiB and 4 GiB, each read budget 5 % between 64 MiB and
+  its default. Under a total of about 10 GiB the render budget falls below
+  its 1 GiB default: 819 MiB at 8 GiB, 128 MiB on a 2 GiB VM, about
+  4.2 Mpx at 32 bytes a pixel, below the 4–6 Mpx frames clients often ask
+  for. A larger frame is a 503 on every retry. Set `MC_RENDER_MEMORY_MB`
+  to pin it.
 - A GRIB source's grid cache is sized from its fields: a 0.1° source,
   sixteen 25 MiB fields plus 15 %, gets 456 MiB, while a 0.25° source keeps
   its 256 MiB default, which holds sixteen of its 4 MiB fields. The cache is
@@ -762,11 +787,18 @@ reading it:
   next reload: nothing re-plans between reloads yet.
 - `/admin/cache-plan` gives each size the plan set the `source`
   `plan:auto`, with `configured_bytes` beside `capacity_bytes`, and
-  `plan.changes` lists what the last boot or reload resized. The log has
-  one INFO block of the changes, old → new; `cache_size_source` on
-  `/metrics` reads `plan:auto` too.
+  `plan.changes` lists what the last boot or reload resized or cleared, and
+  `plan.unapplied_bytes`. The log has one INFO block of the changes,
+  old → new; `cache_size_source` on `/metrics` reads `plan:auto` too.
 - Back in `report` mode, a reload gives each size the plan set its
   configured size again.
+
+Two settings do not pin today. A collection key set to exactly its
+default (`[grib] grid_cache_mb = 256`) reads as `default` until the keys
+can tell set from unset (#1313), so `auto` sizes that cache: pin it at
+another value. An `MC_…` variable set to something that is not a whole
+number of MB (`2G`) keeps its cache at its default, pinned, and the plan
+log warns.
 
 Worked example: `total_mb = 8192` and one local GeoTIFF radar served over
 WMS and EDR, the baseline estimated. The render budget is 819 MiB, the
@@ -779,19 +811,23 @@ radar's tile cache stays empty (local files), and the caches of the
 engines without a collection keep their sizes: none holds anything.
 
 A reload that adds a Zarr collection with `cache_mb = 4096` pins 4 GiB of
-the pool, and the plan now gives the meta-tile cache 1173 MiB. Holding
-about 3.7 GiB of tiles, it is warm, so it shrinks by a quarter:
+the pool. Without holds, the plan would give the meta-tile cache 1173 MiB.
+Holding about 3.7 GiB of tiles, it keeps all but a quarter of them, and the
+other two traffic-driven caches give way to their in-place floors (the
+figures depend on the CPU count):
 
 ```
-Memory plan applied ([memory] mode = "auto"): 4 of 4 sizes changed
-  metatile_cache 4190 MiB → 3143 MiB (share by weight 45; toward 1173 MiB: a warm cache shrinks by at most 25 % at once)
-  rendered_cache 465 MiB → 256 MiB (size today)
-  geotiff_decoded_chunk_cache 1396 MiB → 512 MiB (size today)
+Memory plan applied ([memory] mode = "auto"): 4 of 4 sizes changed; 1656 MiB above the plan until later reloads
+  metatile_cache 4190 MiB → 2829 MiB (held: a warm cache gives up at most 25 % of what it holds at once; toward 1173 MiB)
+  rendered_cache 465 MiB → 117 MiB (cut: traffic)
+  geotiff_decoded_chunk_cache 1396 MiB → 497 MiB (cut: traffic)
   zarr_read 1024 MiB → 409 MiB (scaled to the total)
 ```
 
-While it stays warm, the next reloads take it to 2358, 1769, 1327 and
-1173 MiB. The Zarr object cache keeps its pinned 4096 MiB.
+The budgets keep their sizes, so the plan falls 1.6 GiB short, and says so
+in its WARN block. While the meta-tile cache stays full, the next reloads
+take it to 2122, 1592, 1194 and 1173 MiB, and the others grow back. The
+Zarr object cache keeps its pinned 4096 MiB.
 
 ### Collection Config Fields
 
@@ -2861,7 +2897,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/admin/cach
 - `memory` repeats the process and allocator gauges of `/metrics` (`process_resident_memory_bytes`, `jemalloc_*_bytes`), `null` where they cannot be read: RSS and swap off Linux.
 - A cache's `churn` counts, since it was built, the bytes it admitted for keys not resident (`inserted_bytes`), the inserts it refused because the entry outweighs its shard's hot target (`refused`), the entries it evicted from the cold and hot rings (`evictions`) and their bytes (`evicted_bytes`), the reads that went around it (`bypasses`: a GRIB window larger than the grid cache), and, for a cache that keeps a ghost ring, `ghost_hits`: misses whose key it evicted within 0.5, 1 or 2 times its capacity of evictions, cumulative. `prewarmed` marks a cache filled ahead of its reads (PVOL pixels, GeoTIFF tiles, a GRIB message cache with `prewarm` on).
 - A cache whose engines know what it must hold for their data has its demand: `demand_bytes`, `demand_rule` (how it is computed), `demand_kind` (`floor` for the PVOL pixel cache, whose pre-warm is only part of what it holds, else `demand`), `suggested_bytes` (the demand plus 15 %, or the floor, in whole MiB) and `demand_inputs`, each collection's part with the facts it comes from. The engines compute it from what their polls load, never per request: the satellite scans in each time window, the PVOL pre-warm set (twice it), the station grids computed ahead, 16 fields of a GRIB source's grid and 16 of its messages, 16 fields of a NetCDF grid, 16 inner chunks of an Icechunk store, and every frame of a remote GeoTIFF collection at its mean encoded size. A local GeoTIFF collection and a plain Zarr store demand nothing: their tile and decoded caches stay empty. Caches that hold what requests ask for (meta-tiles, rendered images, decoded chunks) have none: `last_hour` says whether they need more. The fields are `null` where there is no demand. Nothing applies a suggestion.
-- `planned_bytes` is the size the [memory plan](#memory-memory) gives the cache or budget, `planned_reason` why (`pinned`, `unreachable: …`, `demand + 15 %`, `working set`, `share by weight 45`, `size today`, `scaled to the total`, `cut: …`, `fixed`, `floor: …`), and `expected_bytes` what the plan counts it at. The plan is computed at boot and after every accepted reload: an entry entered since has `null`. `plan` holds its `total_bytes` and `total_source`, `cgroup_low_bytes`, the `reserves` (`outside_bytes`, `heap_bytes`, `baseline` `measured` or `estimated`, `render_budget_bytes`, `read_budget_bytes` and the `read_budget` reserved, `slack_bytes`), `pool_bytes`, `expected_bytes`, `demand_bytes`, `floor_bytes`, `pinned_bytes`, `shortfall_bytes` and `cut`, its `mode`, and `changes`, what applying it resized or meant to when it was fitted, each with `id`, `kind`, `collection`, `from_bytes`, `to_bytes`, `target_bytes` and `reason`, and `held` (`warm`, a warm cache shrunk by a quarter at most; `in place`, a size the cache cannot take in place) when `to_bytes` is not the target; `null` when no total is known. In `report` mode it resizes nothing.
+- `planned_bytes` is the size the [memory plan](#memory-memory) gives the cache or budget, `planned_reason` why (`pinned`, `unreachable: …`, `demand + 15 %`, `working set`, `share by weight 45`, `size today`, `off: …`, `held: …`, `scaled to the total`, `cut: …`, `fixed`, `floor: …`), and `expected_bytes` what the plan counts it at. The plan is computed at boot and after every accepted reload: an entry entered since has `null`. `plan` holds its `total_bytes` and `total_source`, `cgroup_low_bytes`, the `reserves` (`outside_bytes`, `heap_bytes`, `baseline` `measured` or `estimated`, `render_budget_bytes`, `read_budget_bytes` and the `read_budget` reserved, `slack_bytes`), `pool_bytes`, `expected_bytes`, `demand_bytes`, `floor_bytes`, `pinned_bytes`, `shortfall_bytes` and `cut`, its `mode`, and `changes`, what applying it resized or meant to when it was fitted, each with `id`, `kind`, `collection`, `from_bytes`, `to_bytes`, `target_bytes` and `reason`, `cleared` for a cache no collection can reach whose entries it dropped, and `held` when `to_bytes` is above the target (`warm`, a warm cache giving up a quarter of what it holds at most; `in place`, a shrink that stops in place; `refused`, a resize that stopped short; `gone`, an owner gone first), and `unapplied_bytes`, the capacity above the plan without holds; `null` when no total is known. In `auto` mode `planned_bytes` is the size applied, never below what the cache can take now. In `report` mode it resizes nothing.
 - When a cache is configured below its demand, the server logs one WARN naming the cache, its size and where it came from, the rule, each collection's inputs, what the shortfall costs and the size to set. It warns again only when the size changes or the demand grows 15 % past the one it reported, so a demand that grows a little each poll, or hovers around the size, warns once; after the demand has dropped under 90 % of the size, a new shortfall warns afresh. A disabled cache (`0`) is never short.
 - A cache's `last_hour` says whether it needs memory, from the counters `/metrics` scrapes sample every five minutes (without a scraper, since the previous plan read; `null` until a cache has five minutes of samples): `lookups` and `lookups_per_hour`, `hit_ratio`, `turnover_per_hour` (capacities admitted per hour), `cold_eviction_share` (evicted before a second use), `ghost_hit_share` by depth, `estimated_hit_ratio` of a cache 1.5, 2 or 3 times as large, a `caveat` for a pre-warmed cache, and its `label`:
 
@@ -2875,7 +2911,7 @@ curl -s -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8000/admin/cach
 
   The ghost ring costs a hash and a lock on every miss, so it is kept only by the meta-tile, rendered-image, GeoTIFF decoded-chunk, PVOL pixel and GRIB grid and message caches. The thresholds are starting points.
 
-The server logs the same list at INFO at boot and after every accepted reload: one line per cache and budget, grouped by scope, with its size in MiB and its source (and its configured size while the plan's applies), a cache's demand and suggested size, its planned size and why, the totals and the memory plan's total and reserves, and after a reload the old size of each one that changed. In `auto` mode a second INFO block names each size the plan changed, old → new, and why. A plan that cuts caches, or falls short, adds one WARN block. On `/metrics`, `cache_size_source{cache,collection,source}` is 1 for each entry, `memory_capacity_total_bytes{kind}` sums the capacities of the caches and of the budgets, `cache_demand_bytes{cache,collection}` is each cache's demand and `cache_demand_ratio{cache,collection}` that over its size, `cache_planned_bytes{cache,collection}` each entry's planned size, and `memory_plan_total_bytes`, `memory_plan_pool_bytes` and `memory_plan_shortfall_bytes` the plan's total, pool and shortfall. The Grafana dashboard's Memory & admission tab shows them in its Cache plan row: the table's Planned and Demand columns, the Demand by cache panel, Memory plan, and Plan against memory, the planned and configured sums against the total and RSS. Its Rendering & caches tab shows each cache's churn and label in the Cache churn row.
+The server logs the same list at INFO at boot and after every accepted reload: one line per cache and budget, grouped by scope, with its size in MiB and its source (and its configured size while the plan's applies), a cache's demand and suggested size, its planned size and why, the totals and the memory plan's total and reserves, and after a reload the old size of each one that changed. In `auto` mode a second INFO block names each size the plan changed, old → new, and why. A plan that cuts caches, or falls short, adds one WARN block. On `/metrics`, `cache_size_source{cache,collection,source}` is 1 for each entry, `memory_capacity_total_bytes{kind}` sums the capacities of the caches and of the budgets, `cache_demand_bytes{cache,collection}` is each cache's demand and `cache_demand_ratio{cache,collection}` that over its size, `cache_planned_bytes{cache,collection}` each entry's planned size, and `memory_plan_total_bytes`, `memory_plan_pool_bytes`, `memory_plan_shortfall_bytes` and `memory_plan_unapplied_bytes` the plan's total, pool, shortfall and what `auto` could not apply yet. The Grafana dashboard's Memory & admission tab shows them in its Cache plan row: the table's Planned and Demand columns, the Demand by cache panel, Memory plan, Plan against memory, Plan not yet applied, the planned and configured sums against the total and RSS. Its Rendering & caches tab shows each cache's churn and label in the Cache churn row.
 
 Memory outside the caches has gauges too ([Memory outside caches](#prometheus-metrics)):
 
@@ -3033,11 +3069,12 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `cache_size_source` | gauge | cache, collection, source | 1 for each cache and admission budget; `cache` is its `/metrics` family, `collection` empty for a process-wide one, `source` where its size came from, `plan:auto` while the memory plan's size applies |
 | `memory_capacity_total_bytes` | gauge | kind | Capacity of every cache (`cache`) or admission budget (`budget`), summed: configured, or the plan's in `auto` mode |
 | `cache_demand_bytes` | gauge | cache, collection | What a cache must hold for its collections' data, as their engines compute it; `collection` empty for a process-wide cache, whose demand sums its collections'. The PVOL pixel cache's is a floor |
-| `cache_demand_ratio` | gauge | cache, collection | `cache_demand_bytes` over the cache's configured capacity: above 1 the cache is below its demand. No series for a disabled cache |
+| `cache_demand_ratio` | gauge | cache, collection | `cache_demand_bytes` over the cache's capacity, configured or, in `auto` mode, the plan's: above 1 the cache is below its demand. No series for a disabled cache |
 | `cache_planned_bytes` | gauge | cache, collection | The size the [memory plan](#memory-memory) gives each cache and admission budget, labelled as `cache_size_source` is. In `[memory] mode = "auto"` an entry no setting pins takes it, a warm cache at most a quarter smaller per reload; in `report` mode the configured size is unchanged |
 | `memory_plan_total_bytes` | gauge | — | The memory the plan fits every cache and budget into: `[memory] total_mb`, else 80 % of a cgroup limit, else the smaller of half of `MemTotal` and 80 % of `MemAvailable` at boot; 0 when unknown |
 | `memory_plan_pool_bytes` | gauge | — | What the caches share of the total after the reserves |
 | `memory_plan_shortfall_bytes` | gauge | — | How much more memory the plan needs with its pins kept and every other cache and budget at its floor; 0 when it fits |
+| `memory_plan_unapplied_bytes` | gauge | — | In `[memory] mode = "auto"`, the capacity above the plan that applying it could not take away yet: warm caches giving up a quarter of what they hold per reload, shrinks that stop in place. The plan counts it, its shortfall what does not fit; 0 in `report` mode |
 
 **Render & storage:**
 
