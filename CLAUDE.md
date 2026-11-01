@@ -376,6 +376,13 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   every_cache_and_budget_on_metrics_is_in_the_plan` fails when a
   `*_cache_bytes` or `*_capacity_bytes` family has no entry: a new engine
   type adds its fixture collection there.
+  `[memory] mode = "auto"` resizes an entry no setting pins through the
+  hook its registration hands over (`.registered`/`.register` and the
+  budgets' `.register` do; `plan::register_sized` for a per-collection
+  cache, with the size its config gives it) and plans it at that
+  configured size, never the one it applied. A reload path that resizes a
+  cache must leave an unpinned one to the plan in `auto`
+  (`crates/server/CLAUDE.md`).
   An engine whose data fixes what a cache must hold (a time window, a
   pre-warm set, a grid) publishes it as a `plan::CacheDemand` through its
   own `plan::DemandSlot`, under the cache id and scope the plan lists the

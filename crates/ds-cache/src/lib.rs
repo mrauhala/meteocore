@@ -24,7 +24,8 @@
 //! #1308).
 //!
 //! Every cache can be resized in place ([`ByteBoundedCache::set_capacity`],
-//! #1311), keeping what still fits.
+//! #1311), keeping what still fits; a registered one by the memory plan
+//! too ([`plan::apply`], #1312).
 
 use std::hash::Hash;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -324,6 +325,35 @@ impl<K: Eq + Hash, V: Clone> Inner<K, V> {
             .resize(capacity_bytes, old_shard, self.cache.shard_capacity());
         self.capacity_bytes.store(capacity_bytes, Ordering::Relaxed);
     }
+
+    /// [`ByteBoundedCache::set_capacity`], here so the memory plan can
+    /// resize a cache through its registration ([`plan::apply`]).
+    fn set_capacity(&self, capacity_bytes: u64) -> u64 {
+        let _resizing = self.resizing.lock().unwrap_or_else(|e| e.into_inner());
+        let from = self.capacity_bytes();
+        let mut target = capacity_bytes;
+        if target > 0 && target < from {
+            let mut floor = self.shape.slice_floor(self.cache.num_shards());
+            if self.entry_floor.load(Ordering::Relaxed) {
+                floor = floor.max(FLOOR_ENTRIES.saturating_mul(self.counters().largest()));
+            }
+            target = target.max(floor.min(from));
+        }
+        if target > from {
+            if from == 0 {
+                // From its 1-byte clamp `quick_cache` would keep a hot
+                // share of 1 and scale its evicted-key list from one byte.
+                // From 0 it starts both again from its defaults.
+                self.resize_store(0, 0);
+            }
+            self.resize_store(target, target);
+        } else {
+            for step in shrink_steps(from, target) {
+                self.resize_store(step.max(1), step);
+            }
+        }
+        target
+    }
 }
 
 /// The capacities a shrink from `from` to `to` bytes passes through: steps
@@ -590,31 +620,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// during one, an insert racing a step counted against the hot target
     /// before or after it.
     pub fn set_capacity(&self, capacity_bytes: u64) -> u64 {
-        let inner = &*self.inner;
-        let _resizing = inner.resizing.lock().unwrap_or_else(|e| e.into_inner());
-        let from = inner.capacity_bytes();
-        let mut target = capacity_bytes;
-        if target > 0 && target < from {
-            let mut floor = inner.shape.slice_floor(inner.cache.num_shards());
-            if inner.entry_floor.load(Ordering::Relaxed) {
-                floor = floor.max(FLOOR_ENTRIES.saturating_mul(inner.counters().largest()));
-            }
-            target = target.max(floor.min(from));
-        }
-        if target > from {
-            if from == 0 {
-                // From its 1-byte clamp `quick_cache` would keep a hot
-                // share of 1 and scale its evicted-key list from one byte.
-                // From 0 it starts both again from its defaults.
-                inner.resize_store(0, 0);
-            }
-            inner.resize_store(target, target);
-        } else {
-            for step in shrink_steps(from, target) {
-                inner.resize_store(step.max(1), step);
-            }
-        }
-        target
+        self.inner.set_capacity(capacity_bytes)
     }
 
     /// Whether [`Self::set_capacity`] to `capacity_bytes` leaves a cache
@@ -1035,12 +1041,34 @@ where
 {
     /// Enter this cache in the memory plan ([`plan`]) as `id`, its
     /// `/metrics` family, sized from `source`. Listed while the cache lives;
-    /// registering it again replaces the entry.
+    /// registering it again replaces the entry. The plan can resize it
+    /// ([`plan::apply`], [`Self::set_capacity`]); its configured size is
+    /// its capacity at its first registration ([`plan::register_resizable`]).
     pub fn register(&self, id: &'static str, scope: plan::Scope, source: plan::SizeSource) {
-        plan::register(
+        plan::register_resizable(
             plan::Entry::cache(id, scope, source),
             &self.inner,
             Inner::usage,
+            Inner::set_capacity,
+        );
+    }
+
+    /// [`Self::register`] with the size its settings give it now,
+    /// `configured_bytes`: for a cache a reload keeps, whose capacity may be
+    /// the plan's ([`plan::register_sized`]).
+    pub fn register_sized(
+        &self,
+        id: &'static str,
+        scope: plan::Scope,
+        source: plan::SizeSource,
+        configured_bytes: u64,
+    ) {
+        plan::register_sized(
+            plan::Entry::cache(id, scope, source),
+            configured_bytes,
+            &self.inner,
+            Inner::usage,
+            Inner::set_capacity,
         );
     }
 

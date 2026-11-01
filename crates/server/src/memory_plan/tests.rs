@@ -332,6 +332,8 @@ fn row(id: &'static str, scope: Scope, source: SizeSource, capacity: u64) -> Row
         },
         window: None,
         demand: None,
+        configured_bytes: capacity,
+        planned: false,
     }
 }
 
@@ -539,4 +541,346 @@ fn the_plan_line_names_the_total_and_the_reserves() {
         Baseline::Measured { outside_bytes, .. } if outside_bytes == GIB
     ));
     assert_eq!(baseline(&MemoryReading::default()), Baseline::Estimated);
+}
+
+/// A GRIB source's decoded-grid cache as the engine builds one: one shard,
+/// entered with the size its settings give it, and the demand of sixteen
+/// fields of `field_bytes` published for it. Its values weigh what they
+/// say, so a test fills gigabytes with nothing.
+struct GridSource {
+    cache: ds_cache::ByteBoundedCache<u64, u64>,
+    _demand: ds_cache::plan::DemandSlot,
+}
+
+fn grid_scope(id: &str) -> Scope {
+    Scope::Source {
+        engine: "grib",
+        id: id.into(),
+    }
+}
+
+fn grid_source(id: &str, source: SizeSource, mb: u64, field_bytes: u64) -> GridSource {
+    let cache = ds_cache::ByteBoundedCache::new_single_shard(mb * MIB, field_bytes, |_, v| *v);
+    cache.register_sized("grid_cache", grid_scope(id), source, mb * MIB);
+    let demand = ds_cache::plan::DemandSlot::new("grid_cache", grid_scope(id), id);
+    demand.publish(
+        ds_cache::plan::CacheDemand::demand(
+            16 * field_bytes,
+            "16 × decoded field bytes",
+            "[grib] grid_cache_mb",
+        )
+        .input("fields", 16)
+        .input("field_bytes", field_bytes),
+    );
+    GridSource {
+        cache,
+        _demand: demand,
+    }
+}
+
+/// The decoded weights of a 0.1° (3600 × 1801) and a 0.25° (1440 × 721)
+/// `f32` field, as the GRIB grid cache weighs them.
+const TENTH_FIELD: u64 = 3600 * 1801 * 4 + 160;
+const QUARTER_FIELD: u64 = 1440 * 721 * 4 + 160;
+
+/// The rows of the GRIB sources `ids`, and the remote GRIB collections
+/// they serve: tests share the registry.
+fn grid_rows(ids: &[&str]) -> (Vec<Row>, HashMap<String, CollectionConfig>) {
+    let rows = ds_cache::plan::snapshot()
+        .into_iter()
+        .filter(|row| {
+            row.entry
+                .scope
+                .collection()
+                .is_some_and(|c| ids.contains(&c))
+        })
+        .collect();
+    let toml: String = ids
+        .iter()
+        .map(|id| {
+            format!(
+                "[[collections]]\nid = \"{id}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"grib\"\napis = [\"edr\", \"wms\"]\n[collections.grib]\n\
+                 data_path = \"s3://bucket/{id}\"\n"
+            )
+        })
+        .collect();
+    (rows, collections(&toml))
+}
+
+/// The plan of `ids` at 16 GiB, in `mode`.
+fn grid_report(ids: &[&str], mode: MemoryMode) -> (Report, Vec<Row>) {
+    let (rows, collections) = grid_rows(ids);
+    let mut report = report(
+        Some(16 * 1024),
+        &Reading::default(),
+        &rows,
+        &collections,
+        Baseline::Estimated,
+    );
+    report.mode = mode;
+    (report, rows)
+}
+
+fn capacity_mb(source: &GridSource) -> u64 {
+    source.cache.capacity_bytes() / MIB
+}
+
+/// #1312 part 2: `report` changes no size; `auto` gives each cache no
+/// setting pins its grant, and a pinned one keeps its size. A 0.1° GRIB
+/// source and a 0.25° one get different grid caches, from their field
+/// sizes: sixteen 0.1° fields plus 15 % (456 MiB), and the 256 MiB default,
+/// which holds sixteen 0.25° fields. Planned again, the same config plans
+/// and applies the same; `report` again gives the configured size back.
+#[test]
+fn auto_applies_the_plan_to_unpinned_caches_and_report_to_none() {
+    let ids = ["mp-auto-tenth", "mp-auto-quarter", "mp-auto-pinned"];
+    let tenth = grid_source(ids[0], SizeSource::Default, 256, TENTH_FIELD);
+    let quarter = grid_source(ids[1], SizeSource::Default, 256, QUARTER_FIELD);
+    let pinned = grid_source(
+        ids[2],
+        SizeSource::Collection("[grib] grid_cache_mb"),
+        256,
+        TENTH_FIELD,
+    );
+    let sizes = || [&tenth, &quarter, &pinned].map(capacity_mb);
+
+    let (report, rows) = grid_report(&ids, MemoryMode::Report);
+    assert_eq!(apply(&report, &rows), Vec::new());
+    assert_eq!(sizes(), [256, 256, 256], "report changes no size");
+    let grant = |id: &str| {
+        let row = rows.iter().find(|r| r.entry.scope.collection() == Some(id));
+        report
+            .plan
+            .as_ref()
+            .unwrap()
+            .grant(&row.unwrap().entry)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(grant(ids[0]).bytes, 456 * MIB);
+    assert_eq!(grant(ids[0]).entry_bytes, Some(TENTH_FIELD));
+    assert_eq!(grant(ids[1]).entry_bytes, Some(QUARTER_FIELD));
+
+    let (report, rows) = grid_report(&ids, MemoryMode::Auto);
+    let changes = apply(&report, &rows);
+    assert_eq!(sizes(), [456, 256, 256]);
+    assert_eq!(
+        tenth.cache.shards(),
+        1,
+        "the layout of a cache built at 456 MiB"
+    );
+    assert_eq!(
+        changes,
+        [Change {
+            entry: Entry::cache("grid_cache", grid_scope(ids[0]), SizeSource::Default),
+            from_bytes: 256 * MIB,
+            to_bytes: 456 * MIB,
+            target_bytes: 456 * MIB,
+            reason: "working set".into(),
+            held: None,
+        }]
+    );
+    let report = Report { changes, ..report };
+    assert_eq!(
+        changes_block(&report).unwrap(),
+        "Memory plan applied ([memory] mode = \"auto\"): 1 of 1 sizes changed\n  \
+         grid_cache mp-auto-tenth 256 MiB → 456 MiB (working set)"
+    );
+    let (rows, _) = grid_rows(&ids);
+    let row = |id: &str| rows.iter().find(|r| r.entry.scope.collection() == Some(id));
+    let applied = row(ids[0]).unwrap();
+    assert!(applied.planned);
+    assert_eq!(applied.source().to_string(), "plan:auto");
+    assert_eq!(applied.configured_bytes, 256 * MIB);
+    assert_eq!(
+        row(ids[2]).unwrap().source().to_string(),
+        "collection:[grib] grid_cache_mb"
+    );
+
+    // The same config again: the plan reads the configured sizes.
+    let (again, rows) = grid_report(&ids, MemoryMode::Auto);
+    assert_eq!(again.plan, report.plan);
+    assert_eq!(apply(&again, &rows), Vec::new());
+    assert_eq!(sizes(), [456, 256, 256]);
+
+    let (back, rows) = grid_report(&ids, MemoryMode::Report);
+    let changes = apply(&back, &rows);
+    assert_eq!(sizes(), [256, 256, 256]);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(
+        (
+            changes[0].from_bytes,
+            changes[0].to_bytes,
+            changes[0].reason.as_str()
+        ),
+        (456 * MIB, 256 * MIB, "configured")
+    );
+}
+
+/// #1312 part 2: a warm cache, one holding more than its grant, shrinks by
+/// at most a quarter each time the plan is applied, logged with its old and
+/// new size; a cold one goes to its grant at once.
+#[test]
+fn a_warm_cache_shrinks_by_at_most_a_quarter_each_time() {
+    let ids = ["mp-warm", "mp-cold"];
+    let warm = grid_source(ids[0], SizeSource::Default, 256, TENTH_FIELD);
+    let cold = grid_source(ids[1], SizeSource::Default, 256, TENTH_FIELD);
+    // An earlier plan gave both 1 GiB; the warm one holds 800 MiB.
+    for id in ids {
+        let entry = Entry::cache("grid_cache", grid_scope(id), SizeSource::Default);
+        assert_eq!(ds_cache::plan::apply(&entry, 1024 * MIB), Some(1024 * MIB));
+    }
+    for key in 0..100 {
+        warm.cache.insert(key, 8 * MIB);
+    }
+    assert_eq!(warm.cache.weight(), 800 * MIB);
+
+    let (report, rows) = grid_report(&ids, MemoryMode::Auto);
+    let changes = apply(&report, &rows);
+    assert_eq!((capacity_mb(&warm), capacity_mb(&cold)), (768, 456));
+    let report = Report { changes, ..report };
+    let block = changes_block(&report).unwrap();
+    assert!(
+        block.contains(
+            "\n  grid_cache mp-warm 1024 MiB → 768 MiB (working set; toward 456 MiB: a warm \
+             cache shrinks by at most 25 % at once)"
+        ),
+        "{block}"
+    );
+    assert!(
+        block.contains("\n  grid_cache mp-cold 1024 MiB → 456 MiB (working set)"),
+        "{block}"
+    );
+    let held = |id: &str| {
+        let change = report
+            .changes
+            .iter()
+            .find(|c| c.entry.scope.collection() == Some(id));
+        change.unwrap().held
+    };
+    assert_eq!((held(ids[0]), held(ids[1])), (Some(Held::Warm), None));
+    // Each later plan takes it a quarter further, until its grant.
+    let mut steps = vec![capacity_mb(&warm)];
+    for _ in 0..3 {
+        let (report, rows) = grid_report(&ids, MemoryMode::Auto);
+        apply(&report, &rows);
+        steps.push(capacity_mb(&warm));
+    }
+    assert_eq!(steps, [768, 576, 456, 456]);
+    assert!(warm.cache.weight() <= 456 * MIB);
+}
+
+/// #1312 part 2: an unreachable cache that holds nothing keeps its size:
+/// it costs nothing, and grown again from 0 it would lose its hot share.
+#[test]
+fn an_unreachable_cache_keeps_its_size_while_it_holds_nothing() {
+    let message = ds_cache::ByteBoundedCache::<u64, u64>::new(64 * MIB, MIB, |_, v| *v);
+    let scope = grid_scope("mp-local");
+    message.register("grib_message_cache", scope.clone(), SizeSource::Default);
+    let toml = "[[collections]]\nid = \"mp-local\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                engine_type = \"grib\"\napis = [\"edr\"]\n[collections.grib]\n\
+                data_path = \"/data/grib\"\n";
+    let plan_of = || {
+        let rows: Vec<Row> = ds_cache::plan::snapshot()
+            .into_iter()
+            .filter(|row| row.entry.scope == scope)
+            .collect();
+        let mut report = report(
+            Some(16 * 1024),
+            &Reading::default(),
+            &rows,
+            &collections(toml),
+            Baseline::Estimated,
+        );
+        report.mode = MemoryMode::Auto;
+        (report, rows)
+    };
+    let (report, rows) = plan_of();
+    assert_eq!(report.plan.as_ref().unwrap().caches[0].bytes, 0);
+    assert_eq!(apply(&report, &rows), Vec::new());
+    assert_eq!(message.capacity_bytes(), 64 * MIB);
+    // Holding entries no collection can read, it lets them go.
+    message.insert(1, MIB);
+    let (report, rows) = plan_of();
+    let changes = apply(&report, &rows);
+    assert_eq!(message.capacity_bytes(), 0);
+    assert_eq!((changes[0].from_bytes, changes[0].to_bytes), (64 * MIB, 0));
+}
+
+/// #1312 part 2: the bytes an Icechunk collection fetched ahead, held
+/// outside its payload cache, count among the store gauges the plan
+/// reserves, and the dashboard's "stores" band stacks every one of them.
+#[test]
+fn staged_icechunk_bytes_are_reserved_with_the_stores() {
+    assert!(STORE_FAMILIES.contains(&"zarr_icechunk_staged_bytes"));
+    let staged = 1u64 << 50;
+    crate::admin::ZARR_ICECHUNK_STAGED_BYTES
+        .with_label_values(&["mp-staged"])
+        .set(staged as i64);
+    let measured = baseline(&MemoryReading(vec![
+        ("process_resident_memory_bytes", Some(3 * GIB)),
+        ("jemalloc_resident_bytes", Some(2 * GIB)),
+    ]));
+    let _ = crate::admin::ZARR_ICECHUNK_STAGED_BYTES.remove_label_values(&["mp-staged"]);
+    assert!(
+        matches!(measured, Baseline::Measured { store_bytes, .. } if store_bytes >= staged),
+        "{measured:?}"
+    );
+    let dashboard = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docker/grafana/dashboards/meteocore-overview.json"),
+    )
+    .unwrap();
+    let stores = format!("__name__=~\\\"{}\\\"", STORE_FAMILIES.join("|"));
+    assert_eq!(
+        dashboard.matches(&stores).count(),
+        3,
+        "the Memory outside caches panels stack the plan's stores: {stores}"
+    );
+}
+
+/// The changes block names a size the plan could not set and why, and in
+/// `report` mode the sizes it gave back.
+#[test]
+fn the_changes_block_says_why_a_size_was_not_set() {
+    let change = |id: &'static str, from: u64, to: u64, target: u64, held| Change {
+        entry: Entry::cache(id, grid_scope("mp-block"), SizeSource::Default),
+        from_bytes: from * MIB,
+        to_bytes: to * MIB,
+        target_bytes: target * MIB,
+        reason: "working set".into(),
+        held,
+    };
+    let mut report = report(
+        None,
+        &Reading::default(),
+        &[],
+        &HashMap::new(),
+        Baseline::Estimated,
+    );
+    report.mode = MemoryMode::Auto;
+    assert_eq!(changes_block(&report), None);
+    report.changes = vec![
+        change("grib_message_cache", 0, 0, 64, Some(Held::InPlace)),
+        change("grid_cache", 256, 256, 16, Some(Held::InPlace)),
+    ];
+    assert_eq!(
+        changes_block(&report).unwrap(),
+        "Memory plan applied ([memory] mode = \"auto\"): 0 of 2 sizes changed\n  \
+         grib_message_cache mp-block kept at 0 MiB (working set; toward 64 MiB: it is off, and \
+         only its setting turns it on)\n  \
+         grid_cache mp-block kept at 256 MiB (working set; toward 16 MiB: it cannot take that \
+         size in place)"
+    );
+    report.mode = MemoryMode::Report;
+    report.changes = vec![Change {
+        reason: "configured".into(),
+        ..change("grid_cache", 456, 256, 256, None)
+    }];
+    assert_eq!(
+        changes_block(&report).unwrap(),
+        "Memory plan ([memory] mode = \"report\"): 1 of 1 sizes the plan had set are back at \
+         their configured sizes\n  grid_cache mp-block 456 MiB → 256 MiB (configured)"
+    );
 }

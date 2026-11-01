@@ -37,6 +37,10 @@
 //! 0 when no collection can reach it. The plan fits the expected use into
 //! the pool, so the grants may sum to more, as configured sizes do today:
 //! a cache allocates only as it fills.
+//!
+//! The server applies the grants in `[memory] mode = "auto"`, each through
+//! [`bounded`]: a warm cache, one holding more than its grant, shrinks by
+//! at most [`WARM_SHRINK_PERCENT`] at once.
 
 use std::fmt;
 
@@ -168,14 +172,45 @@ pub fn class(id: &str) -> Class {
 /// Whether a size came from a setting: an environment variable, a config
 /// key, or a key it follows. A pinned size is never changed.
 pub fn pinned(source: &SizeSource) -> bool {
-    !matches!(source, SizeSource::Default | SizeSource::Constant)
+    !matches!(
+        source,
+        SizeSource::Default | SizeSource::Constant | SizeSource::Planned
+    )
+}
+
+/// The most one resize by the plan shrinks a warm cache, in percent of its
+/// size: a reload's new plan evicts at most this share of a cache in use
+/// at once, and the next reload takes it further (#1312).
+pub const WARM_SHRINK_PERCENT: u64 = 25;
+
+/// Whether a cache holding `used_bytes` in `entries` is warm for a shrink
+/// to `to_bytes`: it holds more than that, so the shrink would evict
+/// entries requests may still ask for. A cache that counts its entries and
+/// has none is never warm. One holding no more than `to_bytes` loses
+/// nothing to the shrink, however full it is.
+pub fn warm(used_bytes: u64, entries: Option<u64>, to_bytes: u64) -> bool {
+    entries != Some(0) && used_bytes > to_bytes
+}
+
+/// The size the plan resizes a cache of `from_bytes`, holding `used_bytes`
+/// in `entries`, to for a grant of `to_bytes`: the grant, but a warm cache
+/// ([`warm`]) shrinks by at most [`WARM_SHRINK_PERCENT`] of `from_bytes`,
+/// to whole MiB. A growth is never bounded.
+pub fn bounded(from_bytes: u64, to_bytes: u64, used_bytes: u64, entries: Option<u64>) -> u64 {
+    if to_bytes >= from_bytes || !warm(used_bytes, entries, to_bytes) {
+        return to_bytes;
+    }
+    let least = mib_up(from_bytes - percent(from_bytes, WARM_SHRINK_PERCENT)).min(from_bytes);
+    to_bytes.max(least)
 }
 
 /// A cache as the plan reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheInput {
     pub entry: Entry,
-    /// Its size today. Unpinned, the built-in default.
+    /// Its size today: a pinned cache's capacity; an unpinned one's
+    /// configured size, its built-in default, whatever size the plan gave
+    /// it ([`Row::configured_bytes`]).
     pub capacity_bytes: u64,
     pub used_bytes: u64,
     pub entries: Option<u64>,
@@ -205,7 +240,7 @@ impl CacheInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BudgetInput {
     pub entry: Entry,
-    /// Its size today.
+    /// Its size today, as a [`CacheInput`]'s.
     pub capacity_bytes: u64,
     /// Why no collection can reach it, when none can.
     pub unreachable: Option<String>,
@@ -236,7 +271,9 @@ pub struct Inputs {
 
 impl Inputs {
     /// The inputs of a snapshot's `rows`, `unreachable` saying why no
-    /// collection can reach an entry, when none can.
+    /// collection can reach an entry, when none can. An unpinned entry is
+    /// read at its configured size, not the plan's: the same config plans
+    /// the same, whatever the plan applied before.
     pub fn of_rows(
         total_bytes: u64,
         collections: u64,
@@ -252,10 +289,15 @@ impl Inputs {
             budgets: Vec::new(),
         };
         for row in rows {
+            let today = if pinned(&row.entry.source) {
+                row.usage.capacity_bytes
+            } else {
+                row.configured_bytes
+            };
             match row.entry.kind {
                 Kind::Cache => inputs.caches.push(CacheInput {
                     entry: row.entry.clone(),
-                    capacity_bytes: row.usage.capacity_bytes,
+                    capacity_bytes: today,
                     used_bytes: row.usage.used_bytes,
                     entries: row.usage.entries,
                     demand: row.demand.clone(),
@@ -267,7 +309,7 @@ impl Inputs {
                 }),
                 Kind::Budget => inputs.budgets.push(BudgetInput {
                     entry: row.entry.clone(),
-                    capacity_bytes: row.usage.capacity_bytes,
+                    capacity_bytes: today,
                     unreachable: unreachable(row),
                 }),
             }

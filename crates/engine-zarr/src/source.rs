@@ -46,6 +46,29 @@ impl Source {
         }
     }
 
+    /// Resize a plain store's object cache (`[zarr] cache_mb`) in place;
+    /// the capacity applied, `None` for an Icechunk repository.
+    pub(crate) fn resize_object_cache(&self, bytes: u64) -> Option<u64> {
+        match self {
+            Self::Plain(source) => Some(source.store.resize_cache(bytes)),
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(_) => None,
+        }
+    }
+
+    /// Resize an Icechunk repository's payload cache in place; the capacity
+    /// applied, `None` for a plain store.
+    pub(crate) fn resize_payload_cache(&self, bytes: u64) -> Option<u64> {
+        match self {
+            Self::Plain(_) => {
+                let _ = bytes;
+                None
+            }
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(source) => Some(source.meter().resize_payload(bytes)),
+        }
+    }
+
     /// An Icechunk repository's payload cache (`[zarr] cache_mb`, #1353);
     /// `None` for a plain store.
     pub(crate) fn payload_cache_metrics(&self) -> Option<ds_cache::CacheMetrics> {

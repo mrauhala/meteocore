@@ -61,6 +61,12 @@ impl DecodedCache {
     pub(crate) fn metrics(&self) -> CacheMetrics {
         self.0.metrics()
     }
+
+    /// Resize in place, keeping the chunks that fit; the capacity applied
+    /// ([`ByteBoundedCache::set_capacity`]).
+    pub(crate) fn resize(&self, bytes: u64) -> u64 {
+        self.0.set_capacity(bytes)
+    }
 }
 
 pub(crate) struct DecodedArray {

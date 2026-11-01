@@ -922,3 +922,110 @@ fn reasons_print_for_the_report() {
         ]
     );
 }
+
+/// #1312 part 2: a warm cache, one holding more than its grant, shrinks by
+/// at most 25 % at once, to whole MiB; one holding no more than its grant,
+/// or nothing, shrinks to it at once; a growth is never bounded.
+#[test]
+fn a_warm_cache_shrinks_by_at_most_a_quarter() {
+    let gib = 1024 * MB;
+    // Holding 3 GiB of a 4 GiB cache granted 1 GiB: 3 GiB.
+    assert!(warm(3 * gib, Some(900), gib));
+    assert_eq!(bounded(4 * gib, gib, 3 * gib, Some(900)), 3 * gib);
+    // A grant within the quarter is applied as it is.
+    assert_eq!(bounded(4 * gib, 3200 * MB, 3500 * MB, None), 3200 * MB);
+    // Holding no more than the grant: nothing to evict.
+    assert!(!warm(gib, Some(300), gib));
+    assert_eq!(bounded(4 * gib, gib, gib, Some(300)), gib);
+    assert_eq!(bounded(4 * gib, gib, 0, Some(0)), gib);
+    // Counted entries, none held: never warm, whatever its weight says.
+    assert!(!warm(5 * MB, Some(0), 0));
+    // Rounded up to whole MiB: never more than a quarter.
+    let odd = 1001 * MB + 7;
+    let least = bounded(odd, 0, odd, None);
+    assert_eq!(least, 751 * MB);
+    assert!(least * 4 >= odd * 3);
+    // A growth.
+    assert_eq!(bounded(gib, 4 * gib, gib, Some(10)), 4 * gib);
+}
+
+/// Rows read at their configured size, not the plan's: an unpinned cache
+/// the plan resized plans as its built-in default, a pinned one at its
+/// capacity, so the same config gives the same plan after it is applied.
+#[test]
+fn rows_plan_at_their_configured_size() {
+    use crate::plan::{Row, Usage};
+    let row = |source: SizeSource, capacity: u64, configured: u64, planned: bool| Row {
+        entry: Entry::cache("metatile_cache", Scope::Process, source),
+        usage: Usage {
+            capacity_bytes: capacity * MB,
+            ..Usage::default()
+        },
+        window: None,
+        demand: None,
+        configured_bytes: configured * MB,
+        planned,
+    };
+    let today = |row: Row| {
+        Inputs::of_rows(8 * GIB, 1, Baseline::Estimated, &[row], |_| None).caches[0].capacity_bytes
+            / MB
+    };
+    assert_eq!(today(row(SizeSource::Default, 4096, 1024, true)), 1024);
+    assert_eq!(
+        today(row(
+            SizeSource::Config("[server] metatile_cache_mb"),
+            8192,
+            6144,
+            false
+        )),
+        8192
+    );
+    assert!(!pinned(&SizeSource::Planned));
+}
+
+/// #1312 acceptance: one 0.1° GRIB source and one 0.25° source get
+/// different grid caches from their field sizes, each grant carrying its
+/// field size for the cache's layout (rule 8). The 0.25° one's sixteen
+/// fields fit its 256 MiB default, which it keeps (rule 6); the 0.1° one's
+/// do not, and it gets them plus 15 %.
+#[test]
+fn a_0_1_and_a_0_25_degree_source_get_different_grid_caches() {
+    // The decoded field sizes of 3600 × 1801 and 1440 × 721 f32 grids.
+    let tenth = 3600 * 1801 * 4 + 160;
+    let quarter = 1440 * 721 * 4 + 160;
+    let field = |bytes: u64| {
+        let part = CacheDemand::demand(16 * bytes, "16 × decoded field bytes", "setting")
+            .input("field_bytes", bytes);
+        Demand {
+            bytes: part.bytes,
+            rule: part.rule,
+            floor: part.floor,
+            ahead: part.ahead,
+            setting: part.setting,
+            parts: vec![("c".into(), part)],
+        }
+    };
+    let source_cache = |id: &str, bytes: u64| CacheInput {
+        demand: Some(field(bytes)),
+        ..default("grid_cache", source("grib", id), 256)
+    };
+    for total in [3.2, 8.0, 31.0] {
+        let caches = vec![
+            source_cache("nwp-tenth", tenth),
+            source_cache("nwp-quarter", quarter),
+        ];
+        let plan = plan(&inputs(total, 2, Baseline::Estimated, caches, Vec::new()));
+        assert_fits(&plan);
+        let (a, b) = (
+            grant(&plan, "grid_cache", Some("nwp-tenth")),
+            grant(&plan, "grid_cache", Some("nwp-quarter")),
+        );
+        let suggested = (16 * tenth + (16 * tenth * 15).div_ceil(100)).div_ceil(MB) * MB;
+        assert_eq!(a.bytes, suggested, "{total}");
+        assert_eq!(a.bytes, 456 * MB);
+        assert_eq!(a.reason, Reason::WorkingSet);
+        assert_eq!(b.bytes, 256 * MB, "{total}");
+        assert_eq!(b.reason, Reason::Today);
+        assert_eq!((a.entry_bytes, b.entry_bytes), (Some(tenth), Some(quarter)));
+    }
+}

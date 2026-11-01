@@ -135,6 +135,12 @@ impl DsStore {
         self.shared.cache.metrics()
     }
 
+    /// Resize the object cache in place, keeping the objects that fit; the
+    /// capacity applied ([`ds_cache::ByteBoundedCache::set_capacity`]).
+    pub(crate) fn resize_cache(&self, bytes: u64) -> u64 {
+        self.shared.cache.set_capacity(bytes)
+    }
+
     pub(crate) fn fresh(&self) -> Self {
         Self {
             shared: self.shared.clone(),

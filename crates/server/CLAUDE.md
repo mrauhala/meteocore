@@ -95,6 +95,16 @@ disk, no TOML needed.
     already gives the most shards that keep 32 entries each. A style
     fingerprint change still drops them, and a disabled cache grown, or a
     size too far from the old one, is built anew.
+  - **In `[memory] mode = "auto"` a reload resizes nothing the plan sizes
+    (#1312).** `ReusableCaches::plan_sized` (`PlanSized::of` the new
+    config) reuses each render cache no setting pins as it is, staging no
+    resize; `EngineReuse::plan_sized` makes a reused GRIB or GeoTIFF
+    engine's staged closure apply `cache_plan::plan_kept_grib` /
+    `plan_kept_geotiff`: the config's pins, every other cache at its live
+    size. The plan fitted after the reload moves them, a warm cache by a
+    quarter at most; a staged shrink to the default first would evict
+    what the 25 % rule keeps. `cache_sizes_only` still judges in place
+    against the config's sizes: a rebuild is always safe.
   - `apply_load` takes the staged resizes after the ready guard accepts the
     load and runs them after the per-collection eviction, so a shrink keeps
     the warm entries of reused collections, not those of rebuilt ones. A
@@ -277,8 +287,35 @@ need no reload pruning.
   the facts `memory_plan::read_at_boot` reads once (`main` calls it before
   the first load, so `MemAvailable` is what boot leaves). The last report
   is a process-wide static that `/admin/cache-plan` (`planned_bytes`,
-  `plan`) and the `/metrics` plan gauges read. It applies nothing: the
-  plan is a report until `[memory] mode = "auto"` (#1312 part 2).
+  `plan`) and the `/metrics` plan gauges read.
+- `[memory] mode` (`AcceptedLoad::memory_mode`): `report`, the default,
+  applies nothing; `auto` makes `memory_plan::replan` call `apply`, which
+  resizes each row no setting pins through `ds_cache::plan::apply`, the
+  hook its registration handed over: `ByteBoundedCache::set_capacity`, a
+  budget's `resize`, the GRIB/GeoTIFF/Zarr engines' `resize_*` (the GRIB
+  ones refuse a size whose hot share would not hold a 0.1° fill, and a
+  cache built off stays off). Shrinks go first. A warm cache, holding more
+  than its grant, goes at most a quarter down per apply
+  (`grant::bounded`). An unreachable cache that holds nothing, and an
+  unreachable budget, keep their size: a cache disabled and grown again
+  restarts at quick_cache's default hot share (the PVOL pixel cache's
+  pre-warm share would go). `report` after `auto` gives each plan-sized
+  entry its configured size back (`restore`). `cache_plan::log` snapshots
+  again after an apply, so the block lists the new sizes, then logs
+  `changes_block` (old → new per entry). `Report::changes` is the
+  endpoint's `plan.changes`.
+- The plan reads an unpinned entry at its configured size
+  (`Row::configured_bytes`), never at the size it applied, or rule 6 and
+  the 8× ceiling would ratchet on every reload. Every server registration
+  says that size (`plan::register_sized`, `ByteBoundedCache::register_sized`,
+  the render caches' `register(source, configured_mb)`) from the accepted
+  config; process-wide statics, registered once at build, take their
+  capacity then. A row whose capacity is the plan's reads source
+  `plan:auto` (`Row::source`); a capacity anything else changed since
+  drops the mark.
+- A new resizable cache: register it with a resize hook, or the plan can
+  only report it. A cache the reload path resizes needs the auto
+  exception too (`PlanSized`, `plan_kept_*`).
 - Detection (`memory_plan/detect.rs`) reads `/proc` and `/sys` under a
   root, so its tests build fixture trees and run on any OS; without
   `<root>/proc/meminfo`, macOS asks `sysctlbyname` and Windows
@@ -288,7 +325,10 @@ need no reload pruning.
   configs cannot reach needs an arm there, and a class in
   `ds_cache::plan::grant::class`, or it plans as `fixed`.
   `STORE_FAMILIES` is the dashboard's "stores" list (Memory outside
-  caches): change both together.
+  caches, three queries) and the Store memory panel's: change them
+  together (`staged_icechunk_bytes_are_reserved_with_the_stores` checks
+  the first). `zarr_icechunk_staged_bytes` is one: ranges fetched ahead
+  and held outside the payload cache.
 - Without `ADMIN_TOKEN` every admin route answers 403 (`require_admin_token`).
 - `metrics_handler` takes the budgets' high-water marks after
   `refresh_metrics` (`update_budget_peaks`); the plan endpoint and log block
