@@ -8158,15 +8158,25 @@ pub(crate) fn collection_data_ages(state: &ServerState) -> Vec<DataAge> {
     // registered, its Ready health entry, with no age once its volumes have
     // all left the catalog. The base id is the network's site inventory and
     // has none. A NOD is ASCII alphanumeric, so `{base}-` with no further
-    // `-` belongs to this source and no other. Not alerting: a radar of
-    // another service down for maintenance is not this server's fault, so
-    // `odim-volume` takes no `expected_interval` either.
+    // `-` belongs to this source and no other site. A configured id is never
+    // a site, whose id is derived: so another source's base id (`pvol-fi`
+    // beside `pvol`) is not read as a site `fi` of the first. Not alerting:
+    // a radar of another service down for maintenance is not this server's
+    // fault, so `odim-volume` takes no `expected_interval` either.
+    let configured: HashSet<String> = state
+        .last_collections
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .cloned()
+        .collect();
     let registered: Vec<String> = state
         .health
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .filter(|h| h.engine_type == "odim-volume" && h.status == CollectionStatus::Ready)
+        .filter(|h| !configured.contains(&h.id))
         .map(|h| h.id.clone())
         .collect();
     for e in state

@@ -20,6 +20,12 @@ fn volume_time() -> DateTime<Utc> {
 /// A server state over a PVOL source `base` holding the fixture and a copy
 /// of it five minutes later, and the source's directory.
 fn pvol_state(base: &str) -> (tempfile::TempDir, super::AdminState) {
+    pvol_state_of(&[base])
+}
+
+/// [`pvol_state`] with a source of each id in `bases`, all over the same
+/// directory.
+fn pvol_state_of(bases: &[&str]) -> (tempfile::TempDir, super::AdminState) {
     let dir = tempfile::tempdir().unwrap();
     let volumes = dir.path().join("volumes");
     std::fs::create_dir(&volumes).unwrap();
@@ -30,17 +36,22 @@ fn pvol_state(base: &str) -> (tempfile::TempDir, super::AdminState) {
     let mut later = fixture.to_vec();
     later[at..at + 6].copy_from_slice(b"120500");
     std::fs::write(volumes.join("202609161205_test_PVOL.h5"), later).unwrap();
+    let sources: String = bases
+        .iter()
+        .map(|base| {
+            format!(
+                "[[collections]]\nid = \"{base}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{}\"\nengine_type = \"odim-volume\"\n\
+                 apis = [\"edr\", \"features\"]\n\
+                 [collections.odim]\nprewarm_sweeps = 0\n",
+                volumes.display()
+            )
+        })
+        .collect();
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
-        format!(
-            "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
-             [[collections]]\nid = \"{base}\"\ntitle = \"t\"\ndescription = \"d\"\n\
-             data_path = \"{}\"\nengine_type = \"odim-volume\"\n\
-             apis = [\"edr\", \"features\"]\n\
-             [collections.odim]\nprewarm_sweeps = 0\n",
-            volumes.display()
-        ),
+        format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{sources}"),
     )
     .unwrap();
     let state = crate::watcher::tests::build_state(&config_path);
@@ -219,4 +230,25 @@ async fn pvol_sources_export_their_scans_and_catalog() {
     super::refresh_metrics(&state);
     assert_eq!(series("pvol_scans_total", BASE), scans);
     assert_eq!(series("pvol_scan_volumes_total", BASE), volumes);
+}
+
+/// #193: two sources whose ids nest, `pvol-nest` and `pvol-nest-fi`, each
+/// report their own radar site alone. The second's id, its site inventory
+/// and no site, is never read as a site `fi` of the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_source_id_extending_another_is_not_its_site() {
+    let (_dir, state) = pvol_state_of(&["pvol-nest", "pvol-nest-fi"]);
+    let mut sites: Vec<(String, bool)> = super::collection_data_ages(&state)
+        .into_iter()
+        .filter(|a| !a.alerting)
+        .map(|a| (a.id, a.age.is_some()))
+        .collect();
+    sites.sort();
+    assert_eq!(
+        sites,
+        [
+            ("pvol-nest-fi-test".to_owned(), true),
+            ("pvol-nest-test".to_owned(), true)
+        ]
+    );
 }
