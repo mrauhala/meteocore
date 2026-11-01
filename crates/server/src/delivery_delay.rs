@@ -5,7 +5,9 @@
 //! (`admin::collection_data_ages`), so it includes the feed's delivery
 //! delay: a scan published 30 minutes after its timestamp is 30 minutes old
 //! the moment the server serves it. `CollectionStale` adds the lower
-//! quartile of the delay measured here over the past day to its threshold.
+//! quartile of the delay measured here over the past day to its threshold,
+//! merged across instances, so a restarted pod or a second replica shares
+//! one history.
 //!
 //! [`DeliveryDelays`] watches the newest timestep of every collection whose
 //! engine reports a data age, read through the same accessor the age is
@@ -14,8 +16,7 @@
 //! it minus its timestamp, in whole seconds, negative for data that arrives
 //! ahead of its timestamp (a forecast's valid time). The gauge is the
 //! median of a collection's newest [`WINDOW`] delays, the larger middle one
-//! of an even count, as `ds_core::health::expected_interval` takes it,
-//! published once it has [`MIN_ARRIVALS`] of them.
+//! of an even count, as `ds_core::health::expected_interval` takes it.
 //!
 //! - **Resolution.** The age is read per scrape. This tracker reads the
 //!   same timestamps on its own [`TICK`] on the poll runtime
@@ -28,7 +29,7 @@
 //!   arrive, an engine that loads in its first poll (satellite) held
 //!   nothing before, and a rebuilt engine (a reload changed its collection)
 //!   scanned what its predecessor already served. A collection has no
-//!   series until its [`MIN_ARRIVALS`]th arrival.
+//!   series until its first arrival.
 //! - **A rebuilt engine keeps its collection's delays:** they describe the
 //!   same feed, and dropping them on each config edit would leave the alert
 //!   without a delay until the next arrival. A collection that leaves the
@@ -57,13 +58,6 @@ use chrono::{DateTime, Utc};
 /// 6-hourly model. Each late arrival moves the median up one rank; it
 /// reads a late delay once 12 of the 24 are late.
 pub(crate) const WINDOW: usize = 24;
-
-/// How many arrivals a collection's ring holds before its median is
-/// published. After a restart the first arrivals alone would make the
-/// median, and one early among them would pull down the day's lower
-/// quartile the alert counts; until then the alert has the history of
-/// the series before the restart, or counts no delay.
-pub(crate) const MIN_ARRIVALS: usize = 5;
 
 /// How often the server reads the newest timesteps
 /// ([`DeliveryDelays::observe`]): the resolution of a delay.
@@ -140,14 +134,13 @@ impl DeliveryDelays {
         *tracks = observed;
         let medians = tracks
             .iter()
-            .filter(|(_, track)| track.delays.len() >= MIN_ARRIVALS)
             .filter_map(|(id, track)| Some((id.clone(), median(&track.delays)?)))
             .collect();
         self.medians.store(Arc::new(medians));
     }
 
-    /// The median delay of every collection with at least
-    /// [`MIN_ARRIVALS`] arrivals, as the last observation published it.
+    /// The median delay of every collection with an arrival, as the last
+    /// observation published it.
     pub(crate) fn medians(&self) -> Arc<HashMap<String, i64>> {
         self.medians.load_full()
     }
@@ -163,7 +156,7 @@ fn median(delays: &VecDeque<i64>) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DataTimeline, DeliveryDelays, MIN_ARRIVALS, WINDOW};
+    use super::{DataTimeline, DeliveryDelays, WINDOW};
     use chrono::{DateTime, Duration, TimeZone, Utc};
     use std::sync::{Arc, Mutex};
 
@@ -255,36 +248,25 @@ mod tests {
         assert_eq!(recorded(&delays, "satellite"), [31]);
     }
 
-    /// No median before [`MIN_ARRIVALS`] arrivals: the first few after a
-    /// restart, one of them early, would make it alone. Then the median of
-    /// the newest arrivals, the larger middle one of an even count: one
-    /// late delivery does not move it, a forecast ahead of its timestamp is
-    /// negative.
+    /// The median of the newest arrivals, the larger middle one of an even
+    /// count: published from the first, one late delivery does not move
+    /// it, a forecast ahead of its timestamp is negative.
     #[test]
-    fn the_median_needs_enough_arrivals() {
+    fn the_delay_is_the_median_of_the_arrivals() {
         let delays = DeliveryDelays::default();
         let scan = feed("scan", Some(at(0)));
         delays.observe(at(30), &timelines(&[&scan]));
-        // A 10-minute scan delivered 30, 32, 50, 31, 29 and 33 minutes late.
-        let late = [30, 32, 50, 31, 29, 33];
-        for (n, late) in late.into_iter().enumerate() {
+        // A 10-minute scan delivered 30, 32, 50 and 31 minutes late.
+        let medians = [(30, 30), (32, 32), (50, 32), (31, 32)];
+        for (n, (late, median)) in medians.into_iter().enumerate() {
             let timestep = 10 * (n as i64 + 1);
             arrive(&delays, &scan, timestep, timestep + late);
-            let published = delay(&delays, "scan");
-            match n + 1 {
-                arrived if arrived < MIN_ARRIVALS => {
-                    assert_eq!(published, None, "{arrived} arrivals")
-                }
-                5 => assert_eq!(published, Some(31 * 60), "29 30 31 32 50"),
-                _ => assert_eq!(published, Some(32 * 60), "29 30 31 32 33 50"),
-            }
+            assert_eq!(delay(&delays, "scan"), Some(median * 60), "{n}");
         }
 
         let forecast = feed("forecast", Some(at(600)));
         delays.observe(at(0), &timelines(&[&forecast]));
-        for n in 1..=MIN_ARRIVALS as i64 {
-            arrive(&delays, &forecast, 900 + 60 * n, 300 + 60 * n);
-        }
+        arrive(&delays, &forecast, 960, 360);
         assert_eq!(delay(&delays, "forecast"), Some(-10 * 3600));
     }
 
@@ -355,7 +337,7 @@ mod tests {
         let delays = DeliveryDelays::default();
         let (radar, model) = (feed("radar", Some(at(0))), feed("model", Some(at(0))));
         delays.observe(at(0), &timelines(&[&radar, &model]));
-        for n in 1..=MIN_ARRIVALS as i64 {
+        for n in 1..=3 {
             *radar.newest.lock().unwrap() = Some(at(5 * n));
             delays.observe(at(5 * n + 5), &timelines(&[&radar, &model]));
         }

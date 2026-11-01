@@ -48,38 +48,51 @@ groups:
       # old, and at least the delay plus an interval plus 15 minutes, so a
       # feed every minute is not stale after three.
       #
-      # The delay counted is the gauge's lower quartile over the past day.
-      # The median follows the newest arrivals, so a feed that keeps
-      # delivering but later and later would teach it the new delay and go
-      # quiet while behind. The day's lower quartile keeps such a feed
-      # alerting for about 18 hours, until three quarters of the day saw the
-      # new delay, and keeps a backlog trickling in after an outage from
-      # loosening the threshold. Unlike the day's minimum, it ignores a
-      # spell of prompt deliveries shorter than about 6 hours, which would
-      # otherwise make the next day stricter. It bridges a restart while the
-      # series keep their instance label. With no delay series in the day
-      # (fewer than 5 arrivals seen), the rule counts no delay, nor for data
-      # that arrives ahead of its timestamp. A collection with no interval
-      # series (a single timestep and no expected_interval) never matches.
-      # Nor does a collection a reload removed, whose delay history lingers
-      # for a day; re-added under the same id within that day, it takes the
-      # history up again.
+      # The delay counted is the lower quartile, over the past day, of the
+      # gauge merged across instances (the highest at each 5 minutes): one
+      # feed's delay, whichever pod or replica measured it, so a restart
+      # under a new instance label keeps the history. The median follows
+      # the newest arrivals, so a feed that keeps delivering but later and
+      # later would teach it the new delay and go quiet while behind. The
+      # day's lower quartile keeps such a feed alerting for about 18 hours,
+      # until three quarters of the day saw the new delay, and keeps a
+      # backlog trickling in after an outage from loosening the threshold.
+      # Unlike the day's minimum, it ignores a spell of prompt deliveries
+      # shorter than about 6 hours, which would otherwise make the next day
+      # stricter. With no delay series in the day, the rule counts no
+      # delay, nor for data that arrives ahead of its timestamp. A
+      # collection with no interval series (a single timestep and no
+      # expected_interval) never matches. Nor does a collection a reload
+      # removed, whose delay history lingers for a day; re-added under the
+      # same id within that day, it takes the history up again.
       - alert: CollectionStale
         expr: |
           collection_data_age_seconds{job="meteocore"}
             >= 3 * collection_expected_interval_seconds{job="meteocore"}
-              + (
-                  clamp_min(quantile_over_time(0.25, collection_expected_delay_seconds{job="meteocore"}[1d]), 0)
+              + on (job, collection) group_left ()
+              (
+                  clamp_min(
+                    quantile_over_time(0.25,
+                      max by (job, collection) (collection_expected_delay_seconds{job="meteocore"})[1d:5m]
+                    ),
+                    0
+                  )
                 or
-                  collection_expected_interval_seconds{job="meteocore"} * 0
+                  max by (job, collection) (collection_expected_interval_seconds{job="meteocore"} * 0)
               )
           and
           collection_data_age_seconds{job="meteocore"}
             >= collection_expected_interval_seconds{job="meteocore"} + 900
-              + (
-                  clamp_min(quantile_over_time(0.25, collection_expected_delay_seconds{job="meteocore"}[1d]), 0)
+              + on (job, collection) group_left ()
+              (
+                  clamp_min(
+                    quantile_over_time(0.25,
+                      max by (job, collection) (collection_expected_delay_seconds{job="meteocore"})[1d:5m]
+                    ),
+                    0
+                  )
                 or
-                  collection_expected_interval_seconds{job="meteocore"} * 0
+                  max by (job, collection) (collection_expected_interval_seconds{job="meteocore"} * 0)
               )
         for: 10m
         labels:

@@ -354,14 +354,18 @@ need no reload pruning.
   never fires for the collection. Same lifecycle as the age series, in the
   same `REPORTED` lock.
 - `collection_expected_delay_seconds` (#1389) is how late the data
-  arrives; `CollectionStale` adds its lower quartile over the past day
-  (`quantile_over_time(0.25, …[1d])`) to its threshold, so a feed that
-  falls behind and keeps delivering cannot teach the median its new delay
-  and go quiet (it alerts for about 18 hours), a backlog cannot loosen the
-  next stop's threshold, and, unlike the day's minimum, a spell of prompt
-  deliveries shorter than about 6 hours does not make the next day
-  stricter. That history survives a restart only while `instance` stays
-  the same; on Kubernetes a new pod starts with none. The gauge comes from
+  arrives; `CollectionStale` adds its lower quartile over the past day to
+  its threshold, so a feed that falls behind and keeps delivering cannot
+  teach the median its new delay and go quiet (it alerts for about 18
+  hours), a backlog cannot loosen the next stop's threshold, and, unlike
+  the day's minimum, a spell of prompt deliveries shorter than about 6
+  hours does not make the next day stricter. The quartile is of the series
+  merged across instances, `quantile_over_time(0.25, max by (job,
+  collection) (…)[1d:5m])`, joined `on (job, collection) group_left ()`:
+  a pod restarting under a new `instance` keeps the history, replicas
+  share one delay, and a pod restarted while its feed is behind cannot
+  learn the late delay from its own short history (a max of per-instance
+  quartiles would). The gauge comes from
   `delivery_delay::DeliveryDelays`, one engine-agnostic tracker on
   `ServerState`. The age is read per scrape; the tracker reads the same
   `DataTimeline::newest` on its own 10 s tick on the poll runtime
@@ -370,16 +374,14 @@ need no reload pruning.
   exact to the tick, the engine's poll interval included as in the age,
   whatever the scrape interval. A scrape reads only the medians the tick
   published (an `ArcSwap`). The gauge is the median of the newest 24
-  arrivals (`WINDOW`, the larger middle of an even count), published from
-  the 5th on (`MIN_ARRIVALS`): the first arrivals after a restart would
-  make it alone and pull down the day's quartile. What an engine
+  arrivals (`WINDOW`, the larger middle of an even count). What an engine
   holds the first time it is seen with data is a baseline, never a delay:
   at boot, for an engine that loads in its first poll, and for an engine a
   reload rebuilt (identity is the engine `Arc`, held weakly). A rebuilt
   engine keeps its collection's delays; a removed collection loses them.
   Only a timestep newer than any its engine held is an arrival, so a
   timestep that leaves and comes back adds nothing. No series until the
-  5th arrival; same `REPORTED` lifecycle as the interval.
+  first arrival; same `REPORTED` lifecycle as the interval.
 - Alert rules live in `docker/prometheus/rules/meteocore.yml`, with a
   promtool unit test per alert in `meteocore.test.yml` (CI job `rules`).
   The chart ships the same file through its `rules/` symlink as a
