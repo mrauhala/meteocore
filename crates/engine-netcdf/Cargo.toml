@@ -13,10 +13,10 @@ ds-poll = { path = "../ds-poll" }
 ds-storage = { path = "../storage" }
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }
-hdf5-reader = { version = "0.9.1", default-features = false }
+hdf5-reader = { version = "0.10.1", default-features = false }
 # The arrays netcdf-reader returns, moved into plain vectors (source.rs).
 ndarray = { version = "0.17", default-features = false, features = ["std"] }
-netcdf-reader = { version = "0.9.1", default-features = false, features = ["netcdf4"] }
+netcdf-reader = { version = "0.10.1", default-features = false, features = ["netcdf4"] }
 thiserror = "2"
 # The I/O runtime remote reads run on, and `block_in_place` around a field
 # read's fill and wait (io.rs, field.rs).
