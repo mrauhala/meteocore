@@ -13,7 +13,7 @@ ds-storage = { path = "../storage" }
 arc-swap = "1"
 chrono = { version = "0.4", features = ["serde"] }
 hdf5-reader = { version = "0.9.2", default-features = false }
-netcdf-reader = { version = "0.9.2", default-features = false, features = ["netcdf4"] }
+netcdf-reader = { version = "0.10.1", default-features = false, features = ["netcdf4"] }
 regex = "1"
 tokio = { version = "1", features = ["rt", "time"] }
 tracing = "0.1"
