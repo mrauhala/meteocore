@@ -117,8 +117,9 @@ apis = ["edr", "features"]          # default ["edr"]
   of [`[postgis.map]`](../engine-postgis/README.md#station-map-layers)
   (`max_age`, `time_step`, `marker_size`, `draw_missing`). `[csv]` holds only `map`. A frame reads the in-memory
   rows: per station the latest value in `[TIME - max_age, TIME]`, drawn at
-  its inventory position. The file is static, so an explicit `TIME` is
-  cached as immutable. WMS GetFeatureInfo does not answer these layers.
+  its inventory position. The file is static, so a `TIME` on a `time_step`
+  is cached as immutable; one that floors to a step revalidates, like any
+  snapped time. WMS GetFeatureInfo does not answer these layers.
 - The runnable example is
   [`collections.d/weather.toml`](../../collections.d/weather.toml).
 - `server --auto-collections <DIR>` creates one such collection, with EDR

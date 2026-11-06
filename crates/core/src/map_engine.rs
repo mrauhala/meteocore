@@ -935,8 +935,9 @@ pub trait MapEngine: Send + Sync {
     /// renders an empty tile instead MUST return `None`: an empty render
     /// keyed on T is served blank from the no-TTL meta-tile cache once T's
     /// data lands. The API layers also send an explicit `time` that resolves
-    /// to `None` with a short, revalidating `Cache-Control` rather than
-    /// `immutable`.
+    /// to `None`, or to any other timestep, with a short, revalidating
+    /// `Cache-Control`: only one that resolves to itself is `immutable`
+    /// (#1415).
     ///
     /// `reference_time` selects a forecast model run, mirroring
     /// [`Self::get_raster_tile`]; non-forecast engines ignore it.

@@ -1374,6 +1374,145 @@ async fn requested_time_ahead_of_catalog_does_not_poison_the_frame() {
     );
 }
 
+/// A GetMap at `TIME={time}` on the snapping fixture, sent with
+/// `If-None-Match: etag` when given.
+async fn snapping_get_map(
+    app: &axum::Router,
+    (crs, bbox): (&str, &str),
+    time: &str,
+    etag: Option<&str>,
+) -> (StatusCode, String, String, String) {
+    let mut request = Request::builder().uri(format!(
+        "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=data&STYLES=\
+         &FORMAT=image/png&CRS={crs}&BBOX={bbox}&WIDTH=512&HEIGHT=512&TIME={time}"
+    ));
+    if let Some(etag) = etag {
+        request = request.header("if-none-match", etag);
+    }
+    let resp = app
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let h = |name: &str| resp.headers()[name].to_str().unwrap().to_string();
+    (resp.status(), h("x-cache"), h("cache-control"), h("etag"))
+}
+
+/// `immutable` only for a `TIME` the engine draws exactly (#1415), on the
+/// direct and the meta-tiled path. A snapped one means another frame later:
+/// past the newest step once the next lands, before the oldest as the window
+/// slides, between two once one lands in the gap. `TIME` is compared as an
+/// instant, so every form that names the step stays pinned.
+#[tokio::test]
+async fn only_a_time_drawn_exactly_is_immutable() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    const T0: &str = "2026-07-11T20:10:00Z";
+    const T1: &str = "2026-07-11T20:15:00Z";
+    for view in [
+        ("CRS:84", "10,55,30,70"),
+        ("EPSG:3857", "2000000,8000000,3000000,9000000"),
+    ] {
+        let (app, _, _) = build_snapping_router(&[T0, T1]);
+        for (time, expected) in [
+            // On the axis, however it is written.
+            (T1, IMMUTABLE),
+            (T0, IMMUTABLE),
+            ("2026-07-11T22:15:00%2B02:00", IMMUTABLE),
+            ("2026-07-11T20:15:00", IMMUTABLE),
+            ("2026-07-11T20:15", IMMUTABLE),
+            // Past the newest step, before the oldest, between two.
+            ("2026-07-11T20:20:00Z", SHORT),
+            ("2026-07-10T20:10:00Z", SHORT),
+            ("2026-07-11T20:12:00Z", SHORT),
+            // It reads like a step, in another offset: 18:15Z.
+            ("2026-07-11T20:15:00%2B02:00", SHORT),
+        ] {
+            let (status, _, cache_control, _) = snapping_get_map(&app, view, time, None).await;
+            assert_eq!(status, StatusCode::OK, "{view:?} {time}");
+            assert_eq!(cache_control, expected, "{view:?} {time}");
+        }
+    }
+}
+
+/// The frame a snapped `TIME` was waiting for lands, and the same URL draws
+/// it: that URL must not have been pinned to the frame it snapped to (#1415).
+#[tokio::test]
+async fn a_time_past_the_newest_step_is_pinned_once_it_lands() {
+    const T0: &str = "2026-07-11T20:15:00Z";
+    const T1: &str = "2026-07-11T20:20:00Z";
+    const VIEW: (&str, &str) = ("CRS:84", "10,55,30,70");
+    let (app, catalog, _) = build_snapping_router(&[T0]);
+    let (_, _, snapped, _) = snapping_get_map(&app, VIEW, T1, None).await;
+    assert_eq!(snapped, "public, max-age=60, must-revalidate");
+    catalog.write().unwrap().push(T1.parse().unwrap());
+    let (_, x_cache, landed, _) = snapping_get_map(&app, VIEW, T1, None).await;
+    assert_eq!(x_cache, "MISS", "the frame's own pixels");
+    assert_eq!(landed, "public, max-age=86400, immutable");
+}
+
+/// A snapped and an exact request for one step share its cached image and
+/// meta-tiles (#507), never its header (#1415): each gets its own, in either
+/// order, on the render, on a hit, and on a 304 from a hit or from a render.
+#[tokio::test]
+async fn the_header_is_the_requests_not_the_cached_images() {
+    const T0: &str = "2026-07-11T20:10:00Z";
+    const EXACT: &str = "2026-07-11T20:15:00Z";
+    const SNAPPED: &str = "2026-07-11T20:20:00Z";
+    let expected = |time: &str| {
+        if time == EXACT {
+            "public, max-age=86400, immutable"
+        } else {
+            "public, max-age=60, must-revalidate"
+        }
+    };
+    for view in [
+        ("CRS:84", "10,55,30,70"),
+        ("EPSG:3857", "2000000,8000000,3000000,9000000"),
+    ] {
+        let mut etags = Vec::new();
+        for (first, second) in [(EXACT, SNAPPED), (SNAPPED, EXACT)] {
+            let (app, _, calls) = build_snapping_router(&[T0, EXACT]);
+            let (status, x_cache, cache_control, etag) =
+                snapping_get_map(&app, view, first, None).await;
+            assert_eq!(status, StatusCode::OK, "{view:?} {first}");
+            assert_eq!(x_cache, "MISS", "{view:?} {first}");
+            assert_eq!(cache_control, expected(first), "{view:?} {first}");
+            let rendered = calls.load(std::sync::atomic::Ordering::Relaxed);
+            for time in [second, first] {
+                let (status, x_cache, cache_control, hit_etag) =
+                    snapping_get_map(&app, view, time, None).await;
+                assert_eq!(status, StatusCode::OK, "{view:?} {time}");
+                assert_eq!(x_cache, "HIT", "{view:?} {time}");
+                assert_eq!(hit_etag, etag, "{view:?} {time}");
+                assert_eq!(cache_control, expected(time), "{view:?} {time}");
+
+                let (status, x_cache, cache_control, _) =
+                    snapping_get_map(&app, view, time, Some(&etag)).await;
+                assert_eq!(status, StatusCode::NOT_MODIFIED, "{view:?} {time}");
+                assert_eq!(x_cache, "HIT", "{view:?} {time}");
+                assert_eq!(cache_control, expected(time), "{view:?} {time}");
+            }
+            assert_eq!(
+                calls.load(std::sync::atomic::Ordering::Relaxed),
+                rendered,
+                "{view:?}: one image"
+            );
+            etags.push(etag);
+        }
+        assert_eq!(etags[0], etags[1], "{view:?}: the same image");
+        // A 304 straight from a render, nothing cached yet.
+        for time in [EXACT, SNAPPED] {
+            let (app, _, _) = build_snapping_router(&[T0, EXACT]);
+            let (status, x_cache, cache_control, _) =
+                snapping_get_map(&app, view, time, Some(&etags[0])).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{view:?} {time}");
+            assert_eq!(x_cache, "MISS", "{view:?} {time}");
+            assert_eq!(cache_control, expected(time), "{view:?} {time}");
+        }
+    }
+}
+
 /// A satellite-style engine before its first scan (a start or reload still
 /// backfilling) renders nothing and resolves every TIME to `None`. A
 /// `TIME=T` request then must neither pin its empty image in browsers for a
@@ -4709,6 +4848,45 @@ mod per_parameter_times {
         assert!(a.contains(&format!("default=\"{}\"", t(T2).to_rfc3339())));
     }
 
+    /// A `TIME` on the parent's union axis but not on the child layer's own
+    /// is a snap, so never `immutable` (#1415), and shares the step's image
+    /// without taking its header.
+    #[tokio::test]
+    async fn a_time_only_another_parameter_has_is_not_immutable() {
+        const IMMUTABLE: &str = "public, max-age=86400, immutable";
+        const SHORT: &str = "public, max-age=60, must-revalidate";
+        let app = router(Arc::default());
+        for (layer, time, expected, x_cache) in [
+            ("sat/a", T2, IMMUTABLE, "MISS"),
+            // T2 is `a`'s: `b` draws T1, and renders it here.
+            ("sat/b", T2, SHORT, "MISS"),
+            ("sat/b", T1, IMMUTABLE, "HIT"),
+            ("sat/b", T2, SHORT, "HIT"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={layer}&STYLES=\
+                             &FORMAT=image/png&CRS=CRS:84&BBOX=0,40,10,50&WIDTH=64&HEIGHT=64\
+                             &TIME={time}"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{layer} at {time}");
+            assert_eq!(
+                resp.headers()["cache-control"],
+                expected,
+                "{layer} at {time}"
+            );
+            assert_eq!(resp.headers()["x-cache"], x_cache, "{layer} at {time}");
+        }
+    }
+
     /// An omitted TIME renders the requested parameter's latest time, and a
     /// time it lacks snaps on its own axis — before any cache key is built.
     #[tokio::test]
@@ -5576,6 +5754,7 @@ mod composites {
         status: StatusCode,
         x_cache: String,
         content_type: String,
+        cache_control: String,
         body: bytes::Bytes,
     }
 
@@ -5596,13 +5775,18 @@ mod composites {
                 .map(|v| v.to_str().unwrap().to_string())
                 .unwrap_or_default()
         };
-        let (status, x_cache, content_type) =
-            (resp.status(), header("x-cache"), header("content-type"));
+        let (status, x_cache, content_type, cache_control) = (
+            resp.status(),
+            header("x-cache"),
+            header("content-type"),
+            header("cache-control"),
+        );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         Reply {
             status,
             x_cache,
             content_type,
+            cache_control,
             body,
         }
     }
@@ -5619,6 +5803,33 @@ mod composites {
         let start = caps.find(&format!("<Name>{name}</Name>")).unwrap();
         let end = caps[start..].find("</Layer>").unwrap();
         &caps[start..start + end]
+    }
+
+    /// A composite is `immutable` only at a scan every band has (#1415), on
+    /// the direct and the meta-tiled path: `a`'s newer T2 is a snap to the
+    /// shared T1, and shares T1's image.
+    #[tokio::test]
+    async fn only_a_scan_every_band_has_is_immutable() {
+        const IMMUTABLE: &str = "public, max-age=86400, immutable";
+        const SHORT: &str = "public, max-age=60, must-revalidate";
+        for (crs, bbox) in [
+            ("CRS:84", "0,40,10,50"),
+            ("EPSG:3857", "2000000,8000000,3000000,9000000"),
+        ] {
+            let engine = Engine::new(&[T0, T1, T2], &[T0, T1]);
+            let (app, _) = router(engine);
+            for (time, x_cache, expected) in [
+                (T2, "MISS", SHORT),
+                (T1, "HIT", IMMUTABLE),
+                ("2026-09-25T19:15:00Z", "HIT", SHORT),
+            ] {
+                let extra = format!("&TIME={time}");
+                let reply = get(&app, &get_map("sat/rgb", crs, bbox, &extra)).await;
+                assert_eq!(reply.status, StatusCode::OK, "{crs} {time}");
+                assert_eq!(reply.x_cache, x_cache, "{crs} {time}");
+                assert_eq!(reply.cache_control, expected, "{crs} {time}");
+            }
+        }
     }
 
     /// The composite is a child layer next to the bands: its own time

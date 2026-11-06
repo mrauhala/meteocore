@@ -110,9 +110,13 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
 ## Responses
 
 - Map tiles carry `Content-Crs`, `ETag` and `x-cache` (`HIT`, `MISS`,
-  `EMPTY`). An explicit instant that resolved to a time step, on an engine that
-  never revises content in place, is `public, max-age=86400, immutable`;
-  everything else is `public, max-age=60, must-revalidate`.
+  `EMPTY`). An instant the engine draws exactly, on an engine that never
+  revises content in place, is `public, max-age=86400, immutable`; everything
+  else is `public, max-age=60, must-revalidate`: no time, an interval even when
+  closed, or an instant snapped to another time step, whose URL draws another
+  frame once one lands or the window slides. Instants are compared, not their
+  text, so a step written with an offset is exact. The header is each request's
+  own: a snapped and an exact request share the step's cached tile.
 - Vector tiles carry `ETag`, `x-cache` and `Cache-Control: public, max-age=300`.
 - Errors are JSON `{"code", "description"}`. 400: a bad parameter, an
   engine's request error, zoom above 24, or an unknown tile matrix set on a

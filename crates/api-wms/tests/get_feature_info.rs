@@ -85,8 +85,8 @@ struct Call {
 
 /// An NWP collection: a temperature `t2m`, an overlay layer `outline` that
 /// no position query answers, and an RGB composite `rgb`; hourly valid
-/// times, two runs, two pressure levels. Times snap latest-not-after, as a
-/// file catalog's do.
+/// times, two runs, two pressure levels. Times snap latest-not-after, the
+/// earliest before them all, as a file catalog's do.
 struct Nwp {
     answer: Answer,
     unit: &'static str,
@@ -174,7 +174,12 @@ impl MapEngine for Nwp {
         let times: Vec<_> = TIMES.iter().map(|t| at(t)).collect();
         match time {
             None => times.last().copied(),
-            Some(time) => times.into_iter().rev().find(|&t| t <= time),
+            Some(time) => times
+                .iter()
+                .rev()
+                .find(|t| **t <= time)
+                .or(times.first())
+                .copied(),
         }
     }
 
@@ -1134,6 +1139,70 @@ async fn cache_control_is_get_maps() {
     assert_eq!(get(&router(revised), &pinned).await.cache_control, SHORT);
 }
 
+/// As GetMap: `immutable` only for a `TIME` the engine draws exactly
+/// (#1415). A snapped one reads another frame later: past the newest step
+/// once the next lands, before the oldest as the window slides, between two
+/// once one lands in the gap. `TIME` is compared as an instant, so every form
+/// that names the step stays pinned. The read itself is of the step drawn.
+#[tokio::test]
+async fn only_a_time_drawn_exactly_is_pinned() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    for (time, drawn, expected) in [
+        // On the axis, however it is written.
+        ("2026-10-01T01:00:00Z", TIMES[1], IMMUTABLE),
+        ("2026-10-01T03:00:00%2B02:00", TIMES[1], IMMUTABLE),
+        ("2026-10-01T01:00:00", TIMES[1], IMMUTABLE),
+        ("2026-10-01T01:00", TIMES[1], IMMUTABLE),
+        // Past the newest step, before the oldest, between two.
+        ("2026-10-01T02:05:00Z", TIMES[2], SHORT),
+        ("2026-09-30T00:00:00Z", TIMES[0], SHORT),
+        ("2026-10-01T00:30:00Z", TIMES[0], SHORT),
+        // It reads like a step, in another offset: 23:00Z the day before.
+        ("2026-10-01T01:00:00%2B02:00", TIMES[0], SHORT),
+    ] {
+        let engine = Nwp::new(Answer::Value(1.0));
+        let reply = get(
+            &router(engine.clone()),
+            &gfi("nwp/t2m", 0, 0, &format!("&TIME={time}")),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::OK, "{time}: {}", reply.body);
+        assert_eq!(reply.cache_control, expected, "{time}");
+        let read = engine.calls().pop().expect("a read");
+        assert_eq!(read.datetime, Some((at(drawn), at(drawn))), "{time}");
+    }
+}
+
+/// A band or a composite snaps on its own axis, though the collection's has
+/// the time (#1415); and every queried layer must draw the `TIME` exactly,
+/// while one only on the map changes nothing in the answer.
+#[tokio::test]
+async fn a_time_snapped_on_a_layers_own_axis_is_not_pinned() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    // `ir` has every hour, `cloud` and so `rgb` hours 0 and 2.
+    let app = layers_router(Sat::new(true), Alerts::new(PickAnswer::Three));
+    for (layers, query_layers, hour, expected) in [
+        ("sat/ir", "sat/ir", 1, IMMUTABLE),
+        ("sat/cloud", "sat/cloud", 1, SHORT),
+        ("sat/cloud", "sat/cloud", 2, IMMUTABLE),
+        ("sat/rgb", "sat/rgb", 1, SHORT),
+        ("sat/rgb", "sat/rgb", 2, IMMUTABLE),
+        ("sat/ir,sat/cloud", "sat/ir,sat/cloud", 1, SHORT),
+        ("sat/cloud,sat/ir", "sat/ir,sat/cloud", 1, SHORT),
+        ("sat/ir,sat/cloud", "sat/ir,sat/cloud", 2, IMMUTABLE),
+        ("sat/ir,sat/cloud", "sat/ir", 1, IMMUTABLE),
+        ("sat/ir,sat/cloud", "sat/cloud", 1, SHORT),
+    ] {
+        let extra = format!("&TIME={}", TIMES[hour]);
+        let reply = get(&app, &gfi_layers(layers, query_layers, &extra)).await;
+        let what = format!("{query_layers} of {layers} at hour {hour}");
+        assert_eq!(reply.status, StatusCode::OK, "{what}: {}", reply.body);
+        assert_eq!(reply.cache_control, expected, "{what}");
+    }
+}
+
 /// The layers GetCapabilities marks queryable are exactly those
 /// GetFeatureInfo answers, and `<Request>` offers it, in schema order,
 /// with exactly its three formats.
@@ -1980,8 +2049,19 @@ async fn a_composite_answers_each_band_at_its_scan() {
     assert!(reply
         .body
         .contains("<tr><th>parameter</th><td>cloud</td></tr>"));
-    // Every band answered at an explicit TIME: pinned, as GetMap pins it.
-    assert_eq!(reply.cache_control, "public, max-age=86400, immutable");
+    // Every band answered, at a TIME snapped to the scan: it revalidates
+    // (#1415). At the scan itself it is pinned, as GetMap pins it.
+    assert_eq!(reply.cache_control, "public, max-age=60, must-revalidate");
+    let exact = gfi(
+        "sat/rgb",
+        0,
+        0,
+        "&TIME=2026-10-01T00:00:00Z&INFO_FORMAT=text/html",
+    );
+    assert_eq!(
+        get(&app, &exact).await.cache_control,
+        "public, max-age=86400, immutable"
+    );
 }
 
 /// Bands that share no scan: GetMap draws the empty image, and

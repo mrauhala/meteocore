@@ -3911,6 +3911,39 @@ mod per_parameter_times {
         );
     }
 
+    /// A time on the collection's union axis but not on the parameter's own
+    /// is a snap, so never `immutable` (#1415), and shares the step's tile
+    /// without taking its header.
+    #[tokio::test]
+    async fn a_time_only_another_parameter_has_is_not_immutable() {
+        const IMMUTABLE: &str = "public, max-age=86400, immutable";
+        const SHORT: &str = "public, max-age=60, must-revalidate";
+        let app = build_router_with_engine(Arc::new(Engine::default()));
+        for (parameter, time, drawn, expected, x_cache) in [
+            ("a", T2, T2, IMMUTABLE, "MISS"),
+            // T2 is `a`'s: `b` draws T1, and renders it here.
+            ("b", T2, T1, SHORT, "MISS"),
+            ("b", T1, T1, IMMUTABLE, "HIT"),
+            ("b", T2, T1, SHORT, "HIT"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(URI(parameter, 0, Some(time)))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let what = format!("{parameter} at {time}");
+            assert_eq!(resp.headers()["ogcapi-datetime"], drawn, "{what}");
+            assert_eq!(resp.headers()["cache-control"], expected, "{what}");
+            assert_eq!(resp.headers()["x-cache"], x_cache, "{what}");
+        }
+    }
+
     /// An omitted `datetime` renders the requested parameter's latest time,
     /// and a time it lacks snaps on its own axis before the cache key is
     /// built — so the snapped request hits what the default one cached.
@@ -4158,6 +4191,7 @@ mod composites {
     struct Reply {
         status: StatusCode,
         x_cache: String,
+        cache_control: String,
         body: bytes::Bytes,
     }
 
@@ -4168,15 +4202,18 @@ mod composites {
             .await
             .unwrap();
         let status = resp.status();
-        let x_cache = resp
-            .headers()
-            .get("x-cache")
-            .map(|v| v.to_str().unwrap().to_string())
-            .unwrap_or_default();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        let (x_cache, cache_control) = (header("x-cache"), header("cache-control"));
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         Reply {
             status,
             x_cache,
+            cache_control,
             body,
         }
     }
@@ -4288,6 +4325,28 @@ mod composites {
         let moved = fetch(&app, &tile_uri("")).await;
         assert_eq!(moved.x_cache, "MISS");
         assert_eq!(moved.body, expected_png(256, 256, T2));
+    }
+
+    /// A composite is `immutable` only at a scan every band has (#1415): `a`'s
+    /// newer T2 is a snap to the shared T1, and shares T1's tile.
+    #[tokio::test]
+    async fn only_a_scan_every_band_has_is_immutable() {
+        const IMMUTABLE: &str = "public, max-age=86400, immutable";
+        const SHORT: &str = "public, max-age=60, must-revalidate";
+        let engine = Engine::new(&[T0, T1, T2], &[T0, T1]);
+        let app = router(engine.clone());
+        for (time, x_cache, expected) in [
+            (T2, "MISS", SHORT),
+            (T1, "HIT", IMMUTABLE),
+            ("2026-09-25T19:15:00Z", "HIT", SHORT),
+        ] {
+            let reply = fetch(&app, &tile_uri(&format!("&datetime={time}"))).await;
+            assert_eq!(reply.status, StatusCode::OK, "{time}");
+            assert_eq!(reply.x_cache, x_cache, "{time}");
+            assert_eq!(reply.cache_control, expected, "{time}");
+        }
+        assert_eq!(engine.calls().len(), 1);
+        assert_eq!(engine.calls()[0].1, Some(t(T1)));
     }
 
     /// Bands that share no scan give an empty tile without an engine call.
@@ -4532,7 +4591,8 @@ mod map_tile_parameters {
     type Render = (Option<DateTime<Utc>>, u32, u32, [f64; 4]);
 
     /// Hourly time steps T0, T1, T2; an instant snaps to the last step at
-    /// or before it. Records every render; `empty` renders all-nodata.
+    /// or before it, the first before them all, as the radar engines do.
+    /// Records every render; `empty` renders all-nodata.
     #[derive(Default)]
     struct Engine {
         renders: std::sync::Mutex<Vec<Render>>,
@@ -4587,7 +4647,12 @@ mod map_tile_parameters {
         ) -> Option<DateTime<Utc>> {
             let times = self.raster_info().times;
             match time {
-                Some(time) => times.into_iter().rev().find(|&ts| ts <= time),
+                Some(time) => times
+                    .iter()
+                    .rev()
+                    .find(|ts| **ts <= time)
+                    .or(times.first())
+                    .copied(),
                 None => times.last().copied(),
             }
         }
@@ -4641,6 +4706,9 @@ mod map_tile_parameters {
         engine.renders.lock().unwrap().len()
     }
 
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+
     /// Width and height from a PNG's IHDR chunk.
     fn png_size(bytes: &[u8]) -> (u32, u32) {
         assert_eq!(&bytes[1..4], b"PNG");
@@ -4651,7 +4719,7 @@ mod map_tile_parameters {
     /// `/req/collections/rc-datetime-definition` B–D on map tiles: an
     /// interval renders the latest time step inside it, reported in
     /// `OGCAPI-datetime` (`/rec/datetime/actual-datetime`), and is not pinned
-    /// `immutable`: new data may land inside an open interval.
+    /// `immutable`: new data may land inside it.
     #[tokio::test]
     async fn datetime_interval_renders_its_latest_time_step() {
         for (query, expected) in [
@@ -4679,8 +4747,9 @@ mod map_tile_parameters {
     }
 
     /// An instant still snaps to the last step at or before it
-    /// (`/per/datetime/closest`), keeps its `immutable` pin, and reports the
-    /// step rendered.
+    /// (`/per/datetime/closest`) and reports the step rendered. Only an
+    /// instant on the axis keeps the `immutable` pin (#1415): a landing frame
+    /// would change what this URL draws.
     #[tokio::test]
     async fn datetime_instant_snaps_as_before() {
         let engine = Arc::new(Engine::default());
@@ -4689,9 +4758,7 @@ mod map_tile_parameters {
             let (status, headers, _) = fetch(&app, &uri).await;
             assert_eq!(status, StatusCode::OK, "{uri}");
             assert_eq!(header(&headers, "ogcapi-datetime"), Some(T1), "{uri}");
-            assert!(header(&headers, "cache-control")
-                .unwrap()
-                .contains("immutable"));
+            assert_eq!(header(&headers, "cache-control"), Some(SHORT), "{uri}");
         }
         assert_eq!(last_render(&engine).0, Some(t(T1)));
         // Without a time, the latest step, reported too.
@@ -4709,7 +4776,7 @@ mod map_tile_parameters {
     async fn subset_datetime_selects_the_time() {
         for (subset, expected, immutable) in [
             (format!(r#"datetime("{T1}")"#), T1, true),
-            (r#"datetime("2026-09-25T19:59:00Z")"#.to_string(), T1, true),
+            (r#"datetime("2026-09-25T19:59:00Z")"#.to_string(), T1, false),
             (format!(r#"datetime("{T0}":"{T1}")"#), T1, false),
             (format!(r#"datetime(*:"{T1}")"#), T1, false),
             (format!(r#"datetime("{T0}":*)"#), T2, false),
@@ -4729,6 +4796,128 @@ mod map_tile_parameters {
                 assert_eq!(pinned, immutable, "{uri}");
             }
             assert_eq!(last_render(&engine).0, Some(t(expected)), "{subset}");
+        }
+    }
+
+    /// `immutable` only for an instant the engine draws exactly (#1415), on
+    /// every map tile route. A snapped one means another frame later: past the
+    /// newest step once the next lands, before the oldest as the window
+    /// slides, between two once one lands in the gap. An interval is never
+    /// exact, even closed, since a step can land inside it. The snapping
+    /// itself stands, and `OGCAPI-datetime` names the step drawn.
+    #[tokio::test]
+    async fn only_an_instant_drawn_exactly_is_immutable() {
+        for (query, drawn, expected) in [
+            // On the axis, however it is written.
+            (format!("datetime={T2}"), T2, IMMUTABLE),
+            (
+                "datetime=2026-09-25T22:00:00%2B02:00".to_string(),
+                T2,
+                IMMUTABLE,
+            ),
+            ("datetime=2026-09-25T20:00:00".to_string(), T2, IMMUTABLE),
+            ("datetime=2026-09-25T20:00".to_string(), T2, IMMUTABLE),
+            (format!(r#"subset=datetime("{T1}")"#), T1, IMMUTABLE),
+            // Past the newest step, before the oldest, between two.
+            ("datetime=2026-09-25T20:05:00Z".to_string(), T2, SHORT),
+            ("datetime=2026-09-24T18:00:00Z".to_string(), T0, SHORT),
+            ("datetime=2026-09-25T18:30:00Z".to_string(), T0, SHORT),
+            (
+                r#"subset=datetime("2026-09-25T18:30:00Z")"#.to_string(),
+                T0,
+                SHORT,
+            ),
+            // It reads like a step, in another offset: 18:00Z is T0, but this
+            // is 17:00Z, before the oldest.
+            (
+                "datetime=2026-09-25T18:00:00%2B01:00".to_string(),
+                T0,
+                SHORT,
+            ),
+            // Closed intervals, the first with its end past the newest step.
+            (format!("datetime={T1}/2026-09-25T20:05:00Z"), T2, SHORT),
+            (
+                format!(r#"subset=datetime("{T1}":"2026-09-25T20:05:00Z")"#),
+                T2,
+                SHORT,
+            ),
+            (format!("datetime={T1}/{T1}"), T1, SHORT),
+            (r#"subset=datetime("2026-09-25")"#.to_string(), T2, SHORT),
+            // Open intervals and `*`.
+            (format!("datetime={T1}/.."), T2, SHORT),
+            ("subset=datetime(*)".to_string(), T2, SHORT),
+        ] {
+            for (app, prefix) in surfaces(Arc::new(Engine::default())) {
+                let uri = format!("{prefix}/1/0/1?{query}");
+                let (status, headers, _) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                assert_eq!(header(&headers, "ogcapi-datetime"), Some(drawn), "{uri}");
+                assert_eq!(header(&headers, "cache-control"), Some(expected), "{uri}");
+            }
+        }
+        // No time at all.
+        for (app, prefix) in surfaces(Arc::new(Engine::default())) {
+            let (_, headers, _) = fetch(&app, &format!("{prefix}/1/0/1")).await;
+            assert_eq!(header(&headers, "cache-control"), Some(SHORT), "{prefix}");
+        }
+    }
+
+    /// GET `uri` with `If-None-Match: etag`.
+    async fn revalidate(app: &axum::Router, uri: &str, etag: &str) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("if-none-match", etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A snapped and an exact request for one step share its cached tile
+    /// (#507), never its header (#1415): each gets its own, in either order,
+    /// on the render, on a hit, and on a 304 from a hit or from a render.
+    #[tokio::test]
+    async fn the_header_is_the_requests_not_the_cached_tiles() {
+        const TILE: &str = "/collections/radar/tiles/WebMercatorQuad/1/0/1";
+        let exact = format!("{TILE}?datetime={T2}");
+        let snapped = format!("{TILE}?datetime=2026-09-25T20:05:00Z");
+        let expected = |uri: &str| if uri == exact { IMMUTABLE } else { SHORT };
+        let mut etags = Vec::new();
+        for (first, second) in [(&exact, &snapped), (&snapped, &exact)] {
+            let engine = Arc::new(Engine::default());
+            let app = api_tiles::router(state(engine.clone()));
+            let (status, headers, _) = fetch(&app, first).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(header(&headers, "x-cache"), Some("MISS"), "{first}");
+            assert_eq!(header(&headers, "cache-control"), Some(expected(first)));
+            let etag = header(&headers, "etag").unwrap().to_string();
+            for uri in [second, first] {
+                let (status, headers, _) = fetch(&app, uri).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(header(&headers, "x-cache"), Some("HIT"), "{uri}");
+                assert_eq!(header(&headers, "etag"), Some(etag.as_str()), "{uri}");
+                assert_eq!(header(&headers, "cache-control"), Some(expected(uri)));
+                assert_eq!(header(&headers, "ogcapi-datetime"), Some(T2), "{uri}");
+
+                let resp = revalidate(&app, uri, &etag).await;
+                assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{uri}");
+                assert_eq!(resp.headers()["x-cache"], "HIT", "{uri}");
+                assert_eq!(resp.headers()["cache-control"], expected(uri), "{uri}");
+            }
+            assert_eq!(render_count(&engine), 1, "one tile, one render");
+            etags.push(etag);
+        }
+        assert_eq!(etags[0], etags[1], "the same tile");
+        // A 304 straight from a render, nothing cached yet.
+        for uri in [&exact, &snapped] {
+            let app = api_tiles::router(state(Arc::new(Engine::default())));
+            let resp = revalidate(&app, uri, &etags[0]).await;
+            assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{uri}");
+            assert_eq!(resp.headers()["x-cache"], "MISS", "{uri}");
+            assert_eq!(resp.headers()["cache-control"], expected(uri), "{uri}");
         }
     }
 

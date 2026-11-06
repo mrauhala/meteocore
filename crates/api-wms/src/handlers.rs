@@ -312,16 +312,18 @@ fn render_job(
 
 /// Cache-Control header value for a WMS response.
 ///
-/// - An explicit TIME that resolved to a timestep, over immutable content
-///   (`content_version == 0`): the pixels for that instant never change —
-///   cache for 24 hours, `immutable` (no revalidation at all).
-/// - Otherwise — no TIME ("latest" moves), a TIME the engine has nothing to
-///   render for yet (resolved to `None`: its catalog is still empty after a
-///   start or reload), or content the engine revises in place under a fixed
-///   instant (`content_version != 0`, e.g. a push-fed alert set): short
-///   cache (60 s) and revalidate, so a browser/CDN that holds a pre-revision
-///   tile for the same URL asks again (the ETag is content-derived, so an
-///   unchanged tile is a cheap 304). The red error tile is always short too.
+/// - A TIME the engine draws exactly (`ResolvedLayer::exact_time`), over
+///   immutable content (`content_version == 0`): the pixels for that instant
+///   never change — cache for 24 hours, `immutable` (no revalidation at all).
+/// - Otherwise — no TIME ("latest" moves), a TIME snapped to another timestep
+///   (the URL draws another frame once one lands, or as the window slides,
+///   #1415), a TIME the engine has nothing to render for yet (resolved to
+///   `None`: its catalog is still empty after a start or reload), or content
+///   the engine revises in place under a fixed instant
+///   (`content_version != 0`, e.g. a push-fed alert set): short cache (60 s)
+///   and revalidate, so a browser/CDN that holds a tile the URL no longer
+///   means asks again (the ETag is content-derived, so an unchanged tile is a
+///   cheap 304). The red error tile is always short too.
 pub(crate) fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
     if pinned_time && content_version == 0 {
         "public, max-age=86400, immutable"
@@ -483,9 +485,12 @@ pub(crate) struct ResolvedLayer {
     /// the style's, else on the root layer the default parameter whose style
     /// it draws with (#1133); for a composite, the composite's name.
     pub parameter: Option<String>,
-    /// Whether the layer takes the request's `TIME` (#1181): a `TIME` was
-    /// sent, and the layer has a time dimension or no listed layer has one.
-    pub explicit_time: bool,
+    /// Whether the layer draws exactly the request's `TIME`
+    /// ([`api_common::subset::is_exact_time`], #1415): it takes it (a `TIME`
+    /// was sent, and the layer has a time dimension or no listed layer has
+    /// one, #1181) and the engine did not snap it. Only such a layer can be
+    /// `immutable`. The request's, never a cached entry's.
+    pub exact_time: bool,
     /// The timestep drawn: `TIME`, or the layer's default, snapped by the
     /// engine (#507). `None` when the engine has nothing to draw.
     pub time: Option<DateTime<Utc>>,
@@ -701,7 +706,7 @@ fn resolve_layer(
         style_name,
         info,
         parameter,
-        explicit_time: requested_time.is_some(),
+        exact_time: api_common::subset::is_exact_time(requested_time, time),
         time,
         reference_time,
         elevation,
@@ -765,11 +770,9 @@ pub async fn wms_handler(
                 .with_quality(params.quality, webp_quality(&state, &layers));
             let content_type = format.content_type();
 
-            // Immutable only when every layer draws an explicit TIME that
-            // resolved, over content no layer's engine revises in place.
-            let pinned_time = layers
-                .iter()
-                .all(|layer| layer.explicit_time && layer.time.is_some());
+            // Immutable only when every layer draws exactly the TIME, over
+            // content no layer's engine revises in place.
+            let pinned_time = layers.iter().all(|layer| layer.exact_time);
             let content_version = layers
                 .iter()
                 .map(|layer| layer.content_version)
