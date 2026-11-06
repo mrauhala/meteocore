@@ -210,9 +210,10 @@ All are in [`collections.d/`](../../collections.d/).
   the window's middle row and column; the polygon mask uses each cell's
   true position.
 - STAC: an EDR query whose window holds more than 400 items without loaded
-  metadata is a 400. Until an item's header loads, the native CRS is
-  reported as `CRS:84`. After three failed on-demand STAC listings in a
-  row, the collection's map and EDR requests fail at once for 5 minutes.
+  metadata is a 400, and so is one whose on-demand listing does not finish
+  within 1000 pages or 10 minutes. Until an item's header loads, the native
+  CRS is reported as `CRS:84`. After three failed on-demand STAC listings in
+  a row, the collection's map and EDR requests fail at once for 5 minutes.
 - Local files are memory-mapped. Replace them by atomic rename, never by
   writing in place: truncating a mapped file can crash the server.
 - `--auto-collections` skips GeoTIFF directories; configure them explicitly.

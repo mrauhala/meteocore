@@ -375,15 +375,30 @@ fn check_cold_stac_budget(cold: usize, windowed: bool) -> Result<(), DataServerE
 /// count, or "at least N" when the STAC listing stopped paging past the cap
 /// and the rest of the window was never counted (#1075).
 fn cold_stac_budget_exceeded(count: &str, windowed: bool) -> DataServerError {
-    let remedy = if windowed {
-        "narrow the datetime window"
-    } else {
-        "add a datetime window"
-    };
+    let remedy = stac_window_remedy(windowed);
     DataServerError::QueryTooLarge(format!(
         "Query would load the metadata of {count} STAC items not read yet; one request may \
          load at most {STAC_REQUEST_MAX_COLD_ITEMS} — {remedy}"
     ))
+}
+
+/// The 400 of a query whose STAC listing a page or time cap cut (#1400).
+fn stac_listing_cut(windowed: bool) -> DataServerError {
+    let remedy = stac_window_remedy(windowed);
+    DataServerError::QueryTooLarge(format!(
+        "The STAC listing of this query's window did not finish within the server's page and \
+         time limits — {remedy}"
+    ))
+}
+
+/// What a client does about a query over too much of a STAC catalog.
+/// `windowed`: the query has a `datetime`.
+fn stac_window_remedy(windowed: bool) -> &'static str {
+    if windowed {
+        "narrow the datetime window"
+    } else {
+        "add a datetime window"
+    }
 }
 
 /// What an area query checks on its window's grid before the window's cold
@@ -1753,6 +1768,12 @@ impl GeoTiffEngine {
     /// and nothing is installed. A `max_files` trim can drop window items
     /// after the listing, so such a catalog lists the window in full and
     /// the count after the trim decides.
+    ///
+    /// A listing a page or time cap cuts is a 400 as well and installs
+    /// nothing (#1400). A window counts as listed once it holds an item, so
+    /// any of the items read so far would keep the rest out for good, and a
+    /// `max_files` trim would keep the newest of what was read, not of the
+    /// window.
     fn list_stac_window(
         &self,
         client: &stac::StacClient,
@@ -1791,6 +1812,12 @@ impl GeoTiffEngine {
                     &format!("at least {counted}"),
                     datetime.is_some(),
                 ))
+            }
+            Ok(stac::StacListing::Cut(_)) => {
+                // Every page read answered, and a client can reach this with
+                // a window of its choosing: no failure of the STAC API.
+                self.record_stac_success();
+                Err(stac_listing_cut(datetime.is_some()))
             }
             Err(e) => {
                 self.record_stac_listing_error(&e);
