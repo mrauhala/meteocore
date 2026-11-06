@@ -1258,7 +1258,7 @@ mod tests {
             postgis_engines: RwLock::new(Vec::new()),
             nowcast_engines: RwLock::new(Vec::new()),
             station_grid_engines: RwLock::new(Vec::new()),
-            reload_lock: tokio::sync::Mutex::new(()),
+            reload_lock: Default::default(),
             learned_records: Default::default(),
             admin_token: None,
             style_fingerprint: std::sync::atomic::AtomicU64::new(0),

@@ -70,6 +70,16 @@ disk, no TOML needed.
 
 - `POST /admin/collections/reload` re-reads config and atomically swaps
   engines. Shared core: `admin::do_reload`.
+- **Reloads never overlap (#1402).** Whoever runs one holds
+  `ServerState::reload_lock` until it ends: the handler (409 when busy), the
+  watcher (waits), the recovery loop (skips a cycle); shutdown takes it for
+  good. hyper drops the handler's future when the client disconnects while its
+  reload runs on, so the handler moves an owned guard into the `poll_runtime`
+  task; the watcher and the recovery loop reload inline on a task nothing
+  cancels. A new caller must hold the guard the same way. Until a reload ends
+  later requests get 409 even if its client left, so a hung reload needs a
+  restart. A panic frees the lock (a Tokio mutex does not poison) and answers
+  500.
 - **Reload is incremental (#574).** Validation stays all-or-nothing (any
   config error rejects the whole reload, live registry untouched), but the
   build phase diffs per collection id against the last accepted config

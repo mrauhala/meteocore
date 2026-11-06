@@ -786,7 +786,7 @@ async fn serve(cli: CliArgs) {
         postgis_engines: RwLock::new(result.postgis_engines),
         nowcast_engines: RwLock::new(result.nowcast_engines),
         station_grid_engines: RwLock::new(result.station_grid_engines),
-        reload_lock: tokio::sync::Mutex::new(()),
+        reload_lock: Default::default(),
         learned_records,
         admin_token,
         style_fingerprint: std::sync::atomic::AtomicU64::new(colormaps::style_config_fingerprint(
