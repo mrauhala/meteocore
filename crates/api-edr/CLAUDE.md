@@ -30,7 +30,9 @@ Key schema rules:
 - **PointSeries**: x/y single-value axes, t string-values axis, z optional
   single-value axis.
 - **Grid**: x/y numeric-values axes, t and z optional. NdArray shape:
-  `[t, y, x]`, `[y, x]`, `[z, y, x]`, or `[t, z, y, x]`.
+  `[t, y, x]`, `[y, x]`, `[z, y, x]`, or `[t, z, y, x]`. A collection with
+  time emits only the `t`-leading forms, one step included (#1412); the
+  `t`-less forms are what the schema allows for a collection without time.
 - **VerticalProfile**: x/y single-value, z numeric-values axis, t optional
   single-value. NdArray shape: `[z]`.
 - **Parameter**: requires `observedProperty` with `label` as an i18n object
@@ -326,9 +328,13 @@ and never under an instance.
   must too, rather than converting the selector to one engine window itself.
   The list skips an instant only on `LocationNotFound`, so an engine must
   report "no step/row in the window" as that (404), never `InvalidParameter`,
-  which fails the whole list (#968). A `Grid` without `t` gets a one-step
-  `t` axis at its instant before the merge, so gridded areas join along `t`;
-  single-`datetime` responses keep the engine's shape.
+  which fails the whole list (#968). Gridded areas join along `t` because
+  every engine puts the steps it served on a `t` axis, one included
+  (#1412); the merge never adds one. A `Grid` without `t` comes only from
+  a collection without time and is never given the listed instants as
+  steps it does not hold. A coverage without a `t` axis to merge along is
+  dropped only when it is identical to another instant's, range values
+  included; one whose values differ stays, in a `CoverageCollection`.
 - A repeating interval `Rn/date-time/duration` (#933) expands inside
   `parse_datetime` to the same `DatetimeSelector::Instants`, so handlers
   never see it. `n` counts instants, like `z`'s `Rn` (the informative

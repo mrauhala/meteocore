@@ -7,18 +7,20 @@
 //! identical to a request naming the instant alone; merging then puts the
 //! answers back together:
 //!
-//! - a `Grid` without `t`, the one-step grid a gridded engine answers an
-//!   instant with, first gets the one-step axis `[t]` at the listed instant
-//!   it answered, so the instants' grids join along `t` as a cube's do
-//!   (a single `datetime` keeps the engine's grid as it is);
 //! - coverages with a leading `t` axis (`PointSeries`, a `Grid` with `t`) that
 //!   agree on everything but time — same position, grid, `z` and parameters —
 //!   become one coverage whose `t` axis holds every instant's steps, ascending,
 //!   each step once (two instants an engine snaps to the same step yield it
-//!   once);
+//!   once). A gridded engine answers an instant with a one-step `[t, …]`
+//!   grid at the step it served (#1412), so the instants' grids join along
+//!   `t` as a cube's do;
 //! - any other coverage (a `VerticalProfile`, a `Section`, a `Trajectory`,
-//!   …) is kept as it is, and an identical one from another instant is
-//!   dropped.
+//!   a `Grid` without `t`, which only a collection without time answers, …)
+//!   is kept as it is. One from another instant is dropped only when it is
+//!   identical, its domain, parameters and range values all the same; one
+//!   whose values differ stays, and the answer is a `CoverageCollection`.
+//!   Nothing here invents a `t` axis: the listed instant is not a step
+//!   such a collection holds.
 //!
 //! The response is `Single` when every instant answered `Single` and the merge
 //! left one coverage, else a `CoverageCollection`.
@@ -73,8 +75,7 @@ pub fn query_instants(
             return Err(DataServerError::DeadlineExceeded);
         }
         match query((t, t)) {
-            Ok(mut response) => {
-                add_time_axis(&mut response, t);
+            Ok(response) => {
                 values = values.saturating_add(count_values(&response));
                 if values > MAX_LIST_VALUES {
                     return Err(DataServerError::QueryTooLarge(format!(
@@ -96,33 +97,6 @@ pub fn query_instants(
         }));
     }
     Ok(merge(responses))
-}
-
-/// Give every `Grid` of `response` without a `t` axis the one-step axis
-/// `[t]`, leading each of its ranges, so it merges along `t` with the other
-/// instants' grids instead of being taken for a duplicate of the first.
-fn add_time_axis(response: &mut CoverageResponse, t: DateTime<Utc>) {
-    let coverages: &mut [QueryResult] = match response {
-        CoverageResponse::Single(q) => std::slice::from_mut(q),
-        CoverageResponse::Collection(v) => v,
-    };
-    for q in coverages {
-        let DomainDescription::Grid { t: axis, .. } = &mut q.domain else {
-            continue;
-        };
-        let whole_grids = q.ranges.values().all(|r| {
-            !r.axis_names.iter().any(|a| a == "t")
-                && r.shape.iter().product::<usize>() == r.values.len()
-        });
-        if axis.is_some() || !whole_grids {
-            continue;
-        }
-        *axis = Some(vec![t]);
-        for range in q.ranges.values_mut() {
-            range.axis_names.insert(0, "t".into());
-            range.shape.insert(0, 1);
-        }
-    }
 }
 
 fn count_values(response: &CoverageResponse) -> usize {
@@ -168,13 +142,26 @@ fn add(merged: &mut Vec<QueryResult>, coverage: QueryResult) {
             append_steps(series, &coverage);
             return;
         }
-    } else if merged
-        .iter()
-        .any(|m| same_domain(&m.domain, &coverage.domain) && same_parameters(m, &coverage))
-    {
+    } else if merged.iter().any(|m| {
+        same_domain(&m.domain, &coverage.domain)
+            && same_parameters(m, &coverage)
+            && same_ranges(m, &coverage)
+    }) {
         return;
     }
     merged.push(coverage);
+}
+
+/// The same ranges: the same names, each with the same shape, axes and
+/// values. Without the values, two instants' answers that share a domain
+/// but differ in data would keep only the first's.
+fn same_ranges(a: &QueryResult, b: &QueryResult) -> bool {
+    a.ranges.len() == b.ranges.len()
+        && a.ranges.iter().all(|(name, ra)| {
+            b.ranges.get(name).is_some_and(|rb| {
+                ra.shape == rb.shape && ra.axis_names == rb.axis_names && ra.values == rb.values
+            })
+        })
 }
 
 /// The coverage's time axis when every range leads with it, so steps can be
@@ -407,6 +394,7 @@ fn sort_steps(coverage: &mut QueryResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Timelike;
     use ds_core::model::{ParameterDescription, ValuePrecision};
     use ds_core::vertical::VerticalKind;
     use std::collections::HashMap;
@@ -450,46 +438,34 @@ mod tests {
 
     /// A 1-step `[t, y, x]` grid of 2 × 2 cells, every cell `v`.
     fn grid(hour: u32, v: f64) -> QueryResult {
-        QueryResult {
-            domain: DomainDescription::Grid {
-                x: vec![24.0, 25.0],
-                y: vec![60.0, 61.0],
-                t: Some(vec![at(hour)]),
-                z: None,
-            },
-            parameters: param(),
-            ranges: HashMap::from([(
-                "temperature".to_string(),
-                NdArray {
-                    shape: vec![1, 2, 2],
-                    axis_names: vec!["t".into(), "y".into(), "x".into()],
-                    values: vec![Some(v); 4],
-                    precision: ValuePrecision::F64,
-                },
-            )]),
-        }
+        step_grid(Some(hour), v, None)
     }
 
-    /// The one-step answer of a gridded engine: 2 × 2 cells, every cell
-    /// `v`, no `t` axis; with `levels`, a `[z, y, x]` grid on those levels.
-    fn timeless_grid(v: f64, levels: Option<&[f64]>) -> QueryResult {
-        let (z, shape, axis_names) = match levels {
-            Some(levels) => (
-                Some(VerticalCoord {
-                    kind: VerticalKind::Pressure,
-                    values: levels.to_vec(),
-                }),
-                vec![levels.len(), 2, 2],
-                vec!["z".into(), "y".into(), "x".into()],
-            ),
-            None => (None, vec![2, 2], vec!["y".into(), "x".into()]),
-        };
+    /// A gridded engine's answer to an instant: 2 × 2 cells, every cell
+    /// `v`, on the one-step `t` axis of the step it served (#1412), or
+    /// without `t` from a collection without time; with `levels`, on a `z`
+    /// axis of those levels too.
+    fn step_grid(step: Option<u32>, v: f64, levels: Option<&[f64]>) -> QueryResult {
+        let mut shape = vec![2, 2];
+        let mut axis_names: Vec<String> = vec!["y".into(), "x".into()];
+        let z = levels.map(|levels| {
+            shape.insert(0, levels.len());
+            axis_names.insert(0, "z".into());
+            VerticalCoord {
+                kind: VerticalKind::Pressure,
+                values: levels.to_vec(),
+            }
+        });
+        if step.is_some() {
+            shape.insert(0, 1);
+            axis_names.insert(0, "t".into());
+        }
         let cells = shape.iter().product();
         QueryResult {
             domain: DomainDescription::Grid {
                 x: vec![24.0, 25.0],
                 y: vec![60.0, 61.0],
-                t: None,
+                t: step.map(|hour| vec![at(hour)]),
                 z,
             },
             parameters: param(),
@@ -627,11 +603,11 @@ mod tests {
         assert_eq!(values(&q), expected);
     }
 
-    /// A gridded engine answers each instant with a grid without `t`; the
-    /// list keeps every instant, joined along `t`, instead of taking the
-    /// later grids for duplicates of the first.
+    /// A gridded engine answers each instant with a one-step grid at the
+    /// step it served; the list keeps every instant's step, joined along
+    /// `t`, the instant without data dropping out.
     #[test]
-    fn timeless_grids_join_along_t_per_instant() {
+    fn one_step_grids_join_along_t_per_instant() {
         let got = query_instants(
             &[at(1), at(2), at(3)],
             || false,
@@ -639,8 +615,12 @@ mod tests {
                 if t == at(2) {
                     return Err(DataServerError::LocationNotFound("no step".into()));
                 }
-                let v = f64::from(t.format("%H").to_string().parse::<u8>().unwrap());
-                Ok(CoverageResponse::Single(timeless_grid(v, None)))
+                let hour = t.hour();
+                Ok(CoverageResponse::Single(step_grid(
+                    Some(hour),
+                    f64::from(hour),
+                    None,
+                )))
             },
         )
         .unwrap();
@@ -657,14 +637,18 @@ mod tests {
     }
 
     #[test]
-    fn timeless_grids_with_levels_become_t_z_y_x() {
+    fn one_step_grids_with_levels_join_as_t_z_y_x() {
         let levels = [850.0, 500.0];
         let got = query_instants(
             &[at(1), at(2)],
             || false,
             |(t, _)| {
-                let v = f64::from(t.format("%H").to_string().parse::<u8>().unwrap());
-                Ok(CoverageResponse::Single(timeless_grid(v, Some(&levels))))
+                let hour = t.hour();
+                Ok(CoverageResponse::Single(step_grid(
+                    Some(hour),
+                    f64::from(hour),
+                    Some(&levels),
+                )))
             },
         )
         .unwrap();
@@ -690,7 +674,7 @@ mod tests {
                 if t == at(1) {
                     Err(DataServerError::LocationNotFound("no step".into()))
                 } else {
-                    Ok(CoverageResponse::Single(timeless_grid(2.0, None)))
+                    Ok(CoverageResponse::Single(step_grid(Some(2), 2.0, None)))
                 }
             },
         )
@@ -701,6 +685,57 @@ mod tests {
         };
         assert_eq!(times(&q), vec![at(2)]);
         assert_eq!(q.ranges["temperature"].shape, vec![1, 2, 2]);
+    }
+
+    /// A collection without time answers every instant with the same grid
+    /// without `t`: the list is that one grid, never a `t` axis made of the
+    /// listed instants, which are no steps the collection holds.
+    #[test]
+    fn a_grid_without_time_stays_one_grid_without_t() {
+        let got = query_instants(
+            &[at(1), at(2)],
+            || false,
+            |_| Ok(CoverageResponse::Single(step_grid(None, 5.0, None))),
+        )
+        .unwrap();
+        assert_valid_covjson(&got);
+        let CoverageResponse::Single(q) = got else {
+            panic!("expected one grid");
+        };
+        assert!(matches!(q.domain, DomainDescription::Grid { t: None, .. }));
+        let range = &q.ranges["temperature"];
+        assert_eq!(range.shape, vec![2, 2]);
+        assert_eq!(range.axis_names, ["y", "x"]);
+        assert_eq!(values(&q), vec![Some(5.0); 4]);
+    }
+
+    /// Grids without `t` that differ in their values are two answers, not a
+    /// duplicate: the list keeps both in a collection rather than only the
+    /// first instant's values.
+    #[test]
+    fn grids_without_time_with_different_values_stay_apart() {
+        let got = query_instants(
+            &[at(1), at(2)],
+            || false,
+            |(t, _)| {
+                Ok(CoverageResponse::Single(step_grid(
+                    None,
+                    f64::from(t.hour()),
+                    None,
+                )))
+            },
+        )
+        .unwrap();
+        assert_valid_covjson(&got);
+        let CoverageResponse::Collection(v) = got else {
+            panic!("two different grids are a collection");
+        };
+        assert_eq!(v.len(), 2);
+        assert_eq!(values(&v[0]), vec![Some(1.0); 4]);
+        assert_eq!(values(&v[1]), vec![Some(2.0); 4]);
+        assert!(v
+            .iter()
+            .all(|q| matches!(q.domain, DomainDescription::Grid { t: None, .. })));
     }
 
     #[test]

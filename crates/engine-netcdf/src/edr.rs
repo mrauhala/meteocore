@@ -1172,7 +1172,8 @@ impl NetcdfEngine {
                 .collect(),
         );
         let sampled = self.sample(&reads, &positions, limits)?;
-        let time_axis = datetime.is_some_and(|(start, end)| start < end);
+        // The steps read are always on a `t` axis, one included (#1412), as
+        // a cube's are.
         let times: Vec<DateTime<Utc>> = reads.steps.iter().map(|(t, _)| *t).collect();
         let vertical = reads.vertical();
         let ranges = reads
@@ -1182,15 +1183,11 @@ impl NetcdfEngine {
             .map(|(&param, slots)| {
                 // `sample`'s slots are step-major `[t][z]`, each `[y][x]`.
                 let values: Vec<Option<f64>> = slots.into_iter().flatten().collect();
-                let mut shape = vec![ny, nx];
-                let mut axis_names = vec!["y", "x"];
+                let mut shape = vec![times.len(), ny, nx];
+                let mut axis_names = vec!["t", "y", "x"];
                 if vertical.is_some() {
-                    shape.insert(0, reads.levels.len());
-                    axis_names.insert(0, "z");
-                }
-                if time_axis {
-                    shape.insert(0, times.len());
-                    axis_names.insert(0, "t");
+                    shape.insert(1, reads.levels.len());
+                    axis_names.insert(1, "z");
                 }
                 (
                     reads.layout.name(param).to_string(),
@@ -1207,7 +1204,7 @@ impl NetcdfEngine {
             domain: DomainDescription::Grid {
                 x: axes.x,
                 y: axes.y,
-                t: time_axis.then_some(times),
+                t: Some(times),
                 z: vertical,
             },
             parameters: Self::descriptions(&catalog, reads.layout, &reads.params),
@@ -1383,10 +1380,11 @@ impl EdrEngine for NetcdfEngine {
     /// projected onto the source grid once and sampled as the map is;
     /// cells outside the polygon are null (#671). A polygon wholly outside
     /// the grid's extent is a 404. Without `datetime` the step a map without
-    /// `TIME` draws (the newest run's last); a `datetime` interval puts every
-    /// step inside it on a `t` axis, even one. On pressure levels the `z`
-    /// levels (every level without `z`) are a `z` axis, even one, as
-    /// engine-grib's level views answer: `[t, z, y, x]` or `[z, y, x]`.
+    /// `TIME` draws (the newest run's last), an instant its exact step, an
+    /// interval every step inside it: always on a `t` axis, even one step
+    /// (#1412). On pressure levels the `z` levels (every level without `z`)
+    /// are a `z` axis, even one, as engine-grib's level views answer:
+    /// `[t, z, y, x]`, else `[t, y, x]`.
     fn query_area(
         &self,
         coords: &str,

@@ -256,7 +256,8 @@ async fn grib_pressure_collection_serves_cube_queries() {
 /// `/req/core/datetime-response` A and F (#967) on the fixture's only step,
 /// 2026-04-05T00Z: a window around it, closed or open, selects it on every
 /// query (they were 400 "No forecast run covers time"), an area or radius
-/// reports it on a `t` axis, and an instant between steps is no data.
+/// reports it on a `t` axis, as at the instant and without `datetime`, and
+/// an instant between steps is no data.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grib_datetime_windows_intersect_the_steps() {
     let app = app();
@@ -296,16 +297,24 @@ async fn grib_datetime_windows_intersect_the_steps() {
         let (status, body) = get(&app, &uri).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
     }
-    // The exact instant keeps the t-less area Grid.
-    let (status, body) = get(
-        &app,
-        &format!(
-            "/collections/{ID}/{}&datetime=2026-04-05T00:00:00Z",
-            queries[1]
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_valid(&covjson, &body, "area at the step");
-    assert_eq!(body["ranges"]["q"]["axisNames"], json!(["z", "y", "x"]));
+    // The exact instant, and no datetime, report the step too (#1412).
+    for query in &queries[1..3] {
+        for datetime in ["&datetime=2026-04-05T00:00:00Z", ""] {
+            let uri = format!("/collections/{ID}/{query}{datetime}");
+            let (status, body) = get(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_valid(&covjson, &body, &uri);
+            assert_eq!(
+                body["domain"]["axes"]["t"]["values"],
+                json!(["2026-04-05T00:00:00+00:00"]),
+                "{uri}"
+            );
+            assert_eq!(
+                body["ranges"]["q"]["axisNames"],
+                json!(["t", "z", "y", "x"]),
+                "{uri}"
+            );
+            assert_eq!(body["ranges"]["q"]["shape"][0], 1, "{uri}");
+        }
+    }
 }

@@ -579,12 +579,18 @@ mod tests {
         else {
             panic!()
         };
-        let DomainDescription::Grid { z: Some(z), .. } = &area.domain else {
+        let DomainDescription::Grid {
+            t: Some(t),
+            z: Some(z),
+            ..
+        } = &area.domain
+        else {
             panic!()
         };
+        assert_eq!(t, &[reference]);
         assert_eq!(z.values, [850.0, 500.0]);
-        assert_eq!(area.ranges["TMP"].shape, [2, 2, 2]);
-        assert_eq!(area.ranges["TMP"].axis_names, ["z", "y", "x"]);
+        assert_eq!(area.ranges["TMP"].shape, [1, 2, 2, 2]);
+        assert_eq!(area.ranges["TMP"].axis_names, ["t", "z", "y", "x"]);
         assert!(area.ranges["OTHER"].values[4..].iter().all(Option::is_none));
         assert!((area.ranges["TMP"].values[4].unwrap() + 23.15).abs() < 1e-9);
     }

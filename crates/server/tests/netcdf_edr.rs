@@ -174,6 +174,29 @@ async fn netcdf_edr_responses_validate() {
         area["ranges"]["wind_speed_10m"]["axisNames"],
         serde_json::json!(["t", "y", "x"])
     );
+    // One step says which (#1412): without `datetime` the newest run's
+    // last, at an instant that step, each a `[1, ny, nx]` range.
+    for (what, parameter, step) in [
+        (
+            "area",
+            "air_pressure_at_sea_level",
+            "2026-10-15T11:00:00+00:00",
+        ),
+        (
+            "instance area",
+            "air_temperature_2m",
+            "2026-10-15T09:00:00+00:00",
+        ),
+    ] {
+        let area = &answers[what];
+        assert_eq!(times(area), [step], "{what}");
+        assert_eq!(
+            area["ranges"][parameter]["axisNames"],
+            serde_json::json!(["t", "y", "x"]),
+            "{what}"
+        );
+        assert_eq!(area["ranges"][parameter]["shape"][0], 1, "{what}");
+    }
     assert_eq!(
         times(&answers["instance position"]).len(),
         4,
@@ -477,7 +500,7 @@ async fn netcdf_pressure_level_responses_validate() {
     );
     assert_eq!(
         answers["area one level"]["ranges"]["geopotential_pl"]["axisNames"],
-        serde_json::json!(["z", "y", "x"])
+        serde_json::json!(["t", "z", "y", "x"])
     );
 
     // Trajectories: one coverage per level of `z`, each with a one-value

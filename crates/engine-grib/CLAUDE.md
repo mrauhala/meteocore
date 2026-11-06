@@ -887,9 +887,10 @@ ones only in the legacy layout.
   `node_coordinate` (the f64 nearest the whole microdegree: `19.9`, never
   `19.900000000000006`). `cache::tests::bbox_edges_on_nodes_keep_exactly_those_nodes`
   and `seam_box_columns_are_pinned_on_global_grids` pin both.
-- Steps come from `grid_steps`: no datetime is the run's last step and an
-  instant its exact step, both a t-less `[z,]y,x` Grid; an interval every
-  step inside it on a `t` axis (`[t, z, y, x]` like cube), even one step.
+- Steps come from `grid_steps`: no datetime is the run's last step, an
+  instant its exact step, an interval every step inside it. They are always
+  a `t` axis, one step included (`[t, z, y, x]` like cube, `[t, y, x]`
+  without levels, #1412).
   The values budget counts steps × levels. A parameter some steps lack
   (an aggregate at the analysis step) is null there; one no step has is
   the canonical-level 400 when named, null when defaulted.

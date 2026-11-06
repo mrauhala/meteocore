@@ -424,6 +424,31 @@ fn grid_coverage_with_time_validates() {
     validate(&json, &schema);
 }
 
+/// An area answer of one step (#1412): a one-value `t` axis and a
+/// `[1, ny, nx]` range, the layout of any number of steps.
+#[test]
+fn grid_coverage_with_one_step_validates() {
+    let schema = load_schema();
+    let x = vec![10.0, 10.5, 11.0];
+    let y = vec![60.0, 60.5];
+    let values: Vec<Option<f64>> = (0..6).map(|i| Some(f64::from(i))).collect();
+    let result = make_grid_query_result(
+        x,
+        y,
+        Some(vec![make_time(0)]),
+        vec![("temperature", "K", values)],
+    );
+    let json = query_result_to_coverage_json(&result);
+    validate(&json, &schema);
+    assert_eq!(
+        json["domain"]["axes"]["t"]["values"],
+        serde_json::json!([make_time(0).to_rfc3339()])
+    );
+    let range = &json["ranges"]["temperature"];
+    assert_eq!(range["axisNames"], serde_json::json!(["t", "y", "x"]));
+    assert_eq!(range["shape"], serde_json::json!([1, 2, 3]));
+}
+
 #[test]
 fn grid_coverage_with_nulls_validates() {
     let schema = load_schema();

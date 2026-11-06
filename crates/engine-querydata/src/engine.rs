@@ -394,8 +394,9 @@ impl EdrEngine for QueryDataEngine {
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the source's
     /// native resolution (each dimension ≤ `MAX_AREA_DIM`), every cell
     /// bilinearly interpolated from the run's grid and cells outside the
-    /// polygon masked to null (#671). One `t` axis when the datetime window
-    /// selects more than one step.
+    /// polygon masked to null (#671). The steps the datetime window selects
+    /// (every step without one) are always a `t` axis, one included: `[t, y,
+    /// x]` (#1412).
     fn query_area(
         &self,
         coords: &str,
@@ -455,7 +456,6 @@ impl EdrEngine for QueryDataEngine {
             })
             .collect();
 
-        let has_time = time_indices.len() > 1;
         let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
         let mut params_map = HashMap::new();
         let mut ranges = HashMap::new();
@@ -470,19 +470,11 @@ impl EdrEngine for QueryDataEngine {
                 }));
             }
             params_map.insert(parameter.key.to_string(), description(parameter.param));
-            let (shape, axis_names) = if has_time {
-                (
-                    vec![times.len(), ny, nx],
-                    vec!["t".to_string(), "y".to_string(), "x".to_string()],
-                )
-            } else {
-                (vec![ny, nx], vec!["y".to_string(), "x".to_string()])
-            };
             ranges.insert(
                 parameter.key.to_string(),
                 NdArray {
-                    shape,
-                    axis_names,
+                    shape: vec![times.len(), ny, nx],
+                    axis_names: vec!["t".to_string(), "y".to_string(), "x".to_string()],
                     values,
                     precision: VALUE_PRECISION,
                 },
@@ -493,7 +485,7 @@ impl EdrEngine for QueryDataEngine {
             domain: DomainDescription::Grid {
                 x: axes.x,
                 y: axes.y,
-                t: has_time.then_some(times),
+                t: Some(times),
                 z: None,
             },
             parameters: params_map,
@@ -1672,11 +1664,16 @@ mod tests {
         let DomainDescription::Grid { x, y, t, .. } = &res.domain else {
             panic!("expected a Grid domain");
         };
-        assert!(t.is_none(), "one timestep → no t axis");
+        assert_eq!(
+            t.as_deref(),
+            Some(&[start][..]),
+            "one timestep, on a t axis"
+        );
         assert!(x.len() > 2 && y.len() > 2, "grid {}×{}", x.len(), y.len());
         assert!(x.windows(2).all(|p| p[0] < p[1]) && y.windows(2).all(|p| p[0] > p[1]));
         let arr = &res.ranges[&param[0]];
-        assert_eq!(arr.shape, vec![y.len(), x.len()]);
+        assert_eq!(arr.shape, vec![1, y.len(), x.len()]);
+        assert_eq!(arr.axis_names, vec!["t", "y", "x"]);
         assert_eq!(arr.values.len(), y.len() * x.len());
         // North-east corner (row 0, last col) is outside the triangle.
         assert!(arr.values[x.len() - 1].is_none());
@@ -1688,6 +1685,60 @@ mod tests {
             inside * 3 > total && inside * 3 < total * 2,
             "a right triangle fills about half its bbox: {inside}/{total}"
         );
+    }
+
+    /// #1412: an instant, or an interval holding one step, answers that
+    /// step on a `t` axis with `[1, ny, nx]` ranges, by area and by radius.
+    /// Without `datetime` every step is served (see
+    /// `engine_area_query_with_time_axis_and_budget`).
+    #[test]
+    fn engine_area_query_reports_a_single_step_on_a_t_axis() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let engine = QueryDataEngine::new(&test_dir(), "test", None, 30, 4).unwrap();
+        let times = engine.latest_data().unwrap().times.clone();
+        assert!(times.len() > 1, "{times:?}");
+        let (step, next) = (times[0], times[1]);
+        let param = vec!["2 Metre Temperature (2t)".to_string()];
+        let windows = [
+            ("instant", (step, step)),
+            ("interval", (step - (next - step), step + (next - step) / 2)),
+        ];
+        for (what, window) in windows {
+            for (query, response) in [
+                (
+                    "area",
+                    engine.query_area(
+                        "POLYGON((36 -2, 38 -2, 38 0, 36 0, 36 -2))",
+                        Some(window),
+                        Some(&param),
+                        None,
+                        None,
+                    ),
+                ),
+                (
+                    "radius",
+                    engine.query_radius(
+                        "POINT(36.8 -1.3)",
+                        80_000.0,
+                        Some(window),
+                        Some(&param),
+                        None,
+                        None,
+                    ),
+                ),
+            ] {
+                let CoverageResponse::Single(res) = response.unwrap() else {
+                    panic!("{what} {query}: expected a single Grid coverage");
+                };
+                let DomainDescription::Grid { x, y, t, .. } = &res.domain else {
+                    panic!("{what} {query}: expected a Grid domain");
+                };
+                assert_eq!(t.as_deref(), Some(&[step][..]), "{what} {query}");
+                let arr = &res.ranges[&param[0]];
+                assert_eq!(arr.shape, vec![1, y.len(), x.len()], "{what} {query}");
+                assert_eq!(arr.axis_names, vec!["t", "y", "x"], "{what} {query}");
+            }
+        }
     }
 
     #[test]

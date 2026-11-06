@@ -76,8 +76,8 @@ runtime).
   CRS84 `Grid` over the polygon bbox at native resolution (≤ 256 cells per
   axis, 1M-value budget across time × cells × parameters), every cell
   bilinearly interpolated and cells outside the polygon masked to null
-  (`QueryPolygon::sample_grid` in ds-core, #671). One `t` axis when the
-  datetime window selects several steps.
+  (`QueryPolygon::sample_grid` in ds-core, #671). The selected steps are
+  always a `t` axis, one included: `[t, y, x]` (#1412).
 - EDR trajectory (#926): the path, time rules and layout come from
   `ds_core::trajectory::TrajectoryPlan`, densified at the area query's mean
   cell size (`lonlat_extent` / grid dims). Each sample is projected once

@@ -298,42 +298,62 @@ fn edr_query_position_rejects_unknown_parameter() {
 
 /// `query_area` over a Denmark bbox returns a `Single` `Grid`
 /// coverage whose `NdArray` length equals the product of its shape
-/// dimensions (the CoverageJSON NdArray invariant).
+/// dimensions (the CoverageJSON NdArray invariant). The one scan it
+/// serves is on a `t` axis (#1412), without `datetime`, at its instant,
+/// and over an interval around it, by area and by radius.
 #[test]
 fn edr_query_area_returns_grid() {
     let (engine, _guard) = dmi_engine();
-    let result = engine
-        .query_area("9.0,55.0,12.0,57.5", None, None, None, None)
-        .expect("area query succeeds");
+    let scan = engine.get_available_times().expect("one scan")[0];
+    let minute = chrono::Duration::minutes(1);
+    let area = "9.0,55.0,12.0,57.5";
+    for (what, result) in [
+        (
+            "no datetime",
+            engine.query_area(area, None, None, None, None),
+        ),
+        (
+            "instant",
+            engine.query_area(area, Some((scan, scan)), None, None, None),
+        ),
+        (
+            "interval",
+            engine.query_area(area, Some((scan - minute, scan + minute)), None, None, None),
+        ),
+        (
+            "radius",
+            engine.query_radius("POINT(10.5 56)", 50_000.0, None, None, None, None),
+        ),
+    ] {
+        let coverage = match result.expect("area query succeeds") {
+            CoverageResponse::Single(qr) => qr,
+            CoverageResponse::Collection(_) => panic!("ODIM area query must return Single"),
+        };
 
-    let coverage = match result {
-        CoverageResponse::Single(qr) => qr,
-        CoverageResponse::Collection(_) => panic!("ODIM area query must return Single"),
-    };
+        let (nx, ny) = match coverage.domain {
+            DomainDescription::Grid {
+                ref x,
+                ref y,
+                ref t,
+                ..
+            } => {
+                assert_eq!(t.as_deref(), Some(&[scan][..]), "{what}");
+                (x.len(), y.len())
+            }
+            other => panic!("expected Grid, got {other:?}"),
+        };
+        assert!(nx > 0 && ny > 0);
 
-    let (nx, ny) = match coverage.domain {
-        DomainDescription::Grid {
-            ref x,
-            ref y,
-            ref t,
-            ..
-        } => {
-            assert!(t.is_none(), "single-file fixture → no time axis");
-            (x.len(), y.len())
-        }
-        other => panic!("expected Grid, got {other:?}"),
-    };
-    assert!(nx > 0 && ny > 0);
-
-    let range = &coverage.ranges["reflectivity"];
-    assert_eq!(range.shape, vec![ny, nx]);
-    assert_eq!(range.axis_names, vec!["y".to_string(), "x".to_string()]);
-    assert_eq!(
-        range.values.len(),
-        ny * nx,
-        "NdArray length must equal the product of shape dims"
-    );
-    assert_eq!(range.precision, ValuePrecision::F32);
+        let range = &coverage.ranges["reflectivity"];
+        assert_eq!(range.shape, vec![1, ny, nx], "{what}");
+        assert_eq!(range.axis_names, vec!["t", "y", "x"], "{what}");
+        assert_eq!(
+            range.values.len(),
+            ny * nx,
+            "NdArray length must equal the product of shape dims"
+        );
+        assert_eq!(range.precision, ValuePrecision::F32);
+    }
 }
 
 /// An unbounded area query (`datetime = None`) over a catalog with more

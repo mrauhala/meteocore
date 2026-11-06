@@ -500,6 +500,36 @@ fn edr_area_and_radius_sample_the_scans() {
             .unwrap(),
     );
     assert!(radius.ranges["ir_10_3"].values.iter().any(Option::is_some));
+
+    // One scan, at its instant or in an interval around it, is still a
+    // `t` axis, `[1, ny, nx]` (#1412).
+    let scans = engine.get_available_times().unwrap();
+    assert_eq!(scans.len(), 2);
+    let minute = chrono::Duration::minutes(1);
+    let later = scans[1];
+    for (what, window) in [
+        ("instant", (later, later)),
+        ("interval", (later - minute, later + minute)),
+    ] {
+        let result = single(
+            engine
+                .query_area(
+                    &polygon,
+                    Some(window),
+                    Some(&["ir_10_3".to_string()]),
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let DomainDescription::Grid { x, y, t, .. } = &result.domain else {
+            panic!("{what}: expected a grid");
+        };
+        assert_eq!(t.as_deref(), Some(&scans[1..]), "{what}");
+        let ir = &result.ranges["ir_10_3"];
+        assert_eq!(ir.axis_names, ["t", "y", "x"], "{what}");
+        assert_eq!(ir.shape, [1, y.len(), x.len()], "{what}");
+    }
     // Outside the disk entirely.
     assert!(engine
         .query_area(
@@ -510,6 +540,36 @@ fn edr_area_and_radius_sample_the_scans() {
             None
         )
         .is_err());
+}
+
+/// A collection of one scan answers an area without `datetime` with that
+/// scan on a `t` axis (#1412).
+#[test]
+fn edr_area_of_one_scan_has_a_t_axis() {
+    let (engine, _dir) = engine(&[(C13, C13)]);
+    let scans = engine.get_available_times().unwrap();
+    assert_eq!(scans.len(), 1);
+    let (lon, lat, _) = reference_pixel(C13, "CMI", 120, 60);
+    let result = single(
+        engine
+            .query_radius(
+                &format!("POINT({lon} {lat})"),
+                20_000.0,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap(),
+    );
+    let DomainDescription::Grid { x, y, t, .. } = &result.domain else {
+        panic!("expected a grid");
+    };
+    assert_eq!(t.as_deref(), Some(&scans[..]));
+    let ir = &result.ranges["ir_10_3"];
+    assert_eq!(ir.axis_names, ["t", "y", "x"]);
+    assert_eq!(ir.shape, [1, y.len(), x.len()]);
+    assert!(ir.values.iter().any(Option::is_some));
 }
 
 fn nearest(axis: &[f64], value: f64) -> usize {

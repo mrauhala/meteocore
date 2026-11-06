@@ -2278,7 +2278,6 @@ impl GeoTiffEngine {
             .map(|r| first_metadata.geo_transform.pixel_to_world(mid_col, r).1)
             .collect();
 
-        let has_time = entries.len() > 1;
         let mut times = Vec::with_capacity(entries.len());
         let mut all_values = Vec::with_capacity(entries.len() * ny * nx);
         // The finest of the files read, so no file's values lose digits.
@@ -2324,30 +2323,17 @@ impl GeoTiffEngine {
             }
         }
 
-        let domain = if has_time {
-            DomainDescription::Grid {
-                x: x_values.clone(),
-                y: y_values.clone(),
-                t: Some(times),
-                z: None,
-            }
-        } else {
-            DomainDescription::Grid {
-                x: x_values.clone(),
-                y: y_values.clone(),
-                t: None,
-                z: None,
-            }
+        // Every entry has the time its filename or STAC item states, so the
+        // steps served are always on a `t` axis, one step included (#1412):
+        // `[t, y, x]` however many match.
+        let domain = DomainDescription::Grid {
+            x: x_values,
+            y: y_values,
+            t: Some(times),
+            z: None,
         };
-
-        let (shape, axis_names) = if has_time {
-            (
-                vec![entries.len(), ny, nx],
-                vec!["t".to_string(), "y".to_string(), "x".to_string()],
-            )
-        } else {
-            (vec![ny, nx], vec!["y".to_string(), "x".to_string()])
-        };
+        let shape = vec![entries.len(), ny, nx];
+        let axis_names = vec!["t".to_string(), "y".to_string(), "x".to_string()];
 
         let mut param_descs = HashMap::new();
         param_descs.insert(
@@ -4160,6 +4146,57 @@ mod tests {
         let ndarray = &result.ranges["reflectivity"];
         assert_eq!(ndarray.shape, vec![5, y.len(), x.len()]);
         assert_eq!(ndarray.values.len(), 5 * y.len() * x.len());
+    }
+
+    /// #1412: an area or radius says which steps it served, on a `t` axis
+    /// even for one: an instant, an interval around one file, and no
+    /// datetime over a catalog of one file each answer that file's time and
+    /// `[1, ny, nx]` ranges.
+    #[test]
+    fn area_reports_a_single_step_on_a_t_axis() {
+        let engine = radar_engine();
+        let (t0, entry) = {
+            let catalog = engine.catalog.load();
+            let (t, e) = catalog.entries.iter().next().unwrap();
+            (*t, e.clone())
+        };
+        let polygon = "POLYGON((24.5 60, 25 60, 25 60.5, 24.5 60.5, 24.5 60))";
+        let one_step = |response: Result<CoverageResponse, DataServerError>, what: &str| {
+            let CoverageResponse::Single(result) = response.unwrap() else {
+                panic!("{what}: expected one coverage");
+            };
+            let DomainDescription::Grid { x, y, t, .. } = &result.domain else {
+                panic!("{what}: expected a Grid domain, got {:?}", result.domain);
+            };
+            assert_eq!(t.as_deref(), Some(&[t0][..]), "{what}");
+            let range = &result.ranges["reflectivity"];
+            assert_eq!(range.axis_names, ["t", "y", "x"], "{what}");
+            assert_eq!(range.shape, [1, y.len(), x.len()], "{what}");
+            assert_eq!(range.values.len(), y.len() * x.len(), "{what}");
+        };
+        // The fixture's files are five minutes apart.
+        let minute = chrono::Duration::minutes(1);
+        for (what, datetime) in [
+            ("instant", (t0, t0)),
+            ("interval", (t0 - minute, t0 + minute)),
+        ] {
+            one_step(
+                engine.query_area(polygon, Some(datetime), None, None, None),
+                what,
+            );
+        }
+
+        let mut catalog = crate::catalog::Catalog::empty();
+        catalog.entries.insert(t0, entry);
+        engine.catalog.store(Arc::new(catalog));
+        one_step(
+            engine.query_area(polygon, None, None, None, None),
+            "no datetime",
+        );
+        one_step(
+            engine.query_radius("POINT(24.75 60.25)", 20_000.0, None, None, None, None),
+            "radius",
+        );
     }
 
     /// #18: a request past its deadline reads no further file. A local read

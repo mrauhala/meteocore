@@ -279,7 +279,8 @@ impl OdimEngine {
     /// Area query: a `Grid` coverage over the polygon's bounding
     /// box. The output grid is a regular WGS84 lon/lat lattice;
     /// cells whose centre falls outside the polygon are masked to
-    /// `None`.
+    /// `None`. Every scan in the window (all of them without one) is a
+    /// step of its `t` axis: `[t, y, x]`.
     fn query_polygon(
         &self,
         polygon: &QueryPolygon,
@@ -320,7 +321,6 @@ impl OdimEngine {
         let x_values = axes.x;
         let y_values = axes.y;
 
-        let has_time = entries.len() > 1;
         let mut times = Vec::with_capacity(entries.len());
         let mut all_values: Vec<Option<f64>> = Vec::with_capacity(entries.len() * ny * nx);
 
@@ -360,29 +360,16 @@ impl OdimEngine {
             }
         }
 
-        let (domain, shape, axis_names) = if has_time {
-            (
-                DomainDescription::Grid {
-                    x: x_values,
-                    y: y_values,
-                    t: Some(times),
-                    z: None,
-                },
-                vec![entries.len(), ny, nx],
-                vec!["t".to_string(), "y".to_string(), "x".to_string()],
-            )
-        } else {
-            (
-                DomainDescription::Grid {
-                    x: x_values,
-                    y: y_values,
-                    t: None,
-                    z: None,
-                },
-                vec![ny, nx],
-                vec!["y".to_string(), "x".to_string()],
-            )
+        // Every catalog entry is a timestamped scan, so the scans served are
+        // always on a `t` axis, one scan included (#1412).
+        let domain = DomainDescription::Grid {
+            x: x_values,
+            y: y_values,
+            t: Some(times),
+            z: None,
         };
+        let shape = vec![entries.len(), ny, nx];
+        let axis_names = vec!["t".to_string(), "y".to_string(), "x".to_string()];
 
         let mut ranges = HashMap::new();
         ranges.insert(

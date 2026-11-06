@@ -790,7 +790,7 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   `datetime` list skips the instant (#968). An instant needs a step at
   exactly it. Without a window: a position series is every step of the
   newest run, an area the newest run's last step (the map's default). An
-  interval puts an area's steps on a `t` axis, even one (grib's rule).
+  area's steps are always a `t` axis, even one (grib's rule, #1412).
   GetFeatureInfo passes the run and step its map resolved
   (`resolve_reference_time`, `resolve_time`), so it reads that field.
 - **Sampling:** `ds_core::resample::SourceGrid::position` projects a point,

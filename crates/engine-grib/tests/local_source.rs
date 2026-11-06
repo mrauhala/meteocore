@@ -112,11 +112,13 @@ fn grib_area_query_masks_outside_the_polygon() {
     let ds_core::model::CoverageResponse::Single(res) = resp else {
         panic!("expected a single Grid coverage");
     };
-    let ds_core::model::DomainDescription::Grid { x, y, .. } = &res.domain else {
+    let ds_core::model::DomainDescription::Grid { x, y, t, .. } = &res.domain else {
         panic!("expected a Grid domain");
     };
+    // The one step served, on a `t` axis (#1412).
+    assert_eq!(t.as_ref().map(Vec::len), Some(1));
     let arr = &res.ranges[&param];
-    assert_eq!(arr.shape, vec![y.len(), x.len()]);
+    assert_eq!(arr.shape, vec![1, y.len(), x.len()]);
     assert!(x.len() >= 2 && y.len() >= 2, "grid {}×{}", x.len(), y.len());
     // y ascends (south first): the last row / last column is the NE corner.
     assert!(

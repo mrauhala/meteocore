@@ -1107,8 +1107,9 @@ fn edr_positions_read_each_field_once_and_cache_none() {
 /// An area is a CRS84 grid over the polygon's bbox at the source's mean
 /// cell size in degrees, each cell centre sampled as the map draws it and
 /// cells outside the polygon null; without `datetime` the step a map
-/// without `TIME` draws, an interval on a `t` axis; a polygon off the grid
-/// a 404. A radius is the area of its circle.
+/// without `TIME` draws, an instant its step, an interval every step inside
+/// it, always on a `t` axis (#1412); a polygon off the grid a 404. A radius
+/// is the area of its circle.
 #[test]
 fn edr_area_is_a_crs84_grid_sampled_like_the_map() {
     let engine = meps();
@@ -1127,7 +1128,9 @@ fn edr_area_is_a_crs84_grid_sampled_like_the_map() {
     let DomainDescription::Grid { x, y, t, z } = &result.domain else {
         panic!("not a Grid: {:?}", result.domain);
     };
-    assert!(t.is_none() && z.is_none());
+    // The newest run's last step, as a map without `TIME` draws.
+    assert_eq!(t.as_deref(), Some(&[at("2026-10-15T11:00:00Z")][..]));
+    assert!(z.is_none());
     // The fixture's cells are 250 km apart: some 7° of longitude and 2.4°
     // of latitude over its extent.
     assert!(
@@ -1135,8 +1138,8 @@ fn edr_area_is_a_crs84_grid_sampled_like_the_map() {
         "{x:?} {y:?}"
     );
     let range = &result.ranges["air_pressure_at_sea_level"];
-    assert_eq!(range.shape, [y.len(), x.len()]);
-    assert_eq!(range.axis_names, ["y", "x"]);
+    assert_eq!(range.shape, [1, y.len(), x.len()]);
+    assert_eq!(range.axis_names, ["t", "y", "x"]);
     let mut inside = 0;
     for (iy, &lat) in y.iter().enumerate() {
         for (ix, &lon) in x.iter().enumerate() {
@@ -1193,6 +1196,38 @@ fn edr_area_is_a_crs84_grid_sampled_like_the_map() {
         assert_eq!(range.shape, [2, y.len(), x.len()]);
         assert_eq!(range.axis_names, ["t", "y", "x"]);
         assert!(range.values.iter().all(Option::is_some));
+    }
+    // An instant, or an interval holding one step (the 06Z run's 08Z): that
+    // one step on a `t` axis.
+    for (window, step) in [
+        (
+            (at("2026-10-15T10:00:00Z"), at("2026-10-15T10:00:00Z")),
+            at("2026-10-15T10:00:00Z"),
+        ),
+        (
+            (at("2026-10-15T07:30:00Z"), at("2026-10-15T08:30:00Z")),
+            at("2026-10-15T08:00:00Z"),
+        ),
+    ] {
+        let result = single(
+            engine
+                .query_area(
+                    "10,58,20,64",
+                    Some(window),
+                    Some(&names(&["air_temperature_2m"])),
+                    None,
+                    None,
+                )
+                .unwrap(),
+        );
+        let DomainDescription::Grid { x, y, t, .. } = &result.domain else {
+            unreachable!()
+        };
+        assert_eq!(t.as_deref(), Some(&[step][..]), "{window:?}");
+        let range = &result.ranges["air_temperature_2m"];
+        assert_eq!(range.shape, [1, y.len(), x.len()], "{window:?}");
+        assert_eq!(range.axis_names, ["t", "y", "x"], "{window:?}");
+        assert!(range.values.iter().all(Option::is_some), "{window:?}");
     }
     assert!(matches!(
         engine.query_area("100,0,110,10", None, None, None, None),
