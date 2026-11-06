@@ -1124,11 +1124,12 @@ The engine can discover GeoTIFF files via a STAC API instead of directory listin
 
 **How it works:**
 1. On startup, fetches collection extent from the STAC collection endpoint (bbox + temporal interval)
-2. When a query arrives, fetches STAC items for that datetime range on-demand
-3. Creates lightweight stubs from STAC metadata (datetime, bbox, asset URL)
-4. GeoTIFF headers are loaded lazily via COG byte-range reads when pixel data is first needed
-5. Loaded metadata is cached — subsequent queries skip all HTTP
-6. Poll loop only fetches newly published items (incremental)
+2. Right after, in the background, the first poll lists the last hour of items and loads the newest ones' headers; nothing waits on it
+3. When a query arrives for a window the catalog does not hold, fetches STAC items for that datetime range on-demand
+4. Creates lightweight stubs from STAC metadata (datetime, bbox, asset URL)
+5. GeoTIFF headers the poll did not load are loaded lazily via COG byte-range reads when pixel data is first needed
+6. Loaded metadata is cached — subsequent queries skip all HTTP
+7. Later polls only fetch newly published items (incremental)
 
 **Security:**
 - `stac_asset_allowlist` is mandatory (SSRF protection). Every asset URL must match at least one prefix.

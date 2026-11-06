@@ -19,7 +19,9 @@ tiles a request touches, so a remote COG is not downloaded whole.
   `timestamp_format`). Excluded and hidden names are dropped first, and one
   file is kept per timestamp. A new local file joins once its size holds
   steady over two more polls. A STAC source takes each item's `datetime`:
-  a poll lists newer items, a request lists older windows on demand.
+  the first poll runs at startup without holding it up and lists the last
+  hour, later polls list newer items, and a request lists older windows on
+  demand.
 - **Metadata.** Each new file's header is read once: tiling, overviews,
   georeferencing, nodata (`GDAL_NODATA`) and scale/offset (GDAL metadata).
   A remote object is read again when the listing names another version of

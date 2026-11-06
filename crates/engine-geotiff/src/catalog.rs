@@ -890,7 +890,8 @@ pub(crate) fn range_not_honoured(e: &DataServerError) -> bool {
 ///
 /// This is called at engine startup. The catalog has no entries but carries
 /// the spatial and temporal extent from the STAC collection metadata.
-/// Items are fetched on-demand when queries arrive.
+/// The poll loop's first poll lists the last hour's items right after, and
+/// queries list older windows on demand.
 pub fn init_stac_from_extent(extent: &crate::stac::StacExtent) -> Catalog {
     let temporal_extent = extent.temporal_start.map(|start| {
         let end = extent.temporal_end.unwrap_or_else(Utc::now);

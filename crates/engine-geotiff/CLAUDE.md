@@ -96,14 +96,25 @@ apply here.
 
 ## STAC metadata loading (#90, #889, #1075)
 
-- Startup reads only the collection extent. Each `poll_cycle` adds items
-  newer than the newest entry as stubs (the first poll: the last hour), then
-  `preload_stac_metadata` fetches the header/IFD of the ones it just
-  discovered or found holding another item (`Catalog::fresh_since`, #1055),
-  on the poll runtime: newest `STAC_PRELOAD_MAX_ITEMS` only,
-  `STAC_PRELOAD_CONCURRENCY` in flight, async reqwest end to end. Never loop
-  the sync `load_stac_entry_metadata` there: that is N sequential blocking
-  round trips (root Critical Rule 9).
+- Construction reads only the collection extent. `poll_loop` runs the first
+  `poll_cycle` before its first sleep (#1409), on the poll runtime with
+  nothing waiting on it, so a restart or a reload's rebuilt engine has
+  timesteps without a poll interval passing. Other sources scan at
+  construction instead. An empty previous catalog makes everything in that
+  first listing fresh, so it costs the most any poll of the collection does:
+  the collection GET, the last hour's `/items` pages, up to
+  `STAC_PRELOAD_MAX_ITEMS` headers and `PREWARM_MAX_FRAMES` warmed frames,
+  each within the limits below. No stagger: the remote sources' construction
+  scans and startup pre-warm have none either. A failed first poll is any
+  failed poll: a WARN, the catalog kept, the next one after the 2× backoff.
+  An engine shut down during its listing starts no preload or pre-warm.
+- Each `poll_cycle` adds items newer than the newest entry as stubs (the
+  first poll: the last hour), then `preload_stac_metadata` fetches the
+  header/IFD of the ones it just discovered or found holding another item
+  (`Catalog::fresh_since`, #1055), on the poll runtime: newest
+  `STAC_PRELOAD_MAX_ITEMS` only, `STAC_PRELOAD_CONCURRENCY` in flight, async
+  reqwest end to end. Never loop the sync `load_stac_entry_metadata` there:
+  that is N sequential blocking round trips (root Critical Rule 9).
 - The request path is the fallback for older items (on-demand
   `fetch_stac_range`), items past the cap and failed preloads. A render
   loads its one item (`ensure_metadata`). An EDR query loads every stub in
@@ -266,7 +277,8 @@ engine-zarr.
   0 off, at most 1/8 of the tile cache), coalesced by `range_batch::plan`,
   4 reads in flight on the poll runtime's blocking pool through the
   explicit-handle bridges, within `PREWARM_BUDGET`. `poll_loop` warms the
-  startup catalog before its first sleep. It fills the compressed cache
+  startup catalog before its first sleep; on a STAC source its first poll
+  does that. It fills the compressed cache
   only: a decoded OPERA frame is ~100 MB of the shared decoded-chunk
   cache. Each read holds `decode_budget::BUDGET.try_reserve_background`,
   which leaves half the budget to requests and is not a counted rejection.

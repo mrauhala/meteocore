@@ -51,6 +51,8 @@ struct MockOptions {
     failing_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// Hold each `/items` page request at this gate ([`pass`]).
     items_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// While set, answer the collection and `/items` with 503.
+    host_down: Option<Arc<AtomicBool>>,
 }
 
 /// Wait at a mock's gate until a permit is added, one per request, or the
@@ -151,7 +153,13 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         gate,
         failing_gate,
         items_gate,
+        host_down,
     } = options;
+    let is_down = move || {
+        host_down
+            .as_ref()
+            .is_some_and(|down| down.load(Ordering::SeqCst))
+    };
     let arrived = Arc::new(tokio::sync::Notify::new());
     let fixture_size = std::fs::metadata(FIXTURE).unwrap().len();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -184,6 +192,7 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
     let items_url = format!("{base}/collections/radar/items");
     let page_base = items_url.clone();
     let page_arrived = Arc::clone(&arrived);
+    let items_down = is_down.clone();
     let items = move |axum::extract::Query(query): axum::extract::Query<
         std::collections::HashMap<String, String>,
     >| {
@@ -192,9 +201,15 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         page_arrived.notify_one();
         let page_base = page_base.clone();
         let items_gate = items_gate.clone();
+        let down = items_down();
         async move {
             if let Some(gate) = &items_gate {
                 pass(gate).await;
+            }
+            if down {
+                return axum::response::IntoResponse::into_response(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                );
             }
             let window = query
                 .get("datetime")
@@ -224,11 +239,11 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
                 }
                 features = features.into_iter().skip(offset).take(limit).collect();
             }
-            axum::Json(serde_json::json!({
+            axum::response::IntoResponse::into_response(axum::Json(serde_json::json!({
                 "type": "FeatureCollection",
                 "features": features,
                 "links": links,
-            }))
+            })))
         }
     };
     let missing = missing.map(|i| format!("/data/item-{i}.tif"));
@@ -306,7 +321,14 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
     let app = axum::Router::new()
         .route(
             "/collections/radar",
-            axum::routing::get(move || async move { axum::Json(collection) }),
+            axum::routing::get(move || async move {
+                if is_down() {
+                    return axum::response::IntoResponse::into_response(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    );
+                }
+                axum::response::IntoResponse::into_response(axum::Json(collection))
+            }),
         )
         .route("/collections/radar/items", axum::routing::get(items))
         .merge(data);
@@ -535,6 +557,158 @@ async fn poll_prewarms_the_tiles_of_new_stac_items() {
         after.1, misses,
         "the first render finds every tile it reads in the cache"
     );
+}
+
+/// Spawn the engine's poll loop, as the server does on its poll runtime.
+fn spawn_poll_loop(engine: &Arc<GeoTiffEngine>) -> tokio::task::JoinHandle<()> {
+    let poller = Arc::clone(engine);
+    tokio::spawn(async move { poller.poll_loop().await })
+}
+
+/// Wait for a poll loop to exit, which it must do without a poll interval
+/// passing.
+async fn loop_exit(task: tokio::task::JoinHandle<()>) {
+    tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the poll loop exits on shutdown")
+        .unwrap();
+}
+
+/// Wait for `condition`, at most 10 s.
+async fn until(what: &str, condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// #1409: construction reads only the extent, and the loop polls right after
+/// it, not one poll interval later (an hour here). The collection then counts
+/// as holding data, for `collection_has_data` and the data age, and its items
+/// are preloaded for the first request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stac_engine_has_timesteps_before_its_first_poll_interval() {
+    let mock = mock_stac_with(3, MockOptions::default()).await;
+    let times = mock.times.clone();
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+    assert_eq!(pages(&mock), 0, "construction lists no items");
+    assert!(engine.raster_info().times.is_empty());
+    assert!(engine.data_age().is_none());
+
+    let task = spawn_poll_loop(&engine);
+    until("the first poll lists and preloads the items", || {
+        loaded_times(&engine) == times
+    })
+    .await;
+
+    assert_eq!(engine.raster_info().times, times);
+    assert!(engine.data_age().is_some());
+    engine.shutdown();
+    loop_exit(task).await;
+    assert_eq!(pages(&mock), 1, "the next poll is an interval away");
+}
+
+/// #1409: nothing waits on the first listing. With its `/items` request held,
+/// the engine is built, the loop spawned and the snapshot answers at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_does_not_wait_for_the_first_stac_listing() {
+    let items_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let options = MockOptions {
+        items_gate: Some(Arc::clone(&items_gate)),
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(2, options).await;
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+
+    let task = spawn_poll_loop(&engine);
+    until_requests(&mock, 1, pages).await;
+    assert!(engine.raster_info().times.is_empty());
+
+    items_gate.close();
+    until("the listing lands once released", || {
+        engine.raster_info().times == mock.times
+    })
+    .await;
+    engine.shutdown();
+    loop_exit(task).await;
+}
+
+/// #1409: a STAC host down at startup fails the extent read and the first
+/// poll like any failed poll: no panic, no second listing before the backoff
+/// of twice the interval, and the retry brings the items and the extent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_first_stac_poll_retries_after_the_backoff() {
+    let down = Arc::new(AtomicBool::new(true));
+    let options = MockOptions {
+        host_down: Some(Arc::clone(&down)),
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(2, options).await;
+    let mut engine = stac_engine(mock.items_url.clone(), mock.allowlist.clone());
+    assert!(engine.catalog.load().spatial_extent.is_none());
+    engine.poll_interval = Duration::from_secs(1);
+    let engine = Arc::new(engine);
+
+    let started = std::time::Instant::now();
+    let task = spawn_poll_loop(&engine);
+    until("the first poll fails", || {
+        engine.consecutive_poll_failures.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert!(engine.raster_info().times.is_empty());
+    assert!(!task.is_finished(), "a failed poll does not end the loop");
+    down.store(false, Ordering::SeqCst);
+
+    until("the retry lists the items", || {
+        engine.raster_info().times == mock.times
+    })
+    .await;
+    assert!(
+        started.elapsed() >= 2 * engine.poll_interval,
+        "the retry waits for the backoff: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(engine.consecutive_poll_failures.load(Ordering::Relaxed), 0);
+    assert!(engine.catalog.load().spatial_extent.is_some());
+    engine.shutdown();
+    loop_exit(task).await;
+}
+
+/// #1409: an engine replaced during its first listing, as a reload does,
+/// starts no preload for a catalog nothing serves, and its loop exits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_during_the_first_stac_listing_ends_the_loop_before_the_preload() {
+    let items_gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let options = MockOptions {
+        items_gate: Some(Arc::clone(&items_gate)),
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(2, options).await;
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+
+    let task = spawn_poll_loop(&engine);
+    until_requests(&mock, 1, pages).await;
+    engine.shutdown();
+    items_gate.close();
+
+    loop_exit(task).await;
+    assert_eq!(
+        asset_requests(&mock),
+        0,
+        "no header read after the shutdown"
+    );
+}
+
+/// #1409: a shutdown that fired before the loop started lists nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_before_the_stac_poll_loop_starts_lists_nothing() {
+    let mock = mock_stac_with(2, MockOptions::default()).await;
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+    engine.shutdown();
+
+    loop_exit(spawn_poll_loop(&engine)).await;
+    assert_eq!(pages(&mock), 0);
 }
 
 /// A point inside the fixture's TM35FIN extent.

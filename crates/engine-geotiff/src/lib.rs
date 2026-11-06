@@ -1022,7 +1022,8 @@ impl GeoTiffEngine {
             demand_lock: Mutex::new(()),
         };
 
-        // Initial scan — STAC mode fetches collection extent only (no items)
+        // Initial scan — STAC mode fetches collection extent only (no items);
+        // `poll_loop` lists them in its first poll (#1409).
         let is_stac = matches!(engine.store_mode, StoreMode::RemoteStac { .. });
         if is_stac {
             if let StoreMode::RemoteStac { ref client, .. } = engine.store_mode {
@@ -1511,6 +1512,9 @@ impl GeoTiffEngine {
         let StoreMode::RemoteStac { client } = &self.store_mode else {
             return;
         };
+        if self.shutdown.is_shutdown() {
+            return;
+        }
         let targets: Vec<StacLoadTarget> = {
             let catalog = self.catalog.load();
             catalog
@@ -1845,11 +1849,22 @@ impl GeoTiffEngine {
     /// On consecutive failures, the poll interval backs off exponentially
     /// (2×, 4×, 8×, up to 16× the base interval) to avoid hammering a
     /// failing remote. Resets to base interval on first success.
+    ///
+    /// A STAC engine's constructor read only the collection extent, so this
+    /// loop's first poll is its startup scan (#1409): it runs before the
+    /// first sleep, as other sources scan at construction, and nothing waits
+    /// on it. A failure counts like any poll's.
     pub async fn poll_loop(&self) {
         let base = self.poll_interval;
-        // No poll has warmed what the startup scan catalogued: warm its
-        // newest frames before the first sleep (#1004).
-        self.prewarm_new_frames(&Catalog::empty()).await;
+        if matches!(self.store_mode, StoreMode::RemoteStac { .. }) {
+            if !self.shutdown.is_shutdown() {
+                self.poll_cycle().await;
+            }
+        } else {
+            // No poll has warmed what the startup scan catalogued: warm its
+            // newest frames before the first sleep (#1004).
+            self.prewarm_new_frames(&Catalog::empty()).await;
+        }
 
         loop {
             let failures = self.consecutive_poll_failures.load(Ordering::Relaxed);
