@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 
 use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use futures::stream::BoxStream;
@@ -585,9 +585,33 @@ fn respond(object: &mut RangeObject, request: &str) -> Vec<u8> {
 #[derive(Clone, Default)]
 pub(crate) struct JsonLog(Arc<Mutex<Vec<u8>>>);
 
+/// Installs a global subscriber that enables nothing, once, so that a capture
+/// keeps its lines whatever other tests do meanwhile (#1414).
+///
+/// tracing decides whether a span or an event is wanted once per callsite,
+/// when a thread first reaches it. While the process has one subscriber it
+/// asks only that thread's default, so a test with no subscriber reaching a
+/// callsite first during a capture on another thread turns the callsite off
+/// for the capture, until the next subscriber is created. With two it asks
+/// them all, and no thread can turn off a callsite a live capture wants. This
+/// subscriber is that second one for good, and its `OFF` hint keeps every
+/// callsite unreached until the first capture's subscriber is in place.
+fn install_second_subscriber() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::level_filters::LevelFilter::OFF)
+                .finish(),
+        )
+        .expect("nothing else sets a global subscriber in these tests");
+    });
+}
+
 impl JsonLog {
     /// A subscriber writing to this sink, at INFO and above.
     pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        install_second_subscriber();
         tracing_subscriber::fmt()
             .json()
             .flatten_event(true)

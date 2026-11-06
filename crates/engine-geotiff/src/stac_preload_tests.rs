@@ -1261,6 +1261,16 @@ async fn a_load_failing_past_the_deadline_drops_no_other_load() {
         async move { query_position_at(&engine, window, Some(deadline)).await }
     });
     until_requests(&mock, STAC_PRELOAD_CONCURRENCY, asset_requests).await;
+    // The mock counts a request and wakes that wait just before it records
+    // the request's path.
+    let started = tokio::time::Instant::now();
+    while item_requests(&mock, failing) == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the failing item is among the first loads"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     assert_eq!(item_requests(&mock, failing), 1);
     tokio::time::sleep_until(deadline.into()).await;
 
