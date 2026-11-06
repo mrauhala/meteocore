@@ -2905,8 +2905,10 @@ pub struct ServerState {
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     pub nowcast_engines: RwLock<Vec<Arc<engine_nowcast::NowcastEngine>>>,
     pub station_grid_engines: RwLock<Vec<Arc<engine_station_grid::StationGridEngine>>>,
-    /// Serializes reload requests to prevent concurrent reloads from racing.
-    pub reload_lock: tokio::sync::Mutex<()>,
+    /// Serializes reloads so they never race: whoever runs one holds this
+    /// until it ends. An `Arc` so the HTTP handler can move an owned guard
+    /// into the task running its reload, which outlives the request (#1402).
+    pub reload_lock: Arc<tokio::sync::Mutex<()>>,
     /// The WCMP2 records WIS2-fed collections learned from their
     /// notifications (#1356): one for the process, in every load's
     /// `Discovery` and every CAP and BUFR engine, so reloads keep them.
@@ -7026,9 +7028,16 @@ pub async fn reload_handler(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_admin_token(&state, &headers)?;
+    serve_reload(&state, do_reload).await
+}
 
+/// Run `reload` ([`do_reload`], outside tests) for one request and answer it.
+async fn serve_reload(
+    state: &AdminState,
+    reload: impl FnOnce(&AdminState) -> Result<ReloadOutcome, ReloadError> + Send + 'static,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // Serialize reload requests — prevent concurrent reloads from racing
-    let _reload_guard = state.reload_lock.try_lock().map_err(|_| {
+    let reload_guard = state.reload_lock.clone().try_lock_owned().map_err(|_| {
         (
             StatusCode::CONFLICT,
             Json(json!({ "error": "A reload is already in progress" })),
@@ -7045,7 +7054,13 @@ pub async fn reload_handler(
     // only in current-thread execution or a `LocalSet`.
     let state2 = state.clone();
     let outcome = crate::poll_runtime()
-        .spawn(async move { do_reload(&state2) })
+        .spawn(async move {
+            // The task owns the guard, not this future: hyper drops this
+            // future when the client disconnects, and the reload runs on
+            // (#1402). A panic releases it too: a Tokio mutex does not poison.
+            let _reload_guard = reload_guard;
+            reload(&state2)
+        })
         .await;
     match outcome {
         Ok(Ok(o)) => Ok(Json(json!({
@@ -7116,12 +7131,15 @@ fn diff_by_identity<T>(old: &[Arc<T>], new: &[Arc<T>]) -> (Vec<Arc<T>>, Vec<Arc<
 /// atomically swap the registries — the shared core behind both
 /// `POST /admin/collections/reload` and the `collections_dir` watcher.
 ///
-/// The caller serializes reloads via `state.reload_lock` (the HTTP handler
-/// `try_lock`s → 409 on contention; the watcher `lock().await`s). On `Err` the
-/// live state is untouched: old engines and their poll loops keep running, and
-/// the freshly-built (rejected) engines are dropped with their loops never
-/// spawned. The (blocking) load runs synchronously — call it off the
-/// request-serving runtime (the watcher uses `poll_runtime()`).
+/// The caller serializes reloads by holding `state.reload_lock` for the whole
+/// call (the HTTP handler `try_lock`s → 409 on contention and moves its guard
+/// into the task calling this; the watcher `lock().await`s). A guard in a
+/// future that can be dropped while this runs serializes nothing (#1402).
+///
+/// On `Err` the live state is untouched: old engines and their poll loops keep
+/// running, and the freshly-built (rejected) engines are dropped with their
+/// loops never spawned. The (blocking) load runs synchronously — call it off
+/// the request-serving runtime (the watcher uses `poll_runtime()`).
 pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError> {
     info!(
         "Reloading collections, re-reading config from {}",
@@ -15649,3 +15667,8 @@ mod station_grid_corrections_tests;
 #[cfg(test)]
 #[path = "pvol_metrics_tests.rs"]
 mod pvol_metrics_tests;
+
+/// The reload lock's lifetime (#1402), in a file of its own.
+#[cfg(test)]
+#[path = "reload_lock_tests.rs"]
+mod reload_lock_tests;
