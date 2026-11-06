@@ -521,8 +521,9 @@ impl EdrEngine for ZarrEngine {
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the store's
     /// native resolution (each dimension ≤ `MAX_AREA_DIM`), every cell
     /// bilinearly sampled from one windowed read per variable and timestep,
-    /// cells outside the polygon masked to null (#671). One `t` axis when the
-    /// datetime window selects more than one step.
+    /// cells outside the polygon masked to null (#671). The steps the
+    /// datetime window selects (every step without one) are always a `t`
+    /// axis, one included: `[t, y, x]` (#1412).
     fn query_area(
         &self,
         coords: &str,
@@ -619,7 +620,6 @@ impl EdrEngine for ZarrEngine {
                 other => other,
             }
         })?;
-        let has_time = time_idx.len() > 1;
         let out_times: Vec<DateTime<Utc>> = time_idx.iter().map(|&i| run_times[i]).collect();
         // The windows' cold inner chunks, of every variable, together first
         // (#1353).
@@ -669,19 +669,11 @@ impl EdrEngine for ZarrEngine {
                     standard_name: v.standard_name.clone(),
                 },
             );
-            let (shape, axis_names) = if has_time {
-                (
-                    vec![out_times.len(), ny, nx],
-                    vec!["t".to_string(), "y".to_string(), "x".to_string()],
-                )
-            } else {
-                (vec![ny, nx], vec!["y".to_string(), "x".to_string()])
-            };
             ranges.insert(
                 v.name.clone(),
                 NdArray {
-                    shape,
-                    axis_names,
+                    shape: vec![out_times.len(), ny, nx],
+                    axis_names: vec!["t".to_string(), "y".to_string(), "x".to_string()],
                     values,
                     precision: v.precision(),
                 },
@@ -692,7 +684,7 @@ impl EdrEngine for ZarrEngine {
             domain: DomainDescription::Grid {
                 x: axes.x,
                 y: axes.y,
-                t: has_time.then_some(out_times),
+                t: Some(out_times),
                 z: None,
             },
             parameters: params_map,

@@ -1207,7 +1207,6 @@ impl EdrEngine for SatelliteEngine {
         } else {
             b.east - b.west
         };
-        let has_time = times.len() > 1;
         let mut descriptions = HashMap::new();
         let mut ranges = HashMap::new();
         for (index, own) in plan {
@@ -1245,16 +1244,13 @@ impl EdrEngine for SatelliteEngine {
             }
             let name = self.parameters[index].name.clone();
             descriptions.insert(name.clone(), self.description(index));
-            let (shape, axis_names) = if has_time {
-                (vec![times.len(), ny, nx], vec!["t", "y", "x"])
-            } else {
-                (vec![ny, nx], vec!["y", "x"])
-            };
+            // The union of the scans is always a `t` axis, one scan
+            // included (#1412).
             ranges.insert(
                 name,
                 NdArray {
-                    shape,
-                    axis_names: axis_names.into_iter().map(String::from).collect(),
+                    shape: vec![times.len(), ny, nx],
+                    axis_names: vec!["t".into(), "y".into(), "x".into()],
                     values,
                     precision: ValuePrecision::F64,
                 },
@@ -1264,7 +1260,7 @@ impl EdrEngine for SatelliteEngine {
             domain: DomainDescription::Grid {
                 x: axes.x,
                 y: axes.y,
-                t: has_time.then_some(times),
+                t: Some(times),
                 z: None,
             },
             parameters: descriptions,

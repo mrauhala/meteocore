@@ -156,19 +156,24 @@ fn area_preserves_requested_level_order_missing_fields_units_and_polygon_holes()
                 .unwrap(),
         );
         let DomainDescription::Grid {
-            x, y, z: Some(z), ..
+            x,
+            y,
+            t: Some(t),
+            z: Some(z),
         } = result.domain
         else {
             panic!()
         };
         assert_eq!(x, vec![0.0, 1.0]);
         assert_eq!(y, vec![0.0, 1.0]);
+        // Without `datetime`, the run's one step, on a `t` axis (#1412).
+        assert_eq!(t, vec![time(0)]);
         assert_eq!(z.values, levels);
         for param in 0..2 {
             let name = parameter(param);
             let range = &result.ranges[&name];
-            assert_eq!(range.shape, vec![3, 2, 2]);
-            assert_eq!(range.axis_names, ["z", "y", "x"]);
+            assert_eq!(range.shape, vec![1, 3, 2, 2]);
+            assert_eq!(range.axis_names, ["t", "z", "y", "x"]);
             assert_eq!(
                 result.parameters[&name].unit,
                 if param == 0 { "°C" } else { "%" }
@@ -241,7 +246,8 @@ fn stepped_fixture() -> (TestSource, GribEngine) {
 
 /// `/req/core/datetime-response` A: an interval reads every step valid
 /// inside it and reports them on a `t` axis; an instant is the step valid at
-/// it, never the nearest one.
+/// it, never the nearest one, and no datetime the last step carrying the
+/// named parameters, each a one-step `t` axis too (#1412).
 #[test]
 fn area_and_radius_read_the_steps_inside_the_datetime() {
     let (_source, engine) = stepped_fixture();
@@ -291,14 +297,25 @@ fn area_and_radius_read_the_steps_inside_the_datetime() {
     assert_eq!(times(Some((min, time(5)))), Some(vec![time(0)]));
     assert_eq!(times(Some((time(1), max))), Some(vec![time(6), time(12)]));
 
-    // An instant: its own step, a t-less Grid as before.
-    let result = single(area(Some((time(6), time(6))), &both).unwrap());
-    assert!(matches!(
-        result.domain,
-        DomainDescription::Grid { t: None, .. }
-    ));
-    assert_eq!(result.ranges["P0"].shape, [2, 2]);
-    assert_value(result.ranges["P0"].values[0], celsius(6.0, 4.0));
+    // An instant, an interval around one step, and no datetime with both
+    // parameters (only step 6 has `P1`) or `P0` alone (the run's last step):
+    // the one step served, on a `t` axis.
+    for (datetime, params, hours) in [
+        (Some((time(6), time(6))), &both[..], 6),
+        (Some((time(5), time(7))), &both[..], 6),
+        (None, &both[..], 6),
+        (None, &both[..1], 12),
+    ] {
+        let result = single(area(datetime, params).unwrap());
+        let DomainDescription::Grid { t, .. } = &result.domain else {
+            panic!("expected a grid")
+        };
+        assert_eq!(t, &Some(vec![time(hours)]), "{datetime:?} {params:?}");
+        let p0 = &result.ranges["P0"];
+        assert_eq!(p0.axis_names, ["t", "y", "x"]);
+        assert_eq!(p0.shape, [1, 2, 2]);
+        assert_value(p0.values[0], celsius(hours as f64, 4.0));
+    }
     // Between steps, or a window with none inside: no data (a 404), where
     // the nearest step used to answer.
     for datetime in [(time(3), time(3)), (time(7), time(7)), (time(1), time(5))] {
@@ -398,8 +415,8 @@ fn single_and_legacy_radius_queries_fetch_each_field_once() {
         ));
         for (param, name) in params.iter().enumerate() {
             let range = &result.ranges[name];
-            assert_eq!(range.axis_names, ["y", "x"]);
-            assert_eq!(range.shape, [2, 2]);
+            assert_eq!(range.axis_names, ["t", "y", "x"]);
+            assert_eq!(range.shape, [1, 2, 2]);
             assert_value(
                 range.values[0],
                 Some(

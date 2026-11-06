@@ -86,7 +86,7 @@ route answers 404 and `/api` omits the path.
 |---|---|---|
 | `locations` | the location id in the path | the location's data; see [Location lists](#location-lists) |
 | `position` | WKT `POINT` or `MULTIPOINT` (at most 64 points, 16 KiB of coordinates, 256 points × `datetime` instants) | a series or profile per point; a MULTIPOINT is flattened into one CoverageCollection |
-| `area` | WKT `POLYGON` (holes allowed) or `west,south,east,north` | a grid over the polygon's bbox with cells outside it null, or the stations inside it |
+| `area` | WKT `POLYGON` (holes allowed) or `west,south,east,north` | a grid over the polygon's bbox with cells outside it null and a `t` axis of the steps served, or the stations inside it |
 | `radius` | `POINT` + `within` + `within-units` (`km`, `m`, `mi`; at most 1000 km) | the area query over a 64-vertex geodesic circle; a circle containing a pole or crossing the antimeridian is a 400 |
 | `trajectory` | WKT `LINESTRING`, `LINESTRING Z`, `M` or `ZM` | values along the path, or a radar cross-section; see [Trajectory](#trajectory) |
 | `cube` | `bbox` (required) and optional `z` | a grid with `t`, `z`, `y`, `x` axes (no `z` on a station grid); see [Cube](#cube) |
@@ -97,6 +97,18 @@ All coordinates are CRS84 (longitude, latitude), finite and in range.
 Coverage domain types: `Point`, `PointSeries`, `Grid` (optional `t` and `z`
 axes), `VerticalProfile`, `Section` and `Trajectory`, alone or in a
 `CoverageCollection`.
+
+An `area` or `radius` grid from a collection with time always has a `t`
+axis listing the steps it served: every step of an interval, the step at
+an instant, or the step or steps it serves without `datetime`, even when
+that is one step. Without `datetime`, GRIB, NetCDF, the station grid and
+the nowcast serve one step, the latest; GeoTIFF, ODIM composites,
+QueryData, Zarr and Satellite serve every step they hold, of the newest
+run where they hold runs. Its ranges are therefore always `[t, y, x]`, or
+`[t, z, y, x]` with levels, and one step is `[1, ny, nx]`: the layout of
+any number of steps, and the cube's. Every engine that answers `area` with
+a grid has a time dimension, since its files, scans or runs are timed; a
+grid without `t` would come only from a collection without time.
 
 ### Output formats
 

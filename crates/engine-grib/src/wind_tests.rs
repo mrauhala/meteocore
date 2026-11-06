@@ -397,13 +397,29 @@ fn derived_matches_native_arpege_speed_and_direction_over_the_domain() {
 
     let native = area(native.as_ref(), &["10si", "10wdir"]);
     let derived = area(&wind, &["10si", "10wdir"]);
-    let (DomainDescription::Grid { x, y, .. }, DomainDescription::Grid { x: dx, y: dy, .. }) =
-        (&native.domain, &derived.domain)
+    let (
+        DomainDescription::Grid { x, y, t, .. },
+        DomainDescription::Grid {
+            x: dx,
+            y: dy,
+            t: dt,
+            ..
+        },
+    ) = (&native.domain, &derived.domain)
     else {
         panic!("expected grids")
     };
-    assert_eq!((x, y), (dx, dy), "one domain");
+    assert_eq!((x, y, t), (dx, dy, dt), "one domain");
     assert_eq!((x.len(), y.len()), (38, 27), "every node of the fixture");
+    // Derived values pair the components on the area's `[t, y, x]` layout,
+    // one step included (#1412).
+    assert_eq!(t.as_ref().map(Vec::len), Some(1));
+    for name in ["10si", "10wdir"] {
+        let range = &derived.ranges[name];
+        assert_eq!(range.axis_names, ["t", "y", "x"], "{name}");
+        assert_eq!(range.shape, [1, 27, 38], "{name}");
+        assert_eq!(range.shape, native.ranges[name].shape, "{name}");
+    }
     assert_eq!(native.parameters["10wdir"].unit, "°");
     assert_eq!(derived.parameters["10wdir"].unit, "°");
     assert_eq!(

@@ -802,13 +802,21 @@ fn a_surface_cube_is_an_area_with_a_time_axis() {
     let DomainDescription::Grid {
         x: area_x,
         y: area_y,
+        t: area_t,
         ..
     } = &area.domain
     else {
         unreachable!()
     };
     assert_eq!((x, y), (area_x, area_y), "the area's cells");
+    // One layout (#1412): the area's one step on a `t` axis, as the cube's.
+    assert_eq!(t, area_t, "the area's step");
     for parameter in parameters {
+        assert_eq!(cube.ranges[parameter].shape, area.ranges[parameter].shape);
+        assert_eq!(
+            cube.ranges[parameter].axis_names,
+            area.ranges[parameter].axis_names
+        );
         assert_eq!(cube.ranges[parameter].values, area.ranges[parameter].values);
     }
 

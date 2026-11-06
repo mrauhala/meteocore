@@ -361,7 +361,7 @@ fn area_query_budgets_the_native_read() {
         e.query_area("-50,20,-40,30", None, None, None, None)
             .unwrap(),
     );
-    assert_eq!(qr.ranges["t"].shape, vec![100, 100]);
+    assert_eq!(qr.ranges["t"].shape, vec![1, 100, 100]);
 }
 
 /// engine-zarr registers its own `zstd` codec; zarrs' `zstd` feature is off.
@@ -426,7 +426,7 @@ fn zstd_v3_store_opens_and_decodes_through_the_engine() {
             .unwrap(),
     );
     let nd = &qr.ranges["t2m"];
-    assert_eq!(nd.shape, vec![2, 2]);
+    assert_eq!(nd.shape, vec![1, 2, 2]);
     for (v, k) in nd.values.iter().zip(kelvin) {
         let v = v.expect("an area cell is null");
         assert!((v - celsius(f64::from(k))).abs() < 1e-4, "{v} vs {k} K");
@@ -1270,15 +1270,19 @@ fn area_query_grid_matches_linear_field_and_masks_the_polygon() {
     let ds_core::model::DomainDescription::Grid { x, y, t, .. } = &qr.domain else {
         panic!("expected a Grid domain");
     };
-    assert!(t.is_none(), "single timestep → no t axis");
+    assert_eq!(
+        t.as_deref(),
+        Some(&[Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()][..]),
+        "single timestep, on a t axis"
+    );
     // Native 1° cells over a 5°×5° bbox.
     assert_eq!(x.len(), 5);
     assert_eq!(y.len(), 5);
     assert!(x.windows(2).all(|p| p[0] < p[1]));
     assert!(y.windows(2).all(|p| p[0] > p[1]));
     let nd = &qr.ranges["t2m"];
-    assert_eq!(nd.shape, vec![5, 5]);
-    assert_eq!(nd.axis_names, vec!["y", "x"]);
+    assert_eq!(nd.shape, vec![1, 5, 5]);
+    assert_eq!(nd.axis_names, vec!["t", "y", "x"]);
     let mut inside = 0;
     for (r, &lat) in y.iter().enumerate() {
         for (c, &lon) in x.iter().enumerate() {
@@ -1332,6 +1336,70 @@ fn area_query_all_timesteps_has_t_axis() {
             assert!((b - a - 1.5).abs() < 0.03, "{key} cell {cell}: {a} → {b}");
         }
     }
+}
+
+/// #1412: an area or radius says which step it served, on a `t` axis even
+/// for one: an instant, an interval around one of the 6-hourly steps, and
+/// no datetime on a store of one step answer `[t]` and `[1, ny, nx]`.
+#[test]
+fn area_reports_a_single_step_on_a_t_axis() {
+    let one_step = |response: CoverageResponse, step: chrono::DateTime<Utc>, what: &str| {
+        let qr = single(response);
+        let ds_core::model::DomainDescription::Grid { x, y, t, .. } = &qr.domain else {
+            panic!("{what}: expected a Grid domain");
+        };
+        assert_eq!(t.as_deref(), Some(&[step][..]), "{what}");
+        assert!(!qr.ranges.is_empty(), "{what}");
+        for (name, nd) in &qr.ranges {
+            assert_eq!(nd.shape, vec![1, y.len(), x.len()], "{what} {name}");
+            assert_eq!(nd.axis_names, vec!["t", "y", "x"], "{what} {name}");
+        }
+    };
+    let e = engine();
+    let step = Utc.with_ymd_and_hms(2026, 1, 1, 6, 0, 0).unwrap();
+    let three = chrono::Duration::hours(3);
+    let t2m = ["t2m".to_string()];
+    for (what, window) in [
+        ("instant", (step, step)),
+        (
+            "interval",
+            (step - three, step + three - chrono::Duration::minutes(1)),
+        ),
+    ] {
+        one_step(
+            e.query_area("4,53,6,55", Some(window), Some(&t2m), None, None)
+                .unwrap(),
+            step,
+            what,
+        );
+        one_step(
+            e.query_radius(
+                "POINT(5.5 54.5)",
+                250_000.0,
+                Some(window),
+                Some(&t2m),
+                None,
+                None,
+            )
+            .unwrap(),
+            step,
+            &format!("{what} radius"),
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    write_grid_store(dir.path(), &[52.0, 51.0], &[10.0, 11.0], &["t"]);
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let one = ZarrEngine::new("one-step", &cfg).unwrap();
+    one_step(
+        one.query_area("9.5,50.5,11.5,52.5", None, None, None, None)
+            .unwrap(),
+        Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap(),
+        "no datetime",
+    );
 }
 
 /// An instant between the 6-hourly steps has no data: a 404 on every

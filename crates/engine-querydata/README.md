@@ -85,8 +85,8 @@ Each file is one model run, and the newest run is the default.
   is a 400.
 - The area grid uses the source's mean cell size, coarsened to at most 256
   cells per axis. A response holds at most 1 000 000 values across
-  timesteps, cells and parameters; more is a 400. The grid has a `t` axis
-  when more than one timestep is selected. A polygon whose bounding box
+  timesteps, cells and parameters; more is a 400. The grid's `t` axis
+  lists the timesteps served, even one. A polygon whose bounding box
   misses the grid's extent is a 404.
 - A trajectory is sampled about once per grid cell crossed, with the
   position query's interpolation. A `Z` coordinate is ignored.

@@ -28,12 +28,10 @@ impl GribEngine {
         let catalog = self.catalog();
         let names = named(parameters);
         let run = resolve_run(&catalog, reference_time, datetime, &names)?;
-        // An interval reads every step valid inside it, reported on a `t`
-        // axis; an instant (only the step valid at it) or no datetime (the
-        // run's last step carrying the named parameters) is the one step of
-        // a t-less Grid.
+        // An interval reads every step valid inside it, an instant only the
+        // step valid at it, and no datetime the run's last step carrying the
+        // named parameters: always on a `t` axis, one step included (#1412).
         let steps = grid_steps(&catalog, run, datetime, &names)?;
-        let time_axis = datetime.is_some_and(|(start, end)| start < end);
         let keys = catalog
             .parameter_keys(&run.reference_time)
             .cloned()
@@ -255,15 +253,11 @@ impl GribEngine {
                     standard_name: None,
                 },
             );
-            let mut shape = vec![layout.y.len(), layout.x.len()];
-            let mut axis_names: Vec<String> = vec!["y".into(), "x".into()];
+            let mut shape = vec![steps.len(), layout.y.len(), layout.x.len()];
+            let mut axis_names: Vec<String> = vec!["t".into(), "y".into(), "x".into()];
             if self.vertical_kind().is_some() {
-                shape.insert(0, n_levels);
-                axis_names.insert(0, "z".into());
-            }
-            if time_axis {
-                shape.insert(0, steps.len());
-                axis_names.insert(0, "t".into());
+                shape.insert(1, n_levels);
+                axis_names.insert(1, "z".into());
             }
             ranges.insert(
                 pname.to_string(),
@@ -280,7 +274,7 @@ impl GribEngine {
             domain: DomainDescription::Grid {
                 x: layout.x.clone(),
                 y: layout.y.clone(),
-                t: time_axis.then(|| steps.iter().map(|(time, _)| *time).collect()),
+                t: Some(steps.iter().map(|(time, _)| *time).collect()),
                 z: self.vertical_kind().map(|kind| VerticalCoord {
                     kind,
                     values: levels.into_iter().flatten().collect(),
