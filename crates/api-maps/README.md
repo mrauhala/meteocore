@@ -116,9 +116,14 @@ tiles, with the Scaling and Background parameters.
 - **Headers.** `Content-Crs`, `Content-Bbox` (the rendered corners in the
   CRS's axis order), `Content-Datetime` (the instant rendered, on collections
   with a time axis), `ETag` and `x-cache` (`HIT`, `MISS` or `EMPTY`).
-  `Cache-Control` is `public, max-age=86400, immutable` for an instant that
-  resolved to a time step on content the engine never revises in place, and
-  `public, max-age=60, must-revalidate` otherwise.
+  `Cache-Control` is `public, max-age=86400, immutable` for an instant the
+  engine draws exactly, on content it never revises in place, and
+  `public, max-age=60, must-revalidate` otherwise: no time, an interval even
+  when closed, or an instant snapped to another time step, whose URL draws
+  another frame once one lands or the window slides. Instants are compared,
+  not their text, so a step written with an offset is exact. The header is
+  each request's own: a snapped and an exact request share the step's cached
+  image.
 
 ## Styles and legends
 

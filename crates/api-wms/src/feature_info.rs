@@ -218,15 +218,15 @@ pub(crate) async fn get_feature_info(
         .zip(replies)
         .map(|(query, reply)| query.answer(reply, position))
         .collect();
-    // As GetMap: `immutable` only for an explicit TIME that resolved, over
-    // content the engine never revises in place, here for every queried
-    // layer. An empty answer always revalidates: some engines answer a read
-    // that failed transiently with a null sample, and GetMap never pins a
-    // failed render either.
+    // As GetMap: `immutable` only for a TIME drawn exactly, over content the
+    // engine never revises in place, here for every queried layer. An empty
+    // answer always revalidates: some engines answer a read that failed
+    // transiently with a null sample, and GetMap never pins a failed render
+    // either.
     let pinned = queries
         .iter()
         .zip(&features)
-        .all(|(query, info)| query.explicit_time && query.time.is_some() && info.answered());
+        .all(|(query, info)| query.exact_time && info.answered());
     let content_version = queries
         .iter()
         .map(|query| query.content_version)
@@ -290,7 +290,7 @@ struct Query {
     /// Each value's unit from the layer's metadata, for an answer whose
     /// coverage names none: the parameter's, or each band's.
     units: Vec<Option<String>>,
-    explicit_time: bool,
+    exact_time: bool,
     time: Option<DateTime<Utc>>,
     reference_time: Option<DateTime<Utc>>,
     /// The level GetMap draws, for a layer with an `ELEVATION` dimension.
@@ -389,7 +389,7 @@ impl Query {
             read,
             parameter,
             units,
-            explicit_time: resolved.explicit_time,
+            exact_time: resolved.exact_time,
             time,
             reference_time,
             elevation,

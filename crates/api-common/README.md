@@ -306,6 +306,9 @@ way.
   - an interval: the latest time step inside it.
 
   When nothing matches, Maps returns 404 and map tiles return 204.
+- `is_exact_time` is the rule for `immutable` on Maps, Tiles and WMS: the
+  engine draws exactly the instant requested. A snapped instant, an interval
+  or no time revalidates.
 - `map_frame` defines `MapCrs` (CRS84, EPSG:4326, EPSG:3857, EPSG:3067,
   EPSG:3035), each in its own axis order. It also handles `Content-Bbox`
   and converts scale denominator to resolution at 0.28 mm per pixel. The

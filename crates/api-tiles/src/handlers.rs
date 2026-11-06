@@ -10,7 +10,7 @@ use axum::Json;
 use serde_json::json;
 
 use api_common::map_frame;
-use api_common::subset::{self, RequestedTime, TimeSelection};
+use api_common::subset::{self, RequestedTime};
 use api_common::workbench::Surface;
 use api_common::{rel, JsonQuery, Mount};
 use ds_core::config::CollectionConfig;
@@ -193,13 +193,15 @@ fn composite_style_not_found(collection_id: &str, composite: &str, style: &str) 
     ))
 }
 
-/// `immutable` (24 h) only for an explicit timestamp that resolved to a
-/// timestep, over content the engine never revises (`content_version == 0`):
-/// a tile at fixed z/x/y + time is then truly immutable. "Latest", a
-/// timestamp the engine has nothing to render for yet (resolved to `None`:
-/// its catalog is still empty after a start or reload) and in-place-revised
-/// content (a push-fed alert set) get 60 s + revalidation so a browser/CDN
-/// holding a pre-revision tile asks again.
+/// `immutable` (24 h) only for an instant the engine draws exactly
+/// ([`subset::is_exact_time`]), over content it never revises
+/// (`content_version == 0`): a tile at fixed z/x/y + time is then truly
+/// immutable. Everything else gets 60 s + revalidation, so a browser/CDN
+/// holding a tile the URL no longer means asks again: "latest" and intervals,
+/// an instant snapped to another timestep (#1415), a timestamp the engine has
+/// nothing to render for yet (resolved to `None`: its catalog is still empty
+/// after a start or reload) and in-place-revised content (a push-fed alert
+/// set).
 fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
     if pinned_time && content_version == 0 {
         "public, max-age=86400, immutable"
@@ -2518,14 +2520,11 @@ async fn render_tile(
     };
 
     let content_type = format.content_type();
-    // Only an instant pins the tile: intervals and `*` follow new data.
-    let has_explicit_time = matches!(
-        validated.time,
-        Some(RequestedTime {
-            selection: TimeSelection::Instant(_),
-            ..
-        })
-    );
+    // Only an instant can pin the tile: intervals and `*` follow new data.
+    let requested_instant = validated
+        .time
+        .as_ref()
+        .and_then(|time| time.selection.instant());
 
     // Determine output CRS from TileMatrixSet
     let output_crs = match tms_id {
@@ -2641,8 +2640,10 @@ async fn render_tile(
         background,
     };
 
+    // This request's, never the cached entry's: a snapped and an exact request
+    // for one timestep share the entry, not the header.
     let cache_control = cache_control_value(
-        has_explicit_time && time.is_some(),
+        subset::is_exact_time(requested_instant, time),
         cache_key.content_version,
     );
     let if_none_match = headers

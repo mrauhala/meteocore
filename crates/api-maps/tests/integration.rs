@@ -3727,6 +3727,39 @@ mod per_parameter_times {
         );
     }
 
+    /// A time on the collection's union axis but not on the parameter's own
+    /// is a snap, so never `immutable` (#1415), and shares the step's image
+    /// without taking its header.
+    #[tokio::test]
+    async fn a_time_only_another_parameter_has_is_not_immutable() {
+        const IMMUTABLE: &str = "public, max-age=86400, immutable";
+        const SHORT: &str = "public, max-age=60, must-revalidate";
+        let app = build_router_with_engine(Arc::new(Engine::default()));
+        for (parameter, time, drawn, expected, x_cache) in [
+            ("a", T2, T2, IMMUTABLE, "MISS"),
+            // T2 is `a`'s: `b` draws T1, and renders it here.
+            ("b", T2, T1, SHORT, "MISS"),
+            ("b", T1, T1, IMMUTABLE, "HIT"),
+            ("b", T2, T1, SHORT, "HIT"),
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(URI(parameter, 0, Some(time)))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let what = format!("{parameter} at {time}");
+            assert_eq!(resp.headers()["content-datetime"], drawn, "{what}");
+            assert_eq!(resp.headers()["cache-control"], expected, "{what}");
+            assert_eq!(resp.headers()["x-cache"], x_cache, "{what}");
+        }
+    }
+
     /// Each parameter advertises its own time axis next to the collection's
     /// union (#279), so a client knows `b` ends a timestep earlier.
     #[tokio::test]
@@ -4083,6 +4116,7 @@ mod composites {
     struct Reply {
         status: StatusCode,
         x_cache: String,
+        cache_control: String,
         body: bytes::Bytes,
     }
 
@@ -4093,15 +4127,18 @@ mod composites {
             .await
             .unwrap();
         let status = resp.status();
-        let x_cache = resp
-            .headers()
-            .get("x-cache")
-            .map(|v| v.to_str().unwrap().to_string())
-            .unwrap_or_default();
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+                .unwrap_or_default()
+        };
+        let (x_cache, cache_control) = (header("x-cache"), header("cache-control"));
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         Reply {
             status,
             x_cache,
+            cache_control,
             body,
         }
     }
@@ -4215,6 +4252,28 @@ mod composites {
         assert_eq!(moved.x_cache, "MISS");
         assert_eq!(moved.body, expected_png(64, 64, T2));
         assert_eq!(engine.calls()[1].1, Some(t(T2)));
+    }
+
+    /// A composite is `immutable` only at a scan every band has (#1415): `a`'s
+    /// newer T2 is a snap to the shared T1, and shares T1's image.
+    #[tokio::test]
+    async fn only_a_scan_every_band_has_is_immutable() {
+        const IMMUTABLE: &str = "public, max-age=86400, immutable";
+        const SHORT: &str = "public, max-age=60, must-revalidate";
+        let engine = Engine::new(&[T0, T1, T2], &[T0, T1]);
+        let app = router(engine.clone());
+        for (time, x_cache, expected) in [
+            (T2, "MISS", SHORT),
+            (T1, "HIT", IMMUTABLE),
+            ("2026-09-25T19:15:00Z", "HIT", SHORT),
+        ] {
+            let reply = fetch(&app, &map_uri(&format!("&datetime={time}"))).await;
+            assert_eq!(reply.status, StatusCode::OK, "{time}");
+            assert_eq!(reply.x_cache, x_cache, "{time}");
+            assert_eq!(reply.cache_control, expected, "{time}");
+        }
+        assert_eq!(engine.calls().len(), 1);
+        assert_eq!(engine.calls()[0].1, Some(t(T1)));
     }
 
     /// Bands that share no scan give an empty image without an engine call.
@@ -4866,6 +4925,120 @@ mod part1 {
             assert_eq!(status, StatusCode::NOT_FOUND, "{query}");
         }
         assert_eq!(engine.renders().len(), before);
+    }
+
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+
+    /// `immutable` only for an instant the engine draws exactly (#1415), on
+    /// every map route. A snapped one means another frame later: past the
+    /// newest step once the next lands, before the oldest as the window
+    /// slides, between two once one lands in the gap. An interval is never
+    /// exact, even closed, since a step can land inside it. The snapping
+    /// itself stands, and `Content-Datetime` names the step drawn.
+    #[tokio::test]
+    async fn only_an_instant_drawn_exactly_is_immutable() {
+        for (query, drawn, expected) in [
+            // On the axis, however it is written.
+            ("datetime=2024-01-01T01:00:00Z", T1, IMMUTABLE),
+            ("datetime=2024-01-01T03:00:00%2B02:00", T1, IMMUTABLE),
+            ("datetime=2024-01-01T01:00:00", T1, IMMUTABLE),
+            ("datetime=2024-01-01T01:00", T1, IMMUTABLE),
+            ("subset=time(%222024-01-01T00:00:00Z%22)", T0, IMMUTABLE),
+            // Past the newest step, before the oldest, between two.
+            ("datetime=2024-01-01T01:05:00Z", T1, SHORT),
+            ("datetime=2023-12-31T00:00:00Z", T0, SHORT),
+            ("datetime=2024-01-01T00:30:00Z", T0, SHORT),
+            ("subset=time(%222024-01-01T00:30:00Z%22)", T0, SHORT),
+            // It reads like a step, in another offset: 23:00Z the day before.
+            ("datetime=2024-01-01T01:00:00%2B02:00", T0, SHORT),
+            // Closed intervals, the first with its end past the newest step.
+            (
+                "datetime=2024-01-01T00:30:00Z/2024-01-01T01:05:00Z",
+                T1,
+                SHORT,
+            ),
+            (
+                "subset=time(%222024-01-01T00:30:00Z%22:%222024-01-01T01:05:00Z%22)",
+                T1,
+                SHORT,
+            ),
+            (
+                "datetime=2024-01-01T01:00:00Z/2024-01-01T01:00:00Z",
+                T1,
+                SHORT,
+            ),
+            ("subset=time(%222024-01-01%22)", T1, SHORT),
+            // Open intervals, `*` and no time at all.
+            ("datetime=2024-01-01T00:30:00Z/..", T1, SHORT),
+            ("subset=time(*)", T1, SHORT),
+            ("bbox=12,56,20,60", T1, SHORT),
+        ] {
+            for (app, path) in map_surfaces(radar()) {
+                let uri = format!("{path}?width=8&{query}");
+                let (status, headers, _) = fetch(&app, &uri).await;
+                assert_eq!(status, StatusCode::OK, "{uri}");
+                assert_eq!(header(&headers, "content-datetime"), Some(drawn), "{uri}");
+                assert_eq!(header(&headers, "cache-control"), Some(expected), "{uri}");
+            }
+        }
+    }
+
+    /// GET `uri` with `If-None-Match: etag`.
+    async fn revalidate(app: &axum::Router, uri: &str, etag: &str) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header("if-none-match", etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A snapped and an exact request for one step share its cached image
+    /// (#507), never its header (#1415): each gets its own, in either order,
+    /// on the render, on a hit, and on a 304 from a hit or from a render.
+    #[tokio::test]
+    async fn the_header_is_the_requests_not_the_cached_images() {
+        let exact = "/collections/radar/map?width=8&datetime=2024-01-01T01:00:00Z";
+        let snapped = "/collections/radar/map?width=8&datetime=2024-01-01T01:05:00Z";
+        let expected = |uri: &str| if uri == exact { IMMUTABLE } else { SHORT };
+        let mut etags = Vec::new();
+        for (first, second) in [(exact, snapped), (snapped, exact)] {
+            let engine = radar();
+            let app = build_router_with_engine(engine.clone());
+            let (status, headers, _) = fetch(&app, first).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(header(&headers, "x-cache"), Some("MISS"), "{first}");
+            assert_eq!(header(&headers, "cache-control"), Some(expected(first)));
+            let etag = header(&headers, "etag").unwrap().to_string();
+            for uri in [second, first] {
+                let (status, headers, _) = fetch(&app, uri).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(header(&headers, "x-cache"), Some("HIT"), "{uri}");
+                assert_eq!(header(&headers, "etag"), Some(etag.as_str()), "{uri}");
+                assert_eq!(header(&headers, "cache-control"), Some(expected(uri)));
+                assert_eq!(header(&headers, "content-datetime"), Some(T1), "{uri}");
+
+                let resp = revalidate(&app, uri, &etag).await;
+                assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{uri}");
+                assert_eq!(resp.headers()["x-cache"], "HIT", "{uri}");
+                assert_eq!(resp.headers()["cache-control"], expected(uri), "{uri}");
+            }
+            assert_eq!(engine.renders().len(), 1, "one image, one render");
+            etags.push(etag);
+        }
+        assert_eq!(etags[0], etags[1], "the same image");
+        // A 304 straight from a render, nothing cached yet.
+        for uri in [exact, snapped] {
+            let resp = revalidate(&build_router_with_engine(radar()), uri, &etags[0]).await;
+            assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{uri}");
+            assert_eq!(resp.headers()["x-cache"], "MISS", "{uri}");
+            assert_eq!(resp.headers()["cache-control"], expected(uri), "{uri}");
+        }
     }
 
     /// An axis the routes do not know is a 400 naming the valid ones, not

@@ -24,7 +24,8 @@
 //!
 //! [`render_time`] turns a [`RequestedTime`] into the instant a map or map
 //! tile renders, so both select the same time step; each API maps a
-//! selection with none ([`NoTimeStep`]) to its own status.
+//! selection with none ([`NoTimeStep`]) to its own status. [`is_exact_time`]
+//! is the rule for whether the response may be `immutable`, WMS's included.
 
 use std::collections::BTreeMap;
 
@@ -333,6 +334,16 @@ impl TimeSelection {
         Ok(Self::Range { start, end })
     }
 
+    /// The instant this selection names; `None` for a range, even a closed
+    /// or one-instant one: a range selects whatever latest time step lies
+    /// inside it, which new data can change.
+    pub fn instant(&self) -> Option<DateTime<Utc>> {
+        match *self {
+            Self::Instant(t) => Some(t),
+            Self::Range { .. } => None,
+        }
+    }
+
     /// The selection as a feature query's interval, the form OGC API -
     /// Features' `datetime` takes: an instant is `start == end`, an open end
     /// `None`. Features intersecting it match; features without a time
@@ -433,6 +444,25 @@ pub fn render_time(
             .map(Some)
             .ok_or_else(|| outside("the requested time interval".to_string())),
     }
+}
+
+/// Whether a map response for the `requested` instant may be pinned: the
+/// engine draws exactly that instant, so the URL keeps meaning that frame
+/// (#1415). `drawn` is what `MapEngine::resolve_parameter_time` returned for
+/// the layer, on the parameter's or composite's own axis.
+///
+/// An instant the engine snapped to another time step is not pinned: past
+/// the newest step the URL draws the next frame once it lands, before the
+/// oldest a later one as the window slides, and between two steps one landing
+/// in the gap. Nor is a request naming no instant, whatever is drawn, or an
+/// instant with nothing to draw. It compares instants, not text:
+/// `2026-01-01T03:00:00+02:00` names the step `2026-01-01T01:00:00Z` exactly.
+///
+/// The answer is the request's own, never stored with a cached image. The
+/// rendered caches key on the time drawn, so a snapped and an exact request
+/// share an image and each gets its own header.
+pub fn is_exact_time(requested: Option<DateTime<Utc>>, drawn: Option<DateTime<Utc>>) -> bool {
+    requested.is_some() && requested == drawn
 }
 
 /// A time value of a subset: an instant, or a partial date or time naming a
@@ -582,6 +612,58 @@ mod tests {
         let mut subsets = parse(&[value]).unwrap();
         assert_eq!(subsets.len(), 1, "{value}");
         subsets.remove(0)
+    }
+
+    /// #1415: only a requested instant drawn exactly is exact, however the
+    /// request wrote it. `None == None` is no exact time.
+    #[test]
+    fn only_an_instant_drawn_exactly_is_exact() {
+        let step = Some(at("2026-01-01T01:00:00Z"));
+        for written in [
+            "2026-01-01T01:00:00Z",
+            "2026-01-01T03:00:00+02:00",
+            "2025-12-31T20:00:00-05:00",
+            "2026-01-01T01:00:00",
+            "2026-01-01T01:00",
+        ] {
+            let requested = parse_instant(written).ok();
+            assert!(is_exact_time(requested, step), "{written}");
+        }
+        // Snapped: an instant past the step, before it, or one that only reads
+        // like it, in another offset.
+        for written in [
+            "2026-01-01T01:05:00Z",
+            "2025-12-31T00:00:00Z",
+            "2026-01-01T01:00:00+02:00",
+        ] {
+            let requested = parse_instant(written).ok();
+            assert!(!is_exact_time(requested, step), "{written}");
+        }
+        // Nothing to draw; no instant asked for.
+        assert!(!is_exact_time(step, None));
+        assert!(!is_exact_time(None, step));
+        assert!(!is_exact_time(None, None));
+    }
+
+    /// Only an instant names one: a range, closed or a single instant wide,
+    /// selects the latest step inside it.
+    #[test]
+    fn only_an_instant_selection_names_an_instant() {
+        let t = at("2026-01-01T01:00:00Z");
+        assert_eq!(TimeSelection::Instant(t).instant(), Some(t));
+        for range in [
+            (Some(t), Some(t)),
+            (Some(t), Some(at("2026-01-01T02:00:00Z"))),
+            (Some(t), None),
+            (None, Some(t)),
+            (None, None),
+        ] {
+            let selection = TimeSelection::Range {
+                start: range.0,
+                end: range.1,
+            };
+            assert_eq!(selection.instant(), None, "{range:?}");
+        }
     }
 
     #[test]

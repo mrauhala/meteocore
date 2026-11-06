@@ -657,6 +657,45 @@ async fn time_applies_to_the_layers_with_a_time_dimension() {
     assert_eq!(reply.exception_code(), "InvalidDimensionValue");
 }
 
+/// A list is `immutable` only when every layer draws the `TIME` exactly
+/// (#1415): one layer snapped means another frame later, whichever it is.
+#[tokio::test]
+async fn immutable_needs_every_layer_to_draw_the_time_exactly() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    let fixture = Fixture::new();
+    for (layers, time, expected) in [
+        ("timed,later", T1, IMMUTABLE),
+        ("later,timed", T1, IMMUTABLE),
+        ("timed", T1, IMMUTABLE),
+        // T2 is on `later`'s axis, past `timed`'s newest step, either way up.
+        ("later", T2, IMMUTABLE),
+        ("timed", T2, SHORT),
+        ("timed,later", T2, SHORT),
+        ("later,timed", T2, SHORT),
+        // Past every layer's newest step, and between two steps of both.
+        ("timed,later", "2026-10-01T03:00:00Z", SHORT),
+        ("timed,later", "2026-10-01T00:30:00Z", SHORT),
+        // Parameters on their own axes: `a` has T0, `b` has T1.
+        ("params/b", T1, IMMUTABLE),
+        ("params/a", T1, SHORT),
+        ("params/a,params/b", T1, SHORT),
+        // An RGB composite on its collection's one scan.
+        ("sat/rgb", T0, IMMUTABLE),
+        ("sat/rgb", T1, SHORT),
+        ("sat/rgb,timed", T1, SHORT),
+    ] {
+        let reply = fixture.get_map(layers, "", &format!("&TIME={time}")).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "{layers} at {time}: {}",
+            reply.text()
+        );
+        assert_eq!(reply.cache_control, expected, "{layers} at {time}");
+    }
+}
+
 /// Without `TIME`, each layer draws its own default, a parameter with its
 /// own time axis its own latest (#819), and keys its caches on it.
 #[tokio::test]

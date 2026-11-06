@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use api_common::map_frame::MapCrs;
-use api_common::subset::{self, TimeSelection};
+use api_common::subset;
 use arc_swap::ArcSwap;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -21,7 +21,7 @@ use ds_executor::{RenderOutcome, RenderPhase, RenderPhases, RenderTiming};
 use ds_render::{CacheKey, CachedRendered, ColorMap, CompositeSpec, RenderedCache, StyleInfo};
 
 use crate::error::MapsError;
-use crate::params::{self, LegendFormat, LegendQueryParams, MapQueryParams, MapRequest, MapTime};
+use crate::params::{self, LegendFormat, LegendQueryParams, MapQueryParams, MapRequest};
 
 /// Shared state for the OGC API Maps service.
 #[derive(Clone)]
@@ -165,13 +165,14 @@ fn composite_style_not_found(collection_id: &str, composite: &str, style: &str) 
     ))
 }
 
-/// Cache-Control header value: `immutable` (24 h) only for an explicit
-/// `time` that resolved to a timestep, over content the engine never revises
-/// (`content_version == 0`); "latest", a `time` the engine has nothing to
-/// render for yet (resolved to `None`: its catalog is still empty after a
-/// start or reload) and in-place-revised content (a push-fed alert set) get
-/// 60 s + revalidation so a browser/CDN holding a pre-revision image asks
-/// again.
+/// Cache-Control header value: `immutable` (24 h) only for an instant the
+/// engine draws exactly ([`subset::is_exact_time`]), over content it never
+/// revises (`content_version == 0`). Everything else gets 60 s + revalidation,
+/// so a browser/CDN holding an image the URL no longer means asks again:
+/// "latest" and intervals, an instant snapped to another timestep (#1415), a
+/// `time` the engine has nothing to render for yet (resolved to `None`: its
+/// catalog is still empty after a start or reload) and in-place-revised
+/// content (a push-fed alert set).
 fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
     if pinned_time && content_version == 0 {
         "public, max-age=86400, immutable"
@@ -1445,14 +1446,11 @@ async fn render_map(
     };
 
     let content_type = format.content_type();
-    // Only an instant pins the image: `*` and intervals follow new data.
-    let has_explicit_time = matches!(
-        validated.time,
-        Some(MapTime {
-            selection: TimeSelection::Instant(_),
-            ..
-        })
-    );
+    // Only an instant can pin the image: `*` and intervals follow new data.
+    let requested_instant = validated
+        .time
+        .as_ref()
+        .and_then(|time| time.selection.instant());
 
     // Parameter selection precedence: ?parameter-name= wins over style.parameter.
     // Validate against the engine's advertised parameters and composites
@@ -1559,8 +1557,10 @@ async fn render_map(
         background,
     };
 
+    // This request's, never the cached entry's: a snapped and an exact request
+    // for one timestep share the entry, not the header.
     let cache_control = cache_control_value(
-        has_explicit_time && time.is_some(),
+        subset::is_exact_time(requested_instant, time),
         cache_key.content_version,
     );
     let if_none_match = headers
