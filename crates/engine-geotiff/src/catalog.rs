@@ -909,19 +909,31 @@ pub fn init_stac_from_extent(extent: &crate::stac::StacExtent) -> Catalog {
 /// Called on-demand from query path when entries are needed for a time range.
 /// Creates lightweight stub entries — no GeoTIFF downloads.
 /// Existing entries (both stubs and loaded) are preserved.
+///
+/// A listing a cap cuts ([`crate::stac::StacListing::Cut`], #1400) installs
+/// nothing and is [`DataServerError::Unavailable`]: nothing would list the
+/// range again once it held an item, and the caller, a render with an empty
+/// catalog, has no window to narrow.
 pub fn fetch_stac_range(
     client: &crate::stac::StacClient,
     existing_catalog: &Catalog,
     time_range: (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
     collection_id: &str,
 ) -> Result<Catalog, DataServerError> {
-    let items = client.fetch_items(Some(time_range), None)?;
-    Ok(merge_stac_range(
-        existing_catalog,
-        &items,
-        time_range,
-        collection_id,
-    ))
+    use crate::stac::StacListing;
+    match client.fetch_items_until(Some(time_range), None, |_| false)? {
+        StacListing::Complete(items) => Ok(merge_stac_range(
+            existing_catalog,
+            &items,
+            time_range,
+            collection_id,
+        )),
+        StacListing::Cut(items) => Err(DataServerError::Unavailable(format!(
+            "[{collection_id}] STAC listing cut by its page or time limit after {} items",
+            items.len()
+        ))),
+        StacListing::Stopped => unreachable!("a listing that never has enough is not stopped"),
+    }
 }
 
 /// Merge the STAC items listed for `time_range` into a copy of

@@ -8,6 +8,9 @@ use super::*;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use std::sync::atomic::AtomicUsize;
 
+#[path = "stac_listing_cap_tests.rs"]
+mod listing_cap;
+
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../testdata/radar-tm35fin/radar_tm35_20260406T0640Z.tif"

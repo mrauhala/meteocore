@@ -35,15 +35,37 @@ pub struct StacItem {
     pub bbox: Option<[f64; 4]>,
 }
 
+/// The caps that end a listing with pages still left.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ListingLimits {
+    pub(crate) max_pages: u32,
+    pub(crate) total_timeout: Duration,
+}
+
+impl Default for ListingLimits {
+    fn default() -> Self {
+        Self {
+            max_pages: STAC_MAX_PAGES,
+            total_timeout: STAC_TOTAL_TIMEOUT,
+        }
+    }
+}
+
 /// How a [`StacClient::fetch_items_until`] listing ended.
 #[derive(Debug)]
 pub enum StacListing {
-    /// Every page was read, up to the pagination limits `fetch_items` has:
-    /// the items, sorted by datetime.
+    /// Every page was read, or the caller's `max_items` was reached: the
+    /// items, sorted by datetime.
     Complete(Vec<StacItem>),
     /// The caller had seen enough with pages still left. What it saw is not
     /// the whole answer, so no items are returned.
     Stopped,
+    /// `STAC_MAX_PAGES` or `STAC_TOTAL_TIMEOUT` ended the listing with pages
+    /// still left (#1400): the items read so far, sorted by datetime. They
+    /// are not the whole answer, so a caller must not take them for it. Only
+    /// a poll installs them, because its next listing starts after the
+    /// newest of them.
+    Cut(Vec<StacItem>),
 }
 
 /// What a HEAD of a STAC asset answered ([`StacClient::head_asset_async`]).
@@ -79,6 +101,7 @@ pub struct StacClient {
     asset_key: String,
     asset_allowlist: Vec<Url>,
     http: Arc<reqwest::Client>,
+    limits: ListingLimits,
 }
 
 impl StacClient {
@@ -141,7 +164,15 @@ impl StacClient {
             asset_key: asset_key.to_string(),
             asset_allowlist: parsed_allowlist,
             http: Arc::new(http),
+            limits: ListingLimits::default(),
         })
+    }
+
+    /// Replace the listing caps, so a test can reach them without a thousand
+    /// pages or ten minutes.
+    #[cfg(test)]
+    pub(crate) fn set_listing_limits(&mut self, limits: ListingLimits) {
+        self.limits = limits;
     }
 
     /// Get a clone of the Arc-wrapped HTTP client for use in DataSource::HttpDirect.
@@ -244,13 +275,19 @@ impl StacClient {
     ///
     /// Returns items sorted by datetime (ascending). Follows pagination up to
     /// `STAC_MAX_PAGES` pages. Stops early if `max_items` is reached.
+    ///
+    /// A listing a cap cuts returns the items read so far like a complete
+    /// one ([`StacListing::Cut`]), so this is for a poll, whose next listing
+    /// starts after the newest of them. A request path takes
+    /// [`fetch_items_until`](Self::fetch_items_until) and tells them apart:
+    /// nothing lists a window again once it holds an item (#1400).
     pub fn fetch_items(
         &self,
         time_filter: Option<(DateTime<Utc>, DateTime<Utc>)>,
         max_items: Option<usize>,
     ) -> Result<Vec<StacItem>, DataServerError> {
         match self.fetch_items_until(time_filter, max_items, |_| false)? {
-            StacListing::Complete(items) => Ok(items),
+            StacListing::Complete(items) | StacListing::Cut(items) => Ok(items),
             StacListing::Stopped => unreachable!("a listing that never has enough is not stopped"),
         }
     }
@@ -260,6 +297,8 @@ impl StacClient {
     /// items; when it returns `true` and another page is left, the listing
     /// ends there as [`StacListing::Stopped`], without following the `next`
     /// link. On the last page the listing is complete whatever it returns.
+    /// Another page left past `STAC_MAX_PAGES` or `STAC_TOTAL_TIMEOUT` ends
+    /// it as [`StacListing::Cut`] (#1400).
     ///
     /// On a request path, under its `ds_core::deadline` (#18), a listing does
     /// not start once the deadline has passed: `DeadlineExceeded`. One that
@@ -273,28 +312,29 @@ impl StacClient {
         max_items: Option<usize>,
         mut enough: impl FnMut(&[StacItem]) -> bool,
     ) -> Result<StacListing, DataServerError> {
-        let mut items = Vec::new();
+        let mut items: Vec<StacItem> = Vec::new();
         let mut url = self.build_initial_url(time_filter, max_items);
         let mut pages = 0;
         let start_time = Instant::now();
         ds_core::deadline::check()?;
 
+        // Both caps are checked only with a `next` link followed, or on the
+        // first page: the listing they end has a page left.
         loop {
-            if pages >= STAC_MAX_PAGES {
-                tracing::warn!(
-                    "STAC pagination limit reached ({} pages), stopping",
-                    STAC_MAX_PAGES
-                );
-                break;
+            if pages >= self.limits.max_pages {
+                tracing::warn!("STAC pagination limit reached ({pages} pages), stopping");
+                items.sort_by_key(|item| item.datetime);
+                return Ok(StacListing::Cut(items));
             }
 
-            if start_time.elapsed() > STAC_TOTAL_TIMEOUT {
+            if start_time.elapsed() > self.limits.total_timeout {
                 tracing::warn!(
                     "STAC total timeout reached ({:?}), stopping after {} pages",
-                    STAC_TOTAL_TIMEOUT,
+                    self.limits.total_timeout,
                     pages
                 );
-                break;
+                items.sort_by_key(|item| item.datetime);
+                return Ok(StacListing::Cut(items));
             }
 
             tracing::debug!("STAC fetch: {}", url);

@@ -125,6 +125,27 @@ apply here.
   gives the exact count. A catalog with `max_files` lists the window in
   full: its trim can drop window items again, and the count after the trim
   decides, as before.
+- A listing `STAC_MAX_PAGES` (1000) or `STAC_TOTAL_TIMEOUT` (600 s) ends with
+  a page left is `StacListing::Cut`, never `Complete` (#1400). A window counts
+  as listed once it holds an item: the catalog keeps no record of what was
+  listed, so a request path installs nothing from a cut listing. Merging the
+  items read so far would keep the rest out for good, and a `max_files` trim
+  would keep the newest of what was read, not of the window. An EDR query is
+  the 400 `QueryTooLarge`, as a listing stopped past the cap is, and no
+  failure of the STAC API. A render lists only over an empty catalog
+  (`fetch_stac_range`): 503 `Unavailable`, counted by the circuit breaker,
+  and the first poll to install an item ends those listings. A poll keeps
+  what it read (`fetch_items`), since its next listing starts after the newest
+  item. On a host that lists newest first the older part of that listing is
+  then never read; a poll's window starts at its newest entry, so it takes
+  over 100 k new items or 600 s to get there.
+- Nothing remembers a cut, and that has a cost: every EDR request for a cut
+  window lists it again, up to those caps and past its deadline, holding one
+  EDR query slot until the listing ends. api-edr's slots are shared by every
+  collection (`query_workers()`, 2 to 8), so repeats can keep other
+  collections' EDR queries waiting. A full `max_files` catalog's old window
+  already costs the same, cut or not: the trim empties the window again, so
+  every request lists it.
 - An area query checks its window's grid between that count and the loads
   (`check_window`, #1075): the bbox must meet the grid, then the mask and
   the response budgets, in `query_area`'s order. The answer uses the grid of
