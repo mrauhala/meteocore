@@ -450,6 +450,18 @@ const PREWARM_MAX_FRAMES: usize = 4;
 const PREWARM_BUDGET: Duration = Duration::from_secs(60);
 
 /// Circuit breaker threshold: number of consecutive failures before opening.
+///
+/// The breaker guards the request paths' on-demand STAC listings, the only
+/// listings it counts: an EDR window the catalog has no entry in, and a
+/// render over an empty catalog. Open, it fails a request that needs such
+/// a listing at once. A request the catalog answers never asks it, so
+/// loaded frames and stubs are still served.
+///
+/// A failure is the STAC API's: a 5xx or transport error through the
+/// retries, a 408 or 429, or a render's cut listing. A page the host
+/// refused with another 4xx ([`stac::StacListing::Refused`]) counts
+/// nothing: a client shapes the window, so a refusal says nothing of the
+/// host's health. Nor does a listing the deadline kept from starting (#18).
 const STAC_CIRCUIT_BREAKER_THRESHOLD: u32 = 3;
 /// How long the circuit breaker stays open before allowing a retry.
 const STAC_CIRCUIT_BREAKER_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
@@ -1720,7 +1732,6 @@ impl GeoTiffEngine {
         let StoreMode::RemoteStac { client } = &self.store_mode else {
             return Ok(());
         };
-        self.check_stac_circuit_breaker()?;
 
         // The window to fetch on demand: the query's, when the catalog has no
         // entry in it; for a query without one ("latest"), the last hour,
@@ -1738,6 +1749,9 @@ impl GeoTiffEngine {
             }
         };
         if let Some(range) = fetch {
+            // The breaker guards the listing: a query the catalog answers is
+            // served while it is open.
+            self.check_stac_circuit_breaker()?;
             let current = self.catalog.load();
             let mut updated = self.list_stac_window(client, &current, range, datetime)?;
             // Count what the query would load from the catalog it would see,
@@ -1819,6 +1833,9 @@ impl GeoTiffEngine {
                 self.record_stac_success();
                 Err(stac_listing_cut(datetime.is_some()))
             }
+            // The host refused a window a client shaped: no failure of the
+            // STAC API either.
+            Ok(stac::StacListing::Refused) => Err(stac::listing_refused()),
             Err(e) => {
                 self.record_stac_listing_error(&e);
                 Err(e)
@@ -2560,8 +2577,6 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         let _ = (parameter, z); // GeoTIFF engine serves a single 2-D band per collection
                                 // For STAC: ensure we have items around the requested time
         if let StoreMode::RemoteStac { ref client, .. } = self.store_mode {
-            self.check_stac_circuit_breaker()?;
-
             let catalog = self.catalog.load();
             let need_fetch = if let Some(t) = time {
                 // Check if we have any entry near this time
@@ -2572,19 +2587,29 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             };
             if need_fetch {
                 drop(catalog);
+                // The breaker guards the listing: a frame the catalog holds
+                // renders while it is open.
+                self.check_stac_circuit_breaker()?;
                 let now = time.unwrap_or_else(Utc::now);
                 let range = (
                     now - chrono::Duration::hours(1),
                     now + chrono::Duration::minutes(5),
                 );
                 let current = self.catalog.load();
-                match catalog::fetch_stac_range(client, &current, range, &self.collection_id) {
+                let listing = client.fetch_items_until(Some(range), None, |_| false);
+                // A request the host refused says nothing of its health.
+                let refused = matches!(listing, Ok(stac::StacListing::Refused));
+                match listing.and_then(|listing| {
+                    catalog::merge_range_listing(listing, &current, range, &self.collection_id)
+                }) {
                     Ok(updated) => {
                         self.record_stac_success();
                         self.store_stac_catalog(updated);
                     }
                     Err(e) => {
-                        self.record_stac_listing_error(&e);
+                        if !refused {
+                            self.record_stac_listing_error(&e);
+                        }
                         return Err(e);
                     }
                 }

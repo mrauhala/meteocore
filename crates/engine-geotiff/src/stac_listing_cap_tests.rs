@@ -45,10 +45,6 @@ fn paged() -> MockOptions {
     }
 }
 
-fn stac_failures(engine: &GeoTiffEngine) -> u32 {
-    engine.stac_consecutive_failures.load(Ordering::SeqCst)
-}
-
 fn catalog_times(engine: &GeoTiffEngine) -> Vec<DateTime<Utc>> {
     engine.catalog.load().entries.keys().copied().collect()
 }

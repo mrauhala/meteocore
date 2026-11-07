@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use ds_core::error::DataServerError;
 use url::Url;
 
@@ -66,6 +66,51 @@ pub enum StacListing {
     /// a poll installs them, because its next listing starts after the
     /// newest of them.
     Cut(Vec<StacItem>),
+    /// The host refused a page with a 4xx other than 408 or 429. That says
+    /// something about the request, not about the host's health, so a
+    /// request path counts no circuit-breaker failure for it: a client
+    /// shapes the window. No items are returned.
+    Refused,
+}
+
+/// The error of a listing the host refused ([`StacListing::Refused`]): the
+/// opaque failure every API answers it with, as before.
+pub(crate) fn listing_refused() -> DataServerError {
+    DataServerError::Engine("STAC metadata request failed".into())
+}
+
+/// The `datetime` parameter of a listing over `start..=end`, or `None` for
+/// no filter. RFC 3339 writes years 0000 to 9999 only. An end past that
+/// range on its open side is written `..`, the STAC API's open end. The
+/// sentinels EDR parses an open `..` end into, `DateTime::<Utc>::MIN_UTC`
+/// and `MAX_UTC`, are such ends. Written out, they are dates the host
+/// refuses. An end past the range on the other side is clamped into it:
+/// the window holds no item either way.
+fn datetime_param(start: DateTime<Utc>, end: DateTime<Utc>) -> Option<String> {
+    let first = NaiveDate::from_ymd_opt(0, 1, 1)
+        .and_then(|day| day.and_hms_opt(0, 0, 0))
+        .expect("a valid date")
+        .and_utc();
+    let last = NaiveDate::from_ymd_opt(9999, 12, 31)
+        .and_then(|day| day.and_hms_opt(23, 59, 59))
+        .expect("a valid date")
+        .and_utc();
+    let write = |t: DateTime<Utc>| {
+        t.clamp(first, last)
+            .format("%Y-%m-%dT%H:%M:%SZ")
+            .to_string()
+    };
+    let start = (start >= first).then(|| write(start));
+    let end = (end <= last).then(|| write(end));
+    if start.is_none() && end.is_none() {
+        return None;
+    }
+    let open = "..";
+    Some(format!(
+        "{}/{}",
+        start.as_deref().unwrap_or(open),
+        end.as_deref().unwrap_or(open)
+    ))
 }
 
 /// What a HEAD of a STAC asset answered ([`StacClient::head_asset_async`]).
@@ -288,6 +333,7 @@ impl StacClient {
     ) -> Result<Vec<StacItem>, DataServerError> {
         match self.fetch_items_until(time_filter, max_items, |_| false)? {
             StacListing::Complete(items) | StacListing::Cut(items) => Ok(items),
+            StacListing::Refused => Err(listing_refused()),
             StacListing::Stopped => unreachable!("a listing that never has enough is not stopped"),
         }
     }
@@ -298,7 +344,8 @@ impl StacClient {
     /// ends there as [`StacListing::Stopped`], without following the `next`
     /// link. On the last page the listing is complete whatever it returns.
     /// Another page left past `STAC_MAX_PAGES` or `STAC_TOTAL_TIMEOUT` ends
-    /// it as [`StacListing::Cut`] (#1400).
+    /// it as [`StacListing::Cut`] (#1400). A page the host refuses with a
+    /// 4xx other than 408 or 429 ends it as [`StacListing::Refused`].
     ///
     /// On a request path, under its `ds_core::deadline` (#18), a listing does
     /// not start once the deadline has passed: `DeadlineExceeded`. One that
@@ -340,7 +387,7 @@ impl StacClient {
             tracing::debug!("STAC fetch: {}", url);
             let url_str = url.as_str().to_string();
             let http = self.http.clone();
-            let body: serde_json::Value = self.block_on(async {
+            let body: Option<serde_json::Value> = self.block_on(async {
                 let retry_delays = [
                     Duration::from_millis(100),
                     Duration::from_millis(200),
@@ -355,7 +402,7 @@ impl StacClient {
                         Ok(response) => {
                             let status = response.status();
                             if status.is_success() {
-                                return response.json().await.map_err(|e| {
+                                return response.json().await.map(Some).map_err(|e| {
                                     tracing::warn!(
                                         "STAC response from {} is not valid JSON: {}",
                                         url_str,
@@ -371,9 +418,17 @@ impl StacClient {
                                     url_str,
                                     status
                                 );
-                                return Err(DataServerError::Engine(
-                                    "STAC metadata request failed".into(),
-                                ));
+                                // A timeout or throttle is the host's state.
+                                if matches!(
+                                    status,
+                                    reqwest::StatusCode::REQUEST_TIMEOUT
+                                        | reqwest::StatusCode::TOO_MANY_REQUESTS
+                                ) {
+                                    return Err(DataServerError::Engine(
+                                        "STAC metadata request failed".into(),
+                                    ));
+                                }
+                                return Ok(None);
                             }
                             // 5xx: retry
                             tracing::warn!(
@@ -411,6 +466,9 @@ impl StacClient {
                     DataServerError::Engine("STAC metadata request failed".into())
                 }))
             })?;
+            let Some(body) = body else {
+                return Ok(StacListing::Refused);
+            };
 
             // Parse features array
             let features = body["features"].as_array().ok_or_else(|| {
@@ -470,14 +528,8 @@ impl StacClient {
         url.query_pairs_mut()
             .append_pair("limit", &limit.to_string());
 
-        if let Some((start, end)) = time_filter {
-            let datetime_param = format!(
-                "{}/{}",
-                start.format("%Y-%m-%dT%H:%M:%SZ"),
-                end.format("%Y-%m-%dT%H:%M:%SZ")
-            );
-            url.query_pairs_mut()
-                .append_pair("datetime", &datetime_param);
+        if let Some(datetime) = time_filter.and_then(|(start, end)| datetime_param(start, end)) {
+            url.query_pairs_mut().append_pair("datetime", &datetime);
         }
 
         url
@@ -895,6 +947,58 @@ mod tests {
         assert!(query.contains("datetime=2026-03-25T10%3A00%3A00Z%2F2026-03-25T12%3A00%3A00Z"));
         assert!(query.contains("limit=100"));
         assert!(!query.contains("sortby")); // sortby removed — client-side sort only
+    }
+
+    /// RFC 3339 writes years 0000 to 9999 only. An end past that range on
+    /// its open side, as the sentinels EDR parses `..` into are, is the
+    /// STAC API's open end `..`; one past it on the other side is clamped
+    /// into it, which keeps the window's items. Open at both ends is no
+    /// filter.
+    #[test]
+    fn build_url_with_an_open_end() {
+        let client = StacClient::new(
+            "https://api.example.com/collections/radar/items",
+            "data",
+            vec![],
+        )
+        .unwrap();
+        let datetime = |start, end| {
+            let url = client.build_initial_url(Some((start, end)), None);
+            url.query_pairs()
+                .find(|(key, _)| key == "datetime")
+                .map(|(_, value)| value.into_owned())
+        };
+        let t = "2026-03-25T10:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let (min, max) = (DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC);
+        let year = |y| {
+            chrono::NaiveDate::from_ymd_opt(y, 6, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+        };
+
+        assert_eq!(datetime(min, t).as_deref(), Some("../2026-03-25T10:00:00Z"));
+        assert_eq!(datetime(t, max).as_deref(), Some("2026-03-25T10:00:00Z/.."));
+        assert_eq!(datetime(min, max), None);
+        assert_eq!(
+            datetime(year(-1), year(10_000)),
+            None,
+            "past the range on the open side"
+        );
+        assert_eq!(
+            datetime(year(10_000), max).as_deref(),
+            Some("9999-12-31T23:59:59Z/.."),
+            "a window after the range holds no item"
+        );
+        assert_eq!(
+            datetime(min, year(-1)).as_deref(),
+            Some("../0000-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            datetime(year(0), year(9999)).as_deref(),
+            Some("0000-06-01T00:00:00Z/9999-06-01T00:00:00Z")
+        );
     }
 
     #[test]
