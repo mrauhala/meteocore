@@ -650,13 +650,12 @@ async fn a_stac_item_with_a_gone_asset_stays_out_until_its_listing_changes() {
     let StoreMode::RemoteStac { client } = &engine.store_mode else {
         unreachable!()
     };
-    let fetched = catalog::fetch_stac_range(
-        client,
-        &engine.catalog.load(),
-        (t0 - chrono::Duration::hours(1), t1),
-        "gone-stac",
-    )
-    .unwrap();
+    let range = (t0 - chrono::Duration::hours(1), t1);
+    let listing = client
+        .fetch_items_until(Some(range), None, |_| false)
+        .unwrap();
+    let fetched =
+        catalog::merge_range_listing(listing, &engine.catalog.load(), range, "gone-stac").unwrap();
     engine.store_stac_catalog(fetched);
     assert_eq!(times(&engine), [t0], "and out of a request's STAC fetch");
     // This poll asks for the items after the older one: the gone one again.
@@ -706,13 +705,12 @@ async fn a_stac_item_gone_before_its_header_is_read_is_read_once_then_dropped() 
     let StoreMode::RemoteStac { client } = &engine.store_mode else {
         unreachable!()
     };
-    let fetched = catalog::fetch_stac_range(
-        client,
-        &engine.catalog.load(),
-        (t0 - chrono::Duration::hours(1), t1),
-        "gone-stac",
-    )
-    .unwrap();
+    let range = (t0 - chrono::Duration::hours(1), t1);
+    let listing = client
+        .fetch_items_until(Some(range), None, |_| false)
+        .unwrap();
+    let fetched =
+        catalog::merge_range_listing(listing, &engine.catalog.load(), range, "gone-stac").unwrap();
     engine.store_stac_catalog(fetched);
     assert_eq!(times(&engine), [t0], "and out of a request's STAC fetch");
     engine.poll_cycle().await;

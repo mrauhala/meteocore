@@ -115,8 +115,9 @@ apply here.
   `STAC_PRELOAD_MAX_ITEMS` only, `STAC_PRELOAD_CONCURRENCY` in flight, async
   reqwest end to end. Never loop the sync `load_stac_entry_metadata` there:
   that is N sequential blocking round trips (root Critical Rule 9).
-- The request path is the fallback for older items (on-demand
-  `fetch_stac_range`), items past the cap and failed preloads. A render
+- The request path is the fallback for older items (on-demand listings:
+  `list_stac_window` for EDR, `merge_range_listing` for a render), items
+  past the cap and failed preloads. A render
   loads its one item (`ensure_metadata`). An EDR query loads every stub in
   its window through `load_cold_stac_entries` (#889); a query without
   `datetime`, every stub in the catalog. More than
@@ -144,7 +145,7 @@ apply here.
   would keep the newest of what was read, not of the window. An EDR query is
   the 400 `QueryTooLarge`, as a listing stopped past the cap is, and no
   failure of the STAC API. A render lists only over an empty catalog
-  (`fetch_stac_range`): 503 `Unavailable`, counted by the circuit breaker,
+  (`merge_range_listing`): 503 `Unavailable`, counted by the circuit breaker,
   and the first poll to install an item ends those listings. A poll keeps
   what it read (`fetch_items`), since its next listing starts after the newest
   item. On a host that lists newest first the older part of that listing is
@@ -157,6 +158,19 @@ apply here.
   collections' EDR queries waiting. A full `max_files` catalog's old window
   already costs the same, cut or not: the trim empties the window again, so
   every request lists it.
+- **Circuit breaker** (`STAC_CIRCUIT_BREAKER_THRESHOLD`): it guards the
+  request paths' on-demand listings and counts only those. It is checked
+  right before each listing, never on entry: a render or EDR query the
+  catalog answers is served while it is open, loaded frames and stubs
+  alike. It counts the STAC API's failures: a 5xx or transport error
+  through the retries, a 408 or 429, a render's cut listing. A page the
+  host refused with another 4xx is `StacListing::Refused` and counts
+  nothing: a client shapes the window, so a refusal says nothing of the
+  host's health.
+- A window end RFC 3339 cannot write, outside years 0000 to 9999, is listed
+  open (`..`) on its open side and clamped on the other
+  (`stac::datetime_param`). EDR parses an open `..` end into
+  `MIN_UTC`/`MAX_UTC`; written out, those were dates the host refused.
 - An area query checks its window's grid between that count and the loads
   (`check_window`, #1075): the bbox must meet the grid, then the mask and
   the response budgets, in `query_area`'s order. The answer uses the grid of

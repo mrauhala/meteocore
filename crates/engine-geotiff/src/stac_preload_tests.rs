@@ -11,6 +11,9 @@ use std::sync::atomic::AtomicUsize;
 #[path = "stac_listing_cap_tests.rs"]
 mod listing_cap;
 
+#[path = "stac_breaker_tests.rs"]
+mod breaker;
+
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../testdata/radar-tm35fin/radar_tm35_20260406T0640Z.tif"
@@ -56,6 +59,25 @@ struct MockOptions {
     items_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// While set, answer the collection and `/items` with 503.
     host_down: Option<Arc<AtomicBool>>,
+    /// While set, answer `/items` with 400, as a host refuses a request it
+    /// cannot serve.
+    refusing: Option<Arc<AtomicBool>>,
+}
+
+/// One end of a STAC `datetime` interval, `None` where it is open (`..`).
+type IntervalEnd = Option<DateTime<Utc>>;
+
+/// A STAC `datetime` parameter's interval, or `None` for one a STAC API
+/// refuses: an end that is not RFC 3339.
+fn parse_interval(interval: &str) -> Option<(IntervalEnd, IntervalEnd)> {
+    let end = |t: &str| match t {
+        ".." => Some(None),
+        t => DateTime::parse_from_rfc3339(t)
+            .ok()
+            .map(|t| Some(t.with_timezone(&Utc))),
+    };
+    let (start, stop) = interval.split_once('/').unwrap_or((interval, interval));
+    Some((end(start)?, end(stop)?))
 }
 
 /// Wait at a mock's gate until a permit is added, one per request, or the
@@ -157,6 +179,7 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         failing_gate,
         items_gate,
         host_down,
+        refusing,
     } = options;
     let is_down = move || {
         host_down
@@ -205,6 +228,9 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         let page_base = page_base.clone();
         let items_gate = items_gate.clone();
         let down = items_down();
+        let refuse = refusing
+            .as_ref()
+            .is_some_and(|refusing| refusing.load(Ordering::SeqCst));
         async move {
             if let Some(gate) = &items_gate {
                 pass(gate).await;
@@ -214,17 +240,29 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
                     axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 );
             }
-            let window = query
-                .get("datetime")
-                .filter(|_| filter_datetime)
-                .and_then(|interval| interval.split_once('/'))
-                .map(|(start, end)| {
-                    let parse = |t: &str| t.parse::<DateTime<Utc>>().expect("RFC 3339");
-                    (parse(start), parse(end))
-                });
+            let window = match query.get("datetime").filter(|_| filter_datetime) {
+                Some(interval) => match parse_interval(interval) {
+                    Some(window) => Some(window),
+                    None => {
+                        return axum::response::IntoResponse::into_response(
+                            axum::http::StatusCode::BAD_REQUEST,
+                        )
+                    }
+                },
+                None => None,
+            };
+            if refuse {
+                return axum::response::IntoResponse::into_response(
+                    axum::http::StatusCode::BAD_REQUEST,
+                );
+            }
             let mut features: Vec<&serde_json::Value> = features
                 .iter()
-                .filter(|(t, _)| window.is_none_or(|(start, end)| (start..=end).contains(t)))
+                .filter(|(t, _)| {
+                    window.is_none_or(|(start, end)| {
+                        start.is_none_or(|start| start <= *t) && end.is_none_or(|end| *t <= end)
+                    })
+                })
                 .map(|(_, feature)| feature)
                 .collect();
             let mut links = Vec::new();
@@ -779,6 +817,11 @@ fn source_at(engine: &GeoTiffEngine, time: DateTime<Utc>) -> Arc<reader::DataSou
 /// The `/items` pages a mock served.
 fn pages(mock: &MockStac) -> usize {
     mock.pages.load(Ordering::SeqCst)
+}
+
+/// The circuit breaker's count of consecutive failed STAC listings.
+fn stac_failures(engine: &GeoTiffEngine) -> u32 {
+    engine.stac_consecutive_failures.load(Ordering::SeqCst)
 }
 
 /// Wait until `count` of `mock` reaches `n`, woken by each request it
