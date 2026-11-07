@@ -68,7 +68,7 @@ uuid = { version = "1", features = ["v4"] }
 # `test-util`: filling a meta-tile cache past a reload's new size (#1311).
 ds-render = { path = "../render", features = ["test-util"] }
 http-body-util = "0.1"
-jsonschema = { version = "0.58", default-features = false }
+jsonschema = { version = "0.60", default-features = false }
 robotstxt = "0.3"
 tempfile = "3"
 toml = "1.1"
