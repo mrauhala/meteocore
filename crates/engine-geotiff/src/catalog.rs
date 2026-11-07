@@ -905,24 +905,26 @@ pub fn init_stac_from_extent(extent: &crate::stac::StacExtent) -> Catalog {
     }
 }
 
-/// Fetch STAC items for a specific datetime range and merge into the catalog.
+/// Merge a render's on-demand listing of `time_range` into the catalog.
 ///
-/// Called on-demand from query path when entries are needed for a time range.
-/// Creates lightweight stub entries — no GeoTIFF downloads.
-/// Existing entries (both stubs and loaded) are preserved.
+/// A render lists only over an empty catalog. The listing's items become
+/// lightweight stub entries, with no GeoTIFF downloads. Existing entries,
+/// stubs and loaded, are preserved.
 ///
 /// A listing a cap cuts ([`crate::stac::StacListing::Cut`], #1400) installs
 /// nothing and is [`DataServerError::Unavailable`]: nothing would list the
 /// range again once it held an item, and the caller, a render with an empty
-/// catalog, has no window to narrow.
-pub fn fetch_stac_range(
-    client: &crate::stac::StacClient,
+/// catalog, has no window to narrow. A refused one
+/// ([`crate::stac::StacListing::Refused`]) installs nothing either and is
+/// the error it always was.
+pub fn merge_range_listing(
+    listing: crate::stac::StacListing,
     existing_catalog: &Catalog,
     time_range: (chrono::DateTime<Utc>, chrono::DateTime<Utc>),
     collection_id: &str,
 ) -> Result<Catalog, DataServerError> {
     use crate::stac::StacListing;
-    match client.fetch_items_until(Some(time_range), None, |_| false)? {
+    match listing {
         StacListing::Complete(items) => Ok(merge_stac_range(
             existing_catalog,
             &items,
@@ -933,14 +935,15 @@ pub fn fetch_stac_range(
             "[{collection_id}] STAC listing cut by its page or time limit after {} items",
             items.len()
         ))),
+        StacListing::Refused => Err(crate::stac::listing_refused()),
         StacListing::Stopped => unreachable!("a listing that never has enough is not stopped"),
     }
 }
 
 /// Merge the STAC items listed for `time_range` into a copy of
-/// `existing_catalog` as stub entries, the second half of
-/// [`fetch_stac_range`] for a caller that lists the items itself (an EDR
-/// query's bounded listing, #1075). Existing entries are preserved.
+/// `existing_catalog` as stub entries: a render's complete listing
+/// ([`merge_range_listing`]) or an EDR query's bounded one (#1075).
+/// Existing entries are preserved.
 pub fn merge_stac_range(
     existing_catalog: &Catalog,
     items: &[crate::stac::StacItem],
