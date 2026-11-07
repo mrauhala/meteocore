@@ -375,6 +375,7 @@ pub(crate) mod tests {
                 }],
             }],
             file_len: bytes.len() as u64,
+            version: None,
         }
     }
 

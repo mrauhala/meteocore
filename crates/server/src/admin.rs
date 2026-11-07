@@ -1578,12 +1578,13 @@ static PVOL_PIXEL_READ_ABORTS: LazyLock<[DeltaCounter; 2]> = LazyLock::new(|| {
 // PVOL EDR read admission (#1041): the bytes an EDR walk's volume batches
 // fetch and decode, process-global like the GeoTIFF/Zarr budgets.
 // The PVOL catalog of each odim-volume source (#1307): parsed volume
-// metadata, no pixels.
+// metadata and what its scans remember of the volumes left out (#1398), no
+// pixels.
 static PVOL_CATALOG_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     collection_gauge(
         "pvol_catalog_bytes",
         "Estimated heap bytes of a PVOL source's catalog: the parsed metadata of its volumes \
-         and sites",
+         and sites, and what its scans remember of the volumes they leave out",
     )
 });
 // What each odim-volume source's scans do (#193): the construction scan and

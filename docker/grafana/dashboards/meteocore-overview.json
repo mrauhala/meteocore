@@ -24281,7 +24281,7 @@
         "spec": {
           "id": 211,
           "title": "PVOL parse cache — hit ratio",
-          "description": "Share of the volumes the polar-volume scans go through that the parse cache already holds, so nothing is read: near 1 in steady state, each poll reading only its new volumes. A ratio that stays low means every scan reads volumes again: files that fail to read or parse, or more volumes in the window than max_files keeps, which the cache drops and every scan downloads again (bound the source with time_window). A gap is a time with no scan.",
+          "description": "Share of the volumes the polar-volume scans go through that the parse cache already holds, so nothing is read: near 1 in steady state, each poll reading only its new volumes. A ratio that stays low means every scan reads volumes again: files that fail to read or parse, or that parse with no usable NOD. Volumes max_files trims are read once and then remembered, so they do not count here. A gap is a time with no scan.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
