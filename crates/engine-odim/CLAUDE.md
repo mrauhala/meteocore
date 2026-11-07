@@ -40,7 +40,8 @@ around `ds-storage` calls (Critical Rules 6–7).
   once its poll finds sites (#190).
 - `catalog_bytes()` (#1307) is computed in `derive_catalog`: each
   catalogued volume's parsed metadata once (the parse cache shares the
-  `Arc`s), the parse cache's table and keys, and `SiteMeta`. A new owned
+  `Arc`s), the parse cache's table and keys, its `left_out` memory, and
+  `SiteMeta`. A new owned
   field in `PolarVolume`/`Sweep`/`PolarMoment` goes into its `HeapSize` impl
   in `pvol.rs`.
 - **Scan metrics (#193).** `ParseCache` holds the parsed volumes with the
@@ -52,8 +53,8 @@ around `ds-storage` calls (Critical Rules 6–7).
   server turns them into `pvol_scans_total`, `pvol_scan_volumes_total`
   and the catalog gauges. Do not name a family `*_cache_hits_total` for
   the parse cache: the dashboard reads every such family as a byte-bounded
-  cache. Volumes `max_files` trims leave the parse cache, so every scan
-  reads them again and counts them as `parsed`. `storage_bytes_read()` is
+  cache. A volume the catalog leaves out is read once and not counted after
+  that (`ParseCache::left_out`, Retention below). `storage_bytes_read()` is
   the source store's counter, shared by every clone of the store (pixel
   reads, cell warm-ups), and COMP's `OdimEngine::storage_bytes_read` the
   same over its catalog's locations. `site_timelines()` gives each site's
@@ -591,6 +592,54 @@ not guarantee monotonic improvement. This baseline does not enable #642.
 - `[odim] max_files` (default unbounded) / `time_window` bound retained
   volumes per site; these set the 3D Tiles animation frame count. Operators
   should bound unbounded sources.
+- **`max_files` counts catalog entries, one per file.** #573's grouping has
+  not shipped, so a radar splitting a volume over per-sweep files keeps
+  fewer volumes than `max_files`. Ties on time rank by file id
+  (`derive_catalog`), so the cap's cut does not depend on read order.
+- **A volume left out is read once (#1398).** The catalog drops volumes after
+  reading them, since a volume's site and time are in the file, and the parse
+  cache holds exactly the catalog's. So `ParseCache::left_out` remembers the
+  site, time and version of each volume the cap or `time_window` left out,
+  about 300 B per file, counted in `catalog_bytes`. `list_and_build` leaves
+  those files unread and, after reading the others, re-ranks them against
+  what it holds (`back_in_catalog`). One ranking among its site's newest
+  `max_files`, inside the window, is read in that same scan, and if it no
+  longer parses the next one follows, so a scan builds what a scan
+  remembering nothing builds (`ScanRig::scan` asserts this).
+- **What the memory answers to.** A file whose listing no longer matches the
+  version it was read as (`LeftOut::is_still` over `PolarVolume::version`:
+  size, modification time, ETag; local files from the `stat` that tells them
+  from a directory) is read again, so a source reusing fixed names does not
+  freeze. It is the version as read, so a file rewritten while kept is read
+  once it is trimmed; while kept it stays frozen in the parse cache, as ever.
+  A file no longer listed is forgotten, so memory follows the listing, unless
+  a prefix failed to list (`Listing::incomplete`): an entry is only consulted
+  through a listed file, so a stale one is harmless, and a clean listing
+  forgets it. The kept files of the failed prefix are read again, as their
+  parse-cache entries are not kept.
+- **A remembered file's failed remote read ends the passes (Critical Rule
+  9).** No further left-out volume is read in that scan, and the rest stay
+  remembered, the one that failed too. Walking the memory a few files per pass
+  takes a batch's time for each, where a scan reading everything fetches twelve
+  at a time: up to 12× slower on a failing store. With every GET failing, a scan
+  reads no more files than that one, in at most one batch more. The price: a
+  refused remembered file costs its radar a slot until it reads or leaves the
+  listing (or, on an active radar, new volumes fill the slot), while other
+  radars stay whole, their files being read in the same pass. Each scan logs it
+  and counts `read_failed`. A new file's failed read ends nothing: an object
+  refused for one radar must not keep a quiet radar's volumes out for good. A
+  local read that fails moves on to the next file, staying remembered: local
+  reads are one at a time either way.
+- A file that fails to parse, or has no usable `NOD`, is not remembered: every
+  scan reads it again, and one with no usable `NOD` counts as `parsed` each
+  time.
+- **Why not rank file names before fetching.** A name's stamp may not be the
+  volume's time, `stream_key` is not a site (a site can have many streams,
+  several sites one), ORD's `{nod}@{stamp}@…` names carry no 12-digit run at
+  all, and a corrupt newest file would cost the site a volume. So only the
+  `time_window` pre-filter and the bootstrap scan trust names. The price: the
+  first poll after a start still reads every listed volume once, and
+  pre-warms it.
 - Local test fixture: `testdata/radar-fmi-pvol/` (fivih = Vihti). Several
   radar fixtures are large and intentionally NOT committed — tests skip with
   an eprintln when a fixture is absent. The committed polar volume is

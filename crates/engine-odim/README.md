@@ -240,9 +240,19 @@ discovery), `radar-fi-volume-s3-h5` (polar volumes on public S3). The
 - Polar sources are a local directory (not recursive) or S3; HTTP is not
   supported. A volume without a `NOD`, or with a non-alphanumeric one, is
   skipped.
-- A remote polar scan downloads every volume in the window to read its
-  metadata. Bound it with `time_window`: `max_files` trims the catalog only
-  after the download.
+- A remote polar scan downloads each volume in the window once to read its
+  metadata, because a volume's site and time are inside the file. One the
+  catalog then leaves out (`max_files`, or its time outside `time_window`) is
+  remembered and not read again while the source lists it unchanged: a new
+  size, modification time or ETag reads it again. The first poll after a
+  start still downloads them all: `time_window` is what limits that download,
+  when the file names carry a timestamp.
+- A remembered remote volume that is refused costs its radar a slot under
+  `max_files` until it reads, leaves the listing or new volumes fill the slot.
+  Other radars stay whole. A local file that fails to read only skips to the
+  next.
+- `max_files` counts files per radar, so a radar that splits a volume over
+  several files keeps fewer volumes than `max_files`.
 - The polar map render and EDR point samples treat range as ground range,
   with no slant-range correction. Rays are assumed evenly spaced from
   north, so sector scans are not supported.

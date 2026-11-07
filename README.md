@@ -3069,7 +3069,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `wis2_dedup_bytes` | gauge | collection | Estimated heap of the duplicate filter |
 | `cap_alert_bytes` | gauge | collection, part | Estimated heap of a CAP collection: `accumulator` (WIS2 mode), `catalog`, `geocode` (with `geocode_geometry`) |
 | `nowcast_frame_bytes` | gauge | collection | Bytes of the frames a nowcast collection holds, exact: its retained generations and the forecasts waiting to be scored at fixed leads |
-| `pvol_catalog_bytes` | gauge | collection | Estimated heap of a PVOL source's catalog of parsed volume metadata |
+| `pvol_catalog_bytes` | gauge | collection | Estimated heap of a PVOL source's catalog of parsed volume metadata, and of what its scans remember of the volumes they leave out |
 | `netcdf_open_file_bytes` | gauge | collection | Estimated heap of a NetCDF collection's open file handles, modelled per file |
 | `process_start_time_seconds` | gauge | — | Start time of the process since the Unix epoch |
 
@@ -3112,7 +3112,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 |--------|------|--------|-------------|
 | `pvol_scans_total` | counter | collection, result | Scans of the source, the construction scan included: `ok`, or `failed` when the source could not be listed and the previous catalog is kept |
 | `pvol_last_scan_duration_seconds` | gauge | collection | Duration of the latest scan: listing, downloads, parses and the pixel pre-warm |
-| `pvol_scan_volumes_total` | counter | collection, outcome | Volumes the scans went through: `cached`, from the parse cache with nothing read; `parsed`; `read_failed`; `parse_failed`. All but `cached` are parse-cache misses, and a failed volume is read again by the next scan. Misses well above the new volumes per poll mean `max_files` trims volumes the window still lists: every scan reads them again, so bound the source with `time_window` |
+| `pvol_scan_volumes_total` | counter | collection, outcome | Volumes the scans went through: `cached`, from the parse cache with nothing read; `parsed`; `read_failed`; `parse_failed`. All but `cached` are parse-cache misses, and a failed volume is read again by the next scan. A volume the catalog leaves out (`max_files`, or a time outside `time_window`) is read once and not counted after that, so in steady state misses are the new volumes per poll. A volume with no usable `NOD` never joins the catalog, so it counts as `parsed` on every scan |
 | `pvol_catalog_volumes` | gauge | collection | Volumes the catalog holds. The parse cache holds exactly these; their heap is `pvol_catalog_bytes` |
 | `pvol_catalog_sites` | gauge | collection | Radar sites the catalog holds |
 

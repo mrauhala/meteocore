@@ -23,9 +23,12 @@ pub struct ScanMetrics {
     /// Volumes a scan took from the parse cache, reading nothing: its hits.
     pub cached: u64,
     /// Volumes a scan read and parsed. With the two failures below, the
-    /// parse cache's misses: new volumes, and volumes it no longer held,
-    /// such as those `max_files` trims, which every scan reads again. Each
-    /// miss is counted once its outcome is known.
+    /// parse cache's misses: new volumes, the first scan's every volume, and
+    /// a left-out volume the catalog has room for again or whose file was
+    /// rewritten. A volume the catalog leaves out is not counted after the
+    /// scan that read it: later scans neither read it nor go through it. One
+    /// with no usable `NOD` never joins the catalog, so every scan parses it.
+    /// Each miss is counted once its outcome is known.
     pub parsed: u64,
     /// Volumes whose read failed: a local read error or a failed download.
     /// The next scan reads them again.

@@ -82,7 +82,7 @@ use ds_storage::discovery::{
     expand_prefix_for_range, expand_prefix_pattern, list_prefixes, validate_prefix_pattern,
     TimeWindow,
 };
-use ds_storage::{RangeRefusal, ReadAnswer};
+use ds_storage::{ObjectVersion, RangeRefusal, ReadAnswer};
 
 use crate::catalog::MAX_REMOTE_FILE_SIZE;
 use crate::engine::EngineError;
@@ -508,8 +508,54 @@ pub(crate) struct ParseCache {
     /// Metadata-only volumes keyed by file identity: exactly the catalog's,
     /// sharing its `Arc`s ([`derive_catalog`] drops the rest).
     pub(crate) volumes: Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+    /// The volumes the last scan listed, or could not list, and left out of
+    /// the catalog (#1398): what the next scan ranks them by without reading
+    /// them again. About
+    /// 300 B each, where a parsed volume's metadata is about 400 B per moment
+    /// (160 moments in an FMI volume): why they do not simply stay in `volumes`.
+    left_out: Mutex<HashMap<FileId, LeftOut>>,
     /// Bumped by [`scan_source`] and [`build_catalog`].
     pub(crate) counts: ScanCounts,
+}
+
+/// What a scan keeps of a volume it read and left out of the catalog
+/// (`max_files`, or a time outside `time_window` its name did not show). A
+/// volume's site and time are inside the file, so without this every scan
+/// would read the file again to find it does not belong (#1398).
+#[derive(Debug)]
+struct LeftOut {
+    /// The radar it belongs to.
+    nod: String,
+    /// The volume's own time, which ranks it.
+    time: DateTime<Utc>,
+    /// The file as it was listed when read ([`PolarVolume::version`]). `None`
+    /// only for a volume that did not come through a scan.
+    version: Option<ObjectVersion>,
+}
+
+impl LeftOut {
+    fn of(nod: &str, entry: &VolumeEntry) -> Self {
+        LeftOut {
+            nod: nod.to_string(),
+            time: entry.volume.time,
+            version: entry.volume.version.clone(),
+        }
+    }
+
+    /// Whether a file listed as `listed` can still be the one this describes.
+    /// A file rewritten under its name is another volume: a source reusing
+    /// fixed names would otherwise freeze.
+    fn is_still(&self, listed: &ObjectVersion) -> bool {
+        self.version
+            .as_ref()
+            .is_none_or(|read| read.matches(listed))
+    }
+}
+
+impl ds_core::heap::HeapSize for LeftOut {
+    fn heap_size(&self) -> usize {
+        self.nod.heap_size() + self.version.as_ref().map_or(0, |v| v.e_tag.heap_size())
+    }
 }
 
 /// An inclusive `(start, end)` UTC time range — a parsed `time_window`
@@ -2366,6 +2412,18 @@ struct PendingFile {
     id: FileId,
     /// Where to fetch the raw HDF5 bytes on a cache miss.
     spec: FetchSpec,
+    /// The file as listed: a remote listing's size, `Last-Modified` and ETag,
+    /// a local file's size and modification time.
+    version: ObjectVersion,
+}
+
+/// What a scan's enumeration of its source found.
+struct Listing {
+    pending: Vec<PendingFile>,
+    /// The inclusive range a `time_window` implies, resolved against now.
+    time_filter: Option<TimeRange>,
+    /// A prefix failed to list, so a file not in `pending` may still exist.
+    incomplete: bool,
 }
 
 /// Where a [`PendingFile`]'s bytes come from.
@@ -2424,6 +2482,25 @@ fn scan_source(
 }
 
 /// [`scan_source`]'s scan, uncounted.
+///
+/// A volume the last scan left out ([`LeftOut`]) is not read while it stays
+/// out: once the others are read, [`back_in_catalog`] ranks it against them
+/// by what the scan remembers, and only one the catalog now has room for is
+/// read, in this same scan. So the catalog is what a scan reading every file
+/// builds, however many scans ago each was read (#1398). Those reads go in
+/// the bounded batches of [`build_catalog`], at most the free slots per pass.
+/// Another pass follows when one no longer parses.
+///
+/// A remembered file's failed remote read ends the passes. Going on would
+/// walk a failing store's whole memory a few files per pass, each pass a
+/// batch that can take the whole background budget, where a scan reading
+/// everything fetches twelve at a time: Critical Rule 9. So with every GET
+/// failing a scan reads no more files than that one, in at most one batch
+/// more, and the volumes not reached stay remembered, the one that failed too.
+/// That file costs its radar a slot until it reads or leaves the listing; other
+/// radars' files are read in the same pass. A new file's failed read ends
+/// nothing: an object refused for one radar must not keep another's volumes
+/// out. Local reads are one at a time either way: the next file follows.
 fn list_and_build(
     collection_id: &str,
     source: &Source,
@@ -2433,7 +2510,7 @@ fn list_and_build(
     prewarm: &Prewarm,
     cells_after: Option<&Catalog>,
 ) -> Result<Catalog, EngineError> {
-    match source {
+    let listing = match source {
         // A local directory is small and cheap to enumerate; the
         // bootstrap bound only matters for remote (S3/HTTP) sources where
         // each file is a multi-MB network fetch, so local always scans in
@@ -2448,45 +2525,152 @@ fn list_and_build(
             let time_filter = time_window.as_ref().map(|tw| tw.to_range(Utc::now()));
             let mut pending = enumerate_local(collection_id, data_dir)?;
             // Drop out-of-window files by FILENAME timestamp *before*
-            // parsing (mirrors the remote arm's pre-filter): the post-parse
-            // filter alone would HDF5-parse every out-of-window file on
-            // every poll only to trim it — and `derive_catalog` then evicts
-            // its parse-cache entry, so it would be re-parsed forever. A
-            // file whose name carries no parseable timestamp falls through
-            // to the post-parse volume-time filter.
+            // parsing (mirrors the remote arm's pre-filter), so they are
+            // never opened at all. A file whose name carries no parseable
+            // timestamp falls through to the post-parse volume-time filter,
+            // and is read once.
             pending.retain(|p| within_window_by_name(&p.id, time_filter));
-            let mut by_site =
-                build_catalog(collection_id, pending, source, cache, prewarm, cells_after);
-            retain_within(&mut by_site, time_filter);
-            Ok(derive_catalog(by_site, &cache.volumes, max_files))
+            Listing {
+                pending,
+                time_filter,
+                incomplete: false,
+            }
         }
         Source::Remote {
             store,
             prefix_pattern,
             time_window,
             ..
-        } => {
-            let (pending, time_filter) =
-                enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?;
-            let mut by_site =
-                build_catalog(collection_id, pending, source, cache, prewarm, cells_after);
-            // A `time_window` also bounds the timestamps kept: the
-            // object listing can include volumes just outside the
-            // window (the prefix is a whole UTC day).
-            retain_within(&mut by_site, time_filter);
-            Ok(derive_catalog(by_site, &cache.volumes, max_files))
+        } => enumerate_remote(collection_id, store, prefix_pattern, time_window, depth)?,
+    };
+
+    let time_filter = listing.time_filter;
+
+    // What the memory still holds after this is what the scan did not list.
+    let mut remembered =
+        std::mem::take(&mut *cache.left_out.lock().unwrap_or_else(|e| e.into_inner()));
+    let (mut unread, mut to_read) = (Vec::new(), Vec::new());
+    for file in listing.pending {
+        match remembered.remove(&file.id) {
+            Some(volume) if volume.is_still(&file.version) => unread.push((file, volume)),
+            _ => to_read.push(file),
         }
     }
+
+    let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+    let mut left_out = HashMap::new();
+    // What is remembered of the files this pass reads back.
+    let mut returning: HashMap<FileId, LeftOut> = HashMap::new();
+    loop {
+        let (read, failed) =
+            build_catalog(collection_id, to_read, source, cache, prewarm, cells_after);
+        for (nod, volumes) in read {
+            by_site.entry(nod).or_default().extend(volumes);
+        }
+        // A `time_window` also bounds the timestamps kept: the object
+        // listing can include volumes just outside the window (the prefix
+        // is a whole UTC day), and a name need not show the volume's time.
+        retain_within(&mut by_site, time_filter, &mut left_out);
+
+        let store_failing = matches!(source, Source::Remote { .. })
+            && failed.iter().any(|id| returning.contains_key(id));
+        // A failed read says nothing of the file: it stays remembered.
+        for id in failed {
+            if let Some(volume) = returning.remove(&id) {
+                left_out.insert(id, volume);
+            }
+        }
+        if store_failing {
+            break;
+        }
+        let back = back_in_catalog(&by_site, &mut unread, max_files, time_filter);
+        if back.is_empty() {
+            break;
+        }
+        (to_read, returning) = back
+            .into_iter()
+            .map(|(file, volume)| {
+                let id = file.id.clone();
+                (file, (id, volume))
+            })
+            .unzip();
+    }
+    left_out.extend(unread.into_iter().map(|(file, volume)| (file.id, volume)));
+    // A failed LIST says nothing of the files it would have listed, so what
+    // is remembered of them stays. An entry is only ever consulted through a
+    // listed file, so a stale one is harmless; a clean listing forgets it.
+    if listing.incomplete {
+        left_out.extend(remembered);
+    }
+    *cache.left_out.lock().unwrap_or_else(|e| e.into_inner()) = left_out;
+    Ok(derive_catalog(by_site, cache, max_files))
+}
+
+/// The remembered volumes that rank among their site's newest `max_files`
+/// inside the window, against the volumes `by_site` holds, taken out of
+/// `unread` for the scan to read. The ranking is [`derive_catalog`]'s.
+///
+/// None in steady state: a new volume only pushes them further out. One comes
+/// back when a kept file is removed from the source.
+fn back_in_catalog(
+    by_site: &HashMap<String, Vec<VolumeEntry>>,
+    unread: &mut Vec<(PendingFile, LeftOut)>,
+    max_files: Option<usize>,
+    filter: Option<TimeRange>,
+) -> Vec<(PendingFile, LeftOut)> {
+    // A volume competing for its site's slots, and whether it is unread.
+    type Competitor<'a> = (DateTime<Utc>, &'a str, bool);
+    let mut sites: HashMap<&str, Vec<Competitor>> = HashMap::new();
+    for (nod, list) in by_site {
+        let held = list.iter().map(|e| (e.volume.time, e.id.as_str(), false));
+        sites.entry(nod).or_default().extend(held);
+    }
+    for (file, volume) in unread.iter() {
+        if time_within(volume.time, filter) {
+            let competitor = (volume.time, file.id.as_str(), true);
+            sites.entry(&volume.nod).or_default().push(competitor);
+        }
+    }
+    let cap = max_files.unwrap_or(usize::MAX);
+    let mut ranked_in = std::collections::HashSet::new();
+    for competitors in sites.values_mut() {
+        competitors.sort_unstable();
+        let newest = competitors.iter().rev().take(cap);
+        ranked_in.extend(newest.filter(|c| c.2).map(|c| c.1.to_string()));
+    }
+    if ranked_in.is_empty() {
+        return Vec::new();
+    }
+    let (back, rest): (Vec<_>, Vec<_>) = std::mem::take(unread)
+        .into_iter()
+        .partition(|(file, _)| ranked_in.contains(&file.id));
+    *unread = rest;
+    back
+}
+
+/// Whether `time` falls inside the inclusive `(start, end)` range. `None`
+/// holds every time.
+fn time_within(time: DateTime<Utc>, filter: Option<TimeRange>) -> bool {
+    filter.is_none_or(|(start, end)| time >= start && time <= end)
 }
 
 /// Drop volumes whose nominal time falls outside the inclusive
-/// `(start, end)` range. `None` keeps everything. Shared by the local
-/// and remote scan arms so both apply the same `time_window` semantics.
-fn retain_within(by_site: &mut HashMap<String, Vec<VolumeEntry>>, filter: Option<TimeRange>) {
-    if let Some((start, end)) = filter {
-        for list in by_site.values_mut() {
-            list.retain(|e| e.volume.time >= start && e.volume.time <= end);
-        }
+/// `(start, end)` range into `left_out`. `None` keeps everything. Shared by
+/// the local and remote scan arms so both apply the same `time_window`
+/// semantics.
+fn retain_within(
+    by_site: &mut HashMap<String, Vec<VolumeEntry>>,
+    filter: Option<TimeRange>,
+    left_out: &mut HashMap<FileId, LeftOut>,
+) {
+    for (nod, list) in by_site {
+        list.retain(|e| {
+            let within = time_within(e.volume.time, filter);
+            if !within {
+                left_out.insert(e.id.clone(), LeftOut::of(nod, e));
+            }
+            within
+        });
     }
 }
 
@@ -2535,13 +2719,22 @@ fn enumerate_local(
         let is_volume = path
             .file_name()
             .is_some_and(|name| is_volume_name(&name.to_string_lossy()));
-        if !is_volume || !path.is_file() {
+        if !is_volume {
             continue;
         }
+        // The one `stat` that tells a file from a directory also versions it.
+        let Some(metadata) = std::fs::metadata(&path).ok().filter(|m| m.is_file()) else {
+            continue;
+        };
         let id = path.display().to_string();
         pending.push(PendingFile {
             id,
             spec: FetchSpec::Local(path),
+            version: ObjectVersion {
+                size: metadata.len(),
+                last_modified: metadata.modified().ok().map(DateTime::<Utc>::from),
+                e_tag: None,
+            },
         });
     }
     Ok(pending)
@@ -2611,8 +2804,8 @@ fn stream_key(key: &str) -> String {
 }
 
 /// Enumerate `.h5` objects under an S3/HTTP store's date-expanded
-/// prefixes. Returns the pending-file list plus the optional
-/// `(start, end)` time filter the window implies.
+/// prefixes: the pending-file list, the optional `(start, end)` time filter
+/// the window implies, and whether a prefix failed to list.
 ///
 /// In [`ScanDepth::Bootstrap`] only the newest object per [`stream_key`]
 /// (≈ one volume per radar) is returned, so a construction-time scan
@@ -2629,14 +2822,13 @@ fn stream_key(key: &str) -> String {
 /// exist yet) is logged and skipped. If *every* prefix fails the call
 /// errors rather than silently returning an empty catalog. Mirrors
 /// `catalog::scan_remote`'s error tolerance.
-#[allow(clippy::type_complexity)]
 fn enumerate_remote(
     collection_id: &str,
     store: &ds_storage::DataStore,
     prefix_pattern: &str,
     time_window: &Option<TimeWindow>,
     depth: ScanDepth,
-) -> Result<(Vec<PendingFile>, Option<TimeRange>), EngineError> {
+) -> Result<Listing, EngineError> {
     use ds_storage::object_store::path::Path as ObjectPath;
 
     let now = Utc::now();
@@ -2664,7 +2856,7 @@ fn enumerate_remote(
         .map(|prefix| ObjectPath::from(prefix.as_str()))
         .collect();
     let listings = list_prefixes(store, &object_prefixes)?;
-    let mut candidates: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
+    let mut candidates: Vec<(String, Option<DateTime<Utc>>, ObjectVersion)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
 
     for ((prefix, object_prefix), listed) in prefixes.iter().zip(&object_prefixes).zip(listings) {
@@ -2705,7 +2897,7 @@ fn enumerate_remote(
                 );
                 continue;
             }
-            candidates.push((key, ts));
+            candidates.push((key, ts, ObjectVersion::from(&obj)));
         }
     }
 
@@ -2719,7 +2911,7 @@ fn enumerate_remote(
     // key only wins its group if no dated key shares the stream.
     if depth == ScanDepth::Bootstrap {
         let mut latest: HashMap<String, usize> = HashMap::new();
-        for (i, (key, ts)) in candidates.iter().enumerate() {
+        for (i, (key, ts, _)) in candidates.iter().enumerate() {
             latest
                 .entry(stream_key(key))
                 .and_modify(|best| {
@@ -2740,9 +2932,10 @@ fn enumerate_remote(
     // `build_catalog` via `DataStore::get_many(.., Some(MAX_REMOTE_FILE_SIZE))`.
     let pending: Vec<PendingFile> = candidates
         .into_iter()
-        .map(|(key, _)| PendingFile {
+        .map(|(key, _, version)| PendingFile {
             id: key.clone(),
             spec: FetchSpec::Remote { key },
+            version,
         })
         .collect();
 
@@ -2762,7 +2955,11 @@ fn enumerate_remote(
             errors.join("; ")
         );
     }
-    Ok((pending, time_filter))
+    Ok(Listing {
+        pending,
+        time_filter,
+        incomplete: !errors.is_empty(),
+    })
 }
 
 /// Parse the enumerated pending files (reusing cached parses) and group
@@ -2773,6 +2970,8 @@ fn enumerate_remote(
 ///
 /// Each pending file is counted in `cache`'s counts (#193): taken from the
 /// parse cache, or read and then parsed, or failed to read or to parse.
+///
+/// Returns the volumes by site, and the files whose read failed.
 fn build_catalog(
     collection_id: &str,
     pending: Vec<PendingFile>,
@@ -2780,12 +2979,12 @@ fn build_catalog(
     cache: &ParseCache,
     prewarm: &Prewarm,
     cells_after: Option<&Catalog>,
-) -> HashMap<String, Vec<VolumeEntry>> {
+) -> (HashMap<String, Vec<VolumeEntry>>, Vec<FileId>) {
     use ds_storage::object_store::path::Path as ObjectPath;
 
     let counts = &cache.counts;
-    let parse = |id: &str, bytes: &Bytes| {
-        let volume = parse_and_cache(collection_id, id, bytes, &cache.volumes);
+    let parse = |id: &str, version: &ObjectVersion, bytes: &Bytes| {
+        let volume = parse_and_cache(collection_id, id, version, bytes, &cache.volumes);
         match volume {
             Some(_) => counts.parsed(),
             None => counts.parse_failed(),
@@ -2803,9 +3002,10 @@ fn build_catalog(
     let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
     // Remote keys needing a fetch, gathered for one bounded-concurrent
     // download pass against the scan's single source `store`.
-    let mut remote_fetch: Vec<(FileId, ObjectPath)> = Vec::new();
+    let mut remote_fetch: Vec<(FileId, ObjectPath, ObjectVersion)> = Vec::new();
+    let mut read_failed: Vec<FileId> = Vec::new();
 
-    for PendingFile { id, spec } in pending {
+    for PendingFile { id, spec, version } in pending {
         // Cache hit — reuse the parsed volume, no fetch.
         let cached = {
             let guard = cache.volumes.lock().unwrap_or_else(|e| e.into_inner());
@@ -2820,7 +3020,7 @@ fn build_catalog(
             // Local reads are cheap; do them inline.
             FetchSpec::Local(path) => match std::fs::read(&path).map(Bytes::from) {
                 Ok(bytes) => {
-                    if let Some(v) = parse(&id, &bytes) {
+                    if let Some(v) = parse(&id, &version, &bytes) {
                         // Prime the pixel cache from the bytes still in hand
                         // (#472): off-peak the page cache for these files is
                         // routinely reclaimed, so without this the first
@@ -2846,12 +3046,13 @@ fn build_catalog(
                 }
                 Err(e) => {
                     counts.read_failed(1);
-                    tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}")
+                    tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}");
+                    read_failed.push(id);
                 }
             },
             // Defer remote reads to the concurrent batch below.
             FetchSpec::Remote { key } => {
-                remote_fetch.push((id, ObjectPath::from(key.as_str())));
+                remote_fetch.push((id, ObjectPath::from(key.as_str()), version));
             }
         }
     }
@@ -2868,7 +3069,8 @@ fn build_catalog(
             );
         }
         counts.read_failed(remote_fetch.len());
-        return by_site;
+        read_failed.extend(remote_fetch.into_iter().map(|(id, ..)| id));
+        return (by_site, read_failed);
     };
 
     // Download the remote misses concurrently, in `FETCH_CONCURRENCY`-sized
@@ -2882,7 +3084,7 @@ fn build_catalog(
     // budget: a stalled attempt is retried instead of dropping the volume
     // until the next poll (#1011).
     for chunk in remote_fetch.chunks(FETCH_CONCURRENCY) {
-        let paths: Vec<ObjectPath> = chunk.iter().map(|(_, p)| p.clone()).collect();
+        let paths: Vec<ObjectPath> = chunk.iter().map(|(_, p, _)| p.clone()).collect();
         let results = match store.get_many_with_budget(
             &paths,
             FETCH_CONCURRENCY,
@@ -2893,13 +3095,14 @@ fn build_catalog(
             Err(e) => {
                 counts.read_failed(chunk.len());
                 tracing::warn!("[{collection_id}] PVOL batch fetch failed: {e}");
+                read_failed.extend(chunk.iter().map(|(id, ..)| id.clone()));
                 continue;
             }
         };
-        for ((id, _), res) in chunk.iter().zip(results) {
+        for ((id, _, version), res) in chunk.iter().zip(results) {
             match res {
                 Ok(bytes) => {
-                    if let Some(v) = parse(id, &bytes) {
+                    if let Some(v) = parse(id, version, &bytes) {
                         // Prime the pixel cache from the bytes still in hand
                         // (background runtime), so the first interactive render
                         // of this newly-fetched volume is a cache hit instead
@@ -2914,13 +3117,14 @@ fn build_catalog(
                 }
                 Err(e) => {
                     counts.read_failed(1);
-                    tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}")
+                    tracing::warn!("[{collection_id}] skipping PVOL file `{id}`: {e}");
+                    read_failed.push(id.clone());
                 }
             }
         }
     }
 
-    by_site
+    (by_site, read_failed)
 }
 
 /// Whether a poll's freshly downloaded `volume` is newer than every volume
@@ -2942,15 +3146,18 @@ fn newest_of_site(previous: Option<&Catalog>, volume: &PolarVolume) -> bool {
 ///
 /// Each moment also records the byte spans its decode reads
 /// ([`crate::layout::probe`], #1047), from the bytes in hand, so that a cold
-/// pixel miss fetches those ranges rather than the whole file.
+/// pixel miss fetches those ranges rather than the whole file. `version` is
+/// the file as the scan listed it.
 fn parse_and_cache(
     collection_id: &str,
     id: &str,
+    version: &ObjectVersion,
     bytes: &Bytes,
     cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
 ) -> Option<Arc<PolarVolume>> {
     match read_polar_volume(bytes) {
         Ok(mut v) => {
+            v.version = Some(version.clone());
             let probed = crate::layout::probe(bytes, &mut v);
             let moments: usize = v.sweeps.iter().map(|s| s.moments.len()).sum();
             if probed < moments {
@@ -2999,9 +3206,10 @@ fn parse_and_cache(
 ///
 /// Best-effort and purely additive: it never marks a moment known-bad (a
 /// transient background decode hiccup must not blacklist a moment for
-/// requests) and skips any moment already resident (a beyond-`max_files`
-/// volume re-fetched on a later poll keeps its primed pixels — see
-/// [`PixelCache::contains`]). Which moments: see [`prewarm_requests`].
+/// requests) and skips any moment already resident (a volume read again, by
+/// a reload's new engine or on returning to the catalog, keeps its primed
+/// pixels — see [`PixelCache::contains`]). Which moments: see
+/// [`prewarm_requests`].
 /// Overflow of the byte-bounded cache evicts like any other entry.
 fn prewarm_pixels(
     source: &Source,
@@ -3016,9 +3224,9 @@ fn prewarm_pixels(
     let cache_id = pixel_cache_id(source, file_id);
     let requests: Vec<(&str, usize, usize)> = prewarm_requests(volume, prewarm)
         .into_iter()
-        // Skip moments a request (or an earlier poll) already cached, so a
-        // re-fetched trimmed volume doesn't re-decode every poll. Advisory, not
-        // a hard guard: a concurrent insert between this `contains` and the
+        // Skip moments a request (or an earlier scan) already cached, so a
+        // volume read again doesn't re-decode them. Advisory, not a hard
+        // guard: a concurrent insert between this `contains` and the
         // `insert` below at worst re-decodes once (pixel arrays are immutable,
         // so the overwrite is identical) — never incorrect.
         .filter(|(path, _, _)| !PIXEL_CACHE.contains(&cache_id, path))
@@ -3227,24 +3435,33 @@ fn is_url_safe_nod(nod: &str) -> bool {
 /// metadata. There is no aggregate/union metadata — each
 /// radar site is its own collection, served by a [`PolarVolumeSiteView`].
 ///
-/// `max_files` caps each site to its most-recent N volumes — an archive
-/// directory (or a wide S3 `time_window`) must not load and cache every
-/// file.
+/// `max_files` caps each site to its most-recent N volumes, one per file —
+/// an archive directory (or a wide S3 `time_window`) must not load and cache
+/// every file. What it trims goes to `cache`'s [`LeftOut`] memory, so a later
+/// scan does not read it again (#1398).
 fn derive_catalog(
     mut by_site: HashMap<String, Vec<VolumeEntry>>,
-    cache: &Mutex<HashMap<FileId, Arc<PolarVolume>>>,
+    cache: &ParseCache,
     max_files: Option<usize>,
 ) -> Catalog {
     // Sort each site's volumes by time ascending, then cap to the
-    // most-recent `max_files`.
-    for list in by_site.values_mut() {
-        list.sort_by_key(|e| e.volume.time);
-        if let Some(cap) = max_files {
-            if list.len() > cap {
-                list.drain(..list.len() - cap);
+    // most-recent `max_files`. Files of one time (a volume split over
+    // several) rank by id, so the cap's cut does not depend on the order
+    // they were read in, nor differ from the ranking in `back_in_catalog`.
+    let left_out_bytes = {
+        let mut left_out = cache.left_out.lock().unwrap_or_else(|e| e.into_inner());
+        for (nod, list) in &mut by_site {
+            list.sort_by(|a, b| (a.volume.time, &a.id).cmp(&(b.volume.time, &b.id)));
+            if let Some(cap) = max_files {
+                let over = list.len().saturating_sub(cap);
+                for trimmed in list.drain(..over) {
+                    let volume = LeftOut::of(nod, &trimmed);
+                    left_out.insert(trimmed.id, volume);
+                }
             }
         }
-    }
+        ds_core::heap::HeapSize::heap_size(&*left_out)
+    };
     // An S3 `time_window` filter can empty a site's list entirely.
     by_site.retain(|_, list| !list.is_empty());
 
@@ -3254,7 +3471,7 @@ fn derive_catalog(
     let cache_bytes = {
         let kept: std::collections::HashSet<&FileId> =
             by_site.values().flatten().map(|e| &e.id).collect();
-        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = cache.volumes.lock().unwrap_or_else(|e| e.into_inner());
         guard.retain(|k, _| kept.contains(k));
         // Its table and keys; its volumes are the catalog's, counted below.
         ds_core::heap::hash_table::<(FileId, Arc<PolarVolume>)>(guard.capacity())
@@ -3281,6 +3498,7 @@ fn derive_catalog(
     let feature_version = feature_version_of(&sorted_nods, &by_site_meta);
 
     let heap_bytes = cache_bytes
+        + left_out_bytes
         + catalog_bytes(&by_site, &by_site_meta)
         + ds_core::heap::HeapSize::heap_size(&sorted_nods);
     let volumes = by_site.values().map(Vec::len).sum();
@@ -3746,9 +3964,9 @@ impl PolarVolumeEngine {
 
     /// The estimated heap of the catalog this engine holds, with its parse
     /// cache (#1307): every catalogued volume's parsed metadata (no pixels,
-    /// which the process-wide pixel cache holds), each site's derived
-    /// metadata and the indexes. Computed when the catalog is derived, so a
-    /// read is O(1).
+    /// which the process-wide pixel cache holds), what the scans remember of
+    /// the volumes left out, each site's derived metadata and the indexes.
+    /// Computed when the catalog is derived, so a read is O(1).
     pub fn catalog_bytes(&self) -> u64 {
         self.catalog.load().heap_bytes
     }
@@ -8139,7 +8357,7 @@ mod tests {
             ],
         );
         by_site.insert("fikor".to_string(), vec![volume("/floor-1309/c.h5", true)]);
-        let catalog = derive_catalog(by_site, &Mutex::new(HashMap::new()), None);
+        let catalog = derive_catalog(by_site, &ParseCache::default(), None);
         // A 360 × 100 sweep of 2-byte cells, its 16-byte file id, its
         // 20-byte dataset path and 64 bytes of overhead.
         let u16_entry = 360 * 100 * 2 + 16 + 20 + 64;
@@ -8765,6 +8983,7 @@ mod tests {
             gets: Mutex::default(),
             fail_first: Mutex::default(),
             forbidden: Mutex::default(),
+            failing_lists: Mutex::default(),
         });
         let source = Source::Remote {
             store: ds_storage::DataStore::new(counted.clone()),
@@ -9015,7 +9234,8 @@ mod tests {
             let file_id = path.to_str().unwrap().to_owned();
             let bytes = Bytes::from(std::fs::read(&path).unwrap());
             let cache = Mutex::new(HashMap::new());
-            let volume = parse_and_cache("fixture", &file_id, &bytes, &cache).unwrap();
+            let version = ObjectVersion::sized(bytes.len() as u64);
+            let volume = parse_and_cache("fixture", &file_id, &version, &bytes, &cache).unwrap();
             let mut planned = 0;
             for sweep in &volume.sweeps {
                 for moment in &sweep.moments {
@@ -9295,6 +9515,8 @@ mod tests {
         gets: Mutex<HashMap<String, usize>>,
         fail_first: Mutex<std::collections::HashSet<String>>,
         forbidden: Mutex<std::collections::HashSet<String>>,
+        /// Prefixes whose LIST fails (#1398).
+        failing_lists: Mutex<std::collections::HashSet<String>>,
     }
 
     impl CountingStore {
@@ -9390,6 +9612,18 @@ mod tests {
             'static,
             ds_storage::object_store::Result<ds_storage::object_store::ObjectMeta>,
         > {
+            use futures::StreamExt;
+            let failing = prefix
+                .is_some_and(|prefix| self.failing_lists.lock().unwrap().contains(prefix.as_ref()));
+            if failing {
+                return futures::stream::once(async {
+                    Err(ds_storage::object_store::Error::Generic {
+                        store: "CountingStore",
+                        source: "server unavailable".into(),
+                    })
+                })
+                .boxed();
+            }
             self.inner.list(prefix)
         }
 
@@ -9464,6 +9698,7 @@ mod tests {
             gets: Mutex::default(),
             fail_first: Mutex::default(),
             forbidden: Mutex::default(),
+            failing_lists: Mutex::default(),
         });
         let source = Source::Remote {
             store: ds_storage::DataStore::new(counted.clone()),
@@ -10866,6 +11101,7 @@ mod tests {
             object: "PVOL".to_string(),
             sweeps: vec![sweep],
             file_len: 0,
+            version: None,
         }
     }
 
@@ -11381,6 +11617,7 @@ mod tests {
             object: "PVOL".to_string(),
             sweeps: vec![sweep],
             file_len: 0,
+            version: None,
         };
         // A box NE of the site spanning many azimuths within range.
         let bbox = [
@@ -11469,6 +11706,7 @@ mod tests {
             object: "PVOL".to_string(),
             sweeps: vec![sweep],
             file_len: 0,
+            version: None,
         };
         let bbox = [
             site_lon + 0.02,
@@ -11690,11 +11928,15 @@ mod tests {
 
         // Full: every file. `time_window: None` so `Utc::now()`-relative
         // filtering doesn't drop the (necessarily past-dated) fixtures.
-        let (full, _) = enumerate_remote("t", &store, "", &None, ScanDepth::Full).unwrap();
+        let full = enumerate_remote("t", &store, "", &None, ScanDepth::Full)
+            .unwrap()
+            .pending;
         assert_eq!(full.len(), 5, "Full scan must enumerate every volume");
 
         // Bootstrap: exactly one (the newest) per site.
-        let (boot, _) = enumerate_remote("t", &store, "", &None, ScanDepth::Bootstrap).unwrap();
+        let boot = enumerate_remote("t", &store, "", &None, ScanDepth::Bootstrap)
+            .unwrap()
+            .pending;
         let mut ids: Vec<&str> = boot.iter().map(|p| p.id.as_str()).collect();
         ids.sort_unstable();
         assert_eq!(
@@ -11730,7 +11972,9 @@ mod tests {
         assert_eq!(local, ["202605150000_fivih_PVOL.h5"]);
 
         let (store, _) = ds_storage::build_store(root.to_str().unwrap()).unwrap();
-        let (remote, _) = enumerate_remote("t", &store, "", &None, ScanDepth::Full).unwrap();
+        let remote = enumerate_remote("t", &store, "", &None, ScanDepth::Full)
+            .unwrap()
+            .pending;
         let remote: Vec<String> = remote.iter().map(|p| basename(&p.id)).collect();
         assert_eq!(remote, ["202605150000_fivih_PVOL.h5"]);
     }
@@ -11758,8 +12002,9 @@ mod tests {
         let basename = |id: &str| id.rsplit('/').next().unwrap().to_string();
 
         let (store, _) = ds_storage::build_store(root.to_str().unwrap()).unwrap();
-        let (remote, _) =
-            enumerate_remote("t", &store, ".archive/pvol", &None, ScanDepth::Full).unwrap();
+        let remote = enumerate_remote("t", &store, ".archive/pvol", &None, ScanDepth::Full)
+            .unwrap()
+            .pending;
         let mut remote: Vec<String> = remote.iter().map(|p| basename(&p.id)).collect();
         remote.sort();
         assert_eq!(
@@ -12051,8 +12296,7 @@ mod tests {
     /// `nod` — mirrors what `PolarVolumeEngine::site_view` produces, but
     /// without a real source scan.
     fn site_view_for(by_site: HashMap<String, Vec<VolumeEntry>>, nod: &str) -> PolarVolumeSiteView {
-        let cache = Mutex::new(HashMap::new());
-        let catalog = derive_catalog(by_site, &cache, None);
+        let catalog = derive_catalog(by_site, &ParseCache::default(), None);
         PolarVolumeSiteView {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             source: Arc::new(Source::Local {
@@ -12278,12 +12522,15 @@ mod tests {
         by_site.insert("fivih".into(), vec![entry(old, "a"), entry(recent, "b")]);
 
         let mut unfiltered = by_site.clone();
-        retain_within(&mut unfiltered, None);
+        let mut left_out = HashMap::new();
+        retain_within(&mut unfiltered, None, &mut left_out);
         assert_eq!(unfiltered["fivih"].len(), 2, "None keeps everything");
+        assert!(left_out.is_empty());
 
         retain_within(
             &mut by_site,
             Some((t("2026-07-05T05:00:00Z"), t("2026-07-05T07:00:00Z"))),
+            &mut left_out,
         );
         let kept: Vec<_> = by_site["fivih"].iter().map(|e| e.volume.time).collect();
         assert_eq!(
@@ -12291,13 +12538,15 @@ mod tests {
             [t("2026-07-05T06:00:00Z")],
             "volumes outside the window are dropped"
         );
+        assert_eq!(left_out.len(), 1, "and remembered: {left_out:?}");
+        assert_eq!(left_out["a"].nod, "fivih");
+        assert_eq!(left_out["a"].time, t("2026-07-05T00:00:00Z"));
     }
 
     /// The pre-parse filename filter (review finding on #471): a file whose
     /// NAME timestamps outside the window is dropped before it is ever
-    /// opened/parsed — otherwise out-of-window local files would be
-    /// HDF5-parsed and parse-cache-evicted on EVERY poll. Unparseable names
-    /// and no-filter pass through (the post-parse filter is the authority).
+    /// opened/parsed. Unparseable names and no-filter pass through (the
+    /// post-parse filter is the authority).
     #[test]
     fn within_window_by_name_drops_only_parseable_out_of_window() {
         let t = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
@@ -12343,8 +12592,7 @@ mod tests {
         sweepless.sweeps.clear();
         by_site.insert("bad".to_string(), vec![entry(sweepless, "b")]);
 
-        let cache = Mutex::new(HashMap::new());
-        let catalog = derive_catalog(by_site, &cache, None);
+        let catalog = derive_catalog(by_site, &ParseCache::default(), None);
 
         // Both survive in `by_site` (non-empty volume lists)...
         assert!(catalog.by_site.contains_key("good"));
@@ -12854,8 +13102,7 @@ mod tests {
         by_site: HashMap<String, Vec<VolumeEntry>>,
         collection_id: &str,
     ) -> PolarVolumeEngine {
-        let cache = Mutex::new(HashMap::new());
-        let catalog = derive_catalog(by_site, &cache, None);
+        let catalog = derive_catalog(by_site, &ParseCache::default(), None);
         PolarVolumeEngine {
             collection_id: collection_id.to_string(),
             source: Arc::new(Source::Local {
@@ -13311,6 +13558,7 @@ mod tests {
             gets: Mutex::default(),
             fail_first: Mutex::default(),
             forbidden: Mutex::default(),
+            failing_lists: Mutex::default(),
         });
         let store = ds_storage::DataStore::new(counted.clone());
         let engine =
@@ -13381,5 +13629,991 @@ mod tests {
         assert_eq!(sites["fikor"].1, None, "one volume has no spacing");
         let metrics = engine.scan_metrics();
         assert_eq!((metrics.volumes, metrics.sites), (4, 2));
+    }
+
+    // -- Volumes the catalog leaves out (#1398) ------------------------------
+
+    /// The committed fixture stamped as site `nod` (four letters) at `time`:
+    /// a byte patch of equal length, since its old-format HDF5 headers carry
+    /// no checksums.
+    fn volume_at(nod: &str, time: DateTime<Utc>) -> Vec<u8> {
+        let mut bytes = COLD_BATCH.to_vec();
+        let mut patch = |from: &[u8], to: &str| {
+            assert_eq!(from.len(), to.len());
+            let at = bytes.windows(from.len()).position(|w| w == from).unwrap();
+            bytes[at..at + to.len()].copy_from_slice(to.as_bytes());
+        };
+        patch(b"20260916", &time.format("%Y%m%d").to_string());
+        patch(b"120000", &time.format("%H%M%S").to_string());
+        patch(b"NOD:test", &format!("NOD:{nod}"));
+        bytes
+    }
+
+    /// A time `minute` minutes into the tests' fixed hour.
+    fn minute(minute: i64) -> DateTime<Utc> {
+        "2026-08-14T12:00:00Z".parse::<DateTime<Utc>>().unwrap() + chrono::Duration::minutes(minute)
+    }
+
+    /// The name a publisher gives `nod`'s volume at `time`.
+    fn stamped(nod: &str, time: DateTime<Utc>) -> String {
+        format!("{}_{nod}_PVOL.h5", time.format("%Y%m%d%H%M"))
+    }
+
+    /// A source over a temporary directory, read as a local directory or
+    /// through the object store, and the parse cache its scans share.
+    struct ScanRig {
+        dir: tempfile::TempDir,
+        source: Source,
+        cache: ParseCache,
+        max_files: usize,
+    }
+
+    impl ScanRig {
+        fn new(remote: bool, max_files: usize, time_window: Option<&str>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let time_window = time_window.map(|window| TimeWindow::parse(window).unwrap());
+            let source = if remote {
+                let (store, _) = ds_storage::build_store(root.to_str().unwrap()).unwrap();
+                Source::Remote {
+                    store,
+                    endpoint: "test://local".to_string(),
+                    bucket: "test".to_string(),
+                    prefix_pattern: String::new(),
+                    time_window,
+                }
+            } else {
+                Source::Local {
+                    data_dir: root,
+                    time_window,
+                }
+            };
+            ScanRig {
+                dir,
+                source,
+                cache: ParseCache::default(),
+                max_files,
+            }
+        }
+
+        fn write(&self, name: &str, nod: &str, time: DateTime<Utc>) {
+            std::fs::write(self.dir.path().join(name), volume_at(nod, time)).unwrap();
+        }
+
+        /// `nod`'s volume at each of `minutes`, under the publisher's names.
+        fn write_stamped(&self, nod: &str, minutes: impl IntoIterator<Item = i64>) {
+            for at in minutes.into_iter().map(minute) {
+                self.write(&stamped(nod, at), nod, at);
+            }
+        }
+
+        /// Rewrite `name` in place: same length, so only its modification
+        /// time tells, set here to `time` so that the clock's tick cannot hide it.
+        fn rewrite(&self, name: &str, nod: &str, time: DateTime<Utc>) {
+            self.write(name, nod, time);
+            let file = std::fs::File::options()
+                .write(true)
+                .open(self.dir.path().join(name))
+                .unwrap();
+            file.set_modified(time.into()).unwrap();
+        }
+
+        fn write_broken(&self, name: &str) {
+            std::fs::write(self.dir.path().join(name), b"not an HDF5 file").unwrap();
+        }
+
+        fn remove(&self, name: &str) {
+            std::fs::remove_file(self.dir.path().join(name)).unwrap();
+        }
+
+        /// Each site's catalogued file names, oldest first, from a scan
+        /// through `cache`.
+        fn scan_with(&self, cache: &ParseCache) -> std::collections::BTreeMap<String, Vec<String>> {
+            self.scan_to(cache, ScanDepth::Full)
+        }
+
+        fn scan_to(
+            &self,
+            cache: &ParseCache,
+            depth: ScanDepth,
+        ) -> std::collections::BTreeMap<String, Vec<String>> {
+            let catalog = scan_source(
+                "scan-rig",
+                &self.source,
+                cache,
+                Some(self.max_files),
+                depth,
+                &Prewarm::default_quantity(0),
+                None,
+            )
+            .unwrap();
+            catalog
+                .by_site
+                .iter()
+                .map(|(nod, list)| {
+                    let names = list
+                        .iter()
+                        .map(|e| e.id.rsplit('/').next().unwrap().to_string())
+                        .collect();
+                    (nod.clone(), names)
+                })
+                .collect()
+        }
+
+        /// One poll's scan: it must build exactly what a scan that remembers
+        /// nothing builds from the same files.
+        fn scan(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+            let catalog = self.scan_with(&self.cache);
+            assert_eq!(catalog, self.scan_with(&ParseCache::default()));
+            catalog
+        }
+
+        /// The volumes this rig's scans have read and parsed, and the files
+        /// they have read that did not parse.
+        fn reads(&self) -> (u64, u64) {
+            let counts = self.cache.counts.snapshot(0, 0);
+            (counts.parsed, counts.parse_failures)
+        }
+    }
+
+    /// #1398: a volume `max_files` trims is read once. Before, it left the
+    /// parse cache, so every scan read it again: from the object store,
+    /// a download of up to 64 MiB, parsed, pre-warmed and thrown away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_scan_reads_nothing_max_files_trimmed() {
+        for remote in [false, true] {
+            let rig = ScanRig::new(remote, 2, None);
+            rig.write_stamped("sita", 0..6);
+            rig.write_stamped("sitb", 0..6);
+            let first = rig.scan();
+            assert_eq!(rig.reads(), (12, 0), "remote {remote}");
+            assert_eq!(
+                first["sita"],
+                [stamped("sita", minute(4)), stamped("sita", minute(5))]
+            );
+            assert_eq!(rig.scan(), first);
+            assert_eq!(rig.reads(), (12, 0), "remote {remote}: nothing read again");
+
+            // A new volume is the one read, and pushes the oldest kept out.
+            rig.write_stamped("sita", [6]);
+            let third = rig.scan();
+            assert_eq!(rig.reads(), (13, 0), "remote {remote}");
+            assert_eq!(
+                third["sita"],
+                [stamped("sita", minute(5)), stamped("sita", minute(6))]
+            );
+            assert_eq!(third["sitb"], first["sitb"]);
+            assert_eq!(rig.scan(), third);
+            assert_eq!(rig.reads(), (13, 0), "remote {remote}: nothing read again");
+        }
+    }
+
+    /// #1398: the construction scan of a remote source reads the newest
+    /// volume per stream. The first poll reads the rest once, and only
+    /// that poll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_poll_after_a_bootstrap_scan_reads_the_rest_once() {
+        let rig = ScanRig::new(true, 2, None);
+        rig.write_stamped("sita", 0..5);
+        let bootstrap = rig.scan_to(&rig.cache, ScanDepth::Bootstrap);
+        assert_eq!(bootstrap["sita"], [stamped("sita", minute(4))]);
+        assert_eq!(rig.reads(), (1, 0));
+
+        let first = rig.scan();
+        assert_eq!(
+            first["sita"],
+            [stamped("sita", minute(3)), stamped("sita", minute(4))]
+        );
+        assert_eq!(rig.reads(), (5, 0), "each volume read once");
+        assert_eq!(rig.scan(), first);
+        assert_eq!(rig.reads(), (5, 0), "and nothing read again");
+    }
+
+    /// #1398: what the issue's metric shows, through a built engine and its
+    /// polls: `parsed` rises by the new volumes alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn polls_count_only_new_volumes_as_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |at: DateTime<Utc>| {
+            let path = dir.path().join(stamped("sita", at));
+            std::fs::write(path, volume_at("sita", at)).unwrap();
+        };
+        (0..5).map(minute).for_each(write);
+        let config = ds_core::config::OdimConfig {
+            max_files: Some(2),
+            prewarm_sweeps: 0,
+            ..empty_config()
+        };
+        let engine =
+            PolarVolumeEngine::new("pvol-trim-1398", dir.path().to_str(), &config).unwrap();
+        let built = engine.scan_metrics();
+        assert_eq!((built.parsed, built.volumes), (5, 2), "{built:?}");
+
+        engine.poll_once().await;
+        let polled = engine.scan_metrics();
+        assert_eq!(
+            (polled.parsed, polled.cached, polled.volumes),
+            (5, 2, 2),
+            "{polled:?}"
+        );
+
+        write(minute(5));
+        engine.poll_once().await;
+        let grown = engine.scan_metrics();
+        assert_eq!(
+            (grown.parsed, grown.cached, grown.volumes),
+            (6, 4, 2),
+            "{grown:?}"
+        );
+    }
+
+    /// #1398: GETs counted at the store: an object `max_files` trims is
+    /// downloaded once, however many polls list it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trimmed_object_is_downloaded_once() {
+        use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+        let inner = Arc::new(ds_storage::object_store::memory::InMemory::new());
+        let keys: Vec<String> = (0..5)
+            .map(|i| format!("trim-1398/{}", stamped("sita", minute(i))))
+            .collect();
+        for (i, key) in keys.iter().enumerate() {
+            inner
+                .put(
+                    &ds_storage::object_store::path::Path::from(key.as_str()),
+                    PutPayload::from(volume_at("sita", minute(i as i64))),
+                )
+                .await
+                .unwrap();
+        }
+        let counted = Arc::new(CountingStore {
+            inner: inner.clone(),
+            gets: Mutex::default(),
+            fail_first: Mutex::default(),
+            forbidden: Mutex::default(),
+            failing_lists: Mutex::default(),
+        });
+        let store = ds_storage::DataStore::new(counted.clone());
+        let source = Source::Remote {
+            store: store.clone(),
+            endpoint: "test://local".to_string(),
+            bucket: "test".to_string(),
+            prefix_pattern: "trim-1398/".to_string(),
+            time_window: None,
+        };
+        let cache = ParseCache::default();
+        let scan = || {
+            scan_source(
+                "trim-1398",
+                &source,
+                &cache,
+                Some(2),
+                ScanDepth::Full,
+                &Prewarm::default_quantity(0),
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(scan().volumes, 2);
+        let downloaded = store.bytes_read();
+        assert_eq!(downloaded, 5 * COLD_BATCH.len() as u64, "each read once");
+        // A read is two store calls: the size check's HEAD and the GET.
+        let calls = |key: &String| counted.gets(key);
+        let after_first: Vec<usize> = keys.iter().map(calls).collect();
+        assert_eq!(after_first, [2; 5]);
+        for _ in 0..3 {
+            assert_eq!(scan().volumes, 2);
+        }
+        assert_eq!(store.bytes_read(), downloaded, "no download since");
+        let after_more: Vec<usize> = keys.iter().map(calls).collect();
+        assert_eq!(after_more, after_first, "no store call for any of them");
+    }
+
+    /// #1398 and the #573 split layouts: one volume spread over per-sweep
+    /// files under ORD's `{nod}@{stamp}@{angles}@{quantities}.h5` names, in
+    /// which a scan finds no timestamp, so nothing can rank them before
+    /// reading them. `max_files` counts catalog entries, one per file, until
+    /// #573 groups them: the newest entries stay exactly those, also where
+    /// a volume straddles the cap and its files tie on time, and none is
+    /// read twice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn split_volumes_keep_their_newest_files_and_are_read_once() {
+        let name = |stamp: &str, angle: &str| format!("sita@20260814T{stamp}@{angle}@DBZH.h5");
+        assert_eq!(parse_key_timestamp(&name("1200", "0.5")), None);
+        for remote in [false, true] {
+            let rig = ScanRig::new(remote, 4, None);
+            for (stamp, at) in [("1200", 0), ("1205", 5), ("1210", 10)] {
+                for angle in ["0.5", "1.0"] {
+                    rig.write(&name(stamp, angle), "sita", minute(at));
+                }
+            }
+            let first = rig.scan();
+            assert_eq!(rig.reads(), (6, 0), "remote {remote}");
+            assert_eq!(
+                first["sita"],
+                [
+                    name("1205", "0.5"),
+                    name("1205", "1.0"),
+                    name("1210", "0.5"),
+                    name("1210", "1.0"),
+                ]
+            );
+            assert_eq!(rig.scan(), first);
+            assert_eq!(rig.reads(), (6, 0), "remote {remote}: nothing read again");
+
+            // The next volume's first sweep: the cap now cuts a volume.
+            rig.write(&name("1215", "0.5"), "sita", minute(15));
+            assert_eq!(
+                rig.scan()["sita"],
+                [
+                    name("1205", "1.0"),
+                    name("1210", "0.5"),
+                    name("1210", "1.0"),
+                    name("1215", "0.5"),
+                ]
+            );
+            assert_eq!(rig.reads(), (7, 0), "remote {remote}");
+            rig.scan();
+            assert_eq!(rig.reads(), (7, 0), "remote {remote}: nothing read again");
+        }
+    }
+
+    /// #1398: a volume's own time ranks it, not its name: a name's stamp can
+    /// run against it, and a name may have none. Reading each file once is
+    /// all a later scan needs to rank it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_volume_time_ranks_not_the_file_name() {
+        for remote in [false, true] {
+            let rig = ScanRig::new(remote, 2, None);
+            rig.write("209901010000_sita_PVOL.h5", "sita", minute(0));
+            rig.write("200001010000_sita_PVOL.h5", "sita", minute(3));
+            rig.write("unstamped_two.h5", "sita", minute(1));
+            rig.write("unstamped_one.h5", "sita", minute(2));
+            let first = rig.scan();
+            assert_eq!(
+                first["sita"],
+                ["unstamped_one.h5", "200001010000_sita_PVOL.h5"],
+                "remote {remote}"
+            );
+            assert_eq!(rig.reads(), (4, 0), "remote {remote}");
+            assert_eq!(rig.scan(), first);
+            assert_eq!(rig.reads(), (4, 0), "remote {remote}: nothing read again");
+        }
+    }
+
+    /// #1398: a newest file that does not parse takes no place: the site
+    /// keeps `max_files` volumes that do. It is read again by every scan, as
+    /// before, since it may be a publisher's upload still in progress.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broken_newest_file_costs_the_site_no_volume() {
+        for remote in [false, true] {
+            let rig = ScanRig::new(remote, 2, None);
+            rig.write_stamped("sita", 0..4);
+            rig.write_broken(&stamped("sita", minute(9)));
+            let first = rig.scan();
+            assert_eq!(
+                first["sita"],
+                [stamped("sita", minute(2)), stamped("sita", minute(3))],
+                "remote {remote}"
+            );
+            assert_eq!(rig.reads(), (4, 1), "remote {remote}");
+            assert_eq!(rig.scan(), first);
+            assert_eq!(rig.reads(), (4, 2), "remote {remote}: only the broken file");
+
+            // Once complete, it is a new volume like any other.
+            rig.write_stamped("sita", [9]);
+            assert_eq!(
+                rig.scan()["sita"],
+                [stamped("sita", minute(3)), stamped("sita", minute(9))],
+                "remote {remote}"
+            );
+            assert_eq!(rig.reads(), (5, 2), "remote {remote}");
+        }
+    }
+
+    /// #1398: a trimmed volume the catalog has room for again returns within
+    /// the scan that finds the room, read once: only it, and the next one if
+    /// it no longer parses. A volume left out and removed is forgotten, so a
+    /// file back under that name is new.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trimmed_volume_returns_when_the_catalog_has_room() {
+        for remote in [false, true] {
+            let rig = ScanRig::new(remote, 2, None);
+            rig.write_stamped("sita", 0..6);
+            rig.scan();
+            assert_eq!(rig.reads(), (6, 0), "remote {remote}");
+
+            // A kept volume removed: the newest trimmed one takes its place.
+            rig.remove(&stamped("sita", minute(5)));
+            assert_eq!(
+                rig.scan()["sita"],
+                [stamped("sita", minute(3)), stamped("sita", minute(4))],
+                "remote {remote}"
+            );
+            assert_eq!(rig.reads(), (7, 0), "remote {remote}: only that one read");
+
+            // The one to return no longer parses: the next takes its place.
+            rig.write_broken(&stamped("sita", minute(2)));
+            rig.remove(&stamped("sita", minute(4)));
+            assert_eq!(
+                rig.scan()["sita"],
+                [stamped("sita", minute(1)), stamped("sita", minute(3))],
+                "remote {remote}"
+            );
+            assert_eq!(rig.reads(), (8, 1), "remote {remote}");
+
+            // A volume arriving late ranks below what is kept: read once.
+            rig.write("late.h5", "sita", minute(0) - chrono::Duration::minutes(1));
+            rig.scan();
+            assert_eq!(rig.reads(), (9, 2), "remote {remote}");
+            rig.scan();
+            assert_eq!(rig.reads(), (9, 3), "remote {remote}: not read again");
+
+            // A late volume and a removal in one scan: the remembered volume
+            // ranking above the late one returns, and the late one leaves.
+            rig.remove(&stamped("sita", minute(3)));
+            rig.write("later.h5", "sita", minute(0) - chrono::Duration::minutes(2));
+            assert_eq!(
+                rig.scan()["sita"],
+                [stamped("sita", minute(0)), stamped("sita", minute(1))],
+                "remote {remote}"
+            );
+            assert_eq!(rig.reads(), (11, 4), "remote {remote}");
+
+            // Removed while left out, then back under that name with another
+            // time: read as the new file it is.
+            rig.remove("late.h5");
+            rig.scan();
+            rig.write("late.h5", "sita", minute(30));
+            assert_eq!(
+                rig.scan()["sita"],
+                [stamped("sita", minute(1)), "late.h5".to_string()],
+                "remote {remote}"
+            );
+            assert_eq!(rig.reads(), (12, 6), "remote {remote}");
+        }
+    }
+
+    /// #1398 review: a source that reuses fixed names, here overwriting its
+    /// oldest slot on each cycle, must not freeze: a rewritten file is not
+    /// the volume remembered of it, so it is read again, and only it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rewritten_remembered_file_is_read_again() {
+        let slot = |i: usize| format!("slot{i}.h5");
+        for remote in [false, true] {
+            let rig = ScanRig::new(remote, 2, None);
+            for i in 0..4 {
+                rig.write(&slot(i), "sita", minute(i as i64));
+            }
+            assert_eq!(rig.scan()["sita"], [slot(2), slot(3)], "remote {remote}");
+            assert_eq!(rig.reads(), (4, 0), "remote {remote}");
+
+            // Slots 0, 1, 2 and 3 in turn hold the newest volume.
+            let mut newest_two = [slot(3), slot(3)];
+            for write in 0..8 {
+                let at = 10 + write as i64;
+                rig.rewrite(&slot(write % 4), "sita", minute(at));
+                newest_two = [newest_two[1].clone(), slot(write % 4)];
+                assert_eq!(
+                    rig.scan()["sita"],
+                    newest_two,
+                    "remote {remote}, write {write}"
+                );
+                assert_eq!(rig.reads(), (5 + write as u64, 0), "remote {remote}");
+            }
+            rig.scan();
+            assert_eq!(
+                rig.reads(),
+                (12, 0),
+                "remote {remote}: nothing changed, no read"
+            );
+        }
+    }
+
+    /// #1398 review: the version remembered is the one the file was read as.
+    /// One rewritten while the catalog kept it stays frozen in the parse
+    /// cache, as ever, but is not taken for unchanged once it is trimmed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_rewritten_while_kept_is_read_once_it_is_trimmed() {
+        for remote in [false, true] {
+            let rig = ScanRig::new(remote, 2, None);
+            rig.write_stamped("sita", 0..2);
+            rig.write("slot.h5", "sita", minute(2));
+            rig.scan();
+            assert_eq!(rig.reads(), (3, 0), "remote {remote}");
+
+            // Kept: nothing reads it, so the catalog still has its old time.
+            rig.rewrite(&stamped("sita", minute(1)), "sita", minute(9));
+            rig.scan_with(&rig.cache);
+            assert_eq!(rig.reads(), (3, 0), "remote {remote}");
+
+            // Trimmed by two newer volumes, it is known by its old version...
+            rig.write_stamped("sita", [3, 4]);
+            rig.scan_with(&rig.cache);
+            assert_eq!(rig.reads(), (5, 0), "remote {remote}");
+
+            // ...so the next scan reads it, and it ranks by its new time.
+            let catalog = rig.scan();
+            assert_eq!(rig.reads(), (6, 0), "remote {remote}");
+            assert_eq!(
+                catalog["sita"],
+                [stamped("sita", minute(4)), stamped("sita", minute(1))],
+                "remote {remote}"
+            );
+        }
+    }
+
+    /// A source over a counting in-memory store and the parse cache of its
+    /// scans, whose objects are `name`d volumes under their prefixes.
+    struct CountedRig {
+        inner: Arc<ds_storage::object_store::memory::InMemory>,
+        counted: Arc<CountingStore>,
+        source: Source,
+        cache: ParseCache,
+        max_files: usize,
+    }
+
+    impl CountedRig {
+        fn new(prefix_pattern: &str, time_window: Option<&str>, max_files: usize) -> Self {
+            let inner = Arc::new(ds_storage::object_store::memory::InMemory::new());
+            let counted = Arc::new(CountingStore {
+                inner: inner.clone(),
+                gets: Mutex::default(),
+                fail_first: Mutex::default(),
+                forbidden: Mutex::default(),
+                failing_lists: Mutex::default(),
+            });
+            let source = Source::Remote {
+                store: ds_storage::DataStore::new(counted.clone()),
+                endpoint: "test://local".to_string(),
+                bucket: "test".to_string(),
+                prefix_pattern: prefix_pattern.to_string(),
+                time_window: time_window.map(|window| TimeWindow::parse(window).unwrap()),
+            };
+            CountedRig {
+                inner,
+                counted,
+                source,
+                cache: ParseCache::default(),
+                max_files,
+            }
+        }
+
+        async fn put(&self, key: &str, time: DateTime<Utc>) {
+            self.put_for("sita", key, time).await;
+        }
+
+        async fn put_for(&self, nod: &str, key: &str, time: DateTime<Utc>) {
+            use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+            let path = ds_storage::object_store::path::Path::from(key);
+            let bytes = PutPayload::from(volume_at(nod, time));
+            self.inner.put(&path, bytes).await.unwrap();
+        }
+
+        async fn delete(&self, key: &str) {
+            use ds_storage::object_store::ObjectStoreExt;
+            let path = ds_storage::object_store::path::Path::from(key);
+            self.inner.delete(&path).await.unwrap();
+        }
+
+        /// The catalog's file ids for the site, oldest first.
+        fn scan(&self) -> Vec<String> {
+            let mut sites = self.scan_sites(&self.cache);
+            sites.remove("sita").unwrap_or_default()
+        }
+
+        /// Each site's catalogued file ids, oldest first, from a scan through
+        /// `cache`.
+        fn scan_sites(
+            &self,
+            cache: &ParseCache,
+        ) -> std::collections::BTreeMap<String, Vec<String>> {
+            let catalog = scan_source(
+                "counted-rig",
+                &self.source,
+                cache,
+                Some(self.max_files),
+                ScanDepth::Full,
+                &Prewarm::default_quantity(0),
+                None,
+            )
+            .unwrap();
+            catalog
+                .by_site
+                .iter()
+                .map(|(nod, list)| (nod.clone(), list.iter().map(|e| e.id.clone()).collect()))
+                .collect()
+        }
+
+        fn remembered(&self) -> usize {
+            self.cache.left_out.lock().unwrap().len()
+        }
+
+        /// How many of `keys` the store has been asked for, in total.
+        fn calls(&self, keys: &[String]) -> usize {
+            keys.iter().map(|key| self.counted.gets(key)).sum()
+        }
+    }
+
+    /// #1398 review: a remembered file's failed GET ends the passes. Walking
+    /// the memory a file per pass would take a batch's time for each, where a
+    /// scan reading all of it fetches twelve at a time (Critical Rule 9), and
+    /// leave nothing remembered. So only the file that ranks in is tried, and
+    /// it and the rest stay remembered for the next scan, which reads only
+    /// that file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_read_ends_the_passes_and_forgets_nothing() {
+        let rig = CountedRig::new("", None, 1);
+        let keys: Vec<String> = (0..6).map(|i| stamped("sita", minute(i))).collect();
+        for (i, key) in keys.iter().enumerate() {
+            rig.put(key, minute(i as i64)).await;
+        }
+        assert_eq!(rig.scan(), [keys[5].clone()]);
+        assert_eq!(rig.remembered(), 5);
+        let read_all = rig.calls(&keys);
+
+        rig.delete(&keys[5]).await;
+        keys[..5]
+            .iter()
+            .for_each(|key| rig.counted.forbid(key, true));
+        assert!(rig.scan().is_empty(), "as a scan reading everything finds");
+        assert_eq!(rig.remembered(), 5, "nothing forgotten");
+        // The HEAD that the failing store refuses, of the newest alone.
+        assert_eq!(rig.calls(&keys), read_all + 1);
+        assert_eq!(rig.counted.gets(&keys[4]), 2 + 1);
+        assert_eq!(rig.cache.counts.snapshot(0, 0).read_failures, 1);
+
+        // The store recovers: one file read, and the catalog is whole again.
+        keys[..5]
+            .iter()
+            .for_each(|key| rig.counted.forbid(key, false));
+        assert_eq!(rig.scan(), [keys[4].clone()]);
+        assert_eq!(rig.remembered(), 4);
+        assert_eq!(
+            rig.calls(&keys),
+            read_all + 1 + 2,
+            "HEAD and GET of that one"
+        );
+        assert_eq!(rig.cache.counts.snapshot(0, 0).parsed, 7);
+    }
+
+    /// #1398 review: a failed read of a new file says nothing of the volumes
+    /// remembered, so it ends no pass. A quiet radar has no new volume to fill
+    /// its room: one object refused for another radar must not leave it short
+    /// until that key reads or leaves the listing. Every radar is whole on the
+    /// first scan, as a scan with an empty cache finds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_read_of_a_new_file_does_not_stop_volumes_coming_back() {
+        let rig = CountedRig::new("", None, 3);
+        let key = |nod: &str, i: i64| stamped(nod, minute(i));
+        let names = |nod: &str, minutes: &[i64]| -> Vec<String> {
+            minutes.iter().map(|i| key(nod, *i)).collect()
+        };
+        for nod in ["sita", "sitb"] {
+            for i in 0..6 {
+                rig.put_for(nod, &key(nod, i), minute(i)).await;
+            }
+        }
+        let first = rig.scan_sites(&rig.cache);
+        assert_eq!(first["sita"], names("sita", &[3, 4, 5]));
+        assert_eq!(first["sitb"], names("sitb", &[3, 4, 5]));
+        assert_eq!(rig.remembered(), 6);
+
+        // A new radar's object refused; the first radar's kept set and one of
+        // the second's removed.
+        let refused = key("sitc", 9);
+        rig.put_for("sitc", &refused, minute(9)).await;
+        rig.counted.forbid(&refused, true);
+        for i in 3..6 {
+            rig.delete(&key("sita", i)).await;
+        }
+        rig.delete(&key("sitb", 5)).await;
+
+        let catalog = rig.scan_sites(&rig.cache);
+        assert_eq!(catalog.get("sita"), Some(&names("sita", &[0, 1, 2])));
+        assert_eq!(catalog.get("sitb"), Some(&names("sitb", &[2, 3, 4])));
+        assert_eq!(catalog, rig.scan_sites(&ParseCache::default()));
+        let counts = rig.cache.counts.snapshot(0, 0);
+        assert_eq!((counts.parsed, counts.read_failures), (16, 1), "{counts:?}");
+
+        // The refused object is read again by each scan, and nothing else.
+        assert_eq!(rig.scan_sites(&rig.cache), catalog);
+        let counts = rig.cache.counts.snapshot(0, 0);
+        assert_eq!((counts.parsed, counts.read_failures), (16, 2), "{counts:?}");
+
+        rig.counted.forbid(&refused, false);
+        assert_eq!(rig.scan_sites(&rig.cache)["sitc"], [refused]);
+    }
+
+    /// #1398 review: what a failed read of a remembered file costs: its radar a
+    /// slot until the file reads or leaves the listing, since the next older
+    /// volume is not tried. Other radars stay whole, their files being read in
+    /// the same pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_remembered_file_costs_only_its_radar_a_slot() {
+        let rig = CountedRig::new("", None, 2);
+        let key = |nod: &str, i: i64| stamped(nod, minute(i));
+        for nod in ["sita", "sitb"] {
+            for i in 0..4 {
+                rig.put_for(nod, &key(nod, i), minute(i)).await;
+            }
+        }
+        rig.scan_sites(&rig.cache);
+        rig.delete(&key("sita", 3)).await;
+        rig.delete(&key("sitb", 3)).await;
+        rig.counted.forbid(&key("sita", 1), true);
+        let older = rig.counted.gets(&key("sita", 0));
+
+        for _ in 0..2 {
+            let catalog = rig.scan_sites(&rig.cache);
+            assert_eq!(catalog["sita"], [key("sita", 2)], "a slot short");
+            assert_eq!(catalog["sitb"], [key("sitb", 1), key("sitb", 2)], "whole");
+        }
+        assert_eq!(
+            rig.counted.gets(&key("sita", 0)),
+            older,
+            "the next not tried"
+        );
+        assert_eq!(
+            rig.remembered(),
+            3,
+            "`sita`'s two, the refused one too, and `sitb`'s"
+        );
+
+        // It leaves the listing: the next older takes the slot.
+        rig.delete(&key("sita", 1)).await;
+        let catalog = rig.scan_sites(&rig.cache);
+        assert_eq!(catalog["sita"], [key("sita", 0), key("sita", 2)]);
+    }
+
+    /// #1398 review: a local read that fails moves on to the next file, since
+    /// local reads are one at a time whatever the scan does, and a file left
+    /// unreadable must not hold a slot open. It stays remembered, and returns
+    /// once it can be read.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_local_read_moves_on_to_the_next_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let rig = ScanRig::new(false, 1, None);
+        rig.write_stamped("sita", 0..3);
+        rig.scan();
+        let unreadable = rig.dir.path().join(stamped("sita", minute(1)));
+        let set_mode = |mode: u32| {
+            let permissions = std::fs::Permissions::from_mode(mode);
+            std::fs::set_permissions(&unreadable, permissions).unwrap();
+        };
+        set_mode(0o000);
+        if std::fs::read(&unreadable).is_ok() {
+            eprintln!("skipping: this user can read a file with no permissions");
+            return;
+        }
+        rig.remove(&stamped("sita", minute(2)));
+        assert_eq!(rig.scan()["sita"], [stamped("sita", minute(0))]);
+        assert_eq!(rig.reads(), (4, 0));
+        assert_eq!(rig.cache.left_out.lock().unwrap().len(), 1);
+
+        set_mode(0o644);
+        assert_eq!(rig.scan()["sita"], [stamped("sita", minute(1))]);
+        assert_eq!(rig.reads(), (5, 0));
+    }
+
+    /// #1398 review: a failed LIST of one prefix says nothing of its files:
+    /// what is remembered of them stays, so the next clean scan reads only
+    /// what the catalog held there, not the whole prefix again. A clean
+    /// listing then forgets what is really gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_list_forgets_nothing_it_did_not_list() {
+        let now = Utc::now();
+        let day = |back: i64| now - chrono::Duration::days(back);
+        // Two days inside the window, whichever day the test runs across.
+        let prefix = |back: i64| day(back).format("%Y%m%d").to_string();
+        let key = |back: i64, i: i64| {
+            let at = day(back) + chrono::Duration::minutes(i);
+            format!("{}/{}", prefix(back), stamped("sita", at))
+        };
+        let rig = CountedRig::new("%Y%m%d/", Some("-P3D"), 2);
+        for back in [1, 2] {
+            for i in 0..5 {
+                let at = day(back) + chrono::Duration::minutes(i);
+                rig.put(&key(back, i), at).await;
+            }
+        }
+        let parsed = || rig.cache.counts.snapshot(0, 0).parsed;
+        assert_eq!(rig.scan(), [key(1, 3), key(1, 4)]);
+        assert_eq!((parsed(), rig.remembered()), (10, 8));
+
+        // Yesterday's LIST fails: the catalog is the older day's newest, as a
+        // scan reading everything finds, and yesterday's memory stays.
+        let failing = prefix(1);
+        rig.counted
+            .failing_lists
+            .lock()
+            .unwrap()
+            .insert(failing.clone());
+        assert_eq!(rig.scan(), [key(2, 3), key(2, 4)]);
+        assert_eq!(parsed(), 12);
+        assert_eq!(rig.remembered(), 6, "3 of the older day, 3 of yesterday");
+
+        // Removed meanwhile: consulted only through a listed file, so harmless.
+        rig.delete(&key(1, 0)).await;
+        rig.counted.failing_lists.lock().unwrap().remove(&failing);
+
+        // Back: only yesterday's two the catalog had are read.
+        assert_eq!(rig.scan(), [key(1, 3), key(1, 4)]);
+        assert_eq!(parsed(), 14, "not yesterday's whole prefix");
+        assert_eq!(
+            rig.remembered(),
+            7,
+            "the clean listing forgot the one removed"
+        );
+    }
+
+    /// #1398: a remembered volume outside the window waits there and returns
+    /// once the window reaches it (a clock ahead of ours stamps a volume in
+    /// the future). The newest of what is known fills the slots, not simply
+    /// the newest remembered, and without a cap everything in the window does.
+    #[test]
+    fn a_remembered_volume_ranks_against_the_held_and_the_window() {
+        let remembered = |at: i64, name: &str, nod: &str| {
+            let file = PendingFile {
+                id: name.to_string(),
+                spec: FetchSpec::Local(PathBuf::from(name)),
+                version: ObjectVersion::sized(1),
+            };
+            let volume = LeftOut {
+                nod: nod.to_string(),
+                time: minute(at),
+                version: None,
+            };
+            (file, volume)
+        };
+        let held = |at: i64, id: &str| {
+            let mut volume = synthetic_volume(25.0, 60.0);
+            volume.time = minute(at);
+            entry(volume, id)
+        };
+        let mut by_site = HashMap::new();
+        by_site.insert("sita".to_string(), vec![held(5, "e"), held(1, "a")]);
+        let mut unread = vec![
+            remembered(2, "b", "sita"),
+            remembered(3, "c", "sita"),
+            remembered(9, "other", "sitb"),
+            remembered(60, "future", "sita"),
+        ];
+        let names = |files: Vec<(PendingFile, LeftOut)>| {
+            let mut names: Vec<String> = files.into_iter().map(|(f, _)| f.id).collect();
+            names.sort();
+            names
+        };
+
+        // Only `future` outranks what is held and `c`, but it is out of the
+        // window; `other` has its site to itself.
+        let window = Some((minute(0), minute(10)));
+        let back = back_in_catalog(&by_site, &mut unread, Some(2), window);
+        assert_eq!(names(back), ["c", "other"]);
+        assert_eq!(unread.len(), 2);
+
+        // The window reaches it: it takes a slot from what is held.
+        let window = Some((minute(0), minute(70)));
+        let back = back_in_catalog(&by_site, &mut unread, Some(2), window);
+        assert_eq!(names(back), ["future"]);
+        assert_eq!(unread.len(), 1);
+
+        // A tie on time ranks by id, as `derive_catalog` cuts it.
+        let mut ties = vec![remembered(5, "d", "sita"), remembered(5, "f", "sita")];
+        let back = back_in_catalog(&by_site, &mut ties, Some(1), None);
+        assert_eq!(names(back), ["f"]);
+        let mut by_cut = HashMap::new();
+        by_cut.insert(
+            "sita".to_string(),
+            vec![held(5, "f"), held(5, "e"), held(5, "d")],
+        );
+        let catalog = derive_catalog(by_cut, &ParseCache::default(), Some(1));
+        assert_eq!(catalog.by_site["sita"][0].id, "f");
+
+        // No cap: every remembered volume has room.
+        let back = back_in_catalog(&by_site, &mut unread, None, None);
+        assert_eq!(names(back), ["b"]);
+        assert!(unread.is_empty());
+    }
+
+    /// #1398: the memory holds only what the source still lists and the
+    /// catalog leaves out, and survives a scan that cannot list the source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_memory_follows_the_listing() {
+        let remembered = |rig: &ScanRig| rig.cache.left_out.lock().unwrap().len();
+        let rig = ScanRig::new(false, 2, None);
+        rig.write_stamped("sita", 0..5);
+        rig.scan();
+        assert_eq!(remembered(&rig), 3);
+
+        rig.remove(&stamped("sita", minute(0)));
+        rig.scan();
+        assert_eq!(remembered(&rig), 2, "no longer listed");
+
+        rig.remove(&stamped("sita", minute(4)));
+        rig.scan();
+        assert_eq!(remembered(&rig), 1, "back in the catalog");
+
+        // A scan that fails to list leaves it as it was.
+        let root = rig.dir.path().to_path_buf();
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let failed = scan_source(
+            "scan-rig",
+            &rig.source,
+            &rig.cache,
+            Some(2),
+            ScanDepth::Full,
+            &Prewarm::default_quantity(0),
+            None,
+        );
+        std::fs::rename(&moved, &root).unwrap();
+        assert!(failed.is_err());
+        assert_eq!(remembered(&rig), 1);
+        let before = rig.reads();
+        rig.scan();
+        assert_eq!(rig.reads(), before, "nothing read again");
+    }
+
+    /// #1398: `time_window` and `max_files` together. A volume outside the
+    /// window never returns, however much room the cap has. One its name
+    /// cannot rule out is read once: only reading it says what time it holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn time_window_and_max_files_bound_the_catalog_together() {
+        for remote in [false, true] {
+            let now = Utc::now();
+            let ago = |minutes: i64| now - chrono::Duration::minutes(minutes);
+            let rig = ScanRig::new(remote, 2, Some("-PT1H"));
+            let name = |minutes: i64| stamped("sita", ago(minutes));
+            for minutes in [10, 20, 30, 40, 180] {
+                rig.write(&name(minutes), "sita", ago(minutes));
+            }
+            rig.write("unstamped_old.h5", "sita", ago(240));
+            let first = rig.scan();
+            assert_eq!(first["sita"], [name(20), name(10)], "remote {remote}");
+            // The four in the window, and the one its name cannot rule out;
+            // the name of the one at 180 minutes rules it out unread.
+            assert_eq!(rig.reads(), (5, 0), "remote {remote}");
+            assert_eq!(rig.scan(), first);
+            assert_eq!(rig.reads(), (5, 0), "remote {remote}: nothing read again");
+
+            rig.remove(&name(10));
+            assert_eq!(rig.scan()["sita"], [name(30), name(20)], "remote {remote}");
+            assert_eq!(
+                rig.reads(),
+                (6, 0),
+                "remote {remote}: the one at 30 minutes"
+            );
+
+            // Room for two, one volume left in the window.
+            rig.remove(&name(20));
+            rig.remove(&name(30));
+            assert_eq!(rig.scan()["sita"], [name(40)], "remote {remote}");
+            assert_eq!(
+                rig.reads(),
+                (7, 0),
+                "remote {remote}: the one at 40 minutes"
+            );
+        }
     }
 }

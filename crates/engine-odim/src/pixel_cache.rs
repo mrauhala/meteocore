@@ -501,8 +501,8 @@ impl PixelCache {
     /// Whether `(file_id, dataset_path)` is already resident — a presence
     /// check that, unlike [`Self::get`], does **not** count a hit or bump LRU
     /// recency. Used by the poll-time pre-warm to skip re-decoding a moment
-    /// that is already cached (e.g. a beyond-`max_files` volume re-fetched on a
-    /// later poll) without polluting the hit metric or keeping evicted volumes
+    /// that is already cached (e.g. a volume read again by a reload's new
+    /// engine) without polluting the hit metric or keeping evicted volumes
     /// artificially warm. Always `false` when disabled (`capacity_mb == 0`).
     pub fn contains(&self, file_id: &str, dataset_path: &str) -> bool {
         if self.inner.capacity_bytes() == 0 {

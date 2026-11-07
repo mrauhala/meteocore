@@ -123,6 +123,10 @@ pub struct PolarVolume {
     pub sweeps: Vec<Sweep>,
     /// Length of the file the volume was read from, in bytes.
     pub(crate) file_len: u64,
+    /// That file as the source listed it when a scan read it: what tells a
+    /// later listing whether a volume left out of the catalog is still that
+    /// file (#1398). `None` until a scan sets it, as parsing cannot know it.
+    pub(crate) version: Option<ds_storage::ObjectVersion>,
 }
 
 impl HeapSize for RadarSite {
@@ -150,7 +154,10 @@ impl HeapSize for Sweep {
 impl HeapSize for PolarVolume {
     /// The parsed metadata a catalog keeps per volume (#1307): no pixels.
     fn heap_size(&self) -> usize {
-        self.site.heap_size() + self.object.heap_size() + self.sweeps.heap_size()
+        self.site.heap_size()
+            + self.object.heap_size()
+            + self.sweeps.heap_size()
+            + self.version.as_ref().map_or(0, |v| v.e_tag.heap_size())
     }
 }
 
@@ -297,6 +304,7 @@ pub fn read_polar_volume(bytes: &Bytes) -> Result<PolarVolume, ReadError> {
         object,
         sweeps,
         file_len: bytes.len() as u64,
+        version: None,
     })
 }
 
