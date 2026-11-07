@@ -3292,6 +3292,21 @@ mod range_tests {
         }
     }
 
+    /// A line another thread reached first, with no subscriber, during the
+    /// capture is still captured (#1414). No other test reaches this line's
+    /// callsite, so the order is this test's own.
+    #[test]
+    fn a_capture_keeps_a_line_another_thread_reached_first() {
+        fn line() {
+            tracing::info!("line");
+        }
+        let lines = logged(|| {
+            std::thread::spawn(line).join().unwrap();
+            line();
+        });
+        assert_eq!(lines.len(), 1, "{lines:#?}");
+    }
+
     /// A remote store's `store` label is the server's or the bucket
     /// endpoint's host and port, and the bucket: never credentials, a path
     /// or a query string. A local store has none.
