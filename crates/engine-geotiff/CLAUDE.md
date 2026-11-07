@@ -434,6 +434,15 @@ depends on the kind:
   would empty the catalog. A WARN at most once a minute per collection
   (`gone::ForbiddenWarnings`); `note_object_health` runs before an EDR
   query returns the error, and from the drop guard on the map path.
+- **Local files (#234):** never take this path, and have no
+  `ObjectHealth`. The scan maps every file it catalogues (#204) and every
+  read uses that mapping, never the path: map renders, the u8 fast path,
+  overviews and EDR. A file deleted after the scan serves the bytes
+  catalogued, without error, until the next scan, whose listing leaves it
+  out; a file re-created under its name is a new file. A permission change
+  after the scan changes nothing. `local_removal_tests` pins this: a change
+  that opens the path per read brings back #234's per-request `Cannot
+  open` error, and must give local files the gone path first.
 
 ## Rendering gotchas (hard-won)
 

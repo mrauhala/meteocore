@@ -7,6 +7,8 @@ mod footprint_tests;
 mod gone;
 #[cfg(test)]
 mod gone_object_tests;
+#[cfg(all(test, unix))]
+mod local_removal_tests;
 mod parse;
 mod prewarm;
 #[cfg(test)]
