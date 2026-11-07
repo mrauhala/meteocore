@@ -7,8 +7,8 @@ type: application
 # Both follow the server's version (crates/server/Cargo.toml). The release
 # pipeline bumps them in the release PR and publishes the chart with the
 # release (.github/workflows/release.yml, #1365).
-version: 0.14.0
-appVersion: "0.14.0"
+version: 0.15.0
+appVersion: "0.15.0"
 home: https://github.com/mrauhala/meteocore
 sources:
   - https://github.com/mrauhala/meteocore
