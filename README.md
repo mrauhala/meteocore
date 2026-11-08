@@ -494,7 +494,8 @@ service, take (#946):
   or a subset entirely outside the time axis, is an empty tile: `204 No
   Content`. `datetime` with a time subset, or any other subset axis, is a 400.
   `OGCAPI-datetime` names the instant rendered. Only an instant the engine
-  draws exactly marks a tile `immutable`; a snapped one revalidates.
+  draws exactly marks a tile `immutable`; a snapped one revalidates, and so
+  does every instant of an engine with model runs, since Tiles names no run.
 - **Size** (Maps Scaling, which Map Tilesets requires on map tiles):
   `width` and `height` override the tile matrix's 256 × 256 over the same tile
   area (one alone keeps square pixels); `scale-denominator` derives the size
@@ -2748,7 +2749,7 @@ PNG/WebP responses are RGBA, transparent where there is no data unless the backg
 - `Content-Bbox:` the rendered frame's corners, in the output CRS's axis order
 - `Content-Datetime:` the instant rendered, on a collection with a temporal extent
 - `ETag:` FNV-1a hash of the encoded response body — changes whenever the rendered pixels change, regardless of whether the cache key changed. This is what makes a server-side fix (e.g. colormap correction) invalidate stale browser caches instead of letting them serve infinite `304`s.
-- `Cache-Control: public, max-age=86400, immutable` when the engine draws exactly the instant requested; `public, max-age=60, must-revalidate` otherwise, an instant snapped to another time step, intervals and `*` included
+- `Cache-Control: public, max-age=86400, immutable` when the engine draws exactly the instant requested, from an engine without model runs; `public, max-age=60, must-revalidate` otherwise, an instant snapped to another time step, intervals, `*` and every instant of an engine with model runs included (Maps names no run, and a newer run re-covers the instant)
 - `X-Cache: HIT | MISS | EMPTY | ERROR` for observability. Set on every 200 and 304 response: `HIT` for cache-hit revalidations, `MISS` for post-render revalidations, `EMPTY` for empty-image fast-paths, `ERROR` for the WMS error-tile fallback. The 304 carries the same label the 200 would, so revalidations stay in their original dashboard category. Operators can grep by value rather than reasoning about header absence.
 
 `If-None-Match` is evaluated against the content-derived ETag from the cache hit or the freshly-rendered bytes — not before the cache lookup. An overloaded render semaphore returns `503 Service Unavailable` with the fixed body `{"code":"ServerBusy","description":"Server busy, try again later"}`. Internal errors return 500 with a redacted body; the original detail is captured via `tracing::warn!` for operators.
@@ -2867,13 +2868,13 @@ A fullscreen WMS client requests an arbitrary bbox + size per pan/zoom, so the T
 
 | Scenario | Cache-Control | ETag |
 |----------|---------------|------|
-| Request with a timestamp the engine draws exactly | `public, max-age=86400, immutable` | Yes |
-| Request without timestamp (latest), or with one snapped to another time step | `public, max-age=60, must-revalidate` | Yes |
-| GetFeatureInfo | As a map request: `immutable` only with a timestamp the engine draws exactly on content it never revises, and only for an answer; a null value or band, or no feature, revalidates | No |
+| Request with a timestamp the engine draws exactly, from a fixed run | `public, max-age=86400, immutable` | Yes |
+| Request without timestamp (latest), with one snapped to another time step, or on a layer with model runs without a `DIM_REFERENCE_TIME` it draws | `public, max-age=60, must-revalidate` | Yes |
+| GetFeatureInfo | As a map request: `immutable` only with a timestamp the engine draws exactly from a fixed run on content it never revises, and only for an answer; a null value or band, or no feature, revalidates | No |
 | GetLegendGraphic | `public, max-age=86400, immutable` | No |
 | Metadata endpoints | No cache headers | No |
 
-The URL of a snapped timestamp draws another frame once one lands or the window slides, so it stays revalidating. The header is each request's own: a snapped and an exact request share the step's cached image.
+The URL of a snapped timestamp draws another frame once one lands or the window slides, so it stays revalidating. A run is fixed when the engine keeps none, or when `DIM_REFERENCE_TIME` names the run the engine draws: without one, a newer forecast run or nowcast generation re-covers the timestamp. The header is each request's own: a snapped and an exact request share the step's cached image.
 
 ## OpenAPI and Swagger UI
 

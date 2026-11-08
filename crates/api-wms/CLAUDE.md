@@ -236,16 +236,24 @@ error images never are. Measured on a day of a live deployment's GetMaps
   `InvalidDimensionValue`, `TIME` passed to every layer. Without `TIME`
   each layer defaults and snaps its own (`resolve_layer`) and keys its own
   time, run, level and content version. `Cache-Control` is `immutable`
-  only when every layer draws exactly the `TIME` it took
-  (`ResolvedLayer::exact_time`) and every content version is 0.
-- **`Cache-Control` follows the time drawn (#1415).** `exact_time` is
-  `api_common::subset::is_exact_time(TIME, resolve_parameter_time(..))`, on the
-  parameter's or composite's own axis, compared as `DateTime<Utc>` so
-  `...+02:00` naming a step stays pinned. A snapped `TIME` keeps its frame but
-  gets the short header: its URL draws another frame once one lands or the
-  window slides. `resolve_layer` computes it per request and nothing stores
-  it: the caches key on the resolved time, so a snapped and an exact request
-  share one entry and each sends its own header, on a hit and a 304 too.
+  only when every layer draws exactly the `TIME` it took from a fixed run
+  (`ResolvedLayer::pinned`) and every content version is 0.
+- **`Cache-Control` follows the time and run drawn (#1415, #1421).**
+  `pinned` is `api_common::subset::is_exact_time(TIME,
+  resolve_parameter_time(..))`, on the parameter's or composite's own axis,
+  compared as `DateTime<Utc>` so `...+02:00` naming a step stays pinned, AND
+  `api_common::subset::is_fixed_run(info.reference_times,
+  DIM_REFERENCE_TIME, resolve_parameter_reference_time(..))`: a layer
+  without runs, or one drawing the run the request named. A snapped `TIME`
+  keeps its frame but gets the short header: its URL draws another frame
+  once one lands or the window slides. So does a `TIME` on a layer with runs
+  and no `DIM_REFERENCE_TIME`: a newer run or nowcast generation re-covers
+  the valid time. The run is compared as named, before the latest is
+  normalised to `None`, so a named latest run the engine draws stays pinned
+  and one it falls back from (GRIB's cross-run fallback) does not.
+  `resolve_layer` computes it per request and nothing stores it: the caches
+  key on the resolved time and run, so a snapped and an exact request share
+  one entry and each sends its own header, on a hit and a 304 too.
 
 ## RGB composite layers (#819)
 
@@ -525,8 +533,8 @@ compares them). Never unwrap it to `f64` on the way out.
   label and value (`check_geo_safety.sh` rejects hand-built markup in this
   crate).
 - **Caching.** `cache_control_value`, as GetMap: `immutable` only for a
-  `TIME` every queried layer draws exactly (`exact_time`, #1415), with
-  `content_version` 0, and only for an
+  `TIME` every queried layer draws exactly from a fixed run (`pinned`,
+  #1415, #1421), with `content_version` 0, and only for an
   answer: every value and band non-null, or at least one feature. An empty
   answer always revalidates: GeoTIFF and GRIB answer a failed
   read with a null sample, except a GRIB read the store kept refusing,

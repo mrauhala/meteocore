@@ -3718,6 +3718,47 @@ async fn getmap_explicit_latest_pin_keeps_fallback_resolution() {
     );
 }
 
+/// #1421: on an engine that retains runs, an exact `TIME` is `immutable`
+/// only under a `DIM_REFERENCE_TIME` the engine draws. Without one the
+/// layer draws the latest run now, and a newer run re-covers the valid time
+/// later. The current latest run, named, is fixed when drawn (it is
+/// normalised before resolution), but not when the engine falls back to an
+/// older run for it: the URL then draws the named run once it covers the
+/// valid time.
+#[tokio::test]
+async fn only_a_named_run_drawn_is_immutable() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    async fn cache_control(app: &axum::Router, run: &str) -> String {
+        let uri = format!("{FC_GETMAP_URI}&TIME=2026-06-07T00:00:00Z{run}");
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{run}");
+        resp.headers()[axum::http::header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+    const OLDER: &str = "&DIM_REFERENCE_TIME=2026-06-07T00:00:00Z";
+    const LATEST: &str = "&DIM_REFERENCE_TIME=2026-06-07T12:00:00Z";
+
+    let (app, _) = build_forecast_router();
+    for (run, expected) in [("", SHORT), (OLDER, IMMUTABLE), (LATEST, IMMUTABLE)] {
+        assert_eq!(cache_control(&app, run).await, expected, "{run}");
+    }
+
+    let fallback = build_forecast_router_with_engine(Arc::new(FallbackForecastMockMapEngine {
+        calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+    }));
+    for (run, expected) in [("", SHORT), (OLDER, IMMUTABLE), (LATEST, SHORT)] {
+        assert_eq!(
+            cache_control(&fallback, run).await,
+            expected,
+            "fallback {run}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-parameter styles: GetLegendGraphic + GetCapabilities
 // ---------------------------------------------------------------------------

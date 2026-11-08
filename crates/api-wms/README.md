@@ -166,8 +166,8 @@ lightning events, station symbols, radar volumes.
 - **Caching.** Each layer reads and fills its own meta-tiles, the ones a
   GetMap of that layer alone uses. The combined image is never in the
   rendered-image cache, and its `Cache-Control` is `immutable` only when
-  every layer draws exactly the `TIME`, over content its engine never
-  revises in place.
+  every layer draws exactly the `TIME` from a fixed run, over content its
+  engine never revises in place.
 - **WebP quality.** Without `QUALITY`, WebP is lossy only when every listed
   collection sets `[wms] webp_quality`, at the highest of them.
 
@@ -449,8 +449,8 @@ server log, at WARN for the last.
 
 | Response | `Cache-Control` |
 |---|---|
-| GetMap with a `TIME` the engine draws exactly, on content never revised in place | `public, max-age=86400, immutable` |
-| GetMap otherwise (no `TIME`, a `TIME` snapped to another time step, CAP alerts, BUFR and PostGIS station symbols, station grids, the error image) | `public, max-age=60, must-revalidate` |
+| GetMap with a `TIME` the engine draws exactly from a fixed run, on content never revised in place | `public, max-age=86400, immutable` |
+| GetMap otherwise (no `TIME`, a `TIME` snapped to another time step, a layer with model runs and no `DIM_REFERENCE_TIME` it draws, CAP alerts, BUFR and PostGIS station symbols, PostGIS lightning until an hour before the newest strike, station grids, the error image) | `public, max-age=60, must-revalidate` |
 | GetFeatureInfo | As GetMap, and an empty answer (a null value or band, no feature) always revalidates |
 | GetLegendGraphic | `public, max-age=86400` |
 
@@ -460,6 +460,13 @@ lands or the window slides, so it revalidates. `TIME` is compared as an
 instant, not as text: a step written with an offset is exact. The header is
 each request's own: a snapped and an exact request share the step's cached
 image.
+
+On a layer with model runs (GRIB, QueryData, Zarr and NetCDF forecasts,
+nowcast generations), a `TIME` is drawn from the run the engine picks, and a
+newer run re-covers it, so it revalidates unless `DIM_REFERENCE_TIME` names
+the run drawn. Naming the latest run keeps it pinned while the engine draws
+that run; a valid time the named run does not cover yet, which GRIB draws
+from an older run, revalidates.
 
 ## Limits and admission
 

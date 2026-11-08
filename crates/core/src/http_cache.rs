@@ -28,8 +28,10 @@ pub const CACHE_CONTROL_SETTLED: &str = "public, max-age=86400";
 /// considered settled. Sized for late-arriving observations: real-time obs
 /// typically land within minutes; an hour covers the common stragglers.
 /// (Later QC revisions are accepted staleness — capped by the one-day
-/// `max-age` in [`CACHE_CONTROL_SETTLED`].)
-fn settled_horizon() -> Duration {
+/// `max-age` in [`CACHE_CONTROL_SETTLED`].) Also how far before its newest
+/// strike a PostGIS lightning map frame must end before it is settled, and
+/// may be `immutable` (#1421).
+pub fn settled_horizon() -> Duration {
     Duration::hours(1)
 }
 

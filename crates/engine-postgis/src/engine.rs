@@ -2784,6 +2784,59 @@ mod tests {
         assert!(events.layer_shows_values(crate::maps::LIGHTNING_AGE_PARAMETER));
     }
 
+    /// #1421: an events frame keeps version `0`, which lets the API layers
+    /// pin an exact `TIME` `immutable`, only once it is settled: its window
+    /// ends an hour or more before the newest strike the snapshot holds. The
+    /// table's writer can insert strikes late and out of order, so a frame
+    /// within that hour, at the newest step, past the newest strike or in the
+    /// future keeps a nonzero version and is sent short. With no strikes
+    /// yet, nothing is settled. A settled frame's version never moves again,
+    /// so its cached renders stay put.
+    #[test]
+    fn only_a_settled_events_frame_keeps_version_zero() {
+        use ds_core::map_engine::MapEngine;
+        let at = |s: &str| -> DateTime<Utc> { s.parse().unwrap() };
+        let cfg = events_engine_config();
+        let engine = engine_with(cfg.clone());
+        // The version the API layers key a request for `time` on.
+        let version = |time: &str| {
+            let end = engine.resolve_parameter_time(None, Some(at(time)), None);
+            engine.content_version_for(None, end, None, None)
+        };
+        assert_ne!(version("2026-07-10T00:00:00Z"), 0, "no strikes yet");
+
+        let newest = at("2026-07-11T20:20:37Z");
+        engine.cache().store(CollectionMeta::build(
+            &cfg,
+            crate::metadata::LocationSet::default(),
+            crate::metadata::TemporalRead {
+                extent: Some((newest - chrono::Duration::days(3), newest)),
+                future_latest: None,
+            },
+            1,
+        ));
+        for (time, settled) in [
+            // Older than the advertised axis, on it, an hour before the
+            // newest strike, and one floored there.
+            ("2026-07-10T00:00:00Z", true),
+            ("2026-07-11T18:00:00Z", true),
+            ("2026-07-11T19:20:00Z", true),
+            ("2026-07-11T19:20:59Z", true),
+            // Within the hour, the newest step, past the newest strike.
+            ("2026-07-11T19:21:00Z", false),
+            ("2026-07-11T20:20:00Z", false),
+            ("2026-07-11T20:21:00Z", false),
+            ("2026-07-12T06:00:00Z", false),
+        ] {
+            assert_eq!(version(time) == 0, settled, "{time}");
+        }
+        // Without TIME: the newest step, never settled.
+        assert_ne!(
+            engine.content_version_for(None, engine.resolve_time(None, None), None, None),
+            0
+        );
+    }
+
     /// #1063, #507: a station layer renders the instant `resolve_time` and
     /// `resolve_parameter_time` key the caches on — the latest advertised
     /// step without `TIME`, the `[postgis.map] time_step` an explicit one

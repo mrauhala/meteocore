@@ -117,10 +117,14 @@ tiles, with the Scaling and Background parameters.
   CRS's axis order), `Content-Datetime` (the instant rendered, on collections
   with a time axis), `ETag` and `x-cache` (`HIT`, `MISS` or `EMPTY`).
   `Cache-Control` is `public, max-age=86400, immutable` for an instant the
-  engine draws exactly, on content it never revises in place, and
-  `public, max-age=60, must-revalidate` otherwise: no time, an interval even
-  when closed, or an instant snapped to another time step, whose URL draws
-  another frame once one lands or the window slides. Instants are compared,
+  engine draws exactly, from an engine without model runs, on content it
+  never revises in place, and `public, max-age=60, must-revalidate`
+  otherwise: no time, an interval even when closed, an instant snapped to
+  another time step, whose URL draws another frame once one lands or the
+  window slides, or an instant of an engine that keeps model runs (GRIB,
+  QueryData, Zarr and NetCDF forecasts, nowcast generations): Maps names no
+  run, and a newer run re-covers the instant. A PostGIS lightning frame is
+  revised until an hour before the newest strike. Instants are compared,
   not their text, so a step written with an offset is exact. The header is
   each request's own: a snapped and an exact request share the step's cached
   image.
