@@ -357,13 +357,14 @@ fn edr_query_area_returns_grid() {
 }
 
 /// An unbounded area query (`datetime = None`) over a catalog with more
-/// entries than the shared area budget allows (65 timesteps × 256 × 256
-/// cells ≫ `MAX_AREA_VALUES`, #673) is rejected with a `400`-class error
-/// rather than allocating a hundreds-of-MB coverage cube. Builds a 65-file
-/// catalog by copying the DMI fixture to distinct 5-minute-spaced
-/// timestamps.
+/// entries than the shared area budget allows at the composite's
+/// resolution (65 timesteps × the native cells ≫ `MAX_AREA_VALUES`, #673)
+/// is coarsened evenly to fit and says so (#1436), rather than allocating a
+/// hundreds-of-MB coverage cube or refusing a request a coarser grid
+/// serves; a narrow window is native again. Builds a 65-file catalog by
+/// copying the DMI fixture to distinct 5-minute-spaced timestamps.
 #[test]
-fn edr_query_area_rejects_too_many_timesteps() {
+fn edr_query_area_coarsens_too_many_timesteps_to_fit() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let src = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../testdata/odim-dmi-fixture.h5")
@@ -407,26 +408,47 @@ fn edr_query_area_rejects_too_many_timesteps() {
     )
     .expect("engine builds over the 65-file catalog");
 
-    // No datetime filter → all 65 entries → over the budget → error.
-    let err = engine
-        .query_area("9.0,55.0,12.0,57.5", None, None, None, None)
-        .unwrap_err();
-    assert!(
-        matches!(err, ds_core::error::DataServerError::QueryTooLarge(_))
-            && format!("{err}").contains("65 timesteps"),
-        "expected the shared area-budget error, got: {err}"
-    );
+    let grid = |datetime| {
+        let Ok(CoverageResponse::Single(qr)) =
+            engine.query_area("9.0,55.0,12.0,57.5", datetime, None, None, None)
+        else {
+            panic!("the area is answered");
+        };
+        let DomainDescription::Grid {
+            x, y, t, coarsened, ..
+        } = qr.domain
+        else {
+            panic!("expected a Grid");
+        };
+        let steps = t.expect("a t axis").len();
+        assert_eq!(
+            qr.ranges["reflectivity"].shape,
+            vec![steps, y.len(), x.len()]
+        );
+        (steps, x.len() * y.len(), coarsened)
+    };
 
-    // A narrow datetime range keeps it under the budget → succeeds.
+    // A narrow datetime range fits at the composite's resolution.
     use chrono::{TimeZone, Utc};
     let start = Utc.with_ymd_and_hms(2026, 5, 14, 0, 0, 0).unwrap();
-    let end = Utc.with_ymd_and_hms(2026, 5, 14, 0, 30, 0).unwrap();
-    assert!(
-        engine
-            .query_area("9.0,55.0,12.0,57.5", Some((start, end)), None, None, None)
-            .is_ok(),
-        "a 7-timestep window must stay under the budget"
-    );
+    let end = Utc.with_ymd_and_hms(2026, 5, 14, 0, 10, 0).unwrap();
+    let (steps, native_cells, coarsened) = grid(Some((start, end)));
+    assert_eq!(steps, 3);
+    assert!(coarsened.is_none(), "native: {coarsened:?}");
+    assert!(65 * native_cells > ds_core::feature::MAX_AREA_VALUES);
+
+    // No datetime filter → all 65 entries → coarsened to fit the budget.
+    let (steps, cells, coarsened) = grid(None);
+    assert_eq!(steps, 65);
+    assert!(steps * cells <= ds_core::feature::MAX_AREA_VALUES);
+    assert!(cells < native_cells, "{cells} vs {native_cells}");
+    let resolution = coarsened.expect("says it was coarsened");
+    for axis in 0..2 {
+        assert!(
+            resolution.served[axis] > resolution.native[axis],
+            "{resolution:?}"
+        );
+    }
 }
 
 /// A `POLYGON(...)` area query masks cells outside the ring to

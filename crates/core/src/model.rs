@@ -169,6 +169,13 @@ pub enum DomainDescription {
         y: Vec<f64>,
         t: Option<Vec<DateTime<Utc>>>,
         z: Option<VerticalCoord>,
+        /// `Some` only when the grid's cells are coarser than its source's:
+        /// an EDR area answer fitted to the value budget
+        /// ([`crate::feature::QueryPolygon::fit_grid`], #1436). `None` for
+        /// a grid at native resolution and for every other grid. Boxed, so
+        /// the rare member does not grow every `QueryResult` moved through
+        /// a `CoverageResponse`.
+        coarsened: Option<Box<GridResolution>>,
     },
     /// A vertical profile at a single point and time (x, y, t fixed, z varies).
     VerticalProfile {
@@ -210,6 +217,18 @@ pub enum DomainDescription {
         node_z: Option<VerticalCoord>,
         z: Option<VerticalCoord>,
     },
+}
+
+/// The cell size of a grid coarsened past its source's (#1436), as
+/// `[dx, dy]` in degrees of the grid's CRS84 `x` and `y` axes: `native` is
+/// the source's cell size as the engine measures it in degrees (a projected
+/// grid's mean), `served` the grid's own. EDR writes it as the domain's
+/// `meteocore:resolution` member, so a client knows the cells are not
+/// native ones.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GridResolution {
+    pub native: [f64; 2],
+    pub served: [f64; 2],
 }
 
 #[derive(Debug, Clone)]

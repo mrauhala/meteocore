@@ -311,6 +311,50 @@ impl EdrEngine for Mock {
         TrajectoryShape::CrossSection
     }
 
+    /// One step over the polygon at 0.01° cells, fitted to the value budget
+    /// as a gridded engine's area is (#1436).
+    fn query_area(
+        &self,
+        coords: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let selected = select_parameters(parameters, &PARAMETERS)?;
+        let axes =
+            crate::feature::parse_area_coords(coords)?.fit_grid(0.01, 0.01, 1, selected.len())?;
+        let (nx, ny) = axes.dims();
+        let descriptions = self.get_parameter_descriptions();
+        Ok(CoverageResponse::Single(QueryResult {
+            domain: DomainDescription::Grid {
+                x: axes.x,
+                y: axes.y,
+                t: Some(vec![hour(0)]),
+                z: None,
+                coarsened: axes.coarsened,
+            },
+            parameters: selected
+                .iter()
+                .map(|&p| (p.to_string(), descriptions[p].clone()))
+                .collect(),
+            ranges: selected
+                .iter()
+                .map(|&p| {
+                    (
+                        p.to_string(),
+                        NdArray {
+                            shape: vec![1, ny, nx],
+                            axis_names: vec!["t".into(), "y".into(), "x".into()],
+                            values: field(p).into_iter().cycle().take(nx * ny).collect(),
+                            precision: ValuePrecision::F64,
+                        },
+                    )
+                })
+                .collect(),
+        }))
+    }
+
     /// A four-step series per parameter, through the shared selection rule.
     fn query_position(
         &self,
@@ -704,6 +748,40 @@ fn every_other_method_delegates() {
         .expect("the inner engine's location filter");
     assert!(filter(&location("kept")));
     assert!(!filter(&location("dropped")));
+}
+
+/// #1436: an engine that fits its area grid to the value budget leaves room
+/// for the ranges the wrapper adds, so a request the old 256-cell cap
+/// answered is not now refused by the wrapper's own budget check: speed
+/// beside both components fitted for the components alone would be 1.5 M.
+#[test]
+fn a_fitted_area_leaves_room_for_the_derived_ranges() {
+    use crate::feature::MAX_AREA_VALUES;
+    let mock = Mock::new(VectorFrame::Earth);
+    let (wind, _) = wrap(&mock);
+    let area = |names: Option<&[&str]>| {
+        let names: Option<Vec<String>> = names.map(|n| n.iter().map(|s| s.to_string()).collect());
+        let Ok(CoverageResponse::Single(q)) =
+            wind.query_area("0,0,40,20", None, names.as_deref(), None, None)
+        else {
+            panic!("{names:?}: expected a grid");
+        };
+        let values: usize = q.ranges.values().map(|r| r.values.len()).sum();
+        assert!(values <= MAX_AREA_VALUES, "{names:?}: {values}");
+        (q.ranges.len(), values)
+    };
+    let (ranges, values) = area(Some(&["10si", "10u", "10v"]));
+    assert_eq!(ranges, 3);
+    assert!(
+        values > MAX_AREA_VALUES * 99 / 100,
+        "the budget is used: {values}"
+    );
+    assert_eq!(area(Some(&["10si", "10wdir", "10u", "10v"])).0, 4);
+    assert_eq!(area(None).0, 5, "the engine's three and two derived");
+    // A speed alone keeps the components' grid: they are dropped again.
+    let (ranges, values) = area(Some(&["10si"]));
+    assert_eq!(ranges, 1);
+    assert!(values > MAX_AREA_VALUES * 49 / 100, "{values}");
 }
 
 /// The derived values count against the shared response budget before any

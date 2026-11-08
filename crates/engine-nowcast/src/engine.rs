@@ -2648,6 +2648,7 @@ impl EdrEngine for NowcastEngine {
                 y: grid.y.iter().map(|&v| round_to(v, 5)).collect(),
                 t: Some(vec![generation.reference_time]),
                 z: None,
+                coarsened: None,
             },
             parameters: param_descs,
             ranges,

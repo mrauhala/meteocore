@@ -94,6 +94,7 @@ fn grid() -> CoverageResponse {
             y: vec![60.0, 60.5],
             t: Some(vec![t0(), t0() + Duration::hours(1)]),
             z: None,
+            coarsened: None,
         },
         &["t", "y", "x"],
         &[2, 2, 3],

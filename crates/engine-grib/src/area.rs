@@ -279,6 +279,7 @@ impl GribEngine {
                     kind,
                     values: levels.into_iter().flatten().collect(),
                 }),
+                coarsened: None,
             },
             parameters: param_descs,
             ranges,

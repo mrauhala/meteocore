@@ -30,22 +30,18 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{parse_area_coords, QueryPolygon};
+use ds_core::feature::{parse_area_coords, AreaGridAxes, QueryPolygon, MAX_EXACT_AREA_CELLS};
+use ds_core::geo::Crs;
+use ds_core::map_engine::OutputCrs;
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult,
 };
+use ds_core::resample::ProjectionGrid;
 
 use crate::catalog::CatalogEntry;
-use crate::engine::OdimEngine;
+use crate::engine::{footprint_guard_envelope, OdimEngine};
 use crate::reader::{OdimComposite, VALUE_PRECISION};
-
-/// Per-dimension cap on the area-query output grid. An ODIM
-/// composite can be ~4400 px across; without a cap an area query
-/// over the whole grid would emit a multi-megabyte coverage per
-/// timestep. 256 keeps a single-timestep area response well under
-/// 1 MB while still being finer than most display use cases need.
-use ds_core::feature::MAX_AREA_DIM;
 
 /// Parse an EDR `coords` value for a position query into
 /// `(lat, lon)`. Accepts WKT `POINT(lon lat)` and the bare
@@ -105,21 +101,46 @@ fn sample_bilinear(
     nodata: f64,
     undetect: Option<f64>,
 ) -> Option<f64> {
+    let (col, row) = source_px(composite, lon, lat)?;
+    sample_px(composite, col, row, gain, offset, nodata, undetect)
+}
+
+/// The composite's fractional pixel `(col, row)` at a WGS84 `(lon, lat)`,
+/// measured from the grid's north-west *corner* (pixel `c` spans
+/// `[c, c + 1)`): `None` where the point projects to a non-finite
+/// coordinate.
+fn source_px(composite: &OdimComposite, lon: f64, lat: f64) -> Option<(f64, f64)> {
     let (x, y) = composite.crs.forward(lon, lat);
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
-
     let [src_w, src_s, src_e, src_n] = composite.bbox;
     let src_dx = (src_e - src_w) / composite.xsize as f64;
     let src_dy = (src_n - src_s) / composite.ysize as f64;
+    Some(((x - src_w) / src_dx, (src_n - y) / src_dy))
+}
+
+/// [`sample_bilinear`] at the fractional pixel `(col, row)` [`source_px`]
+/// measures.
+fn sample_px(
+    composite: &OdimComposite,
+    col: f64,
+    row: f64,
+    gain: f64,
+    offset: f64,
+    nodata: f64,
+    undetect: Option<f64>,
+) -> Option<f64> {
+    if !col.is_finite() || !row.is_finite() {
+        return None;
+    }
     let (rows, cols) = composite.pixels.shape();
 
     // Fractional position relative to pixel *centres*. A pixel `c`
     // spans native-x `[src_w + c·dx, src_w + (c+1)·dx)`, so its
     // centre sits at `src_w + (c+0.5)·dx` — hence the `-0.5`.
-    let col_f = (x - src_w) / src_dx - 0.5;
-    let row_f = (src_n - y) / src_dy - 0.5;
+    let col_f = col - 0.5;
+    let row_f = row - 0.5;
     let col0 = col_f.floor();
     let row0 = row_f.floor();
     let fx = col_f - col0;
@@ -150,8 +171,8 @@ fn sample_bilinear(
 
     // Fallback: nearest-neighbour, identical to the indexing
     // `get_raster_tile` uses.
-    let col = ((x - src_w) / src_dx).floor() as i64;
-    let row = ((src_n - y) / src_dy).floor() as i64;
+    let col = col.floor() as i64;
+    let row = row.floor() as i64;
     if col < 0 || col >= cols as i64 || row < 0 || row >= rows as i64 {
         return None;
     }
@@ -160,7 +181,87 @@ fn sample_bilinear(
         .sample(row as usize, col as usize, gain, offset, nodata, undetect)
 }
 
+/// The composite geometry an area grid's pixel positions depend on.
+type Geometry = (Crs, [f64; 4], u32, u32);
+
+/// Each area cell's composite pixel, `None` outside the polygon or the grid.
+type Positions = Vec<Option<(f64, f64)>>;
+
+fn geometry(composite: &OdimComposite) -> Geometry {
+    (
+        composite.crs.clone(),
+        composite.bbox,
+        composite.xsize,
+        composite.ysize,
+    )
+}
+
 impl OdimEngine {
+    /// Each area cell's composite pixel, as [`source_px`] measures it,
+    /// `None` outside the polygon. A lat/lon composite's is affine and
+    /// exact per cell. A projected one's (stereographic, LAEA, TM) is a
+    /// forward transform per cell, exact as a position query's, up to
+    /// [`MAX_EXACT_AREA_CELLS`]; past it the transforms would dominate the
+    /// answer (Critical Rule 5), and a larger grid's come from a coarse
+    /// [`ProjectionGrid`] that evaluates the transform at its nodes only,
+    /// as the map's does, the cells outside the catalog's footprint left
+    /// out, as the map's ghost guard leaves them (#449, #1436).
+    fn area_positions(
+        &self,
+        composite: &OdimComposite,
+        polygon: &QueryPolygon,
+        axes: &AreaGridAxes,
+        mask: &[bool],
+    ) -> Positions {
+        let (nx, ny) = axes.dims();
+        if matches!(composite.crs, Crs::Wgs84) || nx * ny <= MAX_EXACT_AREA_CELLS {
+            return axes
+                .y
+                .iter()
+                .flat_map(|&y| axes.x.iter().map(move |&x| (x, y)))
+                .zip(mask)
+                .map(|((x, y), &inside)| inside.then(|| source_px(composite, x, y)).flatten())
+                .collect();
+        }
+        let b = &polygon.bbox;
+        let east = if b.crosses_antimeridian() {
+            b.east + 360.0
+        } else {
+            b.east
+        };
+        let (rows, cols) = composite.pixels.shape();
+        let window = OutputCrs::Wgs84.footprint_pixel_window(
+            [b.west, b.south, east, b.north],
+            footprint_guard_envelope(self.seed_spatial_extent),
+            nx as u32,
+            ny as u32,
+        );
+        let grid = ProjectionGrid::build_2d_within(
+            nx as u32,
+            ny as u32,
+            window,
+            cols as u32,
+            rows as u32,
+            |fx, fy| {
+                (
+                    b.west + fx * (east - b.west),
+                    b.north - fy * (b.north - b.south),
+                )
+            },
+            |lon, lat| source_px(composite, lon, lat).unwrap_or((f64::NAN, f64::NAN)),
+        );
+        let (x0, x1, y0, y1) = window;
+        (0..ny)
+            .flat_map(|iy| (0..nx).map(move |ix| (ix, iy)))
+            .map(|(ix, iy)| {
+                let (ox, oy) = (ix as u32, iy as u32);
+                let inside =
+                    mask[axes.index(ix, iy)] && (x0..=x1).contains(&ox) && (y0..=y1).contains(&oy);
+                inside.then(|| grid.sample(ox, oy))
+            })
+            .collect()
+    }
+
     /// Snapshot the catalog entries whose timestamps fall in the
     /// inclusive `datetime` range (or all entries when `None`).
     /// Returns owned clones so the `ArcSwap` guard drops immediately.
@@ -311,22 +412,21 @@ impl OdimEngine {
         let deg_per_px_lat = (lat_span / self.seed_ysize as f64).max(f64::MIN_POSITIVE);
 
         // Shared cell-centre construction (ds-core, #671): x ascends
-        // west→east, y descends north→south, each ≤ `MAX_AREA_DIM`.
-        let axes = polygon.sample_grid(deg_per_px_lon, deg_per_px_lat, MAX_AREA_DIM);
+        // west→east, y descends north→south, at the composite's resolution
+        // while the answer fits the shared per-response budget (#673), and
+        // evenly coarser past it (#1436): an unfiltered query over a full
+        // 5-min catalog is coarsened to fit rather than refused, and only
+        // more scans than the budget has values is a 400.
+        let axes = polygon.fit_grid(deg_per_px_lon, deg_per_px_lat, entries.len(), 1)?;
         let (nx, ny) = axes.dims();
-        // The shared per-response budget (#673) replaces the old 64-timestep
-        // cap: an unfiltered query over a full 5-min catalog (~288 entries ×
-        // 256 × 256 cells) is told to narrow `datetime` instead of
-        // allocating hundreds of MB; a position query has no such cap
-        // because it yields N scalars, not N · ny · nx.
-        ds_core::feature::check_area_budget(entries.len(), ny, nx, 1)?;
-        ds_core::feature::check_mask_budget(nx * ny, polygon)?;
         let mask = polygon.cell_mask(&axes);
-        let x_values = axes.x;
-        let y_values = axes.y;
 
         let mut times = Vec::with_capacity(entries.len());
         let mut all_values: Vec<Option<f64>> = Vec::with_capacity(entries.len() * ny * nx);
+        // Each cell's composite pixel, placed once per composite geometry
+        // (every scan of a catalog normally shares it) rather than once per
+        // cell and scan.
+        let mut placed: Option<(Geometry, Positions)> = None;
 
         for entry in &entries {
             times.push(entry.time);
@@ -345,35 +445,39 @@ impl OdimEngine {
                     continue;
                 }
             };
+            ds_core::deadline::check()?;
+            let key = geometry(&composite);
+            if placed.as_ref().is_none_or(|(placed, _)| *placed != key) {
+                let positions = self.area_positions(&composite, polygon, &axes, &mask);
+                placed = Some((key, positions));
+            }
+            let positions = &placed.as_ref().expect("placed above").1;
             let gain = self.gain_override.unwrap_or(composite.gain);
             let offset = self.offset_override.unwrap_or(composite.offset);
             let nodata = self.nodata_override.unwrap_or(composite.nodata);
-            for (iy, &y) in y_values.iter().enumerate() {
-                for (ix, &x) in x_values.iter().enumerate() {
-                    if mask[iy * nx + ix] {
-                        all_values.push(sample_bilinear(
-                            &composite,
-                            x,
-                            y,
-                            gain,
-                            offset,
-                            nodata,
-                            composite.undetect,
-                        ));
-                    } else {
-                        all_values.push(None);
-                    }
-                }
-            }
+            all_values.extend(positions.iter().map(|position| {
+                position.and_then(|(col, row)| {
+                    sample_px(
+                        &composite,
+                        col,
+                        row,
+                        gain,
+                        offset,
+                        nodata,
+                        composite.undetect,
+                    )
+                })
+            }));
         }
 
         // Every catalog entry is a timestamped scan, so the scans served are
         // always on a `t` axis, one scan included (#1412).
         let domain = DomainDescription::Grid {
-            x: x_values,
-            y: y_values,
+            x: axes.x,
+            y: axes.y,
             t: Some(times),
             z: None,
+            coarsened: axes.coarsened,
         };
         let shape = vec![entries.len(), ny, nx];
         let axis_names = vec!["t".to_string(), "y".to_string(), "x".to_string()];
@@ -398,6 +502,11 @@ impl OdimEngine {
 }
 
 impl EdrEngine for OdimEngine {
+    /// Area and radius answers are fitted to the value budget (#1436).
+    fn coarsens_areas(&self) -> bool {
+        true
+    }
+
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         // ODIM composites are gridded fields, not station networks.
         Ok(LocationSnapshot::empty())

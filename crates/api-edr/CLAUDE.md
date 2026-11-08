@@ -274,6 +274,16 @@ and never under an instance.
   new query type needs one. Trajectory's arm depends on the engine's
   `TrajectoryShape` (formats and description). When `crs` lands (#84), its CRSs join
   `crs_details`; keep the WKT longitude-first (`crs84_wkt_is_longitude_first`).
+- Area answers fitted to the value budget (`QueryPolygon::fit_grid`,
+  #1436) carry `DomainDescription::Grid.coarsened` when coarser than native;
+  the JSON emits it as the `meteocore:resolution` domain member
+  (`response::RESOLUTION_MEMBER`, `{native, served}` `[dx, dy]` degrees),
+  absent at native resolution. A `datetime` list shares the budget among
+  its instants (`AreaShare::answers` in `query_instants`), and the derived
+  wrapper reserves its added ranges (`AreaShare::extra_parameters`):
+  without either, a grid filling the budget alone turns into the list's or
+  wrapper's 400. `data_queries.area`/`.radius` describe it when the
+  engine's `coarsens_areas()` is true.
 - Cross-section responses (`query_trajectory`, ODIM PVOL) are CoverageJSON
   `Section` with a composite `[t,x,y]` axis + numeric `z` axis. When the
   domain carries `coverage_floor` (#514), the JSON emits it as the

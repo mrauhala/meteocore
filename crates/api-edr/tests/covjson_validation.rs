@@ -377,7 +377,13 @@ fn make_grid_query_result(
     }
 
     QueryResult {
-        domain: DomainDescription::Grid { x, y, t, z: None },
+        domain: DomainDescription::Grid {
+            x,
+            y,
+            t,
+            z: None,
+            coarsened: None,
+        },
         parameters,
         ranges,
     }
@@ -756,6 +762,7 @@ fn grid_with_z_validates() {
                 kind: VerticalKind::Pressure,
                 values: vec![850.0, 500.0],
             }),
+            coarsened: None,
         },
         parameters,
         ranges,
@@ -801,6 +808,7 @@ fn cube_grid_with_t_and_z_validates() {
                 kind: VerticalKind::Pressure,
                 values: vec![1000.0, 850.0, 500.0],
             }),
+            coarsened: None,
         },
         parameters,
         ranges,
@@ -935,6 +943,65 @@ fn section_coverage_floor_foreign_member_validates() {
     );
 
     validate(&json, &schema);
+}
+
+/// #1436: an area grid coarsened to fit the value budget says so on its
+/// domain, `meteocore:resolution` with the native and served `[dx, dy]` in
+/// degrees, and the document still validates; a native grid has no member.
+#[test]
+fn coarsened_grid_carries_the_resolution_member() {
+    let schema = load_schema();
+    let grid = |coarsened: Option<Box<GridResolution>>| {
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "t2m".to_string(),
+            ParameterDescription {
+                label: "Temperature".to_string(),
+                unit: "K".to_string(),
+                observed_property: "t2m".to_string(),
+                standard_name: None,
+            },
+        );
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            "t2m".to_string(),
+            NdArray {
+                shape: vec![1, 2, 3],
+                axis_names: vec!["t".to_string(), "y".to_string(), "x".to_string()],
+                values: vec![Some(280.0); 6],
+                precision: ValuePrecision::F32,
+            },
+        );
+        QueryResult {
+            domain: DomainDescription::Grid {
+                x: vec![10.5, 11.5, 12.5],
+                y: vec![61.5, 60.5],
+                t: Some(vec![make_time(6)]),
+                z: None,
+                coarsened,
+            },
+            parameters,
+            ranges,
+        }
+    };
+
+    let native = query_result_to_coverage_json(&grid(None));
+    assert!(
+        native["domain"].get("meteocore:resolution").is_none(),
+        "native resolution → no member: {}",
+        native["domain"]
+    );
+    validate(&native, &schema);
+
+    let coarse = query_result_to_coverage_json(&grid(Some(Box::new(GridResolution {
+        native: [0.25, 0.125],
+        served: [1.0, 1.0],
+    }))));
+    assert_eq!(
+        coarse["domain"]["meteocore:resolution"],
+        serde_json::json!({"native": [0.25, 0.125], "served": [1.0, 1.0]})
+    );
+    validate(&coarse, &schema);
 }
 
 // --- Point domain tests (scattered events, e.g. lightning strikes #501) ---

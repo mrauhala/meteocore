@@ -106,7 +106,7 @@ available.
 | Trait | APIs | Behaviour |
 |---|---|---|
 | `MapEngine` | WMS, Maps, Tiles | One layer, nearest-neighbour. `TIME` picks the nearest timestep; without it, the latest |
-| `EdrEngine` | EDR | `position`: bilinear, one value per timestep. `area`: a bilinear WGS84 grid over the polygon's bbox at about the composite's resolution, at most 256 cells per axis and 1 M values per response (400 beyond), cells outside the polygon null. `radius`: an area over the circle. No locations |
+| `EdrEngine` | EDR | `position`: bilinear, one value per timestep. `area`: a bilinear WGS84 grid over the polygon's bbox at about the composite's resolution while the response fits 1 M values, evenly coarser past it (the domain's `meteocore:resolution` member says so; only more scans than the budget is a 400), cells outside the polygon null. `radius`: an area over the circle. No locations |
 
 **Polar volumes** (`odim-volume`), per site collection `{id}-{nod}`:
 

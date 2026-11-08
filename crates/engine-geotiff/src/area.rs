@@ -6,7 +6,7 @@
 //! `x` and `y` axes places its native cells, and axes taken along the
 //! window's middle row and column put the corners of a few degrees' window
 //! kilometres from their data. A projected source answers a regular CRS84
-//! grid instead, the cell centres of [`QueryPolygon::sample_grid`], each cell
+//! grid instead, the cell centres of [`QueryPolygon::grid_axes`], each cell
 //! the value of the native pixel holding its centre: nearest, never
 //! interpolated, so radar classes stay the values the file holds. The cells
 //! reach their pixels through a coarse [`ProjectionGrid`], never one CRS
@@ -44,11 +44,10 @@ struct RegularGrid {
     /// may lie past ±180°): the longitudes its forward transform is given.
     frame: [f64; 4],
     /// The same box with CRS84 longitudes, `west > east` across the
-    /// antimeridian, for [`QueryPolygon::sample_grid`].
+    /// antimeridian, for [`QueryPolygon::grid_axes`].
     crs84: Bbox,
-    /// The cell size `(dlon, dlat)` in degrees.
-    step: (f64, f64),
-    /// `(nx, ny)`: the cells `sample_grid` gives `crs84` at `step`.
+    /// `(nx, ny)`: [`QueryPolygon::native_dims`] of `crs84` at the cell
+    /// size [`RegularGrid::new`] measures.
     dims: (usize, usize),
 }
 
@@ -142,8 +141,7 @@ impl AreaGrid {
                     holes: Vec::new(),
                     bbox: regular.crs84,
                 };
-                let axes = cells.sample_grid(regular.step.0, regular.step.1, nx.max(ny));
-                debug_assert_eq!(axes.dims(), (nx, ny));
+                let axes = cells.grid_axes(nx, ny);
                 let projection = regular.projection(&geo_transform, axes.dims(), collection);
                 // No cell on the raster: a bbox in a corner of the envelope
                 // a rotated raster leaves empty misses the raster, the 400 it
@@ -214,8 +212,9 @@ impl RegularGrid {
     /// coarser on the grid's equatorward side: both skipped pixels, small
     /// echoes with them. A polar cap takes the same rule; its latitude step
     /// for longitude would multiply its cells by 1 / cos(edge latitude).
-    /// Never coarsened to `MAX_AREA_DIM`: GeoTIFF answers at native
-    /// resolution and refuses an area over budget (#858).
+    /// Never fitted to the budget (`QueryPolygon::fit_grid`, #1436):
+    /// GeoTIFF answers at native resolution and refuses an area over budget
+    /// (#858).
     fn new(geo_transform: &GeoTransform, bbox: &Bbox) -> Result<Self, DataServerError> {
         let [env_west, env_south, env_east, env_north] = geo_transform
             .footprint_envelope()
@@ -263,24 +262,18 @@ impl RegularGrid {
             east: crs84_east,
             north,
         };
-        // `sample_grid`'s own count, computed the same way, so the budgets
-        // run on it before the axes are allocated.
-        let lon_span = if crs84.crosses_antimeridian() {
-            crs84.east + 360.0 - crs84.west
-        } else {
-            crs84.east - crs84.west
-        };
-        let cells = |span: f64, res: f64| -> usize {
-            if !(res.is_finite() && res > 0.0) {
-                return 1;
-            }
-            ((span / res).ceil() as usize).max(1)
-        };
+        // The shared native count, so the budgets run on it before the
+        // axes are allocated.
+        let dims = QueryPolygon {
+            exterior: Vec::new(),
+            holes: Vec::new(),
+            bbox: crs84,
+        }
+        .native_dims(step.0, step.1);
         Ok(Self {
             frame: [west, south, east, north],
             crs84,
-            step,
-            dims: (cells(lon_span, step.0), cells(north - south, step.1)),
+            dims,
         })
     }
 

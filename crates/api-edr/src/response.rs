@@ -20,6 +20,10 @@ pub const COVERAGE_JSON_MEDIA_TYPE: &str = "application/vnd.cov+json";
 /// `f` value ([`crate::params::parse_edr_format`]) so 1.1 clients keep working.
 pub const LEGACY_COVERAGE_JSON_MEDIA_TYPE: &str = "application/prs.coverage+json";
 
+/// The `Grid` domain member giving the native and served cell sizes of an
+/// area answer coarsened to fit the value budget (#1436).
+pub const RESOLUTION_MEMBER: &str = "meteocore:resolution";
+
 /// Pre-built reference system objects (shared across all responses).
 fn spatial_ref() -> Value {
     json!({
@@ -399,7 +403,13 @@ fn build_domain(desc: &DomainDescription) -> Value {
                 "referencing": referencing
             })
         }
-        DomainDescription::Grid { x, y, t, z } => {
+        DomainDescription::Grid {
+            x,
+            y,
+            t,
+            z,
+            coarsened,
+        } => {
             let mut axes = Map::new();
             axes.insert("x".into(), json!({ "values": x }));
             axes.insert("y".into(), json!({ "values": y }));
@@ -416,12 +426,25 @@ fn build_domain(desc: &DomainDescription) -> Value {
                 referencing.push(vertical_ref(zc));
             }
 
-            json!({
+            let mut domain = json!({
                 "type": "Domain",
                 "domainType": "Grid",
                 "axes": axes,
                 "referencing": referencing
-            })
+            });
+            // An area grid coarser than its source (#1436), as a CoverageJSON
+            // custom member named by a compact URI (CoverageJSON 1.0
+            // §9.7.1), like `meteocore:beamCoverage`: `[dx, dy]` cell sizes
+            // in degrees of the CRS84 `x` and `y` axes. Absent at native
+            // resolution, so a client seeing it knows the cells are not the
+            // source's.
+            if let Some(resolution) = coarsened {
+                domain[RESOLUTION_MEMBER] = json!({
+                    "native": resolution.native,
+                    "served": resolution.served,
+                });
+            }
+            domain
         }
         DomainDescription::VerticalProfile { x, y, t, z } => {
             let mut axes = Map::new();
@@ -1001,6 +1024,7 @@ mod precision_tests {
                     y: axis(54.95),
                     t: None,
                     z: None,
+                    coarsened: None,
                 },
                 parameters: HashMap::new(),
                 ranges: HashMap::from([(

@@ -212,6 +212,7 @@ impl NetcdfEngine {
                 y,
                 t: Some(reads.steps.iter().map(|(t, _)| *t).collect()),
                 z: z_axis,
+                coarsened: None,
             },
             parameters: Self::descriptions(&catalog, layout, &reads.params),
             ranges,
@@ -252,7 +253,8 @@ mod tests {
         assert_eq!(centres(64.0, -4.0, 2), [63.0, 61.0]);
         let axes = ds_core::feature::parse_area_coords("10,60,20,64")
             .unwrap()
-            .sample_grid(2.5, 2.0, 256);
+            .fit_grid(2.5, 2.0, 1, 1)
+            .unwrap();
         assert_eq!(axes.x, centres(10.0, 10.0, cells(10.0, 2.5)));
         assert_eq!(axes.y, centres(64.0, -4.0, cells(4.0, 2.0)));
     }

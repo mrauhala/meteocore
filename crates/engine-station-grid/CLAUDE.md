@@ -183,7 +183,7 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   decimal (`value()`), still the same number.
 - No `datetime` = the latest analysis time; an instant must be an analysis
   time (404 otherwise); an interval = every analysis time in it.
-- Area: `QueryPolygon::sample_grid` at the analysis resolution (≤ 256/axis),
+- Area: `QueryPolygon::fit_grid` at the analysis resolution (evenly coarser past the 1 M-value budget, #1436),
   masked; cube: native cells in the bbox ordered west to east from the
   bbox's west edge (across the seam), or `resolution-x/-y` positions; both
   `[t, y, x]` with the `t` axis always present. No `z`.

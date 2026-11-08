@@ -169,14 +169,22 @@ fn pixels_are_where_proj_puts_them_with_their_own_temperature() {
     }
 }
 
+/// A served value in the stored centi-kelvin. 29615 × 0.01 is
+/// 296.15000000000003 in `f64`, one step past the literal 296.15, so a
+/// range is checked in the integers the scan stores.
+fn centi(kelvin: f64) -> i64 {
+    (kelvin * 100.0).round() as i64
+}
+
 /// The canonical seam box, 170°E–170°W × 10–20°N, as a client wrapping the
 /// world sends it (east past 180°) in CRS84 and Web Mercator, and as an
 /// EDR area (west > east): both halves carry the window's values, which lie
-/// within its range of counts (3147–4746 → 296.15–273.86 K).
+/// within its range of counts (3147–4746 → 296.15–273.86 K, stored as
+/// 29615–27386 centi-kelvin).
 #[test]
 fn the_seam_box_reads_both_sides() {
     let (engine, _dir) = engine();
-    let in_range = |v: f64| (273.85..=296.15).contains(&v);
+    let in_range = |v: f64| (27385..=29615).contains(&centi(v));
     for crs in [OutputCrs::Wgs84, OutputCrs::WebMercator] {
         let (width, height) = (80, 40);
         let values = render(&engine, [170.0, 10.0, 190.0, 20.0], (width, height), &crs);
@@ -215,6 +223,89 @@ fn the_seam_box_reads_both_sides() {
         }
     }
     assert!(east > 0 && west > 0, "east {east}, west {west}");
+}
+
+/// #1436: the seam box's EDR area is answered at the window's native
+/// pixel size, about 0.018°, where the old 256-cell cap sampled about one
+/// pixel in four. It reaches the window's warmest pixel, count 3147 at
+/// window row 49, column 16 (29615 centi-kelvin), which the capped grid
+/// skipped, and on both sides of 180° its cells are the pixels a position
+/// query at their centres reads. The cells come from the coarse
+/// output→source map (Critical Rule 5), as they did under the cap: a cell
+/// centre within its interpolation budget of a pixel edge may read the
+/// neighbour, which here is under one cell in ten, and the window's edge
+/// may move by a cell, which here is under one in a hundred.
+#[test]
+fn the_seam_area_reads_the_pixels_a_position_reads() {
+    let (engine, _dir) = engine();
+    let CoverageResponse::Single(result) = engine
+        .query_area("170,10,-170,20", None, None, None, None)
+        .unwrap()
+    else {
+        panic!("expected one coverage");
+    };
+    let DomainDescription::Grid {
+        x, y, coarsened, ..
+    } = &result.domain
+    else {
+        panic!("expected a grid");
+    };
+    assert_eq!(*coarsened, None, "native");
+    assert!(x.len() > 256 && y.len() > 256, "{} × {}", x.len(), y.len());
+    let values = &result.ranges["ir_10_5"].values;
+    let warmest = values.iter().flatten().map(|&v| centi(v)).max();
+    assert_eq!(
+        warmest,
+        Some(29615),
+        "the window's warmest pixel is in the area"
+    );
+    let position = |lon: f64, lat: f64| match engine.query_position(
+        &format!("POINT({lon} {lat})"),
+        None,
+        None,
+        None,
+        None,
+    ) {
+        Ok(CoverageResponse::Single(point)) => point.ranges["ir_10_5"].values[0],
+        Ok(CoverageResponse::Collection(_)) => panic!("expected one coverage"),
+        Err(ds_core::error::DataServerError::LocationNotFound(_)) => None,
+        Err(e) => panic!("({lon}, {lat}): {e}"),
+    };
+    let (mut compared, mut off_window) = (0, 0);
+    let (mut east, mut west) = (0, 0);
+    for (i, value) in values.iter().enumerate() {
+        let Some(value) = *value else {
+            continue;
+        };
+        let warmest = centi(value) == 29615;
+        if i % 23 != 0 && !warmest {
+            continue;
+        }
+        let (lon, lat) = (x[i % x.len()], y[i / x.len()]);
+        let Some(read) = position(lon, lat) else {
+            off_window += 1;
+            continue;
+        };
+        compared += 1;
+        if read == value {
+            if lon > 0.0 {
+                east += 1;
+            } else {
+                west += 1;
+            }
+        }
+        if warmest {
+            assert_eq!(read, value, "the warmest cell ({lon}, {lat})");
+        }
+    }
+    assert!(compared > 1000, "{compared}");
+    assert!(
+        (east + west) * 10 > compared * 9,
+        "{} of {compared} are the position's pixel",
+        east + west
+    );
+    assert!(east > 100 && west > 100, "east {east}, west {west}");
+    assert!(off_window * 100 < compared, "{off_window} past the window");
 }
 
 /// Zoomed out (1.25° output pixels, 10 source columns each), a render

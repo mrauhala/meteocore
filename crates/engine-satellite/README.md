@@ -84,8 +84,13 @@ read by the EDR position query.
 
 **EDR.** `position` is a time series of the pixel under the point (off the
 disk: 404). `area` is a CRS84 grid at the finest selected product's nadir
-pixel size, at most 256 cells per axis, null outside the polygon; `radius`
-is an area over the circle. The time axis is the union of the selected
+pixel size while the answer fits the 1 M-value budget, evenly coarser past
+it (the domain's `meteocore:resolution` member then gives the native and
+served cell size), null outside the polygon; `radius` is an area over the
+circle. A selected product with no scan in the window still sets that
+cell size, so a `datetime` list's instants share one grid: an instant
+where only a 2 km product has a scan is answered at a 0.5 km band's cell
+size, up to 16 times the cells, within the 1 M-value budget. The time axis is the union of the selected
 products' scans, null where a product lacks one. A `datetime` instant
 matches only a scan at exactly that time; no scan in range is 404. A
 query may download 8 evicted scans and decode about 133 million pixels of

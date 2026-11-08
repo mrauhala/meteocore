@@ -555,6 +555,7 @@ mod tests {
                 y: vec![1.0],
                 t: None,
                 z: None,
+                coarsened: None,
             },
             parameters: HashMap::new(),
             ranges: {
@@ -627,6 +628,7 @@ mod tests {
             y: vec![1.0],
             t: None,
             z: None,
+            coarsened: None,
         });
         let mut no_parameters = one_profile();
         no_parameters.ranges.clear();

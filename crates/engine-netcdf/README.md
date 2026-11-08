@@ -205,7 +205,7 @@ apart from its surface family (MEPS `sfc`).
   converted as the map draws them. A point off the grid is null; a polygon
   outside the grid's extent is a 404.
 - An area is a CRS84 grid over the polygon's bounding box at the source's
-  mean cell size, at most 256 cells per axis; cells outside the polygon
+  mean cell size while the answer fits the 1 M-value budget, evenly coarser past it (the domain's `meteocore:resolution` member then gives the native and served cell size); cells outside the polygon
   are null. `radius` is answered as an area.
 - A trajectory is densified along great circles to about one sample per
   source cell (`ds_core::trajectory`), and each sample is read as a
@@ -216,7 +216,7 @@ apart from its surface family (MEPS `sfc`).
   gives one coverage per `z` level.
 - A cube is a CRS84 grid over the bbox with a `t` axis (an area's steps)
   and, on pressure levels, a `z` axis (`z`'s levels, or every level). Its
-  native cells are an area's without the 256 cap, bounded by the
+  native cells are an area's, never coarsened, bounded by the
   1 million value budget; `resolution-x`/`-y` place that many positions
   from edge to edge, and `resolution-z` positions take the nearest level.
   Every cell is sampled as a position query samples a point. A bbox off

@@ -83,9 +83,11 @@ Each file is one model run, and the newest run is the default.
   timestep is a 404.
 - EDR `parameter-name` ignores the case of ASCII letters. An unknown name
   is a 400.
-- The area grid uses the source's mean cell size, coarsened to at most 256
-  cells per axis. A response holds at most 1 000 000 values across
-  timesteps, cells and parameters; more is a 400. The grid's `t` axis
+- The area grid uses the source's mean cell size while the response fits
+  1 000 000 values across timesteps, cells and parameters, and is
+  coarsened evenly past it; its domain's `meteocore:resolution` member then
+  gives the native and served cell size. Only more timesteps × parameters
+  than the budget is a 400. The grid's `t` axis
   lists the timesteps served, even one. A polygon whose bounding box
   misses the grid's extent is a 404.
 - A trajectory is sampled about once per grid cell crossed, with the

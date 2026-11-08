@@ -73,10 +73,15 @@ runtime).
   no longer caps; the cost is `ProjectionGrid`'s, shared by engine-grib and
   every `SourceGrid` (see `engine/global_tests.rs`).
 - EDR position queries and map rendering use bilinear interpolation. EDR area (and radius via the shared default) returns a
-  CRS84 `Grid` over the polygon bbox at native resolution (≤ 256 cells per
-  axis, 1M-value budget across time × cells × parameters), every cell
-  bilinearly interpolated and cells outside the polygon masked to null
-  (`QueryPolygon::sample_grid` in ds-core, #671). The selected steps are
+  CRS84 `Grid` over the polygon bbox at native resolution while it fits
+  the 1M-value budget across time × cells × parameters, evenly coarser past
+  it (`QueryPolygon::fit_grid` in ds-core, #671, #1436), every cell
+  bilinearly interpolated and cells outside the polygon masked to null.
+  Cells are placed exactly (`world_to_grid_px`, one forward transform per
+  cell on a projected grid) up to `ds_core::feature::MAX_EXACT_AREA_CELLS`
+  (256², the old cap, so those answers are unchanged); a larger projected
+  grid's go through the map's coarse `output_map_quiet` (Critical Rule 5),
+  within its 0.2-pixel budget. The selected steps are
   always a `t` axis, one included: `[t, y, x]` (#1412).
 - EDR trajectory (#926): the path, time rules and layout come from
   `ds_core::trajectory::TrajectoryPlan`, densified at the area query's mean
