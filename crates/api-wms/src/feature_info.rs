@@ -47,7 +47,10 @@ use ds_core::map_engine::MapEngine;
 use ds_core::model::{CoverageResponse, DomainDescription, QueryResult, RangeValue};
 
 use crate::error::WmsError;
-use crate::handlers::{cache_control_value, resolve_layers, Paint, ResolvedLayer, WmsState};
+use crate::handlers::{
+    cache_control_value, colon_as_slash, did_you_mean, resolve_layers, Paint, ResolvedLayer,
+    WmsState,
+};
 use crate::params::{InfoFormat, WmsQuery};
 
 /// The most features GetFeatureInfo reports for one layer, whatever
@@ -140,6 +143,21 @@ impl FeatureInfo {
     }
 }
 
+/// `LayerNotDefined` for a `QUERY_LAYERS` name that is not one of the map's
+/// `layers`, with GetMap's hint (#118) when its first `:` as `/`
+/// ([`colon_as_slash`]) is one of them.
+fn query_layer_not_shown(layers: &[ResolvedLayer], name: &str) -> WmsError {
+    let message = format!("QUERY_LAYERS layer '{name}' is not one of LAYERS");
+    WmsError::LayerNotDefined(
+        match colon_as_slash(name)
+            .filter(|candidate| layers.iter().any(|layer| layer.layer == *candidate))
+        {
+            Some(candidate) => format!("{message}. {}", did_you_mean(&candidate)),
+            None => message,
+        },
+    )
+}
+
 /// The GetFeatureInfo handler.
 pub(crate) async fn get_feature_info(
     state: &WmsState,
@@ -157,11 +175,7 @@ pub(crate) async fn get_feature_info(
         let resolved = layers
             .iter()
             .find(|layer| layer.layer == *name)
-            .ok_or_else(|| {
-                WmsError::LayerNotDefined(format!(
-                    "QUERY_LAYERS layer '{name}' is not one of LAYERS"
-                ))
-            })?;
+            .ok_or_else(|| query_layer_not_shown(&layers, name))?;
         queried.push(resolved);
     }
     // Every query layer is queryable, or the request is refused before any
