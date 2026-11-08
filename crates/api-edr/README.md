@@ -280,9 +280,11 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   in every API, on every route that calls an engine, the `/locations`
   inventory included: 400, 404, 503 `ServerBusy`, 503 `SourceUnavailable`,
   or 500; a query past its deadline is EDR's 504, where the render APIs
-  answer 503. An inventory the engine reports not found, as an ODIM PVOL
-  site not in the network catalog yet, is an empty `/locations` list, and
-  each of its location ids a 404.
+  answer 503. So is a PostGIS statement the database cancels for its
+  `statement_timeout`; a PostGIS query before a metadata refresh has
+  checked the tables is a 503 `ServerBusy`. An inventory the engine
+  reports not found, as an ODIM PVOL site not in the network catalog yet,
+  is an empty `/locations` list, and each of its location ids a 404.
 - **Upstream throttling.** An object store that keeps answering 429, 502,
   503 or 504 through all of its retries fails the query with 503
   `SourceUnavailable` and `Retry-After: 10`, whose description names no

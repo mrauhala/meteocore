@@ -51,6 +51,12 @@ injection risk.**
   similarity (a probe oracle), and list only what
   `capabilities::child_layer_names` gives, the names GetCapabilities
   writes. The hint is text through the report writer's escaping.
+- One check decides which names are layers (#1440):
+  `handlers::served_layer`, which GetMap and GetFeatureInfo reach through
+  `resolve_map_layer` and GetLegendGraphic calls directly. An operation
+  that takes a layer name calls it; never re-parse the name, or a name
+  GetMap refuses gets a legend or value (the style lookup falls back to
+  the collection's styles for any `collection/…`).
 - A `LAYERS` list is checked name by name before `LAYER_LIMIT` (5)
   refuses more: `resolve_map_layer` runs on every `(layer, style)` pair
   (`GetMapParams::layers`), so an undefined one is `LayerNotDefined` /
