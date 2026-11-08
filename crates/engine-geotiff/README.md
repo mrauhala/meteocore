@@ -78,7 +78,7 @@ tiles a request touches, so a remote COG is not downloaded whole.
 | API | What |
 |---|---|
 | EDR `position` | the value of the pixel holding the point at every timestep in the `datetime` window (all timesteps without one) |
-| EDR `area` | a CoverageJSON Grid over the polygon's bounding box at native resolution; cells outside the polygon are null |
+| EDR `area` | a CoverageJSON Grid over the polygon's bounding box at native resolution; cells outside the polygon are null. A geographic source answers its own pixels; a projected one a regular CRS84 grid, each cell the value of the pixel holding its centre |
 | EDR `radius` | the circle as a polygon, answered as `area` |
 | WMS | one layer per collection with a `TIME` dimension; GetFeatureInfo reads the EDR position query |
 | Maps, Tiles | map images and map tiles of the same raster, with `datetime` |
@@ -206,9 +206,12 @@ All are in [`collections.d/`](../../collections.d/).
   Maps and Tiles, an error tile in WMS); overviews avoid it.
 - EDR area: at most 1 M values across all timesteps, and at most 20 M
   cell × polygon-vertex tests for a non-rectangular polygon; more is a 400.
-  For a projected source the Grid's x and y axes are approximations along
-  the window's middle row and column; the polygon mask uses each cell's
-  true position.
+  On a projected source the regular grid covers the part of the bbox the
+  raster's pixel window covers. Its step is the ground size of the
+  window's centre pixel in degrees, one cell per pixel there however the
+  grid is rotated against the meridians: a 4° × 1.3° box at 68°N on a
+  250 m TM35FIN grid is 665 × 581 cells. The pixel window read for it is
+  held to 1 M pixels per timestep as well.
 - STAC: an EDR query whose window holds more than 400 items without loaded
   metadata is a 400, and so is one whose on-demand listing does not finish
   within 1000 pages or 10 minutes. Until an item's header loads, the native

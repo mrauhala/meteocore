@@ -1629,10 +1629,12 @@ async fn a_load_failing_past_the_deadline_drops_no_other_load() {
     assert!(engine.loading_in_flight.paths.lock().unwrap().is_empty());
 }
 
-/// A rectangle over the whole fixture grid, 480 × 360 cells: six timesteps
-/// of it are over `MAX_AREA_VALUES`, five are within.
+/// A rectangle over the whole fixture grid. Its 480 × 360 TM35FIN pixels
+/// answer as a regular CRS84 grid over their envelope at the centre
+/// pixel's step, 675 × 372 cells (#1435): four timesteps of it are over
+/// `MAX_AREA_VALUES`, three are within.
 const WHOLE_GRID: &str = "POLYGON((0 50, 50 50, 50 80, 0 80, 0 50))";
-const WHOLE_GRID_CELLS: usize = 480 * 360;
+const WHOLE_GRID_CELLS: usize = 675 * 372;
 
 /// Run an EDR area query the way the EDR executor does, like
 /// [`query_position`].
@@ -1685,11 +1687,11 @@ async fn an_over_budget_area_query_loads_at_most_its_first_item() {
     let times = mock.times.clone();
     let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
     let window = (times[0], times[5]);
-    assert!(ds_core::feature::check_area_budget(6, 360, 480, 1).is_err());
+    assert!(ds_core::feature::check_area_budget(6, 372, 675, 1).is_err());
 
     let refused = query_area(&engine, WHOLE_GRID, window).await;
     let msg = expect_too_large(refused, "Area query would return");
-    assert!(msg.contains("6 timesteps × 360 × 480 cells"), "{msg}");
+    assert!(msg.contains("6 timesteps × 372 × 675 cells"), "{msg}");
     assert_eq!(
         loaded_times(&engine),
         vec![times[0]],
@@ -1706,10 +1708,10 @@ async fn an_over_budget_area_query_loads_at_most_its_first_item() {
     );
     assert_eq!(loaded_times(&engine), vec![times[0]]);
 
-    let response = query_area(&engine, WHOLE_GRID, (times[0], times[4]))
+    let response = query_area(&engine, WHOLE_GRID, (times[0], times[2]))
         .await
-        .expect("five timesteps of the grid are within the budget");
-    assert_eq!(grid_times(response), times[..5].to_vec());
+        .expect("three timesteps of the grid are within the budget");
+    assert_eq!(grid_times(response), times[..3].to_vec());
 }
 
 /// A polygon of `vertices` points on an ellipse around the fixture's grid,
@@ -1742,7 +1744,7 @@ async fn an_over_budget_polygon_mask_fetches_no_item_metadata() {
     assert_eq!(cold_stac_items(&engine.catalog.load(), None).len(), 2);
     let polygon = ring_over_the_grid(200);
     // Within the area budget, over the mask budget.
-    assert!(ds_core::feature::check_area_budget(3, 360, 480, 1).is_ok());
+    assert!(ds_core::feature::check_area_budget(3, 372, 675, 1).is_ok());
     let ring = ds_core::feature::parse_area_coords(&polygon).unwrap();
     assert!(ds_core::feature::check_mask_budget(WHOLE_GRID_CELLS, &ring).is_err());
 
@@ -1780,8 +1782,8 @@ async fn a_grid_estimate_never_refuses_what_the_window_grid_admits() {
         entry.set_loaded(Arc::new(finer), source);
         next
     });
-    assert!(ds_core::feature::check_area_budget(2, 720, 960, 1).is_err());
-    assert!(ds_core::feature::check_area_budget(2, 360, 480, 1).is_ok());
+    assert!(ds_core::feature::check_area_budget(2, 744, 1350, 1).is_err());
+    assert!(ds_core::feature::check_area_budget(2, 372, 675, 1).is_ok());
 
     let response = query_area(&engine, WHOLE_GRID, (times[0], times[1]))
         .await

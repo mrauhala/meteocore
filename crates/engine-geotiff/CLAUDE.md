@@ -182,8 +182,9 @@ apply here.
   (`stac::datetime_param`). EDR parses an open `..` end into
   `MIN_UTC`/`MAX_UTC`; written out, those were dates the host refused.
 - An area query checks its window's grid between that count and the loads
-  (`check_window`, #1075): the bbox must meet the grid, then the mask and
-  the response budgets, in `query_area`'s order. The answer uses the grid of
+  (`check_window`, #1075): the bbox must meet the grid, then the mask,
+  response and native-window budgets, `area::AreaGrid::check` as
+  `query_grid` runs it (see EDR below). The answer uses the grid of
   the window's first entry, so that is the grid checked. Loaded, it is
   checked at once and a refused query loads nothing. A stub loads alone
   first, one round trip, so a refused query loads that one item, not the
@@ -477,16 +478,45 @@ depends on the kind:
 
 Position + area queries. Nearest-neighbour sampling of the source grid.
 
-Area (and radius) answers the native pixel window of the polygon's bbox, like
-GRIB: no `MAX_AREA_DIM` coarsening, which would need overview selection and a
-strided polygon mask. `query_bbox` checks the shared
-`ds_core::feature::check_area_budget` over `timesteps × ny × nx` before it
-allocates the result or reads a file, so an over-budget area is a 400 naming
-the limit (#858). The polygon mask tests each cell of the window against every
-ring vertex, so `query_area` first checks the shared
-`ds_core::feature::check_mask_budget`, before `query_bbox` reads a file
-(#889): over 20 M edge tests is a 400, as on GRIB and QueryData. A rectangle
-is exempt; a radius query's 65-vertex circle trips it past about 307 k cells.
+Area (and radius) answers the grid `area::AreaGrid` gives the polygon's bbox
+on the first matching entry's grid (#1435), at native resolution: no
+`MAX_AREA_DIM` coarsening, which would need overview selection.
+
+- **Geographic (CRS84) source:** the native pixel window of the bbox, like
+  GRIB. Its pixel centres are the axes; each cell is masked by its centre.
+- **Projected source:** a regular CRS84 grid, `QueryPolygon::sample_grid`'s
+  cell centres over the bbox clipped to the CRS84 envelope of the native
+  window (a bbox past the raster answers no larger than the window did),
+  masked by `cell_mask`. Each cell is the native pixel holding its centre,
+  through a coarse `ProjectionGrid` and `resample_nearest`: never one CRS
+  transform per cell (root Critical Rule 5), never interpolated (radar
+  classes stay the file's values). Axes along the window's middle row and
+  column, as before, put corner cells up to 12 km from their data, so a
+  client reading or drawing them by `x`/`y` was wrong.
+- **Step:** `area::native_step`, the ground size of the window's centre
+  pixel in degrees there (a column's for longitude, a row's for latitude),
+  one cell per pixel whatever the rotation. Never the envelope's span over
+  the window's pixels: that is coarser wherever the grid is rotated against
+  the meridians, by 7 % per axis on 250 m TM35FIN at 68°N, and nearest
+  sampling then skipped about one pixel in seven, small echoes with them.
+  That 4° × 1.3° box is 665 × 581 cells from a 712 × 635 pixel window and
+  reaches 98.9 % of the pixels in it. A window holding a pole takes its
+  latitude step for longitude too.
+- **Frame:** `area::source_frame` moves the bbox's longitudes by whole turns
+  to within half a turn of the source's central longitude. An
+  antimeridian-crossing bbox is sampled from `west` to `east + 360°`, not
+  the long way round through the source (which made the whole raster
+  answer as nulls), and an LCC forward, not periodic in longitude (#1114),
+  gets the longitudes it is meant for.
+
+`AreaGrid::check` runs every budget on the answer's cells before the result
+is allocated or a file read: `ds_core::feature::check_mask_budget` for a
+polygon (#889; over 20 M edge tests is a 400, as on GRIB and QueryData; a
+rectangle is exempt, a radius query's 65-vertex circle trips it past about
+307 k cells), `check_area_budget` over `timesteps × ny × nx` (#858), and for
+a projected source its native window, which each timestep reads whole,
+against `MAX_AREA_VALUES` pixels, a 400 naming the source pixels. The STAC
+pre-load check below is the same call.
 Per timestep, only a file that cannot be read (`Engine`, `Storage`, `Io`:
 `is_unreadable_file`), such as a local file that fails to open or decode or a
 remote file with an invalid tile layout, becomes logged nulls; any other read
