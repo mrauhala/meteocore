@@ -374,7 +374,7 @@ pub const MAX_AREA_VALUES: usize = 1_000_000;
 /// interpolation budget: one transform per cell would then dominate the
 /// answer (Critical Rule 5). A lat/lon source's placement is affine and
 /// always exact.
-pub const MAX_EXACT_AREA_CELLS: usize = 256 * 256;
+pub const MAX_EXACT_AREA_CELLS: usize = OLD_AREA_AXIS * OLD_AREA_AXIS;
 
 /// Most values one EDR position response may carry, every MULTIPOINT point
 /// and parameter included. The API refuses a larger one; an engine that
@@ -462,6 +462,9 @@ thread_local! {
 /// engine's synchronous query runs on.
 pub struct AreaShare {
     previous: (usize, usize),
+    /// What this scope set, which its drop expects to find: a guard
+    /// dropped before one made after it would restore a stale scope.
+    set: (usize, usize),
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -469,19 +472,26 @@ impl AreaShare {
     /// The response holds `answers` answers like the next one.
     pub fn answers(answers: usize) -> Self {
         let previous = AREA_SHARE.get();
-        AREA_SHARE.set((previous.0.saturating_mul(answers.max(1)), previous.1));
-        Self {
+        Self::enter(
             previous,
-            _thread: PhantomData,
-        }
+            (previous.0.saturating_mul(answers.max(1)), previous.1),
+        )
     }
 
     /// Each answer gains `parameters` ranges after the engine returns it.
     pub fn extra_parameters(parameters: usize) -> Self {
         let previous = AREA_SHARE.get();
-        AREA_SHARE.set((previous.0, previous.1.saturating_add(parameters)));
+        Self::enter(
+            previous,
+            (previous.0, previous.1.saturating_add(parameters)),
+        )
+    }
+
+    fn enter(previous: (usize, usize), set: (usize, usize)) -> Self {
+        AREA_SHARE.set(set);
         Self {
             previous,
+            set,
             _thread: PhantomData,
         }
     }
@@ -489,6 +499,15 @@ impl AreaShare {
 
 impl Drop for AreaShare {
     fn drop(&mut self) {
+        // Scopes end innermost first; an unwind drops them in that order
+        // too, so only a misuse trips this, never a panic elsewhere.
+        if !std::thread::panicking() {
+            debug_assert_eq!(
+                AREA_SHARE.get(),
+                self.set,
+                "AreaShare scopes dropped out of order"
+            );
+        }
         AREA_SHARE.set(self.previous);
     }
 }
@@ -502,6 +521,11 @@ fn native_cells(span: f64, res: f64) -> usize {
     ((span / res).ceil() as usize).max(1)
 }
 
+/// Cells per axis of the cap before #1436 (`MAX_AREA_DIM`). While that
+/// capped grid fits the budget, no axis of an area grid is coarser than it
+/// was ([`fit_dims`]).
+const OLD_AREA_AXIS: usize = 256;
+
 /// The largest `nx × ny ≤ cells` grid with each axis at most its native
 /// count, coarsened by as even a factor on both axes as whole cells allow,
 /// so the cells keep the native aspect (#1436). The native grid when it
@@ -509,6 +533,12 @@ fn native_cells(span: f64, res: f64) -> usize {
 /// it are tried, the other axis taking what the budget leaves, and the more
 /// even pair wins (on a tie the one with more cells). An axis already at one
 /// cell stays there and the other takes the whole budget.
+///
+/// Never coarser on either axis than the old 256-cell cap answered while
+/// that grid fits `cells`: even coarsening would take a strip's short axis
+/// far below it (256 × 4000 native cells at 15 layers to 65 × 1025, where
+/// the cap gave 256 × 256), so such an axis keeps its capped count and the
+/// other takes what the budget leaves (256 × 260).
 fn fit_dims(native_x: usize, native_y: usize, cells: usize) -> (usize, usize) {
     let (native_x, native_y, cells) = (native_x.max(1), native_y.max(1), cells.max(1));
     if native_x.saturating_mul(native_y) <= cells {
@@ -527,7 +557,7 @@ fn fit_dims(native_x: usize, native_y: usize, cells: usize) -> (usize, usize) {
         let (fs, fl) = (short as f64 / s as f64, long as f64 / l as f64);
         fs.max(fl) / fs.min(fl)
     };
-    let (s, l) = [ideal.floor(), ideal.ceil()]
+    let (mut s, mut l) = [ideal.floor(), ideal.ceil()]
         .into_iter()
         .map(|s| {
             let s = (s as usize).clamp(1, short);
@@ -540,6 +570,18 @@ fn fit_dims(native_x: usize, native_y: usize, cells: usize) -> (usize, usize) {
                 .then((b.0 * b.1).cmp(&(a.0 * a.1)))
         })
         .unwrap_or((1, cells.min(long)));
+    // The old cap's grid, where it fits, is the floor of each axis.
+    let (capped_s, capped_l) = (short.min(OLD_AREA_AXIS), long.min(OLD_AREA_AXIS));
+    if capped_s.saturating_mul(capped_l) <= cells {
+        if s < capped_s {
+            s = capped_s;
+            l = (cells / s).min(long);
+        }
+        if l < capped_l {
+            l = capped_l;
+            s = (cells / l).min(short);
+        }
+    }
     if x_short {
         (s, l)
     } else {
@@ -2727,15 +2769,19 @@ mod tests {
         }
     }
 
-    /// Every answer that fitted the old 256-per-axis cap still fits, with
-    /// as many cells up to one row's rounding: fitting to the budget never
-    /// refuses a request the cap served. (A grid the cap left native on one
-    /// axis can lose a few cells to even coarsening: 100 × 300 cells at 39
-    /// layers was 100 × 256 and is 92 × 278.)
+    /// Every answer that fitted the old 256-per-axis cap still fits, and no
+    /// axis comes back coarser than the cap answered it: fitting to the
+    /// budget never refuses a request the cap served, nor serves it worse.
+    /// Strips are where even coarsening alone fell short of the cap: 256 ×
+    /// 4000 at 15 layers gave 65 × 1025, 36 000 × 256 gave 3030 × 22,
+    /// 100 × 36 000 at 39 layers 8 × 3205, and 100 × 300 at 39 layers fewer
+    /// cells in all, 92 × 278.
     #[test]
     fn fit_grid_serves_at_least_the_old_capped_grid() {
         let rect = parse_area_coords("0,-50,100,50").unwrap();
-        let natives = [1, 10, 100, 125, 200, 255, 256, 300, 1000, 4000, 100_000];
+        let natives = [
+            1, 10, 100, 125, 200, 255, 256, 257, 300, 1000, 4000, 36_000, 100_000,
+        ];
         for nx0 in natives {
             for ny0 in natives {
                 for layers in 1..=40 {
@@ -2750,18 +2796,39 @@ mod tests {
                     assert!(nx <= nx0 && ny <= ny0, "{nx0} × {ny0}: {nx} × {ny}");
                     assert!(layers * nx * ny <= MAX_AREA_VALUES);
                     assert!(
-                        nx * ny + nx.min(ny) > capped,
+                        nx >= nx0.min(256) && ny >= ny0.min(256),
+                        "{nx0} × {ny0} × {layers}: {nx} × {ny} is coarser than the capped \
+                         {} × {}",
+                        nx0.min(256),
+                        ny0.min(256)
+                    );
+                    assert!(
+                        nx * ny >= capped,
                         "{nx0} × {ny0} × {layers}: {nx} × {ny} < the capped {capped}"
                     );
                 }
             }
         }
+        // The review's strips, through `fit_grid` at 0.01° cells (a hair
+        // over, so each span holds a whole number of them).
+        let res = 0.01 * (1.0 + 1e-12);
+        let strip = parse_area_coords("20,30,22.56,70").unwrap();
+        assert_eq!(strip.fit_grid(res, res, 15, 1).unwrap().dims(), (256, 260));
+        let band = parse_area_coords("-180,60,180,62.56").unwrap();
+        let (nx, ny) = band.fit_grid(res, res, 15, 1).unwrap().dims();
+        assert_eq!((nx, ny), (260, 256));
+        assert_eq!(fit_dims(100, 36_000, MAX_AREA_VALUES / 39), (100, 256));
+        assert_eq!(fit_dims(100, 300, MAX_AREA_VALUES / 39), (100, 256));
     }
 
     #[test]
     fn fit_dims_handles_strips_and_single_cells() {
-        assert_eq!(fit_dims(1_000_000, 10, 1_000_000), (333_333, 3));
-        assert_eq!(fit_dims(10, 1_000_000, 1_000_000), (3, 333_333));
+        // A strip keeps the old cap's short axis, here native, while the
+        // capped grid fits; only past that does it coarsen evenly.
+        assert_eq!(fit_dims(1_000_000, 10, 1_000_000), (100_000, 10));
+        assert_eq!(fit_dims(10, 1_000_000, 1_000_000), (10, 100_000));
+        // Past it the short axis reaches one cell and the long takes the rest.
+        assert_eq!(fit_dims(1_000_000, 10, 2_000), (2_000, 1));
         assert_eq!(fit_dims(300, 1, 100), (100, 1));
         assert_eq!(fit_dims(1, 300, 100), (1, 100));
         assert_eq!(fit_dims(5, 5, 1), (1, 1));
@@ -2811,6 +2878,17 @@ mod tests {
             parse_area_coords(&format!("{},{},{},{}", b.west, b.south, b.east, b.north)).unwrap();
         let (rx, ry) = rect.fit_grid(0.001, 0.001, 1, 1).unwrap().dims();
         assert!(rx * ry > nx * ny && rx * ry <= MAX_AREA_VALUES);
+    }
+
+    /// A scope dropped before one made after it would restore a stale
+    /// share: debug builds catch it.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "AreaShare scopes dropped out of order")]
+    fn area_share_dropped_out_of_order_is_caught() {
+        let outer = AreaShare::answers(2);
+        let _inner = AreaShare::extra_parameters(1);
+        drop(outer);
     }
 
     /// A response joining several answers, or adding derived ranges, gives

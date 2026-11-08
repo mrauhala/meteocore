@@ -329,7 +329,10 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   into it, CSV is counted first, and an HTML page reserves its estimated
   size before it renders. It stays charged until the client has read it
   or gone away. A body that does not fit is a 503 `ServerBusy` with
-  `Retry-After: 1`. PNG plots are not counted. `/locations` lists are also
+  `Retry-After: 1`. An area answer at the 1 M-value budget is about 9 MB
+  of CoverageJSON and two to three times that as HTML, so the default
+  holds about 57 of them in flight; size the budget for the largest
+  bodies slow clients may hold at once. PNG plots are not counted. `/locations` lists are also
   capped at `MC_EDR_LOCATIONS_MAX_BYTES` (default 16 MiB) each: a list over
   it is a 503 `ResponseLimit` suggesting `limit`. A body is never
   truncated. `MC_EDR_LOCATIONS_MEMORY_MB` is retired: it is ignored, with a

@@ -903,6 +903,20 @@ impl SatelliteEngine {
     }
 }
 
+/// An area's output cell size in degrees: the finest nadir pixel of
+/// `products`, from each product's grid in the catalog (its first scan's),
+/// never from which of them has a scan in the query's window. So every
+/// instant of a `datetime` list, each queried alone, gets the same grid and
+/// the instants join along `t`, even where only a coarser product has a
+/// scan at one of them (#1436). Infinite, one cell, when no product has a
+/// grid yet.
+fn area_resolution(grids: &[Option<NativeGrid>], products: impl Iterator<Item = usize>) -> f64 {
+    products
+        .filter_map(|index| grids.get(index)?.as_ref())
+        .map(|grid| grid.spacing()[0] / 111_320.0)
+        .fold(f64::INFINITY, f64::min)
+}
+
 impl Catalog {
     /// `composite_bands`: per composite, the product indices of its bands.
     fn build(
@@ -1186,16 +1200,16 @@ impl EdrEngine for SatelliteEngine {
         // Each product has its own grid (ABI bands are 0.5, 1 or 2 km): the
         // decode budget sums the block pixels its polygon's bbox covers on
         // each grid, and the output grid samples at the finest nadir pixel
-        // size.
+        // size of the products asked for, whether or not each has a scan
+        // in the window ([`area_resolution`]).
         let b = &polygon.bbox;
-        let mut resolution = f64::INFINITY;
+        let resolution = area_resolution(&catalog.grids, plan.iter().map(|(index, _)| *index));
         let mut pixels = 0u64;
         for (index, own) in &plan {
             let Some(&first) = own.first() else {
                 continue;
             };
             let probe = self.frame(*index, first, &catalog.frames[*index][&first].paths)?;
-            resolution = resolution.min(probe.gt.pixel_width / 111_320.0);
             let blocks: u64 = probe
                 .windows([b.west, b.south, b.east, b.north])
                 .iter()
@@ -1453,6 +1467,32 @@ mod tests {
             SatelliteEngine::check_decode_budget(MAX_QUERY_PIXELS + 1),
             Err(ds_core::error::DataServerError::QueryTooLarge(_))
         ));
+    }
+
+    /// #1436: an area's cell size is the finest nadir pixel of every product
+    /// asked for, from the catalog's grids, so it is the same whichever of
+    /// them has a scan at a `datetime` list's instant; a product not asked
+    /// for, or without a grid yet, does not count.
+    #[test]
+    fn area_resolution_is_the_finest_requested_product_grid() {
+        let grid = |metres: f64| {
+            NativeGrid::new(
+                ds_core::geo::Crs::WebMercator,
+                None,
+                [100, 100],
+                [0.0, 0.0],
+                [metres, metres],
+            )
+        };
+        let grids = vec![grid(2000.0), grid(500.0), None, grid(10_000.0)];
+        let resolution =
+            |products: &[usize]| super::area_resolution(&grids, products.iter().copied());
+        assert_eq!(resolution(&[0, 1, 3]), 500.0 / 111_320.0);
+        assert_eq!(resolution(&[0, 3]), 2000.0 / 111_320.0);
+        assert_eq!(resolution(&[3]), 10_000.0 / 111_320.0);
+        assert_eq!(resolution(&[2, 3]), 10_000.0 / 111_320.0, "no grid yet");
+        assert_eq!(resolution(&[2]), f64::INFINITY);
+        assert_eq!(resolution(&[7]), f64::INFINITY, "out of range");
     }
 
     /// A grid size is advertised only when the products share it; the
