@@ -6184,9 +6184,10 @@ impl FeatureEngine for PolarVolumeEngine {
 
         Ok(FeaturePage {
             features,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset,
+            next_cursor: None,
         })
     }
 
@@ -13238,21 +13239,21 @@ mod tests {
             ..Default::default()
         };
         let page = engine.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.number_matched, Some(1));
         assert_eq!(page.features[0].id, "fivih");
         query.offset = 1;
         let page = engine.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.number_matched, Some(1));
         assert!(page.features.is_empty());
         query.property_filters[1].1 = "nonexistent".into();
-        assert_eq!(engine.get_features(&query).unwrap().number_matched, 0);
+        assert_eq!(engine.get_features(&query).unwrap().number_matched, Some(0));
     }
 
     #[test]
     fn features_list_sites_sorted_with_properties() {
         let engine = two_site_engine();
         let page = FeatureEngine::get_features(&engine, &FeatureQuery::default()).unwrap();
-        assert_eq!(page.number_matched, 2);
+        assert_eq!(page.number_matched, Some(2));
         assert_eq!(page.number_returned, 2);
         // Stable NOD-sorted order: fikor before fivih.
         let ids: Vec<&str> = page.features.iter().map(|f| f.id.as_str()).collect();
@@ -13382,7 +13383,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.number_matched, Some(1));
         assert_eq!(page.features[0].id, "fivih");
     }
 
@@ -13407,7 +13408,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(wide.number_matched, 2);
+        assert_eq!(wide.number_matched, Some(2));
         // …and a purely historical window includes neither.
         let old = FeatureEngine::get_features(
             &engine,
@@ -13420,7 +13421,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(old.number_matched, 0);
+        assert_eq!(old.number_matched, Some(0));
     }
 
     #[test]
@@ -13435,7 +13436,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(first.number_matched, 2);
+        assert_eq!(first.number_matched, Some(2));
         assert_eq!(first.number_returned, 1);
         assert_eq!(first.features[0].id, "fikor");
         assert_eq!(first.next_offset, Some(1));
@@ -13467,7 +13468,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(page.number_matched, 2);
+        assert_eq!(page.number_matched, Some(2));
         assert_eq!(page.number_returned, 0);
         assert!(page.features.is_empty());
     }

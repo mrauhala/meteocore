@@ -230,10 +230,11 @@ impl FeatureEngine for Source {
             .collect();
         let end = query.offset + features.len();
         Ok(FeaturePage {
-            number_matched: stations.len(),
+            number_matched: Some(stations.len()),
             number_returned: features.len(),
             next_offset: (end < stations.len()).then_some(end),
             features,
+            next_cursor: None,
         })
     }
 

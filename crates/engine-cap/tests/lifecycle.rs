@@ -78,7 +78,7 @@ fn antimeridian_query_must_exclude_helsinki() {
     };
     assert_eq!(
         e.get_features(&q).unwrap().number_matched,
-        0,
+        Some(0),
         "Pacific bbox returned Helsinki"
     );
 }
@@ -332,7 +332,8 @@ fn dateline_query_keeps_both_sides_and_deduplicates() {
         })
         .unwrap();
     assert_eq!(
-        page.number_matched, 3,
+        page.number_matched,
+        Some(3),
         "the area spanning both query halves is returned once"
     );
 }

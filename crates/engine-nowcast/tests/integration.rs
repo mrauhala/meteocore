@@ -1234,7 +1234,7 @@ fn dry_scene_leaves_both_skill_gauges_unset() {
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(page.number_matched, 0, "dry frame {t}");
+        assert_eq!(page.number_matched, Some(0), "dry frame {t}");
     }
 }
 
@@ -1249,7 +1249,7 @@ fn cell_features_are_served_and_tracks_persist() {
     let (source, engine) = build("PT30M", &[t0(), anchor1]);
     engine.poll_once();
     let page = engine.get_features(&FeatureQuery::default()).unwrap();
-    assert_eq!(page.number_matched, 1, "one disc, one cell");
+    assert_eq!(page.number_matched, Some(1), "one disc, one cell");
     let f = &page.features[0];
     assert!(matches!(
         f.properties.get("severity"),
@@ -1288,17 +1288,26 @@ fn cell_features_are_served_and_tracks_persist() {
         limit: 1,
         ..Default::default()
     };
-    assert_eq!(engine.get_features(&filtered).unwrap().number_matched, 1);
+    assert_eq!(
+        engine.get_features(&filtered).unwrap().number_matched,
+        Some(1)
+    );
     filtered.offset = 1;
     assert_eq!(engine.get_features(&filtered).unwrap().number_returned, 0);
     filtered.offset = 0;
     filtered.property_filters[0].1 = "2".into();
-    assert_eq!(engine.get_features(&filtered).unwrap().number_matched, 0);
+    assert_eq!(
+        engine.get_features(&filtered).unwrap().number_matched,
+        Some(0)
+    );
     filtered.datetime = Some(ds_core::feature::DatetimeInterval {
         start: Some(anchor1),
         end: Some(anchor1),
     });
-    assert_eq!(engine.get_features(&filtered).unwrap().number_matched, 1);
+    assert_eq!(
+        engine.get_features(&filtered).unwrap().number_matched,
+        Some(1)
+    );
 
     assert!(matches!(
         f.properties.get("track_age"),
@@ -1349,7 +1358,11 @@ fn cell_features_are_served_and_tracks_persist() {
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(hist.number_matched, 1, "older snapshot must serve history");
+    assert_eq!(
+        hist.number_matched,
+        Some(1),
+        "older snapshot must serve history"
+    );
     assert!(matches!(
         hist.features[0].properties.get("track_age"),
         Some(PV::Integer(2))
@@ -1367,7 +1380,11 @@ fn cell_features_are_served_and_tracks_persist() {
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(none.number_matched, 0, "before all snapshots: nothing");
+    assert_eq!(
+        none.number_matched,
+        Some(0),
+        "before all snapshots: nothing"
+    );
     assert_eq!(engine.feature_count(), 1);
 }
 
@@ -1520,7 +1537,7 @@ fn geometry_change_resets_cell_tracks() {
         .push(anchor1 + Duration::minutes(5));
     engine.poll_once();
     let page = engine.get_features(&FeatureQuery::default()).unwrap();
-    assert_eq!(page.number_matched, 1);
+    assert_eq!(page.number_matched, Some(1));
     assert!(
         matches!(
             page.features[0].properties.get("track_age"),
@@ -1715,7 +1732,7 @@ fn cells_are_ranked_by_significance_with_reasons() {
     engine.poll_once();
 
     let page = engine.get_features(&FeatureQuery::default()).unwrap();
-    assert_eq!(page.number_matched, 2, "two discs, two cells");
+    assert_eq!(page.number_matched, Some(2), "two discs, two cells");
 
     let cell = |severity: &str| {
         page.features
@@ -1980,10 +1997,11 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
                 related: Vec::new(),
             };
             Ok(FeaturePage {
-                number_matched: 1,
+                number_matched: Some(1),
                 number_returned: 1,
                 features: vec![f],
                 next_offset: None,
+                next_cursor: None,
             })
         }
         fn get_feature(&self, _id: &str) -> Result<Feature, DataServerError> {
@@ -2005,7 +2023,7 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
         .expect("engine builds");
     plain.poll_once();
     let page = plain.get_features(&FeatureQuery::default()).unwrap();
-    assert_eq!(page.number_matched, 2);
+    assert_eq!(page.number_matched, Some(2));
     let strong = page
         .features
         .iter()
@@ -2033,7 +2051,7 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
     engine.poll_once();
 
     let page = engine.get_features(&FeatureQuery::default()).unwrap();
-    assert_eq!(page.number_matched, 2);
+    assert_eq!(page.number_matched, Some(2));
     let weak = page
         .features
         .iter()
@@ -2091,7 +2109,8 @@ fn impact_context_lifts_a_populated_cell_above_a_stronger_one() {
     engine.poll_once();
     let page = engine.get_features(&FeatureQuery::default()).unwrap();
     assert_eq!(
-        page.number_matched, 2,
+        page.number_matched,
+        Some(2),
         "a failed join never fails the generation"
     );
     for f in &page.features {
@@ -2175,9 +2194,10 @@ fn wiring_a_source_adds_exactly_its_sortables() {
                     properties: Arc::new(props),
                     related: Vec::new(),
                 }],
-                number_matched: 1,
+                number_matched: Some(1),
                 number_returned: 1,
                 next_offset: None,
+                next_cursor: None,
             })
         }
         fn get_feature(&self, _id: &str) -> Result<ds_core::feature::Feature, DataServerError> {
@@ -2295,7 +2315,7 @@ fn a_stationary_echo_is_flagged_and_demoted() {
     );
 
     // Flagged, but still present and inspectable — never silently dropped.
-    assert_eq!(page.number_matched, 1);
+    assert_eq!(page.number_matched, Some(1));
     assert!(matches!(p.get("max_dbz"), Some(PropertyValue::Float(_))));
 
     // And the demotion actually applied.
@@ -3126,9 +3146,10 @@ impl ds_core::feature_engine::FeatureEngine for ReloadAreas {
                 ),
                 related: Vec::new(),
             }],
-            number_matched: 1,
+            number_matched: Some(1),
             number_returned: 1,
             next_offset: None,
+            next_cursor: None,
         })
     }
     fn get_feature(&self, _: &str) -> Result<ds_core::feature::Feature, DataServerError> {

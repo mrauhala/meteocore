@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Extension, Json};
-use chrono::Utc;
+use chrono::{SubsecRound, Utc};
 use serde_json::{json, Map, Value};
 
 use api_common::{JsonError, JsonQuery, Mount};
@@ -21,7 +21,9 @@ use crate::params::{
     parse_bbox_values, parse_datetime, parse_sortby, ItemQueryParams, ItemsQueryParams,
     DEFAULT_LIMIT, MAX_LIMIT,
 };
-use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query, Annotations};
+use crate::response::{
+    feature_page_to_geojson, feature_to_geojson, preserved_query, Annotations, PageLinks,
+};
 
 /// Shared state for the Features API: a registry of collection engines + metadata.
 #[derive(Clone)]
@@ -433,12 +435,17 @@ pub(crate) fn items_openapi_paths(
     let mut paths = Map::new();
     for config in configs {
         let id = &config.id;
+        // A collection pages by offset or by its `next` link's cursor (#503).
+        let paging = match state.engines.get(id) {
+            Some(engine) if engine.pages_by_cursor() => "cursor",
+            _ => "offset",
+        };
         let mut parameters = vec![
             component_ref("parameters", name, "bbox"),
             component_ref("parameters", name, "bbox-crs"),
             component_ref("parameters", name, "crs"),
             component_ref("parameters", name, "limit"),
-            component_ref("parameters", name, "offset"),
+            component_ref("parameters", name, paging),
             component_ref("parameters", name, "datetime"),
             component_ref("parameters", name, "sortby"),
             feature_format_parameter(),
@@ -576,6 +583,18 @@ pub(crate) fn openapi_components(name: ComponentName) -> Value {
                     "minimum": 0,
                     "default": 0
                 }
+            }),
+        ),
+        // A collection whose items page by cursor (#503) takes it in place of
+        // `offset`. Not from a standard: Part 1 leaves `next` links opaque.
+        (
+            "cursor",
+            json!({
+                "name": "cursor",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string"},
+                "description": "Where the page starts: the cursor of the previous page's `next` link. Opaque; follow the link rather than building one."
             }),
         ),
         (
@@ -915,6 +934,7 @@ fn html_controls(engine: &dyn FeatureEngine) -> crate::html::FeatureControls {
         // The control `/items` accepts `datetime` with (#1143), not whether
         // the collection advertises a span.
         temporal: engine.has_time_dimension(),
+        cursor_paging: engine.pages_by_cursor(),
     }
 }
 
@@ -974,6 +994,7 @@ pub async fn items(
     };
     let ItemsRequest {
         query,
+        requested_datetime,
         crs,
         limit,
         offset,
@@ -997,7 +1018,10 @@ pub async fn items(
         Err(rejected) => return Err(rejected.error),
     };
 
-    let page = match engine.get_features(&query) {
+    // In place for an engine that answers from memory; on the query runtime
+    // for one that reads a database per call (#503).
+    let read = query.clone();
+    let page = match crate::executor::read(engine, move |e| e.get_features(&read)).await {
         Ok(page) => page,
         Err(e) => return Ok(engine_failure(&e, "items")),
     };
@@ -1010,18 +1034,29 @@ pub async fn items(
     // Carry the caller's filters and ordering onto the pagination links:
     // following `rel="next"` is the OGC-recommended pattern, and a next link
     // that drops them silently serves page 2 unfiltered and unsorted.
-    let filters = preserved_query(
-        query.bbox.as_ref(),
-        query.datetime.as_ref(),
-        &query.sortby,
-        &query.property_filters,
-    );
+    // `self` repeats the request; `next` and `prev` carry the interval the
+    // page read, which is the engine's named default window when the request
+    // gave none (#503), so the chain stays on it.
+    let links = |datetime: Option<&ds_core::feature::DatetimeInterval>| {
+        preserved_query(
+            query.bbox.as_ref(),
+            datetime,
+            &query.sortby,
+            &query.property_filters,
+        )
+    };
+    let filters = links(requested_datetime.as_ref());
+    let onward = (requested_datetime != query.datetime).then(|| links(query.datetime.as_ref()));
     let mut doc = feature_page_to_geojson(
         &page,
         &id,
         limit,
         offset,
-        &filters,
+        query.cursor.as_deref(),
+        PageLinks {
+            this: &filters,
+            onward: onward.as_deref(),
+        },
         "",
         root,
         &crs,
@@ -1067,6 +1102,9 @@ pub async fn items(
 /// A validated `/items` request.
 struct ItemsRequest {
     query: FeatureQuery,
+    /// The `datetime` the request gave, which its `self` link repeats; the
+    /// query's may be the engine's named default window instead (#503).
+    requested_datetime: Option<ds_core::feature::DatetimeInterval>,
     crs: ResponseCrs,
     limit: usize,
     offset: usize,
@@ -1151,16 +1189,50 @@ fn items_request(
 
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
+    // A collection pages one way (#503). One paged by cursor starts a page
+    // where the previous one's `next` link says, so an offset is a 400 (a
+    // zero offset, as the HTML form sends, is the first page). One paged by
+    // offset has no cursor to start from: `cursor` is a 400 there.
+    let cursor = match (params.cursor, engine.pages_by_cursor()) {
+        (Some(_), false) => {
+            return Err(Rejected::at(
+                "cursor",
+                bad_request_msg(&format!(
+                    "Collection '{id}' pages by offset; cursor is not supported"
+                )),
+            ))
+        }
+        (_, true) if offset > 0 => {
+            return Err(Rejected::at(
+                "offset",
+                bad_request_msg(&format!(
+                "Collection '{id}' pages by cursor: follow the next link; offset is not supported"
+            )),
+            ))
+        }
+        (cursor, _) => cursor,
+    };
+
+    // Without `datetime`, an engine whose features are then the window ending
+    // now (PostGIS events, #503) has it named here, once: the engine reads
+    // that interval and the `next`/`prev` links carry it, so a chain reads
+    // one fixed interval. Recomputed per page, the window would slide and,
+    // newest first, cut off the oldest events the chain had yet to reach.
+    // Whole seconds, so the links of requests within one second agree.
+    let now = Utc::now();
+    let requested = datetime;
+    let datetime = requested
+        .clone()
+        .or_else(|| engine.default_datetime(now.trunc_subsecs(0)));
 
     // Cache-Control policy (#499): a settled window (closed datetime interval
     // entirely in the past) gets the long policy, everything else the short
-    // one — captured before `datetime` moves into the query.
+    // one. A named default window ends now, so it is never settled.
     let (window_start, window_end) = datetime
         .as_ref()
         .map(|d| (d.start, d.end))
         .unwrap_or((None, None));
-    let cache_control =
-        ds_core::http_cache::data_cache_control(window_start, window_end, Utc::now());
+    let cache_control = ds_core::http_cache::data_cache_control(window_start, window_end, now);
 
     Ok(ItemsRequest {
         query: FeatureQuery {
@@ -1170,7 +1242,9 @@ fn items_request(
             datetime,
             sortby,
             property_filters: params.property_filters,
+            cursor,
         },
+        requested_datetime: requested,
         crs,
         limit,
         offset,
@@ -1271,7 +1345,8 @@ pub async fn item(
         }
     };
     let crs = response_crs(params.crs.as_deref(), wanted)?;
-    let feature = match engine.get_feature(&feature_id) {
+    let wanted_id = feature_id.clone();
+    let feature = match crate::executor::read(engine, move |e| e.get_feature(&wanted_id)).await {
         Ok(feature) => feature,
         Err(e) => return Ok(engine_failure(&e, "item")),
     };
@@ -1341,7 +1416,11 @@ pub(crate) fn collection_parts(
     // Part 2: exactly the CRSs `/items` accepts in `crs` and `bbox-crs`.
     fields.insert("crs".into(), json!(crate::crs::supported_uris()));
     fields.insert("storageCrs".into(), json!(FeatureCrs::Crs84.uri()));
-    fields.insert("numberItems".into(), json!(engine.feature_count()));
+    // Left out for a collection that cannot count its items from memory
+    // (an event table, #503).
+    if let Some(items) = engine.number_items() {
+        fields.insert("numberItems".into(), json!(items));
+    }
 
     // Add spatial + temporal extent if available. A Features collection
     // contributes a bbox and (for time-aware engines like CAP) a temporal

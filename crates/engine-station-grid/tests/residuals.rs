@@ -182,7 +182,7 @@ fn fixture_residuals_match_the_independent_reference() {
         )
         .unwrap();
         let page = features(&engine, &query(instant(t)));
-        assert_eq!(page.number_matched, 192, "{method}");
+        assert_eq!(page.number_matched, Some(192), "{method}");
         let (n, got_rmse) = rmse(&page.features);
         assert_eq!(n, count, "{method}");
         close(got_rmse, want_rmse, method);
@@ -369,7 +369,7 @@ fn an_outlier_has_the_largest_residual() {
     for (method, estimate, residual, elsewhere, want_rmse) in OUTLIER_REFERENCE {
         let engine = lattice_engine(method);
         let page = features(&engine, &query(None));
-        assert_eq!(page.number_matched, 25, "{method}");
+        assert_eq!(page.number_matched, Some(25), "{method}");
         let outlier = page
             .features
             .iter()
@@ -403,7 +403,7 @@ fn an_outlier_has_the_largest_residual() {
             },
         );
         assert_eq!(point(&sorted.features[0]), OUTLIER, "{method}");
-        assert_eq!(sorted.number_matched, 25);
+        assert_eq!(sorted.number_matched, Some(25));
         assert_eq!(sorted.next_offset, Some(1));
     }
 }
@@ -444,7 +444,10 @@ fn datetime_selects_analysis_times_under_the_cap() {
     assert_eq!(times(&at_t), vec!["2026-01-15T12:00:00Z"]);
     // Between analysis times: none.
     let between = features(&engine, &query(instant(t + Duration::minutes(30))));
-    assert_eq!((between.number_matched, between.features.len()), (0, 0));
+    assert_eq!(
+        (between.number_matched, between.features.len()),
+        (Some(0), 0)
+    );
 
     // An interval: every analysis time in it, ends included, in order.
     let interval = |start, end| {
@@ -486,7 +489,11 @@ fn datetime_selects_analysis_times_under_the_cap() {
     one_parameter.limit = 1;
     let page = features(&engine, &one_parameter);
     assert_eq!(page.number_returned, 1);
-    assert!(page.number_matched > 49, "{}", page.number_matched);
+    assert!(
+        page.number_matched.is_some_and(|n| n > 49),
+        "{:?}",
+        page.number_matched
+    );
     assert_eq!(text(&page.features[0], "time"), "2026-01-13T12:00:00Z");
 }
 
@@ -503,14 +510,14 @@ fn paging_filters_and_ids() {
     .unwrap();
     let t = utc(15, 12);
     let all = features(&engine, &query(instant(t)));
-    assert_eq!(all.number_matched, 192);
+    assert_eq!(all.number_matched, Some(192));
 
     // Pages of the natural order are slices of the whole.
     let mut page_query = query(instant(t));
     page_query.limit = 50;
     page_query.offset = 150;
     let page = features(&engine, &page_query);
-    assert_eq!((page.number_matched, page.number_returned), (192, 42));
+    assert_eq!((page.number_matched, page.number_returned), (Some(192), 42));
     assert_eq!(page.next_offset, None);
     let ids = |features: &[Feature]| features.iter().map(|f| f.id.clone()).collect::<Vec<_>>();
     assert_eq!(ids(&page.features), ids(&all.features[150..]));
@@ -548,11 +555,11 @@ fn paging_filters_and_ids() {
         })
         .count();
     assert!(want > 0);
-    assert_eq!(inside.number_matched, want);
+    assert_eq!(inside.number_matched, Some(want));
     let mut filtered = query(instant(t));
     filtered.property_filters = vec![("neighbours".into(), "8".into())];
     let eight = features(&engine, &filtered);
-    assert!(eight.number_matched > 0 && eight.number_matched <= 192);
+    assert!(eight.number_matched.is_some_and(|n| n > 0 && n <= 192));
     assert!(eight
         .features
         .iter()
@@ -608,11 +615,16 @@ fn a_miss_without_a_deadline_is_busy_then_served() {
         Err(DataServerError::ResourceExhausted)
     ));
     assert!(started.elapsed() < StdDuration::from_secs(1), "no wait");
-    let stations = features(&engine, &cold).number_matched;
+    let stations = features(&engine, &cold)
+        .number_matched
+        .expect("a counted page");
     assert!(stations > 100, "{stations}");
     assert_eq!(engine.metrics().0, 1, "one computation served both");
     // Cached now: served without a deadline too.
-    assert_eq!(engine.get_features(&cold).unwrap().number_matched, stations);
+    assert_eq!(
+        engine.get_features(&cold).unwrap().number_matched,
+        Some(stations)
+    );
     // Metadata never computes: the count comes from the latest analysis.
     assert_eq!(engine.feature_count(), stations);
     assert_eq!(engine.metrics().0, 1);

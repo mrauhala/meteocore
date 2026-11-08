@@ -110,11 +110,16 @@ impl ImpactIndex {
             ..Default::default()
         };
         let page = source.get_features(&query)?;
-        if page.number_matched > MAX_IMPACT_AREAS {
+        // An uncounted page (#503) still says whether more follow.
+        let more = page.next_offset.is_some() || page.next_cursor.is_some();
+        let matched = page.number_matched.map_or_else(
+            || format!("more than {MAX_IMPACT_AREAS}"),
+            |n| n.to_string(),
+        );
+        if page.number_matched.map_or(more, |n| n > MAX_IMPACT_AREAS) {
             tracing::warn!(
-                "impact source returned {} areas; only the first {MAX_IMPACT_AREAS} are used \
-                 (is this the right granularity for named-area impact?)",
-                page.number_matched
+                "impact source returned {matched} areas; only the first {MAX_IMPACT_AREAS} are used \
+                 (is this the right granularity for named-area impact?)"
             );
         }
 
@@ -328,10 +333,11 @@ mod tests {
             _query: &FeatureQuery,
         ) -> Result<ds_core::feature::FeaturePage, ds_core::error::DataServerError> {
             Ok(ds_core::feature::FeaturePage {
-                number_matched: self.0.len(),
+                number_matched: Some(self.0.len()),
                 number_returned: self.0.len(),
                 features: self.0.clone(),
                 next_offset: None,
+                next_cursor: None,
             })
         }
 

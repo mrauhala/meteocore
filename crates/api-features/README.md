@@ -21,8 +21,17 @@ while the engines stay free of HTTP and JSON.
 
 - An engine implements `ds_core::feature_engine::FeatureEngine`. It answers a
   `FeatureQuery` (`bbox`, `datetime`, `sortby`, property filters, `limit`,
-  `offset`) with a `FeaturePage` of domain `Feature`s: an id, CRS84 geometry
-  and typed `PropertyValue` properties.
+  `offset` or `cursor`) with a `FeaturePage` of domain `Feature`s: an id,
+  CRS84 geometry and typed `PropertyValue` properties.
+- Most engines answer from memory and are called on the request worker. An
+  engine that reads a database per call (`reads_on_request`: PostGIS
+  `events`) runs on ds-executor's shared query runtime instead, under this
+  crate's own admission (one read per query-runtime worker, 32 waiting) and
+  a 30-second deadline (`src/executor.rs`); a full queue or the deadline is
+  a 503 with `Retry-After: 1`.
+- A collection pages by `offset`, or, when its engine `pages_by_cursor`
+  (PostGIS `events`), by the cursor its `next` link carries. See
+  [Responses](#responses).
 - The handlers check each parameter against what the engine advertises
   (`filterables`, `sortables`, `has_time_dimension`). An unsupported
   parameter is a 400, never ignored; where there is a list of valid values,
@@ -61,7 +70,7 @@ while the engines stay free of HTTP and JSON.
 | `/features/api/docs` | HTML | Swagger UI from embedded assets under `/features/api/docs/`; no CDN |
 | `/features/conformance` | JSON, HTML | |
 | `/features/collections` | JSON, HTML | collections that have a feature engine; Common collection search |
-| `/features/collections/{id}` | JSON, HTML | `itemType: "feature"`, `crs`, `storageCrs` (CRS84), `numberItems`, `extent`, an `items` link, and a `tilesets-vector` link when api-tiles serves the collection as vector tiles; WIS2 topic `themes`, configured or from a WIS2 subscription, and WCMP2 `describedby` links, configured or learned from WIS2 notifications (#1356) |
+| `/features/collections/{id}` | JSON, HTML | `itemType: "feature"`, `crs`, `storageCrs` (CRS84), `numberItems` (left out where the engine cannot count its features from memory: PostGIS `events`), `extent`, an `items` link, and a `tilesets-vector` link when api-tiles serves the collection as vector tiles; WIS2 topic `themes`, configured or from a WIS2 subscription, and WCMP2 `describedby` links, configured or learned from WIS2 notifications (#1356) |
 | `/features/collections/{id}/items` | GeoJSON, HTML | a page of features |
 | `/features/collections/{id}/items/{featureId}` | GeoJSON, HTML | one feature; takes only `f` and `crs` |
 
@@ -100,7 +109,8 @@ any `bbox` or `datetime`. The search rules are in
 | `bbox-crs` | CRS of `bbox`, one of the collection's `crs` values; default CRS84. The engine always gets a CRS84 box. Checked even without `bbox` |
 | `datetime` | RFC 3339 instant, `start/end`, `../end`, `start/..` or `../..`. A reversed interval is a 400. On a collection without a time dimension it is a 400 |
 | `limit` | default 100; a value outside 1–1000 is clamped. A value that is not a non-negative integer is a 400 |
-| `offset` | default 0; a value that is not a non-negative integer is a 400 |
+| `offset` | default 0; a value that is not a non-negative integer is a 400. On a collection paged by cursor, a value other than 0 is a 400 |
+| `cursor` | only on a collection paged by cursor (PostGIS `events`): where the page starts, the value of the previous page's `next` link, opaque. Elsewhere a 400. A cursor the engine did not write is a 400 |
 | `sortby` | `[+\|-]property,…`. Every property must be in the engine's `sortables`, else a 400 naming the valid ones. A `+` decoded to a space counts as ascending. A property listed twice is a 400 |
 | `crs` | response CRS, one of the collection's `crs` values; default CRS84. HTML takes CRS84 only |
 | `f` | `json` or `html` (also `application/json`, `text/html`), case-insensitive. Feature routes also take `application/geo+json` (send `+` as `%2B`). Overrides `Accept` |
@@ -112,7 +122,9 @@ Each control parameter may appear once; a repeat is a 400.
 Property filters:
 
 - A name must be in the engine's `filterables`; an unknown name is a 400 that
-  lists the valid ones. The control names above cannot be property filters.
+  lists the valid ones. The control names above cannot be property filters,
+  on any collection: since `cursor` became one (#503), a property named
+  `cursor` has no equality filter either.
   `/features/api` lists each collection's filter names as query parameters.
 - Names are case-sensitive and matching is exact: no wildcards, substrings or
   type coercion. Numbers match their canonical form (`12`, `1.5`), booleans
@@ -160,18 +172,32 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
 
 ## Responses
 
-- `/items` is a GeoJSON `FeatureCollection` with `numberMatched`,
-  `numberReturned`, `timeStamp` and `self`, `next` (when more remain), `prev`
-  (when `offset` > 0) and `alternate` links. Past the end, `prev` is the last
+- `/items` is a GeoJSON `FeatureCollection` with `numberMatched` (left out
+  when the engine does not know it: a PostGIS events page that is not the
+  whole answer), `numberReturned`, `timeStamp` and `self`, `next` (when more
+  remain), `prev` (when `offset` > 0) and `alternate` links. Past the end, `prev` is the last
   page that has features.
+- On a collection paged by cursor, `next` carries `cursor` in place of
+  `offset` and starts after the page's last feature: a feature added
+  meanwhile never makes another repeat or drop out, though one added before
+  the cursor is not on a later page. Such a page has no `prev`, and its HTML
+  shows how many it holds rather than a range, and the match count only
+  when the response has one.
+- Without `datetime`, an engine whose features are then a window ending
+  now (`default_datetime`: PostGIS events) has that window named once, in
+  whole seconds, before the first read: the page reads it, and `next` and
+  `prev` carry it as an explicit `datetime=start/end`, so a chain reads one
+  fixed interval rather than a window that slides on and drops its oldest
+  features. `self` repeats the request. Such a window ends now, so its
+  pages are `max-age=60` until it ended an hour ago.
 - Each feature has `self` and `collection` links, plus a `related` link for
   each resource its engine names and an API here serves.
 - A feature's `title` property is its engine's label, unless the feature
   has a `title` of its own. EDR `items` carries the same `title`, without
   the `related` links.
-- Paging links carry `offset`, `limit`, the explicit format and the parsed
-  `bbox`, `datetime`, `sortby`, property filters and `crs`. Following `next`
-  keeps the same query.
+- Paging links carry `offset` (or `cursor`), `limit`, the explicit format
+  and the parsed `bbox`, `datetime`, `sortby`, property filters and `crs`.
+  Following `next` keeps the same query.
 - Geometry types are `Point`, `Polygon`, `MultiPolygon` and `null`.
 - Feature ids are opaque strings. Links percent-encode an id as one path
   segment. Build URLs the same way, or follow the links.
@@ -257,6 +283,7 @@ api-tiles vector-tile cache key.
 | GeoJSON | each feature of the file | geometry intersects the box | 400: no time dimension | 400 | every property name in the loaded file | yes / – | the file's modification time |
 | CAP | one alert area (Polygon, MultiPolygon or null) | area's bounding box intersects the box; null geometry excluded | alert active window intersects the interval | 400 | the standard CAP alert, info and area properties and derived ones (always), plus producer parameter and `eventCode:` names from loaded alerts | yes / earliest window start to latest window end, extended to the catalog time; none when every window is open | changes with the alert set |
 | PostGIS stations | one station (Point) from the cached station list | point inside the box | 400: no time dimension | 400 | configured `stations.property_cols` (always), plus names the loaded rows carry | yes / – | changes per metadata refresh |
+| PostGIS events | one event (Point, or null for a degenerate geometry), read from the table per request, newest first, paged by cursor | point inside the box, edges included | events whose time is in the interval. Without `datetime`: the `default_datetime` window ending now, as EDR | 400 | 400: none | `extent_bbox` / first to latest event, per metadata refresh | changes per metadata refresh |
 | BUFR | one station (Point) | point inside the box | stations with a report in the interval | `last_report`, `first_report`, `report_count`, `name` | `name`, `wigos_station_identifier`, `elevation`, `first_report`, `last_report`, `report_count` | yes / oldest to newest report | changes per snapshot |
 | ODIM PVOL network | one radar site (Point), the site inventory | point inside the box | sites with a retained volume in the interval | 400 | site properties (below) | yes / earliest to latest retained volume | changes with the inventory |
 | Nowcast | one tracked storm cell (Point) of one generation | cell point inside the box | the newest retained generation inside the interval; none inside: no features. Without `datetime`: the latest | cell facts (below) | every cell property except `significance_contributions`, including the groups of wired sources | yes / retained history | changes every generation |
@@ -273,8 +300,20 @@ api-tiles vector-tile cache key.
   sources are wired. It keeps the last 48 generations (4 hours at a 5-minute
   cadence). `/items/{featureId}` returns the cell as it is in the latest
   generation.
-- PostGIS `events` collections have no Features surface: `apis = ["features"]`
-  on them is a config error.
+- PostGIS events (#503): a feature's properties are `time` (RFC 3339), each
+  configured parameter, filtered by `valid_range` and `missing_values` as in
+  EDR, `type` from `cloud_indicator_col` and `peak_current_ka` from
+  `peak_current_col` when declared and no parameter reads it; the
+  properties GetFeatureInfo answers. Its id is its `(time, id)` key,
+  `<id_col value>@<time>`, written one way only, and `/items/{featureId}`
+  reads that event back by its primary key. Any other string, the same key
+  written another way (`017@…`, a `+02:00` time) or an id with a NUL, is a
+  404 without a query; as a cursor it is a 400. A page is one statement
+  starting after the cursor's key, and no statement counts: `numberMatched`
+  is there only on a first page that holds every match. No vector tiles: their `tiles` are the strike
+  layer's raster tiles. Late strikes: a closed `datetime` that ended at
+  least an hour ago is the settled `max-age=86400`, anything else
+  `max-age=60`.
 - An ODIM volume source with `features` in `apis` serves the site inventory
   under its own id. The per-site radar collections are not feature
   collections.
@@ -328,7 +367,7 @@ api-tiles vector-tile cache key.
 
 The crate has no config section of its own. List `features` in a
 collection's `apis`. The engine types that accept it are `csv`, `geojson`,
-`cap`, `bufr`, `postgis` (station shapes), `odim-volume`, `nowcast` and
+`cap`, `bufr`, `postgis` (every shape), `odim-volume`, `nowcast` and
 `station-grid`.
 
 ```toml
@@ -352,8 +391,8 @@ and `municipalities.toml` (GeoJSON), `cap-alerts.toml` and
 
 ## Limits
 
-- `limit` is at most 1000. Paging is by `offset`. Responses are buffered,
-  not streamed.
+- `limit` is at most 1000. Paging is by `offset`, or by cursor on PostGIS
+  `events`. Responses are buffered, not streamed.
 - Geometry is Point, Polygon, MultiPolygon or null: no lines and no
   multi-points. There is no `properties` selection. The classes marked "no"
   under [Conformance classes](#conformance-classes) are not implemented.
@@ -379,6 +418,8 @@ files.
 - `caching_tests.rs`: ETag, `If-None-Match` and Cache-Control.
 - `engine_errors_tests.rs`: an engine's errors on `/items` and
   `/items/{featureId}` and their statuses.
+- `cursor_paging_tests.rs`: cursor paging, each collection's paging
+  parameter, reads on the query runtime, `numberItems` left out.
 
 Shared code paths have tests elsewhere: run `cargo test -p api-edr --test
 items_tests` for EDR `items`, `cargo test -p server --test

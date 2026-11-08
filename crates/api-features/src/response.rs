@@ -240,16 +240,44 @@ pub fn preserved_query(
     q
 }
 
+/// The filter/sort fragments (from [`preserved_query`]) a page's links
+/// carry. A plain `&str` is both.
+#[derive(Debug, Clone, Copy)]
+pub struct PageLinks<'a> {
+    /// What `self` carries: the request's own query.
+    pub this: &'a str,
+    /// What `next` and `prev` carry instead, when the page read another
+    /// interval than the request named: an engine's default window, named so
+    /// the chain stays on it (#503). `None`: the same as `self`.
+    pub onward: Option<&'a str>,
+}
+
+impl<'a> From<&'a str> for PageLinks<'a> {
+    fn from(this: &'a str) -> Self {
+        Self { this, onward: None }
+    }
+}
+
+impl<'a> From<&'a String> for PageLinks<'a> {
+    fn from(this: &'a String) -> Self {
+        Self::from(this.as_str())
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // pagination links need every query axis
-pub fn feature_page_to_geojson(
+pub fn feature_page_to_geojson<'a>(
     page: &FeaturePage,
     collection_id: &str,
     limit: usize,
     offset: usize,
+    // The cursor this page started at, on a collection that pages by cursor
+    // (#503): the `self` link repeats it, and `next` carries the page's
+    // `next_cursor` in place of an offset. Such a page has no `prev`.
+    cursor: Option<&str>,
     // Filter/sort fragment from `preserved_query`, carried onto every
     // pagination link. Without it, following `rel="next"` — the pattern OGC
     // recommends — silently drops the caller's filters and ordering.
-    filters: &str,
+    filters: impl Into<PageLinks<'a>>,
     timestamp: &str,
     root: &str,
     crs: &ResponseCrs,
@@ -262,20 +290,36 @@ pub fn feature_page_to_geojson(
         .collect();
     // The CRS rides along with the filters: a `next` page in another CRS
     // would mix coordinate systems in one result set.
-    let filters = match crs.link_query() {
+    let with_crs = |filters: &str| match crs.link_query() {
         q if q.is_empty() => filters.to_owned(),
         q => format!("{filters}&{q}"),
     };
+    let filters = filters.into();
+    let this = with_crs(filters.this);
+    let onward = filters.onward.map_or_else(|| this.clone(), with_crs);
+
+    let at_cursor = |cursor: &str, filters: &str| {
+        let cursor: String = form_urlencoded::byte_serialize(cursor.as_bytes()).collect();
+        format!("{root}/collections/{collection_id}/items?cursor={cursor}&limit={limit}{filters}")
+    };
+    let at_offset = |offset: usize, filters: &str| {
+        format!("{root}/collections/{collection_id}/items?offset={offset}&limit={limit}{filters}")
+    };
 
     let mut links = vec![json!({
-        "href": format!("{root}/collections/{}/items?offset={}&limit={}{}", collection_id, offset, limit, filters),
+        "href": cursor.map_or_else(|| at_offset(offset, &this), |c| at_cursor(c, &this)),
         "rel": "self",
         "type": "application/geo+json"
     })];
 
-    if let Some(next) = page.next_offset {
+    let next = match (&page.next_cursor, page.next_offset) {
+        (Some(cursor), _) => Some(at_cursor(cursor, &onward)),
+        (None, Some(next)) => Some(at_offset(next, &onward)),
+        (None, None) => None,
+    };
+    if let Some(next) = next {
         links.push(json!({
-            "href": format!("{root}/collections/{}/items?offset={}&limit={}{}", collection_id, next, limit, filters),
+            "href": next,
             "rel": "next",
             "type": "application/geo+json"
         }));
@@ -283,24 +327,34 @@ pub fn feature_page_to_geojson(
 
     if offset > 0 {
         // Past the end, `prev` is the last page that has features, not the
-        // empty one before this (#1143).
-        let last_page = page.number_matched.saturating_sub(1) / limit.max(1) * limit;
-        let prev_offset = offset.saturating_sub(limit).min(last_page);
+        // empty one before this (#1143). An offset-paged engine always knows
+        // `number_matched`; without it `prev` is the page before.
+        let prev_offset = offset.saturating_sub(limit);
+        let prev_offset = match page.number_matched {
+            Some(matched) => prev_offset.min(matched.saturating_sub(1) / limit.max(1) * limit),
+            None => prev_offset,
+        };
         links.push(json!({
-            "href": format!("{root}/collections/{}/items?offset={}&limit={}{}", collection_id, prev_offset, limit, filters),
+            "href": at_offset(prev_offset, &onward),
             "rel": "prev",
             "type": "application/geo+json"
         }));
     }
 
-    json!({
-        "type": "FeatureCollection",
-        "timeStamp": timestamp,
-        "numberMatched": page.number_matched,
-        "numberReturned": page.number_returned,
-        "features": features,
-        "links": links
-    })
+    // OGC API - Features makes `numberMatched` a recommendation: an engine
+    // that would have to count for it (#503) leaves it out rather than
+    // reporting a guess. Members keep their order, so a counted page's bytes
+    // (and ETag) are what they were.
+    let mut doc = serde_json::Map::new();
+    doc.insert("type".into(), json!("FeatureCollection"));
+    doc.insert("timeStamp".into(), json!(timestamp));
+    if let Some(matched) = page.number_matched {
+        doc.insert("numberMatched".into(), json!(matched));
+    }
+    doc.insert("numberReturned".into(), json!(page.number_returned));
+    doc.insert("features".into(), Value::Array(features));
+    doc.insert("links".into(), Value::Array(links));
+    Value::Object(doc)
 }
 
 #[cfg(test)]
@@ -377,15 +431,17 @@ mod tests {
     fn feature_page_geojson_structure() {
         let page = FeaturePage {
             features: vec![sample_feature()],
-            number_matched: 3,
+            number_matched: Some(3),
             number_returned: 1,
             next_offset: Some(1),
+            next_cursor: None,
         };
         let json = feature_page_to_geojson(
             &page,
             "weather",
             1,
             0,
+            None,
             "",
             "2024-01-01T00:00:00Z",
             "",
@@ -408,15 +464,17 @@ mod tests {
     fn feature_page_no_next_link_on_last_page() {
         let page = FeaturePage {
             features: vec![sample_feature()],
-            number_matched: 1,
+            number_matched: Some(1),
             number_returned: 1,
             next_offset: None,
+            next_cursor: None,
         };
         let json = feature_page_to_geojson(
             &page,
             "weather",
             10,
             0,
+            None,
             "",
             "2024-01-01T00:00:00Z",
             "",
@@ -429,19 +487,82 @@ mod tests {
         assert!(!links.iter().any(|l| l["rel"] == "next"));
     }
 
+    /// #503: a counted page keeps its members in their order, so its bytes
+    /// and ETag do not change; an uncounted one leaves `numberMatched` out
+    /// (never `null`) and links `next` by its cursor.
+    #[test]
+    fn number_matched_is_written_only_when_known() {
+        let page = |number_matched| FeaturePage {
+            features: vec![sample_feature()],
+            number_matched,
+            number_returned: 1,
+            next_offset: None,
+            next_cursor: Some("17@2026-01-01T05:30:00Z".into()),
+        };
+        let doc = |page: &FeaturePage| {
+            feature_page_to_geojson(
+                page,
+                "ev",
+                1,
+                0,
+                Some("18@2026-01-01T05:40:00Z"),
+                "",
+                "",
+                "",
+                &ResponseCrs::default(),
+                &Annotations::default(),
+            )
+        };
+        let counted = doc(&page(Some(9)));
+        // The document as it was written before #503, member for member.
+        let before = json!({
+            "type": "FeatureCollection",
+            "timeStamp": "",
+            "numberMatched": 9,
+            "numberReturned": 1,
+            "features": counted["features"],
+            "links": counted["links"]
+        });
+        assert_eq!(
+            serde_json::to_string(&counted).unwrap(),
+            serde_json::to_string(&before).unwrap()
+        );
+        let uncounted = doc(&page(None));
+        assert!(uncounted.get("numberMatched").is_none(), "{uncounted}");
+        let link = |rel: &str| {
+            uncounted["links"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|l| l["rel"] == rel)
+                .map(|l| l["href"].as_str().unwrap().to_string())
+        };
+        assert_eq!(
+            link("self").as_deref(),
+            Some("/collections/ev/items?cursor=18%402026-01-01T05%3A40%3A00Z&limit=1")
+        );
+        assert_eq!(
+            link("next").as_deref(),
+            Some("/collections/ev/items?cursor=17%402026-01-01T05%3A30%3A00Z&limit=1")
+        );
+        assert_eq!(link("prev"), None);
+    }
+
     #[test]
     fn feature_page_prev_link_when_offset() {
         let page = FeaturePage {
             features: vec![sample_feature()],
-            number_matched: 3,
+            number_matched: Some(3),
             number_returned: 1,
             next_offset: Some(2),
+            next_cursor: None,
         };
         let json = feature_page_to_geojson(
             &page,
             "weather",
             1,
             1,
+            None,
             "",
             "2024-01-01T00:00:00Z",
             "",
@@ -512,15 +633,17 @@ mod tests {
         let crs = ResponseCrs::new(Some(FeatureCrs::Epsg4326));
         let page = FeaturePage {
             features: vec![sample_feature()],
-            number_matched: 3,
+            number_matched: Some(3),
             number_returned: 1,
             next_offset: Some(1),
+            next_cursor: None,
         };
         let json = feature_page_to_geojson(
             &page,
             "weather",
             1,
             0,
+            None,
             "&bbox=1,2,3,4",
             "",
             "",
@@ -549,15 +672,17 @@ mod tests {
     fn empty_feature_page() {
         let page = FeaturePage {
             features: vec![],
-            number_matched: 0,
+            number_matched: Some(0),
             number_returned: 0,
             next_offset: None,
+            next_cursor: None,
         };
         let json = feature_page_to_geojson(
             &page,
             "weather",
             10,
             0,
+            None,
             "",
             "2024-01-01T00:00:00Z",
             "",
@@ -577,15 +702,17 @@ mod tests {
         let prev = |matched, limit, offset| {
             let page = FeaturePage {
                 features: vec![],
-                number_matched: matched,
+                number_matched: Some(matched),
                 number_returned: 0,
                 next_offset: None,
+                next_cursor: None,
             };
             let json = feature_page_to_geojson(
                 &page,
                 "w",
                 limit,
                 offset,
+                None,
                 "",
                 "",
                 "",

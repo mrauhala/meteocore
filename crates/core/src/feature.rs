@@ -1427,9 +1427,19 @@ pub fn matches_property_values(
 #[derive(Debug, Clone)]
 pub struct FeaturePage {
     pub features: Vec<Feature>,
-    pub number_matched: usize,
+    /// Every feature the query matches, before paging: the response's
+    /// `numberMatched`. `None` when the engine does not know it without a
+    /// count it will not run (engine-postgis events past their last page,
+    /// #503); the response then leaves `numberMatched` out, which OGC API
+    /// Features permits. Offset-paged engines always know it.
+    pub number_matched: Option<usize>,
     pub number_returned: usize,
     pub next_offset: Option<usize>,
+    /// The next page's [`FeatureQuery::cursor`], for an engine that pages by
+    /// cursor ([`crate::feature_engine::FeatureEngine::pages_by_cursor`],
+    /// #503): `Some` while more features match, and then `next_offset` is
+    /// `None`. Always `None` from an engine that pages by offset.
+    pub next_cursor: Option<String>,
 }
 
 /// Bounding box: west, south, east, north.
@@ -1532,6 +1542,12 @@ pub struct FeatureQuery {
     pub sortby: Vec<SortKey>,
     /// Exact property predicates, applied before counting, sorting and paging.
     pub property_filters: Vec<(String, String)>,
+    /// Where a page starts for an engine that pages by cursor (#503): the
+    /// previous page's [`FeaturePage::next_cursor`], opaque to the API layer;
+    /// `None` for the first page. The API passes it only to an engine whose
+    /// [`crate::feature_engine::FeatureEngine::pages_by_cursor`] is true, and
+    /// with `offset` 0.
+    pub cursor: Option<String>,
 }
 
 /// Sort direction for one [`SortKey`].
@@ -1672,6 +1688,7 @@ impl Default for FeatureQuery {
             datetime: None,
             sortby: Vec::new(),
             property_filters: Vec::new(),
+            cursor: None,
         }
     }
 }

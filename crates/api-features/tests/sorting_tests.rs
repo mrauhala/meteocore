@@ -113,9 +113,10 @@ impl FeatureEngine for SortableEngine {
         let number_returned = page.len();
         Ok(FeaturePage {
             features: page,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset: (end < number_matched).then_some(end),
+            next_cursor: None,
         })
     }
 
@@ -136,9 +137,10 @@ impl FeatureEngine for PlainEngine {
     fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         Ok(FeaturePage {
             features: vec![],
-            number_matched: 0,
+            number_matched: Some(0),
             number_returned: 0,
             next_offset: None,
+            next_cursor: None,
         })
     }
     fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {

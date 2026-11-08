@@ -382,6 +382,64 @@ in step when changing this lifecycle.
   (`block_in_place` on the query runtime), never `maps.rs`'s
   `spawn_blocking` bridge. Station layers do not pick.
 
+## Features on the events shape (#503)
+
+- One feature per event, read per request (`event_features`,
+  `event_feature` in `engine.rs`). `reads_on_request` is true, so
+  api-features runs both on the shared query runtime under its admission
+  and deadline (`api-features/src/executor.rs`); `run_single_query_sync`'s
+  `block_in_place` is valid there. Never answer them from a request worker.
+- **One column layout, one decoder.** `query::event_projection` is the
+  pick's and the Features statements' select list, and `EventRecord`
+  decodes it for both, so GetFeatureInfo and `/items` report an event the
+  same way (`time`, parameters filtered as in EDR, `type`,
+  `peak_current_ka`). Add an event property there, never in one caller.
+- **Keyset, never offset.** Order `time DESC, id::text COLLATE "C" DESC`
+  (`event_id_order`: any id type, one byte order in ORDER BY and the
+  cursor predicate). A page starts after the cursor's key
+  with `time <= t AND (time < t OR id < k)`: the bare-column time bound is
+  the index range, the `OR` only resolves ties. The key `(time, id)` must be
+  unique and the id never NULL, as a hypertable's key is; a duplicate or
+  NULL id at a page boundary is skipped. `offset > 0` is a 400.
+- **Name the order's time through the table alias** (`mc_events."time"`).
+  The select list emits `... AS time`; a bare `ORDER BY "time"` resolves to
+  that OUTPUT column, which for a naive column is the converted expression
+  no index provides, so every page would sort the whole window. Keep the
+  alias in any new ordered events statement.
+- The feature id and the cursor are the same string, `EventKey`:
+  `<id>@<time>`, RFC 3339 UTC `AutoSi`, so a microsecond time round-trips
+  exactly; parsed at the last `@`. **One event, one id:** `EventKey::parse`
+  takes only the string `Display` writes back (no `+02:00` or `.000Z`
+  time) and no NUL, which no PostgreSQL text bind holds (it was a 22021
+  database error, a 500). An integer id is bound only in its own form
+  (`017`, `+17` are no `bigint` id), and `event_feature` 404s a row whose
+  id is not the one asked for (a padded `char(n)`). A rejected id is a 404
+  and a rejected cursor a 400, both before any query.
+- **`/items/{featureId}` is a primary-key lookup, never a scan**
+  (`run_event_by_key_sync`). It prepares `time = $1 AND id = $2` on the
+  bare id column, so PostgreSQL types `$2` as the column, and binds the id
+  in that type for `int2/4/8` and text-like columns: both columns are the
+  `(time, id)` index condition. An id the type cannot hold (`abc` for a
+  `bigint`) is a 404 without executing. Any other id type (`uuid`,
+  `numeric`) runs `EventIdMatch::Text`, the id compared as text after the
+  time column's index probe. The DB test pins the plan's `Index Cond`.
+- **No count, ever (#503).** `number_matched` is `Some` only on a first
+  page that holds every match (no cursor, no next page: it is the page's
+  length) and `None` on every other page; api-features then leaves
+  `numberMatched` out. Do not add a `COUNT`: a valid paged request must
+  never fail or slow down for one.
+- `bbox` is `&&` against `ST_MakeEnvelope` binds, edges included; west >
+  east is two envelopes split at ±180. Without `datetime`,
+  `events_default_range`, the one home of the window EDR's area query
+  uses too. `default_datetime(now)` names that window for api-features,
+  which passes it explicitly on every page of a chain: the engine's own
+  fallback slides with the clock, and a chain that relied on it lost its
+  oldest events (#503 review). Keep both on `events_default_range_at`.
+- `number_items` is `None` (no table count; `feature_count` is the cached
+  stations, `0`), `temporal_extent` the snapshot's, `filterables` and
+  `sortables` empty. EDR `items` is not wired for events (`admin.rs`
+  `edr_items_engine`): it pages by offset.
+
 ## Database tests (`tests/db.rs`, #1062)
 
 - The only tests that run SQL. They read `MC_TEST_POSTGIS_DSN` (a
@@ -412,6 +470,18 @@ in step when changing this lifecycle.
   the station without one; without filters the same rows read back as
   stored. `value_filters_events_shape`: a `real` peak current, out of range
   or the sentinel, is null on its event.
+- `events_features_shape` (#503, `mc503_events`): Features on a naive-UTC
+  table keyed `(time, id)`. Paging two at a time visits every event once
+  with a boundary inside a three-way tie whose ids order differently as
+  text; `numberMatched` only on a first page holding every match; `bbox`
+  edges and the 170,10,-170,20 seam box; an instant and an open
+  `datetime`; the default window against rows written at `now()`; each
+  feature read back by its id, a microsecond time, a malformed `bigint` id
+  as a 404, and the by-id statement's plan an `Index Cond` on the
+  primary key. `events_feature_by_a_uuid_key` (`mc503_uuid`): the text
+  fallback for an id type with no bind of its own.
+  `events_features_default_window_chain` (`mc503_chain`): a chain on the
+  named default window, events inserted between pages, each visited once.
 - The timing test prints both paths by stations × steps on a TimescaleDB
   hypertable, each path's time to the value-budget 400 for a week over
   20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It

@@ -77,9 +77,10 @@ impl FeatureEngine for Places {
         let end = offset.saturating_add(query.limit).min(matched.len());
         Ok(FeaturePage {
             features: matched[offset..end].iter().map(|f| (*f).clone()).collect(),
-            number_matched: matched.len(),
+            number_matched: Some(matched.len()),
             number_returned: end - offset,
             next_offset: (end < matched.len()).then_some(end),
+            next_cursor: None,
         })
     }
 

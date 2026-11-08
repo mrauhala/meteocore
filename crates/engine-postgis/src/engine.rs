@@ -20,7 +20,8 @@ use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
-    check_mask_budget, parse_area_coords, Geometry, PropertyValue, QueryPolygon,
+    check_mask_budget, parse_area_coords, Feature, FeaturePage, FeatureQuery, Geometry,
+    PropertyValue, QueryPolygon,
 };
 use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::model::{
@@ -34,10 +35,11 @@ use crate::config::PostgisEngineConfig;
 use crate::health::{Health, HealthSnapshot, HealthStatus, LiveHealth};
 use crate::metadata::{CollectionMeta, LocationsCut, MetadataCache};
 use crate::query::{
-    build_area_set, build_events_area, build_events_pick, build_events_window, build_location,
-    build_position, build_stations_in_polygon, first_observation_column, params_as_refs,
-    BuiltQuery, WindowAttrs, DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_OBSERVATION_ROWS,
-    MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
+    build_area_set, build_events_area, build_events_feature, build_events_features,
+    build_events_pick, build_events_window, build_location, build_position,
+    build_stations_in_polygon, first_observation_column, params_as_refs, BuiltQuery, EventIdMatch,
+    EventsSelection, WindowAttrs, DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_EVENTS_PAGE,
+    MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
 };
 use crate::schema::{EventsShape, ObservationSchema};
 use crate::station_map::StationSymbols;
@@ -505,19 +507,8 @@ impl PostgisEngine {
         let polygon_wkt = normalize_area_wkt(coords)?;
 
         // No `datetime` never means full history — fall back to the
-        // configured window ending "now". `events_default_window` is always
-        // Some for an events config (resolve sets it unconditionally); the
-        // fallback shares the resolve-time constant so they cannot drift.
-        let (t0, t1) = match datetime {
-            Some(range) => range,
-            None => {
-                let window = self.config.events_default_window.unwrap_or_else(|| {
-                    chrono::Duration::hours(crate::config::DEFAULT_EVENTS_WINDOW_HOURS)
-                });
-                let now = Utc::now();
-                (now - window, now)
-            }
-        };
+        // configured window ending "now", as Features does (#503).
+        let (t0, t1) = datetime.unwrap_or_else(|| self.events_default_range());
 
         let per_row = key_refs.len().max(1);
         // +1 sentinel row: crossing the budget is detected as "one more row
@@ -601,61 +592,18 @@ impl PostgisEngine {
                 .max(0) as usize,
             None => 0,
         };
-        let peak_current_column = shape
-            .peak_current_col
-            .as_deref()
-            .filter(|col| !source_keys.iter().any(|key| key == col));
         let mut features = Vec::with_capacity(rows.len());
         for row in &rows {
-            let time: DateTime<Utc> = row
-                .try_get("time")
-                .map_err(|e| DataServerError::Engine(format!("decode event time: {e}")))?;
-            let lon: Option<f64> = row
-                .try_get("lon")
-                .map_err(|e| DataServerError::Engine(format!("decode event lon: {e}")))?;
-            let lat: Option<f64> = row
-                .try_get("lat")
-                .map_err(|e| DataServerError::Engine(format!("decode event lat: {e}")))?;
+            let event = EventRecord::decode(&self.config, shape, &key_refs, row)?;
             // A degenerate geometry (ST_X of POINT EMPTY) has no position:
             // counted, as the database counted it, but not listed.
-            let (Some(lon), Some(lat)) = (lon, lat) else {
+            let Some((lon, lat)) = event.position else {
                 continue;
             };
-            let id: Option<String> = row
-                .try_get("mc_id")
-                .map_err(|e| DataServerError::Engine(format!("decode event id: {e}")))?;
-            let number =
-                |value: Option<f64>| value.map_or(PropertyValue::Null, PropertyValue::Float);
-            let mut properties = vec![(
-                "time".to_string(),
-                PropertyValue::String(time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)),
-            )];
-            for key in &key_refs {
-                let value: Option<f64> = row
-                    .try_get(*key)
-                    .map_err(|e| DataServerError::Engine(format!("decode event {key}: {e}")))?;
-                properties.push((source_key_to_param_name(&self.config, key), number(value)));
-            }
-            if shape.cloud_indicator_col.is_some() {
-                let value = row
-                    .try_get::<_, Option<f64>>("mc_cloud_indicator")
-                    .map_err(|e| {
-                        DataServerError::Engine(format!("decode event cloud indicator: {e}"))
-                    })?;
-                properties.push(("type".to_string(), strike_type(value)));
-            }
-            if peak_current_column.is_some() {
-                let value = row
-                    .try_get::<_, Option<f64>>("mc_peak_current")
-                    .map_err(|e| {
-                        DataServerError::Engine(format!("decode event peak current: {e}"))
-                    })?;
-                properties.push(("peak_current_ka".to_string(), number(value)));
-            }
             features.push(PickedFeature {
-                id: id.unwrap_or_default(),
+                id: event.id,
                 geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
-                properties,
+                properties: event.properties,
             });
         }
         Ok(PickedFeatures {
@@ -663,6 +611,244 @@ impl PostgisEngine {
             number_matched,
         })
     }
+
+    /// Features `/items` on the events shape (#503): one feature per event
+    /// of the request's `bbox` and `datetime` (without one, the
+    /// `default_datetime` window ending now, as EDR reads it), newest first
+    /// and ties by id, `limit` at a time. A page is one statement that
+    /// starts after the cursor's `(time, id)`, a keyset predicate the time
+    /// index serves, never an offset. No count runs: `number_matched` is
+    /// reported only by a first page that holds every match, and is `None`
+    /// on every other page.
+    pub(crate) fn event_features(
+        &self,
+        shape: &EventsShape,
+        query: &FeatureQuery,
+    ) -> Result<FeaturePage, DataServerError> {
+        // The API turns these down first; a caller other than the API gets
+        // the same answer rather than an unfiltered page.
+        if query.offset > 0 {
+            return Err(DataServerError::InvalidParameter(
+                "this collection pages by cursor: follow the next link; offset is not supported"
+                    .into(),
+            ));
+        }
+        if !query.sortby.is_empty() || !query.property_filters.is_empty() {
+            return Err(DataServerError::InvalidParameter(
+                "events have no sortable or filterable properties".into(),
+            ));
+        }
+        let after = query
+            .cursor
+            .as_deref()
+            .map(|cursor| {
+                crate::feature::EventKey::parse(cursor).ok_or_else(|| {
+                    DataServerError::InvalidParameter(
+                        "cursor is not a page cursor of this collection: follow the next link"
+                            .into(),
+                    )
+                })
+            })
+            .transpose()?;
+        self.require_validated()?;
+        let (start, end) = match &query.datetime {
+            Some(datetime) => (datetime.start, datetime.end),
+            None => {
+                let (start, end) = self.events_default_range();
+                (Some(start), Some(end))
+            }
+        };
+        let selection = EventsSelection {
+            start,
+            end,
+            bbox: query.bbox.map(|b| [b.west, b.south, b.east, b.north]),
+            after: after.as_ref().map(|key| (key.time, key.id.as_str())),
+        };
+        let limit = query.limit.min(MAX_EVENTS_PAGE);
+        let source_keys = resolve_source_keys(&self.config, None)?;
+        let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
+        let page = build_events_features(
+            shape,
+            &self.config.parameters,
+            &selection,
+            &key_refs,
+            limit + 1,
+        )
+        .map_err(|e| DataServerError::Engine(format!("build_events_features: {e}")))?;
+        let rows = run_single_query_sync(&self.pool, page)?;
+        for row in &rows {
+            self.check_geometry_row(row)?;
+        }
+        let more = rows.len() > limit;
+        let mut features = Vec::with_capacity(rows.len().min(limit));
+        for row in rows.iter().take(limit) {
+            features.push(EventRecord::decode(&self.config, shape, &key_refs, row)?.into_feature());
+        }
+        let next_cursor = more
+            .then(|| features.last().map(|f| f.id.clone()))
+            .flatten();
+        let number_returned = features.len();
+        // Known for free only when this page holds every match: the first
+        // page, with none after it. Otherwise left out; never counted.
+        let number_matched = (after.is_none() && !more).then_some(number_returned);
+        Ok(FeaturePage {
+            features,
+            number_matched,
+            number_returned,
+            next_offset: None,
+            next_cursor,
+        })
+    }
+
+    /// Features `/items/{featureId}` on the events shape (#503): the event of
+    /// the id's `(time, id)` key, a primary-key lookup
+    /// ([`run_event_by_key_sync`]). An id that is no event key as this engine
+    /// writes it ([`crate::feature::EventKey::parse`]), or whose id part the
+    /// id column's type cannot hold, is not found, without a query.
+    pub(crate) fn event_feature(
+        &self,
+        shape: &EventsShape,
+        feature_id: &str,
+    ) -> Result<Feature, DataServerError> {
+        let not_found = || DataServerError::FeatureNotFound(feature_id.to_string());
+        let key = crate::feature::EventKey::parse(feature_id).ok_or_else(not_found)?;
+        self.require_validated()?;
+        let source_keys = resolve_source_keys(&self.config, None)?;
+        let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
+        let built = |id_match| {
+            build_events_feature(
+                shape,
+                &self.config.parameters,
+                &key_refs,
+                (key.time, &key.id),
+                id_match,
+            )
+            .map_err(|e| DataServerError::Engine(format!("build_events_feature: {e}")))
+        };
+        let column = built(EventIdMatch::Column)?;
+        let text = built(EventIdMatch::Text)?;
+        let rows = run_event_by_key_sync(&self.pool, column, text, &key.id)?;
+        for row in &rows {
+            self.check_geometry_row(row)?;
+        }
+        let row = rows.first().ok_or_else(not_found)?;
+        let feature = EventRecord::decode(&self.config, shape, &key_refs, row)?.into_feature();
+        // One event, one id: an id the column only compares equal to (a
+        // padded `char(n)`) names no feature, as a non-canonical time does.
+        if feature.id != feature_id {
+            return Err(not_found());
+        }
+        Ok(feature)
+    }
+
+    /// The window an events query without `datetime` reads: the configured
+    /// `default_datetime` ending now, both ends included. One home for EDR's
+    /// area query and Features (#503), so they cannot drift.
+    fn events_default_range(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+        self.events_default_range_at(Utc::now())
+    }
+
+    /// [`Self::events_default_range`] ending at `now`: what
+    /// `FeatureEngine::default_datetime` names for the Features API to fix
+    /// one interval for a whole `next` chain (#503).
+    pub(crate) fn events_default_range_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
+        // `events_default_window` is always Some for an events config
+        // (resolve sets it unconditionally); the fallback shares the
+        // resolve-time constant.
+        let window = self
+            .config
+            .events_default_window
+            .unwrap_or_else(|| chrono::Duration::hours(crate::config::DEFAULT_EVENTS_WINDOW_HOURS));
+        (now - window, now)
+    }
+}
+
+/// One event row of `query::event_projection`'s layout (#1100, #503): what
+/// GetFeatureInfo and Features report of an event, decoded in one place.
+struct EventRecord {
+    time: DateTime<Utc>,
+    /// `(lon, lat)`; `None` for a NULL or empty geometry.
+    position: Option<(f64, f64)>,
+    /// The `id_col` value as text.
+    id: String,
+    /// `time` as RFC 3339, every requested parameter by name (filtered, as
+    /// EDR filters it), `type` from `cloud_indicator_col` and
+    /// `peak_current_ka` from `peak_current_col` when declared and no
+    /// parameter already reads that column.
+    properties: Vec<(String, PropertyValue)>,
+}
+
+impl EventRecord {
+    fn decode(
+        cfg: &PostgisEngineConfig,
+        shape: &EventsShape,
+        key_refs: &[&str],
+        row: &Row,
+    ) -> Result<Self, DataServerError> {
+        let decode = |what: &str, e: tokio_postgres::Error| {
+            DataServerError::Engine(format!("decode event {what}: {e}"))
+        };
+        let time: DateTime<Utc> = row.try_get("time").map_err(|e| decode("time", e))?;
+        let lon: Option<f64> = row.try_get("lon").map_err(|e| decode("lon", e))?;
+        let lat: Option<f64> = row.try_get("lat").map_err(|e| decode("lat", e))?;
+        let id: Option<String> = row.try_get("mc_id").map_err(|e| decode("id", e))?;
+        let number = |value: Option<f64>| value.map_or(PropertyValue::Null, PropertyValue::Float);
+        let mut properties = vec![("time".to_string(), PropertyValue::String(rfc3339(time)))];
+        for key in key_refs {
+            let value: Option<f64> = row.try_get(*key).map_err(|e| decode(key, e))?;
+            properties.push((source_key_to_param_name(cfg, key), number(value)));
+        }
+        if shape.cloud_indicator_col.is_some() {
+            let value = row
+                .try_get::<_, Option<f64>>("mc_cloud_indicator")
+                .map_err(|e| decode("cloud indicator", e))?;
+            properties.push(("type".to_string(), strike_type(value)));
+        }
+        let peak_current_column = shape
+            .peak_current_col
+            .as_deref()
+            .filter(|col| !key_refs.contains(col));
+        if peak_current_column.is_some() {
+            let value = row
+                .try_get::<_, Option<f64>>("mc_peak_current")
+                .map_err(|e| decode("peak current", e))?;
+            properties.push(("peak_current_ka".to_string(), number(value)));
+        }
+        Ok(Self {
+            time,
+            position: lon.zip(lat),
+            id: id.unwrap_or_default(),
+            properties,
+        })
+    }
+
+    /// The event as a Features feature (#503): its id is its key
+    /// ([`crate::feature::EventKey`]), its geometry the point, or null for a
+    /// degenerate one (listed and counted, as the database counted it).
+    fn into_feature(self) -> Feature {
+        let key = crate::feature::EventKey {
+            time: self.time,
+            id: self.id,
+        };
+        Feature {
+            id: key.to_string(),
+            geometry: Arc::new(match self.position {
+                Some((x, y)) => Geometry::Point { x, y },
+                None => Geometry::Null,
+            }),
+            properties: Arc::new(self.properties.into_iter().collect()),
+            related: Vec::new(),
+        }
+    }
+}
+
+/// An event time as every events surface writes it: RFC 3339 UTC, as many
+/// fraction digits as it has (a microsecond time round-trips exactly).
+pub(crate) fn rfc3339(time: DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 /// A strike's `type` from its `cloud_indicator_col` value: 0 cloud-to-ground,
@@ -1474,6 +1660,91 @@ fn run_single_query_sync(pool: &Pool, built: BuiltQuery) -> Result<Vec<Row>, Dat
             .query(&built.sql, &refs)
             .await
             .map_err(|e| map_pg_error(e, &built))
+    })
+}
+
+/// An event key's id bound in its column's type (#503).
+#[derive(Debug, PartialEq)]
+enum EventIdBind {
+    I64(i64),
+    I32(i32),
+    I16(i16),
+    Text(String),
+}
+
+impl EventIdBind {
+    /// `id` in the type PostgreSQL gave `$2` (the id column's); `None` for a
+    /// type this engine binds as text instead. An integer is taken only in
+    /// the form the column writes it (`17`, never `017` or `+17`), so one
+    /// event has one id; `Some(None)` is an id no row of the column has.
+    fn of(ty: &tokio_postgres::types::Type, id: &str) -> Option<Option<Self>> {
+        use tokio_postgres::types::Type;
+        fn canonical<T: std::str::FromStr + ToString>(id: &str) -> Option<T> {
+            id.parse::<T>().ok().filter(|v| v.to_string() == id)
+        }
+        Some(match *ty {
+            Type::INT8 => canonical(id).map(Self::I64),
+            Type::INT4 => canonical(id).map(Self::I32),
+            Type::INT2 => canonical(id).map(Self::I16),
+            Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
+                Some(Self::Text(id.to_string()))
+            }
+            _ => return None,
+        })
+    }
+
+    fn as_sql(&self) -> &(dyn tokio_postgres::types::ToSql + Sync) {
+        match self {
+            Self::I64(v) => v,
+            Self::I32(v) => v,
+            Self::I16(v) => v,
+            Self::Text(v) => v,
+        }
+    }
+}
+
+/// The rows of an event key (#503), on one pooled connection. `column`
+/// compares the bare id column (`EventIdMatch::Column`): preparing it types
+/// `$2` as that column, and an integer or text column gets the id in its
+/// own type, so `(time, id)` is one equality on the table's primary key.
+/// An id that type cannot hold (`abc` for a `bigint`) is no event: no rows,
+/// without executing. Any other column type runs `text` instead, the id
+/// compared as text after the time index's probe.
+fn run_event_by_key_sync(
+    pool: &Pool,
+    column: BuiltQuery,
+    text: BuiltQuery,
+    id: &str,
+) -> Result<Vec<Row>, DataServerError> {
+    let pool = pool.clone();
+    block_on_async(async move {
+        let client = pool
+            .get()
+            .await
+            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+        let statement = client
+            .prepare(&column.sql)
+            .await
+            .map_err(|e| map_pg_error(e, &column))?;
+        let bind = statement
+            .params()
+            .get(1)
+            .and_then(|ty| EventIdBind::of(ty, id));
+        match bind {
+            Some(Some(bind)) => {
+                let mut refs = params_as_refs(&column.params);
+                refs[1] = bind.as_sql();
+                client
+                    .query(&statement, &refs)
+                    .await
+                    .map_err(|e| map_pg_error(e, &column))
+            }
+            Some(None) => Ok(Vec::new()),
+            None => client
+                .query(&text.sql, &params_as_refs(&text.params))
+                .await
+                .map_err(|e| map_pg_error(e, &text)),
+        }
     })
 }
 
@@ -2299,6 +2570,161 @@ mod tests {
         );
     }
 
+    /// #503: an events collection is a Features collection read per request
+    /// and paged by cursor, with a time dimension, its configured extent and
+    /// no `numberItems`, its time first in a listing. A station shape keeps
+    /// its offset-paged inventory served from memory.
+    #[test]
+    fn events_engine_features_surface() {
+        use ds_core::feature_engine::FeatureEngine;
+        let events = engine_with(events_engine_config());
+        assert!(events.pages_by_cursor());
+        assert!(events.reads_on_request());
+        assert!(events.has_time_dimension());
+        assert_eq!(events.number_items(), None);
+        assert_eq!(events.feature_count(), 0);
+        assert_eq!(
+            FeatureEngine::spatial_extent(&events),
+            Some([4.0, 54.0, 42.0, 72.0])
+        );
+        assert!(events.filterables().is_empty());
+        assert!(events.sortables().is_empty());
+        assert_eq!(events.summary_properties(), ["time"]);
+        assert!(events.items_description().is_some());
+        // The window a chain without `datetime` reads, named for the API.
+        let now: DateTime<Utc> = "2026-01-01T06:00:00Z".parse().unwrap();
+        assert_eq!(
+            events.default_datetime(now),
+            Some(ds_core::feature::DatetimeInterval {
+                start: Some("2026-01-01T05:00:00Z".parse().unwrap()),
+                end: Some(now),
+            })
+        );
+
+        let mut stations = events_engine_config();
+        stations.location_source = crate::schema::LocationSource::Stations(dummy_stations());
+        stations.observations = dummy_long_obs();
+        stations.events_default_window = None;
+        stations.events_extent_bbox = None;
+        let stations = engine_with(stations);
+        assert!(!stations.pages_by_cursor());
+        assert!(!stations.reads_on_request());
+        assert!(!stations.has_time_dimension());
+        assert_eq!(stations.number_items(), Some(0));
+        assert_eq!(FeatureEngine::temporal_extent(&stations), None);
+        assert!(stations.summary_properties().is_empty());
+        assert!(stations.items_description().is_none());
+        assert_eq!(stations.default_datetime(now), None);
+    }
+
+    /// #503: an id is bound in its column's type only in the form that
+    /// type writes, so `017` and `+17` name no `bigint` event and one event
+    /// has one id; a type without a bind of its own is compared as text.
+    #[test]
+    fn event_id_binds_in_its_column_type_only_canonically() {
+        use tokio_postgres::types::Type;
+        assert_eq!(
+            EventIdBind::of(&Type::INT8, "17"),
+            Some(Some(EventIdBind::I64(17)))
+        );
+        assert_eq!(
+            EventIdBind::of(&Type::INT4, "-3"),
+            Some(Some(EventIdBind::I32(-3)))
+        );
+        assert_eq!(
+            EventIdBind::of(&Type::INT2, "7"),
+            Some(Some(EventIdBind::I16(7)))
+        );
+        for id in ["017", "+17", " 17", "17 ", "1e3", "abc", "", "99999999999"] {
+            assert_eq!(EventIdBind::of(&Type::INT4, id), Some(None), "{id:?}");
+        }
+        assert_eq!(
+            EventIdBind::of(&Type::TEXT, "017"),
+            Some(Some(EventIdBind::Text("017".into())))
+        );
+        assert_eq!(EventIdBind::of(&Type::UUID, "017"), None);
+        assert_eq!(EventIdBind::of(&Type::NUMERIC, "17"), None);
+    }
+
+    /// #503: what the events Features surface turns down before it reads: a
+    /// cursor it did not write, an offset, a sort or a filter are 400s, an
+    /// id that is no event key a 404. Then, before the schema is validated,
+    /// a well-formed request is the pending error; this pool reaches no
+    /// database, so none of these touched one.
+    #[test]
+    fn events_features_reject_before_reading() {
+        use ds_core::feature::{FeatureQuery, SortKey};
+        use ds_core::feature_engine::FeatureEngine;
+        let engine = engine_with(events_engine_config());
+        let rejected = [
+            FeatureQuery {
+                cursor: Some("nope".into()),
+                ..Default::default()
+            },
+            FeatureQuery {
+                cursor: Some("17@yesterday".into()),
+                ..Default::default()
+            },
+            // No text bind holds a NUL; the database would answer a 500.
+            FeatureQuery {
+                cursor: Some("\0@2026-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+            // Not the cursor this engine writes for that key.
+            FeatureQuery {
+                cursor: Some("17@2026-01-01T07:30:00+02:00".into()),
+                ..Default::default()
+            },
+            FeatureQuery {
+                offset: 100,
+                ..Default::default()
+            },
+            FeatureQuery {
+                sortby: vec![SortKey::ascending("time")],
+                ..Default::default()
+            },
+            FeatureQuery {
+                property_filters: vec![("type".into(), "x".into())],
+                ..Default::default()
+            },
+        ];
+        for query in &rejected {
+            let err = engine.get_features(query).unwrap_err();
+            assert!(
+                matches!(err, DataServerError::InvalidParameter(_)),
+                "{query:?}: {err:?}"
+            );
+        }
+        for id in [
+            "17",
+            "\0@2026-01-01T00:00:00Z",
+            "17@2026-01-01T07:30:00+02:00",
+            "17@2026-01-01T05:30:00.000Z",
+        ] {
+            let err = FeatureEngine::get_feature(&engine, id).unwrap_err();
+            assert!(
+                matches!(err, DataServerError::FeatureNotFound(_)),
+                "{id:?}: {err:?}"
+            );
+        }
+
+        let pending = |err: DataServerError| matches!(err, DataServerError::Engine(ref m) if m == crate::validation::PENDING_ERROR);
+        assert!(pending(
+            engine.get_features(&FeatureQuery::default()).unwrap_err()
+        ));
+        assert!(pending(
+            engine
+                .get_features(&FeatureQuery {
+                    cursor: Some("17@2026-01-01T05:30:00Z".into()),
+                    ..Default::default()
+                })
+                .unwrap_err()
+        ));
+        assert!(pending(
+            FeatureEngine::get_feature(&engine, "17@2026-01-01T05:30:00Z").unwrap_err()
+        ));
+    }
+
     #[test]
     fn assemble_event_coverages_one_point_per_event() {
         use crate::config::ValidatedParameter;
@@ -2572,7 +2998,9 @@ mod tests {
     async fn feature_property_filters_use_cached_properties_before_paging() {
         use ds_core::feature::{FeatureQuery, PropertyValue};
         use ds_core::feature_engine::FeatureEngine;
-        let engine = engine_with(events_engine_config());
+        // A station shape: since #503 an events collection's features are
+        // its events, read from the table, not the cached stations.
+        let engine = engine_with(stations_engine_config(&["region"]));
         let mut meta = meta_with(vec![
             loc("a", 10.0, 60.0),
             loc("b", 20.0, 60.0),
@@ -2596,7 +3024,7 @@ mod tests {
             ..Default::default()
         };
         let page = engine.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 2);
+        assert_eq!(page.number_matched, Some(2));
         assert_eq!(page.features[0].id, "c");
         assert_eq!(page.next_offset, None);
     }
@@ -2641,7 +3069,7 @@ mod tests {
             ..Default::default()
         };
         let page = engine.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 0);
+        assert_eq!(page.number_matched, Some(0));
         assert_eq!(page.number_returned, 0);
         assert!(page.features.is_empty());
     }

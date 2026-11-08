@@ -1846,9 +1846,10 @@ mod mvt {
             let features: Vec<Feature> = matched.into_iter().take(take).cloned().collect();
             Ok(FeaturePage {
                 features,
-                number_matched: n,
+                number_matched: Some(n),
                 number_returned: take,
                 next_offset: None,
+                next_cursor: None,
             })
         }
 
@@ -2034,9 +2035,10 @@ mod mvt {
             let len = features.len();
             Ok(FeaturePage {
                 features,
-                number_matched: self.emit,
+                number_matched: Some(self.emit),
                 number_returned: len,
                 next_offset: None,
+                next_cursor: None,
             })
         }
 
@@ -5349,9 +5351,10 @@ mod vector_tile_time {
             let n = features.len();
             Ok(FeaturePage {
                 features,
-                number_matched: n,
+                number_matched: Some(n),
                 number_returned: n,
                 next_offset: None,
+                next_cursor: None,
             })
         }
 

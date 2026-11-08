@@ -469,9 +469,10 @@ impl FeatureEngine for CsvEngine {
 
         Ok(FeaturePage {
             features: page,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset,
+            next_cursor: None,
         })
     }
 
@@ -583,7 +584,7 @@ mod tests {
                 })
                 .unwrap();
             let ids: Vec<String> = page.features.iter().map(|f| f.id.clone()).collect();
-            assert_eq!(page.number_matched, ids.len());
+            assert_eq!(page.number_matched, Some(ids.len()));
             ids
         };
         // Rows: zeta and alpha at 00:00 and 01:00, beta at 00:00 only.
@@ -630,12 +631,12 @@ mod tests {
             ..Default::default()
         };
         let first = engine.get_features(&query).unwrap();
-        assert_eq!(first.number_matched, 2);
+        assert_eq!(first.number_matched, Some(2));
         assert_eq!(first.features[0].id, "zeta");
         assert_eq!(first.next_offset, Some(1));
         query.offset = 1;
         let last = engine.get_features(&query).unwrap();
-        assert_eq!(last.number_matched, 2);
+        assert_eq!(last.number_matched, Some(2));
         assert_eq!(last.features[0].id, "beta");
         assert_eq!(last.next_offset, None);
 
@@ -655,7 +656,7 @@ mod tests {
             query.limit = usize::MAX;
             let beyond = engine.get_features(&query).unwrap();
             assert!(beyond.features.is_empty());
-            assert_eq!(beyond.number_matched, if filtered { 2 } else { 3 });
+            assert_eq!(beyond.number_matched, Some(if filtered { 2 } else { 3 }));
             assert_eq!(beyond.next_offset, None);
             query.offset = 0;
             query.limit = 0;
@@ -677,11 +678,11 @@ mod tests {
             ..Default::default()
         };
         let page = engine.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.number_matched, Some(1));
         assert_eq!(page.features[0].id, target.id);
         query.offset = 1;
         let page = engine.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.number_matched, Some(1));
         assert!(page.features.is_empty());
     }
 
@@ -694,8 +695,8 @@ mod tests {
                 ..Default::default()
             })
             .unwrap();
-        assert!(all.number_matched > 0);
-        assert_eq!(all.number_matched, all.number_returned);
+        assert!(all.number_matched.is_some_and(|n| n > 0));
+        assert_eq!(all.number_matched, Some(all.number_returned));
         assert!(all.next_offset.is_none());
         // Each feature should have a point geometry and properties
         for f in &all.features {
@@ -730,7 +731,7 @@ mod tests {
     fn get_features_pagination() {
         let engine = CsvEngine::new(test_store());
         let all = engine.get_features(&FeatureQuery::default()).unwrap();
-        let total = all.number_matched;
+        let total = all.number_matched.expect("an offset page is counted");
         assert!(total >= 3, "need at least 3 locations for pagination test");
 
         let query = FeatureQuery {
@@ -739,7 +740,7 @@ mod tests {
             ..Default::default()
         };
         let page1 = engine.get_features(&query).unwrap();
-        assert_eq!(page1.number_matched, total);
+        assert_eq!(page1.number_matched, Some(total));
         assert_eq!(page1.number_returned, 2);
         assert_eq!(page1.next_offset, Some(2));
 
@@ -764,7 +765,10 @@ mod tests {
             ..Default::default()
         };
         let result = engine.get_features(&query).unwrap();
-        assert!(result.number_matched > 0, "expected Helsinki-area stations");
+        assert!(
+            result.number_matched.is_some_and(|n| n > 0),
+            "expected Helsinki-area stations"
+        );
         // All returned features should be within the bbox
         for f in &result.features {
             match *f.geometry {
@@ -786,7 +790,7 @@ mod tests {
             ..Default::default()
         };
         let result = engine.get_features(&query).unwrap();
-        assert_eq!(result.number_matched, 0);
+        assert_eq!(result.number_matched, Some(0));
         assert!(result.features.is_empty());
     }
 

@@ -101,9 +101,10 @@ impl FeatureEngine for MockFeatureEngine {
 
         Ok(FeaturePage {
             features: page,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset,
+            next_cursor: None,
         })
     }
 

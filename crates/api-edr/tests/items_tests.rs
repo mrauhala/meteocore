@@ -86,10 +86,11 @@ impl FeatureEngine for Stations {
         let number_returned = features.len();
         Ok(FeaturePage {
             features,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset: (offset + number_returned < number_matched)
                 .then_some(offset + number_returned),
+            next_cursor: None,
         })
     }
 

@@ -225,7 +225,8 @@ impl FeatureEngine for Every {
             next_offset: (query.offset + features.len() < 3)
                 .then_some(query.offset + features.len()),
             features,
-            number_matched: 3,
+            number_matched: Some(3),
+            next_cursor: None,
         })
     }
 

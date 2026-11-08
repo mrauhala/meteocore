@@ -36,8 +36,54 @@ pub trait FeatureEngine: Send + Sync {
             limit: 0,
             ..Default::default()
         })
-        .map(|p| p.number_matched)
+        .ok()
+        .and_then(|p| p.number_matched)
         .unwrap_or(0)
+    }
+
+    /// The collection metadata's `numberItems`: [`feature_count`](Self::
+    /// feature_count) by default. `None` leaves it out, for a collection
+    /// that cannot count its features from memory: an event table with
+    /// unbounded history (engine-postgis `events`, #503).
+    fn number_items(&self) -> Option<usize> {
+        Some(self.feature_count())
+    }
+
+    /// Whether `/items` pages this collection by cursor instead of offset
+    /// (#503): a source read in key order per request, where an offset would
+    /// re-read every row before it. The API layer then passes the previous
+    /// page's [`FeaturePage::next_cursor`] as [`FeatureQuery::cursor`],
+    /// links `next` with it and turns a non-zero `offset` down with a 400.
+    /// An engine that pages by offset (the default) gets a `cursor` turned
+    /// down instead.
+    fn pages_by_cursor(&self) -> bool {
+        false
+    }
+
+    /// Whether [`get_features`](Self::get_features) and
+    /// [`get_feature`](Self::get_feature) read a database or another source
+    /// on each call instead of answering from memory (#503). The API layer
+    /// then runs them on ds-executor's shared query runtime, under its own
+    /// admission and deadline, never on a request worker (root CLAUDE.md
+    /// Critical Rule 7). An engine that answers from memory (the default) is
+    /// called in place.
+    fn reads_on_request(&self) -> bool {
+        false
+    }
+
+    /// The interval `/items` reads when a request has no `datetime`, for an
+    /// engine whose features are then the window ending `now` (engine-postgis
+    /// `events`, its `default_datetime`, #503). The API layer resolves it
+    /// once per request and passes it as [`FeatureQuery::datetime`], and the
+    /// request's `next` and `prev` links carry it as an explicit `datetime`,
+    /// so every page of a chain reads one fixed interval. Recomputed per
+    /// page, the window would slide, and newest first its lower edge would
+    /// cut off the oldest features the chain still had to reach. `None`
+    /// (the default): no such window, and a query without `datetime` is
+    /// answered as before.
+    fn default_datetime(&self, now: DateTime<Utc>) -> Option<DatetimeInterval> {
+        let _ = now;
+        None
     }
 
     /// Feature properties this engine can sort on, in the order they should be
