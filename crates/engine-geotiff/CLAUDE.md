@@ -480,11 +480,12 @@ Position + area queries. Nearest-neighbour sampling of the source grid.
 
 Area (and radius) answers the grid `area::AreaGrid` gives the polygon's bbox
 on the first matching entry's grid (#1435), at native resolution: no
-`MAX_AREA_DIM` coarsening, which would need overview selection.
+`QueryPolygon::fit_grid` coarsening (#1436), which would need overview
+selection.
 
 - **Geographic (CRS84) source:** the native pixel window of the bbox, like
   GRIB. Its pixel centres are the axes; each cell is masked by its centre.
-- **Projected source:** a regular CRS84 grid, `QueryPolygon::sample_grid`'s
+- **Projected source:** a regular CRS84 grid, `QueryPolygon::grid_axes`'
   cell centres over the bbox clipped to the raster's CRS84 envelope
   (`footprint_envelope`: a bbox past the raster answers the raster's part,
   one missing the envelope is the 400), masked by `cell_mask`. Each cell is

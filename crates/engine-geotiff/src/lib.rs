@@ -2392,7 +2392,7 @@ impl GeoTiffEngine {
         // the same pixel window. The shared budgets (#673) count EVERY
         // matching timestep, before the `timesteps × ny × nx` result is
         // allocated or a file read (#858). The answer stays at native
-        // resolution, like GRIB: no `MAX_AREA_DIM` coarsening, so an
+        // resolution, like GRIB: no `fit_grid` coarsening, so an
         // over-budget area is the 400.
         let first_entry = entries[0].1;
         let first_metadata = first_entry
@@ -2481,6 +2481,7 @@ impl GeoTiffEngine {
             y: plan.y,
             t: Some(times),
             z: None,
+            coarsened: None,
         };
         let shape = vec![entries.len(), ny, nx];
         let axis_names = vec!["t".to_string(), "y".to_string(), "x".to_string()];

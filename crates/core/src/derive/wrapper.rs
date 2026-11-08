@@ -11,7 +11,7 @@ use super::{DerivationLog, Derivations, DerivedParameter, Outcome, Plan};
 use crate::cube::CubeResolution;
 use crate::edr_engine::{EdrEngine, ItemRadius, LocationFilter, TrajectoryShape};
 use crate::error::DataServerError;
-use crate::feature::{Bbox, DatetimeInterval, Feature, MAX_AREA_VALUES};
+use crate::feature::{AreaShare, Bbox, DatetimeInterval, Feature, MAX_AREA_VALUES};
 use crate::feature_pick::{FeaturePick, PickedFeatures};
 use crate::instances::RunInfo;
 use crate::map_engine::{
@@ -49,8 +49,10 @@ type TimeAndRun = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 ///   combined per value; inputs the client did not ask for are dropped
 ///   again. The response, derived values included, must fit the shared
 ///   value budget ([`MAX_AREA_VALUES`]); it is counted before anything is
-///   derived. A formula that reads the level's pressure takes each value's
-///   level from the coverage's `z`.
+///   derived. An engine that fits an area grid to that budget leaves room
+///   for the derived ranges ([`AreaShare::extra_parameters`], #1436). A
+///   formula that reads the level's pressure takes each value's level from
+///   the coverage's `z`.
 ///
 /// Time, run and content resolve as the inputs do (root `CLAUDE.md`,
 /// adding-an-engine step 7). A parameter derived from one input resolves
@@ -369,7 +371,13 @@ impl Derived {
         let plan = self.plan();
         match EdrSelection::new(&plan, parameters) {
             None => query(parameters),
-            Some(selection) => selection.finish(query(selection.inner.as_deref())?),
+            Some(selection) => {
+                // An area grid fitted to the budget leaves room for the
+                // ranges added here, or the response check below would
+                // refuse what a coarser grid serves (#1436).
+                let _share = AreaShare::extra_parameters(selection.added_ranges());
+                selection.finish(query(selection.inner.as_deref())?)
+            }
         }
     }
 }
@@ -458,6 +466,13 @@ impl EdrSelection {
             derive,
             drop,
         })
+    }
+
+    /// How many more ranges the response has than the wrapped engine
+    /// answers at most: a range per derived parameter, less the inputs only
+    /// the derivation asked for.
+    fn added_ranges(&self) -> usize {
+        self.derive.len().saturating_sub(self.drop.len())
     }
 
     fn finish(&self, response: CoverageResponse) -> Result<CoverageResponse, DataServerError> {
@@ -1102,6 +1117,10 @@ impl EdrEngine for Derived {
 
     fn serves_station_series(&self) -> bool {
         self.edr.serves_station_series()
+    }
+
+    fn coarsens_areas(&self) -> bool {
+        self.edr.coarsens_areas()
     }
 
     fn query_area(

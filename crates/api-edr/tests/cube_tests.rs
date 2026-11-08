@@ -156,6 +156,7 @@ impl EdrEngine for CubeMock {
                     kind: VerticalKind::Pressure,
                     values: levels.clone(),
                 }),
+                coarsened: None,
             },
             parameters: HashMap::from([(
                 "temperature".to_string(),

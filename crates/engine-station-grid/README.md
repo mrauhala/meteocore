@@ -91,10 +91,11 @@ leaves out is null there as it is transparent on the map.
 - `parameter-name` ignores case; an unknown name is a 400. `position` takes
   `POINT(lon lat)`; off the grid is a 404.
 - `area` is a CRS84 grid over the polygon's bounding box at the analysis
-  resolution, at most 256 cells per axis, null outside the polygon.
+  resolution while the answer fits the 1 M-value budget, evenly coarser past it (the domain's `meteocore:resolution` member then gives the native and served cell size), null outside the polygon.
   `radius` is answered as an area. `cube` returns the analysis cells whose
   centres lie in the bbox, or `resolution-x`/`-y` evenly spaced positions.
-  An area, radius or cube response holds at most 1 M values (else 400).
+  A cube response holds at most 1 M values (else 400); an area or radius
+  is coarsened to fit them instead, a 400 only when one cell cannot.
 - No `locations` or `trajectory` query, instances, items or vertical axis.
 
 **Features.** `/collections/<id>/items` is one Point per station,

@@ -588,6 +588,7 @@ mod tests {
                 y: vec![2.0],
                 t: None,
                 z: None,
+                coarsened: None,
             },
             parameters: HashMap::new(),
             ranges: HashMap::new(),

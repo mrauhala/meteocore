@@ -1112,7 +1112,7 @@ fn source_label(source: &Source) -> String {
 /// clipped a viewport past ±180° (OGC API Maps sends a bbox crossing the
 /// antimeridian unwrapped, #828) a few degrees past the seam.
 /// The latitude bound is kept either way.
-fn footprint_guard_envelope(extent: [f64; 4]) -> [f64; 4] {
+pub(crate) fn footprint_guard_envelope(extent: [f64; 4]) -> [f64; 4] {
     match extent {
         [w, s, e, n] if w > e || e - w >= 360.0 => [w - 360.0, s, e + 360.0, n],
         extent => extent,

@@ -46,15 +46,13 @@ use ds_core::cube::{axis_positions, check_cube_budget, CubeResolution};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::edr_engine::{select_parameters, EdrEngine};
 use ds_core::error::DataServerError;
-use ds_core::feature::{
-    check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, Bbox, MAX_AREA_DIM,
-};
+use ds_core::feature::{parse_area_coords, parse_point_coords, Bbox};
 use ds_core::map_engine::{
     select_common_time, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile, RasterValues,
 };
 use ds_core::model::{
-    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    CoverageResponse, DomainDescription, GridResolution, LocationSnapshot, NdArray,
+    ParameterDescription, QueryResult, ValuePrecision,
 };
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
@@ -733,13 +731,14 @@ impl StationGridEngine {
     }
 
     /// A gridded response sampling `cells` (row-major over `ny × nx`, `None`
-    /// off the grid or outside the area) from each grid.
+    /// off the grid or outside the area) from each grid; `coarsened` when
+    /// an area's grid is coarser than the analysis grid (#1436).
     fn grid_response(
         &self,
         params: &[usize],
         times: Vec<DateTime<Utc>>,
-        x: Vec<f64>,
-        y: Vec<f64>,
+        (x, y): (Vec<f64>, Vec<f64>),
+        coarsened: Option<Box<GridResolution>>,
         cells: &[Option<usize>],
     ) -> Result<CoverageResponse, DataServerError> {
         let grids = self.grids_for(params, &times)?;
@@ -766,6 +765,7 @@ impl StationGridEngine {
                 y,
                 t: Some(times),
                 z: None,
+                coarsened,
             },
             parameters: self.description_map(params),
             ranges,
@@ -1370,6 +1370,11 @@ impl MapEngine for StationGridEngine {
 /// query reads the latest analysis time; an instant must be an analysis
 /// time; an interval reads every analysis time inside it.
 impl EdrEngine for StationGridEngine {
+    /// Area and radius answers are fitted to the value budget (#1436).
+    fn coarsens_areas(&self) -> bool {
+        true
+    }
+
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         Ok(LocationSnapshot::empty())
     }
@@ -1460,8 +1465,9 @@ impl EdrEngine for StationGridEngine {
     }
 
     /// A CRS84 grid over the polygon's bbox at the analysis grid's
-    /// resolution (at most 256 cells per axis), each cell the analysis cell
-    /// under its centre; cells outside the polygon are null.
+    /// resolution while it fits the value budget, evenly coarser past it
+    /// (#1436), each cell the analysis cell under its centre; cells outside
+    /// the polygon are null.
     fn query_area(
         &self,
         coords: &str,
@@ -1481,10 +1487,9 @@ impl EdrEngine for StationGridEngine {
             )));
         }
         let times = self.query_times(datetime)?;
-        let axes = polygon.sample_grid(geom.dx, geom.dy, MAX_AREA_DIM);
-        let (nx, ny) = axes.dims();
-        check_area_budget(times.len(), ny, nx, params.len())?;
-        check_mask_budget(nx * ny, &polygon)?;
+        // Native resolution while the answer fits the budget, evenly
+        // coarser past it (#1436).
+        let axes = polygon.fit_grid(geom.dx, geom.dy, times.len(), params.len())?;
         let mask = polygon.cell_mask(&axes);
         let cells: Vec<Option<usize>> = axes
             .y
@@ -1499,7 +1504,7 @@ impl EdrEngine for StationGridEngine {
                 self.collection_id()
             )));
         }
-        self.grid_response(&params, times, axes.x, axes.y, &cells)
+        self.grid_response(&params, times, (axes.x, axes.y), axes.coarsened, &cells)
     }
 
     /// The analysis cells whose centres lie in the bbox, or `resolution`
@@ -1570,7 +1575,7 @@ impl EdrEngine for StationGridEngine {
                 self.collection_id()
             )));
         }
-        self.grid_response(&params, times, x, y, &cells)
+        self.grid_response(&params, times, (x, y), None, &cells)
     }
 }
 

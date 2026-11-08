@@ -270,6 +270,7 @@ impl EdrEngine for GriddedEngine {
                 y: vec![60.0],
                 t: None,
                 z: None,
+                coarsened: None,
             },
             parameters: series(0.0, 0.0).parameters,
             ranges: HashMap::new(),
