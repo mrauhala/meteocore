@@ -207,11 +207,13 @@ All are in [`collections.d/`](../../collections.d/).
 - EDR area: at most 1 M values across all timesteps, and at most 20 M
   cell × polygon-vertex tests for a non-rectangular polygon; more is a 400.
   On a projected source the regular grid covers the part of the bbox the
-  raster's pixel window covers. Its step is the ground size of the
-  window's centre pixel in degrees, one cell per pixel there however the
-  grid is rotated against the meridians: a 4° × 1.3° box at 68°N on a
-  250 m TM35FIN grid is 665 × 581 cells. The pixel window read for it is
-  held to 1 M pixels per timestep as well.
+  raster covers. Its step is a pixel's ground size in degrees, its
+  longitude step at the grid's latitude nearest the equator, so no cell
+  is wider than a pixel and poleward cells are finer: a 4° × 1.3° box at
+  68°N on a 250 m TM35FIN grid is 684 × 581 cells. The answer can hold
+  more cells than the raster has pixels, and both budgets count its
+  cells. The pixel window read for it is held to 1 M pixels per timestep
+  as well.
 - STAC: an EDR query whose window holds more than 400 items without loaded
   metadata is a 400, and so is one whose on-demand listing does not finish
   within 1000 pages or 10 minutes. Until an item's header loads, the native

@@ -16,7 +16,7 @@ use ds_core::feature::{Bbox, MAX_AREA_VALUES};
 use ds_core::geo::{Crs, Ellipsoid, GeoTransform};
 use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
 
-use crate::area::AreaGrid;
+use crate::area::{AreaGrid, AreaPlan};
 use crate::GeoTiffEngine;
 
 /// Tile side of the written fixtures; their sizes are multiples of it.
@@ -387,6 +387,72 @@ fn values(result: &QueryResult) -> &[Option<f64>] {
     &result.ranges["value"].values
 }
 
+/// The plan of an area query over `bbox` on `gt`, one timestep.
+fn plan(gt: &GeoTransform, [west, south, east, north]: [f64; 4]) -> AreaPlan {
+    let bbox = Bbox {
+        west,
+        south,
+        east,
+        north,
+    };
+    AreaGrid::new(gt, &bbox)
+        .unwrap()
+        .plan(None, 1, "test")
+        .unwrap()
+}
+
+/// The share of the native pixels whose centre lies in `lons` × `lats` that
+/// some cell of `result` holds: nearest sampling at a step coarser than a
+/// pixel skips some.
+fn reached_share(
+    fixture: &Fixture,
+    result: &QueryResult,
+    lons: std::ops::RangeInclusive<f64>,
+    lats: std::ops::RangeInclusive<f64>,
+) -> f64 {
+    let gt = fixture.geo_transform();
+    let reached: std::collections::HashSet<u64> =
+        values(result).iter().flatten().map(|&v| v as u64).collect();
+    let (mut inside, mut hit) = (0usize, 0usize);
+    for row in 0..gt.height {
+        for col in 0..gt.width {
+            let (lon, lat) = gt.pixel_to_world(col, row);
+            if lons.contains(&lon) && lats.contains(&lat) {
+                inside += 1;
+                hit += usize::from(reached.contains(&u64::from(row * gt.width + col)));
+            }
+        }
+    }
+    assert!(inside > 0);
+    hit as f64 / inside as f64
+}
+
+/// Every cell of `result` whose centre lies on the raster holds its own
+/// pixel's value, and every other cell is null; within [`EDGE_PX`] of the
+/// raster's edge, either.
+fn assert_cells_on_the_raster_are_filled(fixture: &Fixture, result: &QueryResult, what: &str) {
+    let (x, y) = axes(result);
+    let values = values(result);
+    let gt = fixture.geo_transform();
+    let on_raster = |lon: f64, lat: f64| {
+        let (col, row) = gt.world_to_pixel_f64(lon, lat);
+        col >= EDGE_PX
+            && row >= EDGE_PX
+            && col < f64::from(gt.width) - EDGE_PX
+            && row < f64::from(gt.height) - EDGE_PX
+    };
+    let mut wrong = 0;
+    for (j, &lat) in y.iter().enumerate() {
+        for (i, &lon) in x.iter().enumerate() {
+            let value = values[j * x.len() + i];
+            let right = pixel_values(&gt, lon, lat).contains(&value)
+                || (value.is_none() && !on_raster(lon, lat));
+            wrong += usize::from(!right);
+        }
+    }
+    assert_eq!(wrong, 0, "{what}: cells that do not hold their own pixel");
+}
+
 /// `axis` is evenly spaced; its step.
 fn assert_regular(axis: &[f64], what: &str) -> f64 {
     assert!(axis.len() > 2, "{what}: {} cells", axis.len());
@@ -465,25 +531,16 @@ fn a_tm35fin_area_is_a_regular_crs84_grid_of_its_own_pixels() {
     assert!((x[x.len() - 1] + dx / 2.0 - 24.0).abs() < 1e-9);
     assert!((y[0] - dy / 2.0 - 68.8).abs() < 1e-9);
     assert!((y[y.len() - 1] + dy / 2.0 - 67.5).abs() < 1e-9);
-    // One cell per native pixel at the window's centre, whatever the grid's
-    // rotation there: 250 m is 0.00225° of latitude, and 0.0060° of
-    // longitude at 68.15°N, the box's middle.
+    // A native pixel's ground size, whatever the grid's rotation: 250 m is
+    // 0.00225° of latitude, and 0.00588° of longitude at 67.5°N, the box's
+    // edge nearest the equator, so no cell is wider than a pixel.
     let metres_per_degree = ds_core::geo::EARTH_RADIUS_M * std::f64::consts::PI / 180.0;
     let native_dy = 250.0 / metres_per_degree;
-    let native_dx = native_dy / 68.15_f64.to_radians().cos();
+    let native_dx = native_dy / 67.5_f64.to_radians().cos();
     assert!((-dy / native_dy - 1.0).abs() < 0.01, "y step {dy}");
     assert!((dx / native_dx - 1.0).abs() < 0.01, "x step {dx}");
-    let grid = AreaGrid::new(
-        &fixture.geo_transform(),
-        &Bbox {
-            west: 20.0,
-            south: 67.5,
-            east: 24.0,
-            north: 68.8,
-        },
-    )
-    .unwrap();
-    let (window_nx, window_ny) = grid.window_dims();
+    let plan = plan(&fixture.geo_transform(), [20.0, 67.5, 24.0, 68.8]);
+    let (window_nx, window_ny) = plan.window_dims();
     eprintln!(
         "4° × 1.3° at 68°N on 250 m TM35FIN: {} × {} = {} cells, native window {window_nx} × \
          {window_ny} = {} pixels, steps {dx:.5}° × {:.5}°",
@@ -496,31 +553,117 @@ fn a_tm35fin_area_is_a_regular_crs84_grid_of_its_own_pixels() {
     assert!(x.len() * y.len() <= window_nx * window_ny);
     assert_cells_are_where_the_axes_say(&fixture, &result, "TM35FIN");
 
-    // Nearest sampling reaches nearly every native pixel whose centre lies
-    // in the box. It misses a few where the rotated pixel rows cross the
-    // cell rows, and toward the box's south edge, where a degree of
-    // longitude is a few percent longer than at its middle.
-    let gt = fixture.geo_transform();
-    let (c0, r0, c1, r1) = grid.window;
-    let inside = (r0..r1)
-        .flat_map(|r| (c0..c1).map(move |c| (c, r)))
-        .filter(|&(c, r)| {
-            let (lon, lat) = gt.pixel_to_world(c, r);
-            (20.0..=24.0).contains(&lon) && (67.5..=68.8).contains(&lat)
-        })
-        .count();
-    let reached: std::collections::HashSet<u64> = values(&result)
-        .iter()
-        .flatten()
-        .map(|&v| v as u64)
-        .collect();
-    let share = reached.len() as f64 / inside as f64;
+    // Nearest sampling reaches every native pixel whose centre lies in the
+    // box, but for a few where the rotated pixel rows cross the cell rows.
+    let share = reached_share(&fixture, &result, 20.0..=24.0, 67.5..=68.8);
     eprintln!(
-        "{} of the {inside} native pixels in the box reached ({:.1} %)",
-        reached.len(),
+        "{:.2} % of the native pixels in the box reached",
         100.0 * share
     );
-    assert!(share > 0.9, "{share}");
+    assert!(share > 0.995, "{share}");
+}
+
+/// Review of #1435: the longitude step is taken at the grid's latitude
+/// nearest the equator, not at its centre's. Over 60–70°N a step at 65°N
+/// was a fifth wider than a pixel at 60°N, and nearest sampling reached
+/// only 85.6 % of the pixels there; every band now reaches all but a few.
+#[test]
+fn no_cell_is_wider_than_a_native_pixel_anywhere_on_a_tall_area() {
+    let fixture = Fixture::new("tall", tm35fin(), [20.0, 60.0, 30.0, 70.0], 1_000.0);
+    let result = fixture.area("20,60,30,70").unwrap();
+    let (x, y) = axes(&result);
+    let dx = assert_regular(x, "x");
+    let metres_per_degree = ds_core::geo::EARTH_RADIUS_M * std::f64::consts::PI / 180.0;
+    let native_dx = 1_000.0 / metres_per_degree / 60.0_f64.to_radians().cos();
+    assert!((dx / native_dx - 1.0).abs() < 0.01, "x step {dx}");
+    eprintln!(
+        "20,60,30,70 on 1 km TM35FIN: {} × {} cells",
+        x.len(),
+        y.len()
+    );
+    for lats in [60.0..=61.0, 65.0..=66.0, 69.0..=70.0] {
+        let share = reached_share(&fixture, &result, 20.0..=30.0, lats.clone());
+        eprintln!("{lats:?}: {:.2} % reached", 100.0 * share);
+        assert!(share > 0.99, "{lats:?}: {share}");
+    }
+}
+
+/// Review of #1435: a polar cap takes the same equatorward longitude step,
+/// not its latitude step, which made a cap 1 / cos(edge latitude) times the
+/// cells: on a 3 km polar LAEA grid -180,85,180,90 was 2.5 M cells, a 400,
+/// where the native window was 141 k. Each cap now answers, its cells their
+/// own pixels'.
+#[test]
+fn a_polar_cap_answers_at_the_native_step_of_its_edge() {
+    let polar = Projection {
+        crs: Crs::LambertAzimuthalEqualArea {
+            lat0: 90.0_f64.to_radians(),
+            lon0: 0.0,
+            false_e: 0.0,
+            false_n: 0.0,
+            figure: Ellipsoid::WGS84,
+        },
+        geokeys: vec![
+            1, 1, 0, 7, //
+            1024, 0, 1, 1, //
+            1025, 0, 1, 1, //
+            3072, 0, 1, 32767, //
+            3075, 0, 1, 10, // Lambert azimuthal equal area
+            3080, 34736, 1, 0, // natural origin longitude
+            3081, 34736, 1, 1, // natural origin latitude
+        ],
+        doubles: vec![0.0, 90.0],
+    };
+    let fixture = Fixture::new("polar", polar, [-180.0, 79.5, 180.0, 90.0], 3_000.0);
+    let metres_per_degree = ds_core::geo::EARTH_RADIUS_M * std::f64::consts::PI / 180.0;
+    let dlat = 3_000.0 / metres_per_degree;
+    for (coords, [west, south, east, north]) in [
+        ("-180,85,180,90", [-180.0, 85.0, 180.0, 90.0]),
+        ("-180,80,180,90", [-180.0, 80.0, 180.0, 90.0]),
+        ("0,85,90,90", [0.0, 85.0, 90.0, 90.0]),
+    ] {
+        let result = fixture.area(coords).unwrap();
+        let (x, y) = axes(&result);
+        let dlon = dlat / f64::to_radians(south).cos();
+        let expected = ((east - west) / dlon).ceil() * ((north - south) / dlat).ceil();
+        let cells = (x.len() * y.len()) as f64;
+        eprintln!(
+            "{coords} on 3 km polar LAEA: {} × {} cells",
+            x.len(),
+            y.len()
+        );
+        assert!(
+            (cells / expected - 1.0).abs() < 0.02,
+            "{coords}: {cells} cells, {expected}"
+        );
+        if coords == "-180,85,180,90" {
+            assert_cells_are_where_the_axes_say(&fixture, &result, coords);
+        }
+    }
+}
+
+/// Review of #1435: the answer and its read window come from the cells'
+/// own source positions, not from points sampled along the bbox's edges.
+/// Those miss the bulge of a parallel at the central meridian between
+/// samples: over a raster at 25.5–28.5°E, -10,62,60,70 answered 720 cells
+/// on the raster as nulls, and -180,62,180,70 2656, its grid starting at
+/// 62.279°N. -40,62,94,70 had a sample on 27°E.
+#[test]
+fn a_wide_bbox_answers_every_cell_on_the_raster() {
+    let fixture = Fixture::new("wide", tm35fin(), [25.5, 61.8, 28.5, 62.8], 250.0);
+    for coords in ["-10,62,60,70", "-180,62,180,70", "-40,62,94,70"] {
+        let result = fixture.area(coords).unwrap();
+        let (x, y) = axes(&result);
+        let dy = assert_regular(y, coords);
+        assert!(
+            (y[y.len() - 1] + dy / 2.0 - 62.0).abs() < 1e-9,
+            "{coords}: the grid reaches the bbox's south edge, {}",
+            y[y.len() - 1]
+        );
+        assert!(values(&result).iter().any(Option::is_some), "{coords}");
+        assert_cells_on_the_raster_are_filled(&fixture, &result, coords);
+        eprintln!("{coords}: {} × {} cells", x.len(), y.len());
+    }
 }
 
 /// The issue's LAEA case, an OPERA-like EPSG:3035 grid over 10–14°E,
@@ -639,29 +782,29 @@ fn the_budgets_count_the_answer_and_the_native_window() {
     };
     let thin = AreaGrid::new(&gt, &bbox(10.0, 62.0, 20.0, 62.01)).unwrap();
     let (nx, ny) = thin.dims();
-    let (window_nx, window_ny) = thin.window_dims();
     assert!(nx * ny <= MAX_AREA_VALUES, "{nx} × {ny}");
-    assert!(window_nx * window_ny > MAX_AREA_VALUES);
-    match thin.check(None, 1) {
+    match thin.plan(None, 1, "test") {
         Err(DataServerError::QueryTooLarge(msg)) => {
             assert!(msg.contains("source pixels"), "{msg}");
             assert!(msg.contains(&MAX_AREA_VALUES.to_string()), "{msg}");
         }
-        other => panic!("expected QueryTooLarge, got {other:?}"),
+        Err(e) => panic!("expected QueryTooLarge, got {e:?}"),
+        Ok(_) => panic!("expected QueryTooLarge, got a plan"),
     }
 
-    let small = AreaGrid::new(&gt, &bbox(24.0, 62.0, 25.0, 62.5)).unwrap();
-    let (nx, ny) = small.dims();
-    assert!(small.check(None, 1).is_ok());
+    let small = || AreaGrid::new(&gt, &bbox(24.0, 62.0, 25.0, 62.5)).unwrap();
+    let (nx, ny) = small().dims();
+    assert!(small().plan(None, 1, "test").is_ok());
     let over = MAX_AREA_VALUES / (nx * ny) + 1;
-    match small.check(None, over) {
+    match small().plan(None, over, "test") {
         Err(DataServerError::QueryTooLarge(msg)) => {
             assert!(
                 msg.contains(&format!("{over} timesteps × {ny} × {nx} cells")),
                 "{msg}"
             );
         }
-        other => panic!("expected QueryTooLarge, got {other:?}"),
+        Err(e) => panic!("expected QueryTooLarge, got {e:?}"),
+        Ok(_) => panic!("expected QueryTooLarge, got a plan"),
     }
 }
 

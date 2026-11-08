@@ -2361,20 +2361,18 @@ impl GeoTiffEngine {
             north,
         };
         self.query_grid(&bbox, None, datetime, parameters)
-            .map(|(result, _)| result)
     }
 
     /// Area query: the values of every matching timestep on the grid
-    /// [`area::AreaGrid`] gives `bbox`, unmasked, and that grid. With
-    /// `polygon`, the mask budget over the grid's cells is checked with the
-    /// others, before any file is read.
+    /// [`area::AreaGrid`] gives `bbox`, masked by `polygon` when given, after
+    /// the budgets on that grid and before any file is read.
     fn query_grid(
         &self,
         bbox: &ds_core::feature::Bbox,
         polygon: Option<&ds_core::feature::QueryPolygon>,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
-    ) -> Result<(QueryResult, area::AreaGrid), DataServerError> {
+    ) -> Result<QueryResult, DataServerError> {
         ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
 
         // Lazily load STAC stubs for the requested time range. `query_area`
@@ -2391,44 +2389,25 @@ impl GeoTiffEngine {
         }
 
         // The first entry's grid is the answer's; every entry is read over
-        // the same pixel window.
+        // the same pixel window. The shared budgets (#673) count EVERY
+        // matching timestep, before the `timesteps × ny × nx` result is
+        // allocated or a file read (#858). The answer stays at native
+        // resolution, like GRIB: no `MAX_AREA_DIM` coarsening, so an
+        // over-budget area is the 400.
         let first_entry = entries[0].1;
         let first_metadata = first_entry
             .metadata()
             .ok_or_else(|| DataServerError::Engine("First entry has no metadata loaded".into()))?;
-        let grid = area::AreaGrid::new(&first_metadata.geo_transform, bbox)?;
-        let (col_start, row_start, col_end, row_end) = grid.window;
-        let (nx, ny) = grid.dims();
-        // The shared per-response budget (#673) over EVERY matching timestep,
-        // before the `timesteps × ny × nx` result is allocated or a file read
-        // (#858). The answer stays at native resolution, like GRIB: no
-        // `MAX_AREA_DIM` coarsening, so an over-budget area is the 400.
-        grid.check(polygon, entries.len())?;
-
-        // A geographic source's pixel centres are CRS84 cell centres: its
-        // native window is the answer, its axes the window's columns and
-        // rows. A projected source answers its regular CRS84 grid (#1435),
-        // each cell sampled from the native window through `projection`.
-        let (x_values, y_values, projection) = match &grid.regular {
-            None => {
-                let gt = &grid.geo_transform;
-                let mid_row = (row_start + row_end) / 2;
-                let mid_col = (col_start + col_end) / 2;
-                let x: Vec<f64> = (col_start..col_end)
-                    .map(|c| gt.pixel_to_world(c, mid_row).0)
-                    .collect();
-                let y: Vec<f64> = (row_start..row_end)
-                    .map(|r| gt.pixel_to_world(mid_col, r).1)
-                    .collect();
-                (x, y, None)
-            }
-            Some(regular) => (
-                regular.axes.x.clone(),
-                regular.axes.y.clone(),
-                Some(regular.projection(&grid.geo_transform, &self.collection_id)),
-            ),
-        };
-        let (window_nx, _) = grid.window_dims();
+        // A geographic source answers its native window; a projected one
+        // its regular CRS84 grid (#1435), each cell sampled from the native
+        // window through `plan.projection`.
+        let plan = area::AreaGrid::new(&first_metadata.geo_transform, bbox)?.plan(
+            polygon,
+            entries.len(),
+            &self.collection_id,
+        )?;
+        let (nx, ny) = (plan.x.len(), plan.y.len());
+        let (window_nx, _) = plan.window_dims();
         let all_cells = (0, nx as u32 - 1, 0, ny as u32 - 1);
 
         let mut times = Vec::with_capacity(entries.len());
@@ -2450,6 +2429,11 @@ impl GeoTiffEngine {
                 }
             };
             precision = precision.max(Some(metadata.value_precision()));
+            // No cell on the raster: nothing to read.
+            let Some((col_start, row_start, col_end, row_end)) = plan.window else {
+                all_values.extend(std::iter::repeat_n(None, nx * ny));
+                continue;
+            };
 
             let read = reader::read_bbox(
                 source,
@@ -2463,7 +2447,7 @@ impl GeoTiffEngine {
                 self.band_index,
             );
             self.note_object_health(timestamp, entry);
-            match (read, &projection) {
+            match (read, &plan.projection) {
                 (Ok(window), None) => {
                     all_values.extend(window);
                 }
@@ -2475,7 +2459,7 @@ impl GeoTiffEngine {
                     ny as u32,
                     &window,
                     window_nx,
-                    grid.window,
+                    (col_start, row_start, col_end, row_end),
                     None,
                     all_cells,
                     &mut all_values,
@@ -2489,12 +2473,16 @@ impl GeoTiffEngine {
             }
         }
 
+        if let Some(polygon) = polygon {
+            mask_area(&mut all_values, &plan, polygon);
+        }
+
         // Every entry has the time its filename or STAC item states, so the
         // steps served are always on a `t` axis, one step included (#1412):
         // `[t, y, x]` however many match.
         let domain = DomainDescription::Grid {
-            x: x_values,
-            y: y_values,
+            x: plan.x,
+            y: plan.y,
             t: Some(times),
             z: None,
         };
@@ -2523,12 +2511,41 @@ impl GeoTiffEngine {
             },
         );
 
-        let result = QueryResult {
+        Ok(QueryResult {
             domain,
             parameters: param_descs,
             ranges,
-        };
-        Ok((result, grid))
+        })
+    }
+}
+
+/// Null an area's cells outside `polygon`, every timestep's (`values` is
+/// `[t][y][x]`). A projected source's regular CRS84 grid takes the shared
+/// mask over its cell centres, as the other gridded engines' grids do
+/// (#1435); a geographic source's native window masks each pixel by its
+/// centre, as it always did.
+fn mask_area(
+    values: &mut [Option<f64>],
+    plan: &area::AreaPlan,
+    polygon: &ds_core::feature::QueryPolygon,
+) {
+    let (nx, ny) = (plan.x.len(), plan.y.len());
+    let inside: Vec<bool> = match (&plan.projection, plan.window) {
+        (None, Some((col_start, row_start, _, _))) => (0..ny)
+            .flat_map(|iy| (0..nx).map(move |ix| (ix, iy)))
+            .map(|(ix, iy)| {
+                let (lon, lat) = plan
+                    .geo_transform
+                    .pixel_to_world(col_start + ix as u32, row_start + iy as u32);
+                polygon.contains(lon, lat)
+            })
+            .collect(),
+        _ => polygon.mask_cells(&plan.x, &plan.y),
+    };
+    for (i, value) in values.iter_mut().enumerate() {
+        if !inside[i % inside.len()] {
+            *value = None;
+        }
     }
 }
 
@@ -3164,77 +3181,21 @@ impl EdrEngine for GeoTiffEngine {
         let polygon = ds_core::feature::parse_area_coords(coords)?;
         ds_core::edr_engine::select_parameters(parameters, &[self.parameter.as_str()])?;
 
-        // On a STAC source, the checks below and in `query_grid` that need
-        // the window's grid run before its cold items load, in the same
-        // order (#1075): the bbox must meet the grid, then the budgets of
-        // `AreaGrid::check` on the answer's cells and the native window.
+        // On a STAC source, the checks in `query_grid` that need the
+        // window's grid run before its cold items load, in the same order
+        // (#1075): the bbox must meet the grid, then the budgets of
+        // `AreaGrid::plan` on the answer's cells and the native window.
         let check = |metadata: &reader::TiffMetadata, timesteps: usize| {
             area::AreaGrid::new(&metadata.geo_transform, &polygon.bbox)?
-                .check(Some(&polygon), timesteps)
+                .plan(Some(&polygon), timesteps, &self.collection_id)
+                .map(drop)
         };
         self.ensure_entries_loaded(datetime, Some(&check))?;
 
         // The mask tests every cell of the answer against every ring vertex:
         // the shared mask budget the other gridded engines apply (#889),
         // checked with the others before `query_grid` reads a file.
-        let (mut result, grid) =
-            self.query_grid(&polygon.bbox, Some(&polygon), datetime, parameters)?;
-
-        // A projected source's regular CRS84 grid takes the shared mask over
-        // its cell centres, as the other gridded engines' grids do (#1435).
-        if let Some(regular) = &grid.regular {
-            let mask = polygon.cell_mask(&regular.axes);
-            for ndarray in result.ranges.values_mut() {
-                for (i, value) in ndarray.values.iter_mut().enumerate() {
-                    if !mask[i % mask.len()] {
-                        *value = None;
-                    }
-                }
-            }
-            return Ok(CoverageResponse::Single(result));
-        }
-
-        // A geographic source's native window: mask each pixel by its centre.
-        let geo_transform = &grid.geo_transform;
-        if let DomainDescription::Grid {
-            ref x,
-            ref y,
-            ref t,
-            ..
-        } = result.domain
-        {
-            let nt = t.as_ref().map_or(1, |tv| tv.len());
-            let ny = y.len();
-            let nx = x.len();
-            let expected_len = nt * ny * nx;
-            let (col_start, row_start, _, _) = grid.window;
-            for ndarray in result.ranges.values_mut() {
-                if ndarray.values.len() != expected_len {
-                    tracing::error!(
-                        "NdArray length mismatch: expected {} ({}*{}*{}), got {}",
-                        expected_len,
-                        nt,
-                        ny,
-                        nx,
-                        ndarray.values.len()
-                    );
-                    continue;
-                }
-                for iy in 0..ny {
-                    for ix in 0..nx {
-                        let (lon, lat) = geo_transform
-                            .pixel_to_world(col_start + ix as u32, row_start + iy as u32);
-                        if !polygon.contains(lon, lat) {
-                            for it in 0..nt {
-                                let idx = it * ny * nx + iy * nx + ix;
-                                ndarray.values[idx] = None;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        let result = self.query_grid(&polygon.bbox, Some(&polygon), datetime, parameters)?;
         Ok(CoverageResponse::Single(result))
     }
 
