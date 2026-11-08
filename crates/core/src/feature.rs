@@ -523,27 +523,54 @@ fn native_cells(span: f64, res: f64) -> usize {
 
 /// Cells per axis of the cap before #1436 (`MAX_AREA_DIM`). While that
 /// capped grid fits the budget, no axis of an area grid is coarser than it
-/// was ([`fit_dims`]).
+/// was; past it, that grid is what is coarsened ([`fit_dims`]).
 const OLD_AREA_AXIS: usize = 256;
 
-/// The largest `nx × ny ≤ cells` grid with each axis at most its native
-/// count, coarsened by as even a factor on both axes as whole cells allow,
-/// so the cells keep the native aspect (#1436). The native grid when it
-/// fits. Rounding hurts the axis with fewer cells most: both roundings of
-/// it are tried, the other axis taking what the budget leaves, and the more
-/// even pair wins (on a tie the one with more cells). An axis already at one
-/// cell stays there and the other takes the whole budget.
+/// The largest `nx × ny ≤ cells` grid, each axis at most its native count
+/// (#1436): the native grid when it fits, else a coarsened one that never
+/// answers worse than the old 256-cell cap did and moves on smoothly where
+/// the cap refused.
 ///
-/// Never coarser on either axis than the old 256-cell cap answered while
-/// that grid fits `cells`: even coarsening would take a strip's short axis
-/// far below it (256 × 4000 native cells at 15 layers to 65 × 1025, where
-/// the cap gave 256 × 256), so such an axis keeps its capped count and the
-/// other takes what the budget leaves (256 × 260).
+/// - While the old cap's grid (each axis's native count, at most 256) fits
+///   `cells`, the native grid is coarsened as evenly as whole cells allow
+///   ([`even_dims`]), and the capped grid is the floor of each axis: even
+///   coarsening alone would take a strip's short axis far below it (256 ×
+///   4000 native cells at 15 layers to 65 × 1025, where the cap gave
+///   256 × 256), so such an axis keeps its capped count and the other takes
+///   what the budget leaves (256 × 260).
+/// - Past it, where the cap answered a 400, the capped grid itself is
+///   coarsened evenly, so one more layer moves each axis by about what the
+///   budget moves, never from the floor down to the even pick at once: the
+///   strip at 16 layers is 250 × 250, not 63 × 992.
 fn fit_dims(native_x: usize, native_y: usize, cells: usize) -> (usize, usize) {
     let (native_x, native_y, cells) = (native_x.max(1), native_y.max(1), cells.max(1));
     if native_x.saturating_mul(native_y) <= cells {
         return (native_x, native_y);
     }
+    let (capped_x, capped_y) = (native_x.min(OLD_AREA_AXIS), native_y.min(OLD_AREA_AXIS));
+    if capped_x.saturating_mul(capped_y) > cells {
+        return even_dims(capped_x, capped_y, cells);
+    }
+    let (mut nx, mut ny) = even_dims(native_x, native_y, cells);
+    if nx < capped_x {
+        nx = capped_x;
+        ny = (cells / nx).min(native_y);
+    }
+    if ny < capped_y {
+        ny = capped_y;
+        nx = (cells / ny).min(native_x);
+    }
+    (nx, ny)
+}
+
+/// The largest `nx × ny ≤ cells` grid coarsening `native_x` × `native_y`
+/// (which do not fit) by as even a factor on both axes as whole cells
+/// allow, so the cells keep its aspect. Rounding hurts the axis with fewer
+/// cells most: both roundings of it are tried, the other axis taking what
+/// the budget leaves, and the more even pair wins (on a tie the one with
+/// more cells). An axis already at one cell stays there and the other takes
+/// the whole budget.
+fn even_dims(native_x: usize, native_y: usize, cells: usize) -> (usize, usize) {
     // The factor that coarsens both axes alike to exactly `cells`.
     let factor = (native_x as f64 * native_y as f64 / cells as f64).sqrt();
     let x_short = native_x <= native_y;
@@ -557,7 +584,7 @@ fn fit_dims(native_x: usize, native_y: usize, cells: usize) -> (usize, usize) {
         let (fs, fl) = (short as f64 / s as f64, long as f64 / l as f64);
         fs.max(fl) / fs.min(fl)
     };
-    let (mut s, mut l) = [ideal.floor(), ideal.ceil()]
+    let (s, l) = [ideal.floor(), ideal.ceil()]
         .into_iter()
         .map(|s| {
             let s = (s as usize).clamp(1, short);
@@ -570,18 +597,6 @@ fn fit_dims(native_x: usize, native_y: usize, cells: usize) -> (usize, usize) {
                 .then((b.0 * b.1).cmp(&(a.0 * a.1)))
         })
         .unwrap_or((1, cells.min(long)));
-    // The old cap's grid, where it fits, is the floor of each axis.
-    let (capped_s, capped_l) = (short.min(OLD_AREA_AXIS), long.min(OLD_AREA_AXIS));
-    if capped_s.saturating_mul(capped_l) <= cells {
-        if s < capped_s {
-            s = capped_s;
-            l = (cells / s).min(long);
-        }
-        if l < capped_l {
-            l = capped_l;
-            s = (cells / l).min(short);
-        }
-    }
     if x_short {
         (s, l)
     } else {
@@ -2769,17 +2784,25 @@ mod tests {
         // The served step is the axes' own spacing.
         assert!((axes.x[1] - axes.x[0] - r.served[0]).abs() < 1e-12);
         assert!((axes.y[0] - axes.y[1] - r.served[1]).abs() < 1e-12);
-        // Timesteps × parameters share the budget.
+        // Timesteps × parameters share the budget. While the old capped grid,
+        // 256 × 256 here, fits, the native aspect is kept; past it, the
+        // capped grid's.
         for (timesteps, parameters) in [(4, 1), (2, 3), (24, 2), (999, 1)] {
             let axes = rect.fit_grid(0.01, 0.01, timesteps, parameters).unwrap();
             let (nx, ny) = axes.dims();
-            assert!(timesteps * parameters * nx * ny <= MAX_AREA_VALUES);
+            let layers = timesteps * parameters;
+            assert!(layers * nx * ny <= MAX_AREA_VALUES);
             assert!(
-                timesteps * parameters * (nx + 1) * (ny + 1) > MAX_AREA_VALUES,
+                layers * (nx + 1) * (ny + 1) > MAX_AREA_VALUES,
                 "the largest even grid: {nx} × {ny}"
             );
             let aspect = nx as f64 / ny as f64;
-            assert!((aspect - 2.0).abs() < 0.2, "{nx} × {ny}");
+            let kept = if layers * 256 * 256 <= MAX_AREA_VALUES {
+                2.0
+            } else {
+                1.0
+            };
+            assert!((aspect - kept).abs() < 0.1 * kept, "{layers}: {nx} × {ny}");
         }
     }
 
@@ -2835,14 +2858,41 @@ mod tests {
         assert_eq!(fit_dims(100, 300, MAX_AREA_VALUES / 39), (100, 256));
     }
 
+    /// No cliff where the old capped grid stops fitting: on the 256 × 4000
+    /// strip, from 14 to 30 layers, neither axis grows, and neither shrinks
+    /// by more than the budget does from one layer count to the next, plus
+    /// one cell of rounding. 15 layers is 256 × 260, 16 is 250 × 250 rather
+    /// than the even pick from native, 63 × 992.
+    #[test]
+    fn fit_grid_moves_smoothly_past_the_old_capped_grid() {
+        let strip = parse_area_coords("20,30,22.56,70").unwrap();
+        let res = 0.01 * (1.0 + 1e-12);
+        let grid = |layers: usize| strip.fit_grid(res, res, layers, 1).unwrap().dims();
+        assert_eq!(grid(15), (256, 260));
+        assert_eq!(grid(16), (250, 250));
+        for layers in 14..30 {
+            let ((ax, ay), (bx, by)) = (grid(layers), grid(layers + 1));
+            let budget =
+                (MAX_AREA_VALUES / (layers + 1)) as f64 / (MAX_AREA_VALUES / layers) as f64;
+            for (a, b) in [(ax, bx), (ay, by)] {
+                assert!(b <= a, "{layers} → {}: {a} grew to {b}", layers + 1);
+                assert!(
+                    (b + 1) as f64 >= a as f64 * budget,
+                    "{layers} → {}: {a} fell to {b}, the budget by {budget}",
+                    layers + 1
+                );
+            }
+        }
+    }
+
     #[test]
     fn fit_dims_handles_strips_and_single_cells() {
         // A strip keeps the old cap's short axis, here native, while the
         // capped grid fits; only past that does it coarsen evenly.
         assert_eq!(fit_dims(1_000_000, 10, 1_000_000), (100_000, 10));
         assert_eq!(fit_dims(10, 1_000_000, 1_000_000), (10, 100_000));
-        // Past it the short axis reaches one cell and the long takes the rest.
-        assert_eq!(fit_dims(1_000_000, 10, 2_000), (2_000, 1));
+        // Past it the capped 256 × 10 is coarsened evenly.
+        assert_eq!(fit_dims(1_000_000, 10, 2_000), (222, 9));
         assert_eq!(fit_dims(300, 1, 100), (100, 1));
         assert_eq!(fit_dims(1, 300, 100), (1, 100));
         assert_eq!(fit_dims(5, 5, 1), (1, 1));
