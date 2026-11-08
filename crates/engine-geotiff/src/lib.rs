@@ -690,37 +690,43 @@ impl GeoTiffEngine {
     }
 
     /// Derive [`RasterInfo`] from the current catalog — a pure read of what's
-    /// already loaded, with **no** metadata fetch. `times` come from the entry
-    /// keys (fixed at scan); `native_crs`/`grid_size` from currently-loaded entry
-    /// metadata. Local entries are `Loaded` at scan (CRS correct from
-    /// construction); STAC entries are stubs until the poll preloads them (#90)
-    /// or a request loads one, so `native_crs` is the `CRS:84` placeholder
-    /// until `install_stac_metadata` calls
-    /// [`refresh_raster_info`](Self::refresh_raster_info). The STAC cold-start
-    /// `CRS:84` window (GetCapabilities / `/collections` before the first poll
-    /// that discovers items) is tracked in #322.
+    /// already in memory, with **no** metadata fetch. `times` come from the
+    /// entry keys (fixed at scan); `native_crs`, `grid_size` and `native_grid`
+    /// from the first live loaded entry. Local entries are `Loaded` at scan
+    /// (CRS correct from construction). STAC entries are stubs until the poll
+    /// preloads them (#90) or a request loads one; a poll that leaves no item
+    /// loaded loads one more ([`preload_stac_grid`](Self::preload_stac_grid)),
+    /// so the first poll that discovers items gives the snapshot its grid
+    /// (#322). A catalog without a loaded entry keeps the grid the last
+    /// snapshot had: a `max_files` trim to new stubs, or every loaded entry
+    /// gone, must not send GetCapabilities and `/collections` back to the
+    /// `CRS:84` placeholder, which stays only until the first entry loads.
     fn build_raster_info(&self) -> ds_core::map_engine::RasterInfo {
         let catalog = self.catalog.load();
-        let crs_name = catalog
-            .live()
-            .find_map(|(_, entry)| entry.metadata().map(|m| crs_label(&m.geo_transform.crs)))
-            // No metadata could be read; the engine works internally in
-            // lon-first geographic coordinates, so default to CRS:84.
-            .unwrap_or_else(|| "CRS:84".to_string());
+        let (crs_name, grid_size, native_grid) =
+            match catalog.live().find_map(|(_, entry)| entry.metadata()) {
+                // Native full-resolution grid, from the first loaded entry
+                // (all entries in a collection share the same grid), in its
+                // own CRS with the EPSG code its GeoKeys state (#1237).
+                Some(m) => (
+                    crs_label(&m.geo_transform.crs),
+                    Some([m.width, m.height]),
+                    NativeGrid::from_geo_transform(&m.geo_transform, m.epsg),
+                ),
+                // Nothing loaded: the last snapshot's grid, else the
+                // construction placeholder. The engine works internally in
+                // lon-first geographic coordinates, so that is CRS:84.
+                None => {
+                    let last = self.raster_info.load();
+                    (
+                        last.native_crs.clone(),
+                        last.grid_size,
+                        last.native_grid.clone(),
+                    )
+                }
+            };
 
         let times: Vec<DateTime<Utc>> = catalog.live().map(|(t, _)| *t).collect();
-
-        // Native full-resolution grid dimensions, taken from the first loaded
-        // entry (all entries in a collection share the same grid).
-        let grid_size = catalog
-            .live()
-            .find_map(|(_, entry)| entry.metadata().map(|m| [m.width, m.height]));
-        // The same entry's grid in its own CRS, with the EPSG code its
-        // GeoKeys state (#1237).
-        let native_grid = catalog
-            .live()
-            .find_map(|(_, entry)| entry.metadata())
-            .and_then(|m| NativeGrid::from_geo_transform(&m.geo_transform, m.epsg));
 
         ds_core::map_engine::RasterInfo {
             native_crs: crs_name,
@@ -1536,7 +1542,9 @@ impl GeoTiffEngine {
     /// fetches in flight, within `STAC_PRELOAD_BUDGET`. Async on the poll
     /// runtime: no `block_in_place`, no sequential round trips. Anything
     /// skipped, failed or cut off by the budget keeps the lazy
-    /// [`ensure_metadata`](Self::ensure_metadata) fallback.
+    /// [`ensure_metadata`](Self::ensure_metadata) fallback. Then, within the
+    /// same budget, [`preload_stac_grid`](Self::preload_stac_grid) loads one
+    /// more item while none is loaded (#322).
     async fn preload_stac_metadata(&self, previous: &Catalog) {
         let StoreMode::RemoteStac { client } = &self.store_mode else {
             return;
@@ -1552,29 +1560,76 @@ impl GeoTiffEngine {
                 .take(STAC_PRELOAD_MAX_ITEMS)
                 .collect()
         };
-        if targets.is_empty() {
-            return;
-        }
-        let attempted = targets.len();
-        let preload = futures::stream::iter(targets)
-            .map(|target| self.preload_stac_entry(client, target))
-            .buffer_unordered(STAC_PRELOAD_CONCURRENCY)
-            .filter(|loaded| futures::future::ready(*loaded))
-            .count();
+        let tried: Vec<DateTime<Utc>> = targets.iter().map(|target| target.0).collect();
+        let preload = async {
+            let loaded = futures::stream::iter(targets)
+                .map(|target| self.preload_stac_entry(client, target))
+                .buffer_unordered(STAC_PRELOAD_CONCURRENCY)
+                .filter(|loaded| futures::future::ready(*loaded))
+                .count()
+                .await;
+            self.preload_stac_grid(client, &tried).await;
+            loaded
+        };
         // On timeout the unfinished fetches drop, releasing their claims.
         match tokio::time::timeout(STAC_PRELOAD_BUDGET, preload).await {
+            Ok(_) if tried.is_empty() => {}
             Ok(loaded) => tracing::debug!(
                 "[{}] STAC preload: metadata for {}/{} new items",
                 self.collection_id,
                 loaded,
-                attempted
+                tried.len()
+            ),
+            Err(_) if tried.is_empty() => tracing::warn!(
+                "[{}] STAC header load for the collection's grid exceeded {}s; left to the next poll",
+                self.collection_id,
+                STAC_PRELOAD_BUDGET.as_secs()
             ),
             Err(_) => tracing::warn!(
                 "[{}] STAC preload of {} new items exceeded {}s; the rest is left to the request path",
                 self.collection_id,
-                attempted,
+                tried.len(),
                 STAC_PRELOAD_BUDGET.as_secs()
             ),
+        }
+    }
+
+    /// Load one STAC item when the catalog holds no live loaded entry (#322):
+    /// the newest live stub this poll's preload did not try (`tried`). The
+    /// `RasterInfo` snapshot takes its CRS and grid from a loaded entry, so
+    /// until one loads it has only the `CRS:84` placeholder for
+    /// GetCapabilities and `/collections`. The preload alone can leave none:
+    /// every header read failed or found its asset gone, and a later poll
+    /// that lists nothing new preloads nothing. One item per poll, on the
+    /// poll runtime, never on the request path. A failed load is tried
+    /// again at the next poll; a gone one leaves, and the next newest stub
+    /// is tried then.
+    async fn preload_stac_grid(&self, client: &stac::StacClient, tried: &[DateTime<Utc>]) {
+        if self.shutdown.is_shutdown() {
+            return;
+        }
+        let target = {
+            let catalog = self.catalog.load();
+            if catalog.live().rev().any(|(_, entry)| entry.is_loaded()) {
+                return;
+            }
+            let newest = catalog
+                .live()
+                .rev()
+                .filter(|(timestamp, _)| !tried.contains(timestamp))
+                .find_map(stac_load_target);
+            newest
+        };
+        let Some(target) = target else {
+            return;
+        };
+        let timestamp = target.0;
+        if self.preload_stac_entry(client, target).await {
+            tracing::debug!(
+                "[{}] STAC preload: no item had metadata; loaded {} for the collection's grid",
+                self.collection_id,
+                timestamp.to_rfc3339()
+            );
         }
     }
 
@@ -3528,14 +3583,15 @@ mod tests {
         }
     }
 
-    /// #211 review: guards the STAC cold-start behaviour change. A stub-backed
-    /// catalog (STAC, pre-render) must report `CRS:84` / no grid — with **no**
-    /// metadata fetch (`build_raster_info` is pure) — while `times` still derive
-    /// from the entry keys; once an entry is `Loaded` (as `do_load_metadata`
-    /// does) and the snapshot is refreshed, the real CRS/grid reappear. Built
-    /// over the committed local fixture so a real loaded entry is available.
+    /// #211 review, #322: `build_raster_info` is pure. A stub-only catalog
+    /// fetches **no** metadata: `times` derive from the entry keys, and the
+    /// CRS and grid stay what the last snapshot had (#322), never the
+    /// `CRS:84` placeholder once a grid is known. A `Loaded` entry (as
+    /// `do_load_metadata` installs) gives them again on refresh. Built over
+    /// the committed local fixture so a real loaded entry is available; the
+    /// placeholder before the first load is pinned in `stac_preload_tests`.
     #[test]
-    fn raster_info_stub_reports_crs84_then_real_crs_after_load() {
+    fn raster_info_over_stubs_keeps_the_known_crs_then_takes_a_loaded_one() {
         use ds_core::map_engine::MapEngine;
         let config = tm35fin_test_config();
         let engine = GeoTiffEngine::new(
@@ -3546,7 +3602,9 @@ mod tests {
         .expect("engine builds from the committed TM35FIN fixture");
 
         // Local entries are Loaded at scan → real projected CRS from construction.
-        assert_ne!(engine.raster_info().native_crs, "CRS:84");
+        let known = engine.raster_info();
+        assert_ne!(known.native_crs, "CRS:84");
+        assert!(known.grid_size.is_some() && known.native_grid.is_some());
 
         // Borrow a real loaded entry to reuse for the transition half.
         let (loaded_ts, loaded_entry) = {
@@ -3555,8 +3613,8 @@ mod tests {
             (*ts, e.clone())
         };
 
-        // Cold-start: a stub-only catalog reports the placeholder CRS, no grid,
-        // and no fetch — but `times` come from the keys.
+        // A stub-only catalog keeps the known CRS and grid, fetches nothing
+        // and takes `times` from the keys.
         let stub_ts = loaded_ts + chrono::Duration::minutes(5);
         let mut stub_catalog = crate::catalog::Catalog::empty();
         stub_catalog.entries.insert(
@@ -3574,17 +3632,25 @@ mod tests {
         engine.refresh_raster_info();
         let stub_info = engine.raster_info();
         assert_eq!(
-            stub_info.native_crs, "CRS:84",
-            "stub entries report the placeholder CRS without a metadata fetch"
+            (
+                &stub_info.native_crs,
+                stub_info.grid_size,
+                &stub_info.native_grid
+            ),
+            (&known.native_crs, known.grid_size, &known.native_grid),
+            "stub entries keep the known CRS and grid (#322)"
         );
-        assert!(stub_info.grid_size.is_none());
+        assert!(
+            !engine.catalog.load().entries[&stub_ts].is_loaded(),
+            "the refresh fetched no metadata"
+        );
         assert_eq!(
             stub_info.times,
             vec![stub_ts],
             "times derive from entry keys even for stubs"
         );
 
-        // Transition: a Loaded entry + refresh restores the real CRS/grid.
+        // Transition: a Loaded entry + refresh gives the real CRS/grid.
         let mut loaded_catalog = crate::catalog::Catalog::empty();
         loaded_catalog.entries.insert(loaded_ts, loaded_entry);
         engine.catalog.store(Arc::new(loaded_catalog));
@@ -3594,7 +3660,8 @@ mod tests {
             reloaded.native_crs, "CRS:84",
             "a Loaded entry yields the real CRS after refresh (do_load_metadata path)"
         );
-        assert!(reloaded.grid_size.is_some());
+        assert_eq!(reloaded.grid_size, known.grid_size);
+        assert_eq!(reloaded.times, vec![loaded_ts]);
     }
 
     #[test]

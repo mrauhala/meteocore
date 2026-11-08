@@ -115,6 +115,16 @@ apply here.
   `STAC_PRELOAD_MAX_ITEMS` only, `STAC_PRELOAD_CONCURRENCY` in flight, async
   reqwest end to end. Never loop the sync `load_stac_entry_metadata` there:
   that is N sequential blocking round trips (root Critical Rule 9).
+- `RasterInfo`'s `native_crs`, `grid_size` and `native_grid` come from a
+  loaded entry (#322); `build_raster_info` stays a pure read, never a
+  fetch. A poll whose catalog then holds no live loaded entry loads one
+  more within the preload budget (`preload_stac_grid`): the newest stub
+  its preload did not try, one per poll. That covers a preload whose reads
+  all failed or found the assets gone, and the next poll that lists nothing
+  new. A catalog without a loaded entry, such as a `max_files` trim to new
+  stubs, keeps the last snapshot's grid. So `CRS:84` is only the
+  placeholder before the first entry loads: an engine before its first
+  poll, a reload's rebuilt one included.
 - The request path is the fallback for older items (on-demand listings:
   `list_stac_window` for EDR, `merge_range_listing` for a render), items
   past the cap and failed preloads. A render
