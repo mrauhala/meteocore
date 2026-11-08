@@ -105,6 +105,15 @@ around `ds-storage` calls (Critical Rules 6–7).
   measurement), or the 3D Tiles products (those sample nearest, then
   `ds-3dtiles` applies its own 3-D `smooth_grid` blur; the point cloud is
   raw).
+- **COMP composites: one fetch and decode per file** (`load_composite`,
+  `COMPOSITE_CACHE`, `MC_ODIM_COMPOSITE_CACHE_MB`), shared by renders and
+  EDR. A request waits for another's fill until its deadline
+  (`get_or_insert_with_until`, #1399), then `DeadlineExceeded`; the fill
+  lands for later requests, and none starts past the deadline. A fetch's
+  own deadline stays `DeadlineExceeded`, never an `Engine` error. COMP EDR
+  position/area leave a gap for an unreadable file but fail the query on a
+  deadline (504), never a gap for it. Pinned by
+  `a_wait_for_another_composite_fetch_ends_at_the_deadline`.
 - **The sweep a map draws is `drawn_sweep`**: among the sweeps carrying the
   quantity, the one nearest `z`, else the lowest. `polar_sample` and the
   site view's `MapEngine::resolve_elevation` share it, so WMS GetFeatureInfo
@@ -462,7 +471,10 @@ in `crates/api-3dtiles/CLAUDE.md`.
   threshold changes share one polar resample
   (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512). The resample resolves each
   `(radius, height)` column once (`ColumnTarget`) instead of per-cell
-  lookups.
+  lookups. A request waits for another's fill until its deadline (#1399):
+  a `CELLS` tile's 3 s can sit behind a 3D Tiles request's 30 s fill. Then
+  `DeadlineExceeded`, and the fill lands for later requests
+  (`a_wait_for_another_voxel_grid_fill_ends_at_the_deadline`).
 
 ## Quantitative voxel validation (#641)
 

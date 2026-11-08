@@ -6930,29 +6930,38 @@ impl PolarVolumeSiteView {
             Arc::from(quantity),
             dims,
         );
-        // `get_or_insert_with` is the single-flight: quick_cache's placeholder
-        // guard runs the closure for exactly one caller per key and blocks
-        // concurrent callers until it finishes — so simultaneous first-time
-        // requests for *different representations* of the same grid (whose
-        // content-cache keys differ, hence separate gates there) still share
-        // one polar resample (PR #378 review). Blocking the calling thread is
-        // acceptable in both caller contexts (a `spawn_blocking` pool thread,
-        // or a request worker that would have done the resample itself).
-        let result = VOXEL_GRID_CACHE.get_or_insert_with(&key, || {
-            let pix = Pixels {
-                moments: None,
-                source: &self.source,
-                handle,
-            };
-            let moments = pix.volume_moments(&entry.volume, &entry.id, quantity)?;
-            let pix = Pixels {
-                moments: Some(&moments),
-                ..pix
-            };
-            let (grid, valid) =
-                voxel_grid_from_volume(&entry.volume, &entry.id, pix, quantity, Some(dims))?;
-            Ok::<_, DataServerError>((Arc::new(grid), valid))
-        })?;
+        // `get_or_insert_with_until` is the single-flight: quick_cache's
+        // placeholder guard runs the closure for exactly one caller per key
+        // and blocks concurrent callers until it finishes — so simultaneous
+        // first-time requests for *different representations* of the same
+        // grid (whose content-cache keys differ, hence separate gates there)
+        // still share one polar resample (PR #378 review). Blocking the
+        // calling thread is acceptable in both caller contexts (a
+        // `spawn_blocking` pool thread, or a request worker that would have
+        // done the resample itself), but not past the request's deadline
+        // (#1399): a `CELLS` tile (3 s) can wait on a 3D Tiles request's
+        // fill (30 s). It is `DeadlineExceeded` then, and the fill lands for
+        // the requests after it. Past the deadline no fill starts.
+        let result = VOXEL_GRID_CACHE.get_or_insert_with_until(
+            &key,
+            ds_core::deadline::current(),
+            || {
+                let pix = Pixels {
+                    moments: None,
+                    source: &self.source,
+                    handle,
+                };
+                let moments = pix.volume_moments(&entry.volume, &entry.id, quantity)?;
+                let pix = Pixels {
+                    moments: Some(&moments),
+                    ..pix
+                };
+                let (grid, valid) =
+                    voxel_grid_from_volume(&entry.volume, &entry.id, pix, quantity, Some(dims))?;
+                Ok::<_, DataServerError>((Arc::new(grid), valid))
+            },
+            || DataServerError::DeadlineExceeded,
+        )?;
         Ok(result)
     }
 }
@@ -12307,6 +12316,87 @@ mod tests {
             collection_id: format!("test-{nod}"),
             resampling: ResamplingMethod::default(),
         }
+    }
+
+    /// #1399: a request waiting for another's fill of a voxel grid (a
+    /// `CELLS` tile behind a 3D Tiles request, say) waits no longer than
+    /// its deadline, and the fill still lands for the next request. Without
+    /// a deadline the waiter gets the filled grid.
+    #[test]
+    fn a_wait_for_another_voxel_grid_fill_ends_at_the_deadline() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let id = unique_file_id();
+        let volume = entry(synthetic_volume(25.0, 60.0), &id);
+        let mut by_site = HashMap::new();
+        by_site.insert("fivih".to_string(), vec![volume.clone()]);
+        let view = site_view_for(by_site, "fivih");
+        let dims = [16, 36, 8];
+        let read = |deadline: Option<Instant>| {
+            let _deadline = ds_core::deadline::enter(deadline);
+            view.voxel_grid_cached(&volume, "DBZH", dims, None)
+                .map(|(grid, _)| grid)
+        };
+        let built = view
+            .voxel_grid_cached(&volume, "DBZH", dims, None)
+            .expect("builds");
+        let key: VoxelGridKey = (
+            Arc::from(pixel_cache_id(&view.source, &id).as_ref()),
+            Arc::from("DBZH"),
+            dims,
+        );
+        // Another request's fill of the grid, held until released.
+        let fill = |release: mpsc::Receiver<()>, started: mpsc::Sender<()>| {
+            VOXEL_GRID_CACHE.get_or_insert_with(&key, || {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+                Ok::<_, DataServerError>(built.clone())
+            })
+        };
+
+        VOXEL_GRID_CACHE.remove(&key).expect("resident");
+        std::thread::scope(|scope| {
+            let (release_tx, release_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let filler = scope.spawn(|| fill(release_rx, started_tx));
+            started_rx.recv().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            scope.spawn(move || {
+                let start = Instant::now();
+                let grid = read(Some(start + Duration::from_millis(200)));
+                done_tx.send((grid, start.elapsed())).unwrap();
+            });
+            let waited = done_rx.recv_timeout(Duration::from_secs(3));
+            release_tx.send(()).unwrap();
+            let (grid, elapsed) = waited.expect("the request waited past its deadline");
+            assert!(
+                matches!(grid, Err(DataServerError::DeadlineExceeded)),
+                "{:?}",
+                grid.err()
+            );
+            assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+            assert!(filler.join().unwrap().is_ok());
+        });
+        let landed = read(None).expect("the fill landed");
+        assert!(Arc::ptr_eq(&landed, &built.0));
+
+        VOXEL_GRID_CACHE.remove(&key).expect("resident");
+        std::thread::scope(|scope| {
+            let (release_tx, release_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let filler = scope.spawn(|| fill(release_rx, started_tx));
+            started_rx.recv().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            scope.spawn(move || done_tx.send(read(None)).unwrap());
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "without a deadline the request waits for the fill"
+            );
+            release_tx.send(()).unwrap();
+            let grid = done_rx.recv().unwrap().expect("the filled grid");
+            assert!(Arc::ptr_eq(&grid, &built.0));
+            assert!(filler.join().unwrap().is_ok());
+        });
     }
 
     /// A per-site view advertises **bare** quantities (no

@@ -540,9 +540,11 @@ impl MessageCache {
     /// other half for a GET of its own, read around the cache: the
     /// read-ahead's GET runs under the background budget, and a stalled one
     /// must not fail the frame it was meant to speed up. Another request's
-    /// fill, and any fill without a deadline in scope, is waited on as long
-    /// as it takes, as before. A request's first read of a read-ahead fill
-    /// peeks it ([`Self::first_read_ahead`]).
+    /// fill is waited on until the request's deadline, then
+    /// `DeadlineExceeded`, and that fill lands for the readers after it
+    /// (#1399); without a deadline in scope, as long as it takes. A
+    /// request's first read of a read-ahead fill peeks it
+    /// ([`Self::first_read_ahead`]).
     pub(crate) fn get_with<T>(
         &self,
         store: &DataStore,
@@ -613,7 +615,16 @@ impl MessageCache {
                 // waiting on that claim would hand this request the abandoned
                 // claim, and both would fetch. Join the read-ahead instead.
                 CacheEntry::Timeout if !joined && self.filling.contains(&key) => {}
-                CacheEntry::Timeout => break self.cache.get_or_insert_with(&key, fill)?,
+                // Another reader's fill: until the deadline (#1399), and that
+                // fill lands for the readers after this one.
+                CacheEntry::Timeout => {
+                    break self.cache.get_or_insert_with_until(
+                        &key,
+                        deadline::current(),
+                        fill,
+                        || DataServerError::DeadlineExceeded,
+                    )?
+                }
             }
         };
         if validated.is_none() {
@@ -802,3 +813,6 @@ impl MessageCache {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod join_tests;

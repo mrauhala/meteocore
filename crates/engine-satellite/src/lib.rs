@@ -886,16 +886,22 @@ impl SatelliteEngine {
         }
     }
 
-    /// The scan, from the cache or fetched again after eviction.
+    /// The scan, from the cache or fetched again after eviction. A request
+    /// waits for another's download of it no longer than its deadline
+    /// (#1399): `DeadlineExceeded` then, and that download lands for the
+    /// requests after it. Past the deadline it starts none of its own.
     fn frame(
         &self,
         index: usize,
         time: DateTime<Utc>,
         scan: &Scan,
     ) -> Result<Arc<Frame>, DataServerError> {
-        FRAMES.get_or_insert_with(&self.frame_key(index, time), || {
-            self.open(index, scan, FetchBudget::Request).map(Arc::new)
-        })
+        FRAMES.get_or_insert_with_until(
+            &self.frame_key(index, time),
+            ds_core::deadline::current(),
+            || self.open(index, scan, FetchBudget::Request).map(Arc::new),
+            || DataServerError::DeadlineExceeded,
+        )
     }
 }
 
@@ -1671,6 +1677,93 @@ mod tests {
         assert!(engine
             .query_position(&point, instant, None, None, None)
             .is_err());
+    }
+
+    /// A render waiting for another request's download of an evicted scan
+    /// waits no longer than its deadline (#1399), and the download still
+    /// lands for the next request. Without a deadline the render waits for
+    /// that download and draws it.
+    #[test]
+    fn a_render_waits_for_another_download_no_longer_than_its_deadline() {
+        use ds_core::error::DataServerError;
+        use std::sync::{mpsc, Arc};
+        use std::time::{Duration, Instant};
+        let dir = c13_scans(&["1900"]);
+        let engine = ir_engine("sat-join-deadline", dir.path());
+        engine.poll_once();
+        let t0 = at("2026-09-25T19:00:00Z");
+        let key = engine.frame_key(0, t0);
+        let extent = engine.raster_info().spatial_extent.unwrap();
+        let render = |deadline: Option<Instant>| {
+            let _deadline = ds_core::deadline::enter(deadline);
+            engine.get_raster_tile(
+                extent,
+                16,
+                16,
+                Some(t0),
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            )
+        };
+        // Evicted, and the source gone: what a render draws, another
+        // request's download filled.
+        let frame = FRAMES.remove(&key).expect("ingested");
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        // Another request's download of the scan, held until released.
+        let download = |release: mpsc::Receiver<()>, started: mpsc::Sender<()>| {
+            FRAMES.get_or_insert_with(&key, || {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+                Ok::<_, DataServerError>(frame.clone())
+            })
+        };
+
+        std::thread::scope(|scope| {
+            let (release_tx, release_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let filler = scope.spawn(|| download(release_rx, started_tx));
+            started_rx.recv().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            scope.spawn(move || {
+                let start = Instant::now();
+                let tile = render(Some(start + Duration::from_millis(200)));
+                done_tx.send((tile, start.elapsed())).unwrap();
+            });
+            let waited = done_rx.recv_timeout(Duration::from_secs(3));
+            release_tx.send(()).unwrap();
+            let (tile, elapsed) = waited.expect("the render waited past its deadline");
+            assert!(
+                matches!(tile, Err(DataServerError::DeadlineExceeded)),
+                "{:?}",
+                tile.err()
+            );
+            assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+            assert!(filler.join().unwrap().is_ok());
+        });
+        assert!(Arc::ptr_eq(&FRAMES.get_untracked(&key).unwrap(), &frame));
+        render(None).expect("the next render draws the downloaded scan");
+
+        FRAMES.remove(&key).expect("held");
+        std::thread::scope(|scope| {
+            let (release_tx, release_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let filler = scope.spawn(|| download(release_rx, started_tx));
+            started_rx.recv().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            scope.spawn(move || done_tx.send(render(None)).unwrap());
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "without a deadline the render waits for the download"
+            );
+            release_tx.send(()).unwrap();
+            let tile = done_rx.recv().unwrap().expect("drawn from the download");
+            assert!((0..tile.values.len()).any(|i| tile.values.value_at(i).is_some()));
+            assert!(filler.join().unwrap().is_ok());
+        });
     }
 
     #[test]

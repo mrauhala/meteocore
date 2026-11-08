@@ -824,7 +824,7 @@ impl OdimEngine {
     ) -> Result<Arc<OdimComposite>, DataServerError> {
         // Composites are immutable, so the location id (local path or S3 key)
         // fully determines the decode — no data-version in the key (same as
-        // the PVOL pixel / voxel-grid caches). `get_or_insert_with` is the
+        // the PVOL pixel / voxel-grid caches). `get_or_insert_with_until` is the
         // single-flight: quick_cache's placeholder guard runs the fetch+decode
         // closure for exactly one caller per key and blocks concurrent callers
         // for the SAME key until it finishes, so a burst of cold misses on one
@@ -840,17 +840,29 @@ impl OdimEngine {
         // failure does NOT poison the key — the next request retries it.
         // Hit/miss accounting (including counting a failed read as a miss)
         // lives in the shared cache.
-        let composite = COMPOSITE_CACHE.get_or_insert_with(&key, || {
-            let bytes = fetch_bytes(location)
-                .map_err(|e| DataServerError::Engine(format!("[{}] {e}", self.collection_id)))?;
-            let composite = Arc::new(read_composite(&bytes).map_err(|e| {
-                DataServerError::Engine(format!(
-                    "[{}] failed to parse ODIM file `{}`: {e}",
-                    self.collection_id, key
-                ))
-            })?);
-            Ok::<_, DataServerError>(composite)
-        })?;
+        //
+        // A request waits for another's fill no longer than its deadline
+        // (#1399): `DeadlineExceeded`, and the fill lands for the requests
+        // after it. Past the deadline it starts no fetch of its own.
+        let composite = COMPOSITE_CACHE.get_or_insert_with_until(
+            &key,
+            ds_core::deadline::current(),
+            || {
+                let bytes = fetch_bytes(location).map_err(|e| match e {
+                    // Its own fetch ran out of the request's time.
+                    DataServerError::DeadlineExceeded => e,
+                    e => DataServerError::Engine(format!("[{}] {e}", self.collection_id)),
+                })?;
+                let composite = Arc::new(read_composite(&bytes).map_err(|e| {
+                    DataServerError::Engine(format!(
+                        "[{}] failed to parse ODIM file `{}`: {e}",
+                        self.collection_id, key
+                    ))
+                })?);
+                Ok::<_, DataServerError>(composite)
+            },
+            || DataServerError::DeadlineExceeded,
+        )?;
         Ok(composite)
     }
 }
@@ -1464,6 +1476,105 @@ mod tests {
             bytes > 0,
             "two resident composites should report a positive resident weight"
         );
+    }
+
+    /// #1399: a request waiting for another's fetch of a composite waits no
+    /// longer than its deadline, and an EDR position query answers that
+    /// deadline rather than a gap for the timestep. The fetch still lands
+    /// for the next request; without a deadline the waiter gets it.
+    #[test]
+    fn a_wait_for_another_composite_fetch_ends_at_the_deadline() {
+        use ds_core::edr_engine::EdrEngine;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata/odim-dmi-fixture.h5");
+        // The older of the two: the newer is the engine's seed composite.
+        let older = dir.path().join("20260120T1125_radar.h5");
+        std::fs::copy(&src, &older).expect("copy fixture");
+        std::fs::copy(&src, dir.path().join("20260120T1130_radar.h5")).expect("copy fixture");
+        let config = config_with(None, None, None, None);
+        let engine = OdimEngine::new("composite-join-deadline", dir.path().to_str(), &config)
+            .expect("OdimEngine::new");
+        let location = Location::Local(older);
+        let composite = engine.load_composite(&location).expect("loads");
+        let key: Arc<str> = Arc::from(location.id().as_str());
+        let [w, s, e, n] = engine.seed_spatial_extent;
+        let point = format!("POINT({} {})", (w + e) / 2.0, (s + n) / 2.0);
+        let time: DateTime<Utc> = "2026-01-20T11:25:00Z".parse().unwrap();
+        // Another request's fetch of the composite, held until released.
+        let fetch = |release: mpsc::Receiver<()>, started: mpsc::Sender<()>| {
+            COMPOSITE_CACHE.get_or_insert_with(&key, || {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+                Ok::<_, DataServerError>(composite.clone())
+            })
+        };
+        let within = |budget: Duration| {
+            let start = Instant::now();
+            (start, ds_core::deadline::enter(Some(start + budget)))
+        };
+
+        COMPOSITE_CACHE.remove(&key).expect("resident");
+        std::thread::scope(|scope| {
+            let (release_tx, release_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let filler = scope.spawn(|| fetch(release_rx, started_tx));
+            started_rx.recv().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let (engine, location, point) = (&engine, &location, &point);
+            scope.spawn(move || {
+                let (start, deadline) = within(Duration::from_millis(200));
+                let load = engine.load_composite(location).map(|_| ());
+                let load_waited = start.elapsed();
+                drop(deadline);
+                let (start, _deadline) = within(Duration::from_millis(200));
+                let query = engine
+                    .query_position(point, Some((time, time)), None, None, None)
+                    .map(|_| ());
+                done_tx
+                    .send((load, load_waited, query, start.elapsed()))
+                    .unwrap();
+            });
+            let waited = done_rx.recv_timeout(Duration::from_secs(4));
+            release_tx.send(()).unwrap();
+            let (load, load_waited, query, query_waited) =
+                waited.expect("a waiter waited past its deadline");
+            assert!(
+                matches!(load, Err(DataServerError::DeadlineExceeded)),
+                "{load:?}"
+            );
+            assert!(
+                matches!(query, Err(DataServerError::DeadlineExceeded)),
+                "{query:?}"
+            );
+            for waited in [load_waited, query_waited] {
+                assert!(waited >= Duration::from_millis(200), "{waited:?}");
+            }
+            assert!(filler.join().unwrap().is_ok());
+        });
+        let landed = engine.load_composite(&location).expect("the fetch landed");
+        assert!(Arc::ptr_eq(&landed, &composite));
+
+        COMPOSITE_CACHE.remove(&key).expect("resident");
+        std::thread::scope(|scope| {
+            let (release_tx, release_rx) = mpsc::channel();
+            let (started_tx, started_rx) = mpsc::channel();
+            let filler = scope.spawn(|| fetch(release_rx, started_tx));
+            started_rx.recv().unwrap();
+            let (done_tx, done_rx) = mpsc::channel();
+            let (engine, location) = (&engine, &location);
+            scope.spawn(move || done_tx.send(engine.load_composite(location)).unwrap());
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+                "without a deadline the request waits for the fetch"
+            );
+            release_tx.send(()).unwrap();
+            let waited = done_rx.recv().unwrap().expect("the fetched composite");
+            assert!(Arc::ptr_eq(&waited, &composite));
+            assert!(filler.join().unwrap().is_ok());
+        });
     }
 
     #[test]

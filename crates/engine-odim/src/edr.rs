@@ -240,6 +240,10 @@ impl OdimEngine {
                         composite.undetect,
                     ));
                 }
+                // The request's time is up (#1399): no gap stands in for it.
+                Err(DataServerError::DeadlineExceeded) => {
+                    return Err(DataServerError::DeadlineExceeded)
+                }
                 Err(e) => {
                     // A single unreadable file shouldn't fail the
                     // whole series — emit a gap and carry on.
@@ -328,6 +332,9 @@ impl OdimEngine {
             times.push(entry.time);
             let composite = match self.load_composite(&entry.location) {
                 Ok(c) => c,
+                Err(DataServerError::DeadlineExceeded) => {
+                    return Err(DataServerError::DeadlineExceeded)
+                }
                 Err(e) => {
                     tracing::warn!(
                         "[{}] EDR area query: failed to load `{}`: {e}",

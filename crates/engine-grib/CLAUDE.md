@@ -400,7 +400,13 @@ on the request path. Single-level and legacy views require exact metadata.
   fetched once. A request that finds a mark waits on the signal, for half
   its remaining time with a deadline (then reads around the cache, a
   bypass), as long as the fetch takes without one, then takes the first
-  read by peek.
+  read by peek. Another reader's claimed fill is waited on until the
+  request's deadline (#1399), then `DeadlineExceeded`, and that fill lands
+  for the readers after it; without a deadline, as long as it takes
+  (`message_cache/join_tests.rs`).
+- Point-index builds (`points_from`, `complex_points_from`) single-flight
+  a CPU decode of bytes the builder already holds, no I/O, so a waiter
+  waits one decode at most and the wait carries no deadline.
 - Scan resistance (#1340): a request's first read of a fill is a
   `ByteBoundedCache::peek` (`first_read_ahead`), no recency, as a map's own
   fill is never looked up again; a lookup would promote every frame and
@@ -560,8 +566,13 @@ ones only in the legacy layout.
     uses a resident grid or awaits a fill in flight (no longer than the
     deadline), else the field is read without inserting; the message cache
     still fills. A window that fits is `GridFill::Insert`, cached as before;
-    maps (`fetch_grid`) always insert. Never insert an oversized window: it
-    evicts its own fields, and the maps' grids, before any reuse. The grid
+    maps (`fetch_grid`) always insert. An `Insert` reader also waits for
+    another's fill no longer than its deadline
+    (`GridCache::get_or_insert_until`, #1399), then `DeadlineExceeded`, and
+    starts no fill past it; the fill lands for later readers
+    (`a_wait_for_another_grid_fill_ends_at_the_deadline`). Never insert an
+    oversized window: it evicts its own fields, and the maps' grids,
+    before any reuse. The grid
     cache is one shard (`new_single_shard_with_hot_allocation`) because
     `holds` plans residency: at 256 MiB a sharded cache is two 128 MiB
     halves, so six 0.1° fields that "fit" could all hash to one half and

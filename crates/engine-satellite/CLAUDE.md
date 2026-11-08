@@ -71,6 +71,12 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     plain-Zarr exception to Critical Rule 7 — where an explicit `get_on`
     handle panics on the async worker. ISatSS tiles come
     `get_many_with_budget`-concurrently.
+  - A request waits for another's download of the scan, a request's or
+    the poll's re-download, until its deadline (`frame`,
+    `get_or_insert_with_until`, #1399): a 3 s render no longer sits out a
+    30 s fetch. Then `DeadlineExceeded` (503/504), and the download lands
+    for later requests. No download starts past the deadline
+    (`a_render_waits_for_another_download_no_longer_than_its_deadline`).
   - **Fetch budgets (#1011).** Only the poll's ingest of a new scan uses
     `FetchBudget::Background` (120 s per file): no request can wait on a
     scan the catalog does not hold yet, and 30 s left object_store's retry
