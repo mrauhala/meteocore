@@ -978,7 +978,11 @@ ones only in the legacy layout.
   run's u with the old run's v.
 - The grid is reported `GridAxes::NorthAligned` because only Template 3.0
   decodes. A rotated or projected template must report its own axes there,
-  or grid-relative components would silently pass as earth-relative.
+  `GridAxes::of(&crs)`, or grid-relative components would silently pass as
+  earth-relative. With that, a bit-5 grid-relative pair on a Lambert or
+  polar stereographic template gets its direction turned to true north by
+  the shared wrapper (`ds_core::geo::Convergence`, #897) with no other
+  engine change.
 - GRIB1 (code table 7, same bit) is not read: the engine is GRIB2 only.
 - `wind_tests::derived_matches_native_arpege_speed_and_direction_over_the_domain`
   is the frame check against real data: `testdata/grib-arpege-wind` (13 KB,

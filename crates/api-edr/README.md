@@ -393,9 +393,13 @@ checked to be English.
 
 GRIB, QueryData, Zarr and NetCDF collections that publish wind only as u/v
 components also serve wind speed and, where the source states the component
-frame and the grid allows it, direction (`ds_core::wind`). The derived
-parameters work like native ones in every query and count against the same
-value budget. `derive_wind = false` turns this off for a collection.
+frame and the grid allows it, direction (`ds_core::wind`). Components
+relative to a projected or rotated grid (QueryData LCC, stereographic and
+rotated lat/lon areas, NetCDF's MEPS Lambert grid) are turned to true north
+by the grid's convergence angle at each value's own position, in every
+query type, before the direction is taken. The derived parameters work like
+native ones in every query and count against the same value budget.
+`derive_wind = false` turns this off for a collection.
 
 ### Derived geopotential height
 

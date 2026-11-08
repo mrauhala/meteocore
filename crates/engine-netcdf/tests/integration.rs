@@ -1319,15 +1319,32 @@ fn edr_instances_are_the_runs() {
         .all(|range| range.values.iter().all(Option::is_some)));
 }
 
+/// The direction a wind blows from of components `(x, y)` along MEPS's
+/// Lambert grid at longitude `lon`, worked out apart from `ds_core`: the
+/// direction on the grid, `atan2(-x, -y)`, plus the grid's convergence
+/// there, `γ = n (λ − λ₀)` with the tangent cone's n = sin 63.3° and
+/// λ₀ = 15°E, its `projection_lambert` (#897).
+fn meps_true_direction(x: f64, y: f64, lon: f64) -> f64 {
+    let gamma = 63.3f64.to_radians().sin() * (lon - 15.0);
+    ((-x).atan2(-y).to_degrees() + gamma).rem_euclid(360.0)
+}
+
+/// Two directions in degrees apart, through north.
+fn degrees_apart(a: f64, b: f64) -> f64 {
+    ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs()
+}
+
 /// MEPS's 10 m wind is grid-relative (`x_wind`/`y_wind`) on a Lambert grid:
-/// the derived wind is its speed, on every API, and no direction until the
-/// components are turned to true north (#1067 decision 6).
+/// the derived wind is its speed, on every API, and in EDR its direction,
+/// each value's components turned to true north by the grid's convergence
+/// where the value is (#897). The fixture's cells lie from 8°W to 39°E, up
+/// to 21° of convergence from the central meridian.
 #[test]
-fn derived_wind_is_the_speed_of_the_grid_relative_components() {
+fn derived_wind_turns_the_grid_relative_components_to_true_north() {
     use ds_core::wind::{DerivedWind, GridAxes, VectorFrame, WindSource};
     let engine = Arc::new(meps());
     let facts = engine.wind_facts();
-    assert_eq!(facts.grid, GridAxes::Rotated);
+    assert!(matches!(facts.grid, GridAxes::Rotated(Some(_))));
     let u = facts
         .parameters
         .iter()
@@ -1348,7 +1365,7 @@ fn derived_wind_is_the_speed_of_the_grid_relative_components() {
     );
     let outcome = outcomes.lock().unwrap()[0].clone();
     assert_eq!(outcome.speed.as_deref(), Ok("wind_speed_10m"));
-    assert!(outcome.direction.is_err(), "{outcome:?}");
+    assert_eq!(outcome.direction.as_deref(), Ok("wind_direction_10m"));
     let info = MapEngine::raster_info(&wind);
     let speed = info
         .parameters
@@ -1359,7 +1376,9 @@ fn derived_wind_is_the_speed_of_the_grid_relative_components() {
         (speed.title.as_str(), speed.unit.as_str()),
         ("Wind speed (10 m)", "m/s")
     );
+    // Direction is EDR only: no cyclic palette.
     assert!(!info.parameters.iter().any(|p| p.name.contains("direction")));
+    assert!(EdrEngine::get_parameters(&wind).contains(&"wind_direction_10m".to_string()));
 
     let nine = at("2026-10-15T09:00:00Z");
     let (lat, lon) = met_latlon();
@@ -1403,6 +1422,88 @@ fn derived_wind_is_the_speed_of_the_grid_relative_components() {
         )
         .unwrap();
     assert!((drawn.values.value_at(0).unwrap() - speed).abs() < 1e-3);
+
+    // The direction at fixture cells west of, near and east of 15°E, from
+    // the stored components and MET Norway's longitude of the cell.
+    let mut turned = 0;
+    for (j, i) in [(4, 3), (2, 0), (4, 4), (5, 9), (6, 8)] {
+        let result = single(
+            EdrEngine::query_position(
+                &wind,
+                &format!("POINT({} {})", lon[j][i], lat[j][i]),
+                Some((nine, nine)),
+                Some(&names(&["wind_speed_10m", "wind_direction_10m"])),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        assert_eq!(result.ranges.len(), 2, "the components are dropped");
+        let (x, y) = (
+            stored(file, "x_wind_10m")[j][i],
+            stored(file, "y_wind_10m")[j][i],
+        );
+        let want = meps_true_direction(x, y, lon[j][i]);
+        let got = result.ranges["wind_direction_10m"].values[0].unwrap();
+        assert!(
+            degrees_apart(got, want) < 0.01,
+            "cell ({j}, {i}) at {}°E: {got} ≠ {want}",
+            lon[j][i]
+        );
+        // Not the direction on the grid: the turn is several degrees.
+        let on_grid = (-x).atan2(-y).to_degrees().rem_euclid(360.0);
+        if degrees_apart(got, on_grid) > 3.0 {
+            turned += 1;
+        }
+        let speed = result.ranges["wind_speed_10m"].values[0].unwrap();
+        assert!((speed - x.hypot(y)).abs() < 1e-3, "the speed is not turned");
+        let description = &result.parameters["wind_direction_10m"];
+        assert_eq!(description.unit, "°");
+        assert_eq!(
+            description.standard_name.as_deref(),
+            Some("wind_from_direction")
+        );
+    }
+    assert_eq!(turned, 4, "every cell but the one at 13.9°E turns by > 3°");
+
+    // An area: each CRS84 cell's direction is its own sampled components
+    // turned at its own longitude.
+    let area = single(
+        EdrEngine::query_area(
+            &wind,
+            "POLYGON((0 52, 36 52, 36 66, 0 66, 0 52))",
+            Some((nine, nine)),
+            Some(&names(&["x_wind_10m", "y_wind_10m", "wind_direction_10m"])),
+            None,
+            None,
+        )
+        .unwrap(),
+    );
+    let DomainDescription::Grid {
+        x: lons, y: lats, ..
+    } = &area.domain
+    else {
+        panic!("not a Grid: {:?}", area.domain);
+    };
+    let range = |name: &str| &area.ranges[name].values;
+    let mut cells = 0;
+    for (iy, _) in lats.iter().enumerate() {
+        for (ix, &cell_lon) in lons.iter().enumerate() {
+            let k = iy * lons.len() + ix;
+            let (Some(x), Some(y)) = (range("x_wind_10m")[k], range("y_wind_10m")[k]) else {
+                assert_eq!(range("wind_direction_10m")[k], None);
+                continue;
+            };
+            let got = range("wind_direction_10m")[k].unwrap();
+            let want = meps_true_direction(x, y, cell_lon);
+            assert!(
+                degrees_apart(got, want) < 1e-6,
+                "({cell_lon}, {iy}): {got} ≠ {want}"
+            );
+            cells += 1;
+        }
+    }
+    assert!(cells >= 20, "{cells} cells");
 }
 
 /// Critical Rule 7: EDR queries complete on the shared query runtime's
@@ -1817,10 +1918,11 @@ fn edr_z_selects_the_levels_a_query_reads() {
 }
 
 /// Derived wind on pressure levels: `x_wind_pl`/`y_wind_pl` have no pairing
-/// level (they span the vertical axis) and pair into `wind_speed_pl`, read
-/// at the one level asked for, on the map and in EDR, speed only on the
-/// Lambert grid. The fixture's 300 hPa jet passes the surface components'
-/// ±40 m/s, which is why the pressure-level styles are wider.
+/// level (they span the vertical axis) and pair into `wind_speed_pl` and
+/// `wind_direction_pl`, read at the one level asked for, on the map and in
+/// EDR; the direction is EDR only and turned to true north on the Lambert
+/// grid. The fixture's 300 hPa jet passes the surface components' ±40 m/s,
+/// which is why the pressure-level styles are wider.
 #[test]
 fn derived_wind_pairs_the_components_level_by_level() {
     use ds_core::wind::{DerivedWind, VectorFrame, WindSource};
@@ -1843,7 +1945,7 @@ fn derived_wind_pairs_the_components_level_by_level() {
     );
     let outcome = outcomes.lock().unwrap()[0].clone();
     assert_eq!(outcome.speed.as_deref(), Ok("wind_speed_pl"));
-    assert!(outcome.direction.is_err(), "{outcome:?}");
+    assert_eq!(outcome.direction.as_deref(), Ok("wind_direction_pl"));
     let info = MapEngine::raster_info(&wind);
     let speed = info
         .parameters
@@ -1893,6 +1995,36 @@ fn derived_wind_pairs_the_components_level_by_level() {
         assert!((drawn - value).abs() < 1e-3, "{hpa}: {drawn} {value}");
     }
     assert!(values[1].unwrap() > values[0].unwrap(), "faster aloft");
+
+    // The direction per level, at cells west and east of 15°E: the stored
+    // components of that level turned at the cell's longitude.
+    for (j, i) in [(4, 0), (6, 8)] {
+        let cell = met_cell((j, i));
+        let CoverageResponse::Collection(profiles) = EdrEngine::query_position(
+            &wind,
+            &format!("POINT({} {})", cell.0, cell.1),
+            Some((six, six)),
+            Some(&names(&["wind_direction_pl"])),
+            Some(&[300.0, 850.0]),
+            Some(six),
+        )
+        .unwrap() else {
+            panic!("a profile");
+        };
+        let directions = &profiles[0].ranges["wind_direction_pl"].values;
+        for (got, hpa) in directions.iter().zip([850.0, 300.0]) {
+            let want = meps_true_direction(
+                stored_pl(file, "x_wind_pl", hpa)[j][i],
+                stored_pl(file, "y_wind_pl", hpa)[j][i],
+                cell.0,
+            );
+            let got = got.unwrap();
+            assert!(
+                degrees_apart(got, want) < 0.01,
+                "cell ({j}, {i}) at {hpa} hPa: {got} ≠ {want}"
+            );
+        }
+    }
 }
 
 /// A pressure axis stored in Pa (`level`, 50000/85000/100000 Pa, top first)

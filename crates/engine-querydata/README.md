@@ -112,9 +112,11 @@ direction. Pairs are found by FMI parameter number (23 `WindUMS`,
 `10u`/`10v`. The derived parameters take that vocabulary's names:
 `WindSpeedMS` and `WindDirection`, or `10si` and `10wdir`. QueryData does
 not state the components' frame, so the engine follows newbase's
-convention that u and v are relative to the grid. Direction is therefore
-derived only on lat/lon areas; rotated lat/lon, stereographic and LCC areas
-get speed only. `derive_wind = false` turns this off.
+convention that u and v are relative to the grid. On lat/lon areas that is
+east and north; on rotated lat/lon, stereographic and LCC areas the
+direction turns each value's components to true north by the grid's
+convergence angle where the value is. `derive_wind = false` turns this
+off.
 
 ### Derived relative humidity and dew point
 

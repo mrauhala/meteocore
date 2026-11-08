@@ -5,7 +5,8 @@ MEPS. Read the root `CLAUDE.md` first — Critical Rules 5, 6, 7, 9 and 10
 shape this crate. Today: local directories and remote files read in place
 by HTTP range or through OPeNDAP (thredds.met.no; OPeNDAP only for MEPS
 since 2026-10-22, #1264), WMS/Maps/Tiles, EDR position/area/radius/
-trajectory/cube with runs as instances, GetFeatureInfo, derived wind speed, and a CF
+trajectory/cube with runs as instances, GetFeatureInfo, derived wind speed and
+(EDR) direction, and a CF
 pressure axis as the collection's vertical axis (PR 8, the last of the
 #1067 plan), per-step amounts of run-start accumulations (#1165), and
 curvilinear grids placed by 2-D latitude/longitude (#1174).
@@ -898,18 +899,25 @@ the layout (`catalog::wind_facts`): per variable its CF `standard_name`,
 the frame `VectorFrame::from_standard_name` gives (`x_wind`/`y_wind` ⇒
 `Grid`), the served unit (`Layout::unit`: `DerivedWind` combines served
 values), and the level (`"10 m"`: the single level's value and
-units) as the pairing level; the grid's `GridAxes::of(crs)`. MEPS's Lambert
-grid is `Rotated`, so `x_wind_10m`/`y_wind_10m` give `wind_speed_10m` and no
-direction (decision 6; rotation by the convergence angle is a follow-up on
-#897). The server wraps the engine in `ds_core::derive::Derived`
+units) as the pairing level; the grid's `GridAxes::of(crs)`, which carries
+the projection's convergence (`ds_core::geo::Convergence`). MEPS's Lambert
+grid is `Rotated(Some(_))`, so `x_wind_10m`/`y_wind_10m` give
+`wind_speed_10m` and, in EDR, `wind_direction_10m`: the wrapper turns each
+value's grid-relative components to true north by γ = n (λ − λ₀) at its own
+longitude (n = sin 63.3°) before the direction (#897; it replaced the
+speed-only decision 6 of #1067). The engine does nothing for it. The server
+wraps the engine in `ds_core::derive::Derived`
 (`derived_wrapped`), which derives on every API from the components' own
 reads; a `geopotential` variable gives its height the same way
 (`geopotential_pl` → `geopotential_height_pl`, #948). Components on the
 pressure axis (`x_wind_pl`/`y_wind_pl`) have no pairing level, as
 `ParameterFacts::level` asks of a parameter spanning the vertical axis:
-they pair into `wind_speed_pl`, and `DerivedWind` reads both at the one `z`
-of each request, so the speed is per level
-(`tests/integration.rs` `derived_wind_pairs_the_components_level_by_level`;
+they pair into `wind_speed_pl` and `wind_direction_pl`, and `DerivedWind`
+reads both at the one `z` of each request, so speed and direction are per
+level (`tests/integration.rs`
+`derived_wind_turns_the_grid_relative_components_to_true_north` and
+`derived_wind_pairs_the_components_level_by_level` check the direction
+against the stored components and MET Norway's longitudes;
 a Pa file with earth-relative `u`/`v` on lat/lon gives `ws` and `wdir` per
 level, `pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level`).
 The same facts carry `vertical: Some(Pressure)` for a variable on the

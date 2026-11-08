@@ -299,9 +299,10 @@ impl Layout {
 /// `x_wind_pl`/`y_wind_pl` pair level by level (#1067 PR 8), and its
 /// `vertical` says the level is a pressure, which a humidity derived from
 /// specific humidity reads (#898). MEPS's
-/// Lambert grid is `GridAxes::Rotated`, so its grid-relative 10 m wind
-/// gives a speed and no direction until the components are turned by the
-/// convergence angle (a follow-up on #897); a curvilinear grid's are
+/// Lambert grid is `GridAxes::Rotated` with its convergence, so its
+/// grid-relative 10 m wind gives a speed, and a direction the components
+/// turned to true north at each value's position (#897); a curvilinear
+/// grid's are
 /// `GridAxes::Skewed` (#1174), so grid-relative components give nothing
 /// there, while earth-relative ones give both. Nothing is taken from a
 /// name.
