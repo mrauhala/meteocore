@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ds_cache::{ByteBoundedCache, CacheEntry, CacheMetrics, MIB};
@@ -68,7 +68,21 @@ pub(crate) struct MessageCache {
     read_ahead: AheadFills,
     /// The messages whose fill a map read-ahead holds right now.
     filling: Filling,
+    /// Held across each insert into `cache` and a kept fill's keep
+    /// ([`Self::admit`], #1425).
+    admission: Mutex<()>,
+    /// Readers waiting to take `admission`, for tests to wait on.
+    #[cfg(test)]
+    admitting: AtomicUsize,
+    /// Called between a kept fill's insert and its keep, for tests that
+    /// order another fill against it.
+    #[cfg(test)]
+    before_keep: Mutex<Option<KeepHook>>,
 }
+
+/// What [`MessageCache`] calls between a kept fill's insert and its keep.
+#[cfg(test)]
+type KeepHook = Arc<dyn Fn(&MessageKey) + Send + Sync>;
 
 /// The most messages an [`Unread`] or [`AheadFills`] waits on. Each
 /// pre-warm first forgets those the cache no longer holds, as does a
@@ -318,8 +332,35 @@ impl MessageCache {
                 prewarmed: Unread::default(),
                 read_ahead: AheadFills::default(),
                 filling: Filling::default(),
+                admission: Mutex::new(()),
+                #[cfg(test)]
+                admitting: AtomicUsize::new(0),
+                #[cfg(test)]
+                before_keep: Mutex::new(None),
             }
         })
+    }
+
+    /// The admission lock (#1425), held across one insert into the cache
+    /// and, for a kept fill, its keep, never across a fetch or a decode.
+    /// [`ByteBoundedCache::keep`] marks a fill read with a lookup of its
+    /// own after the insert; another insert in between could evict the
+    /// unread fill from the cold ring, and the keep then put it back past
+    /// the hot ring's target, which cost the cache an entry more than it
+    /// added back: in a full cache, one of a window's own. Every insert
+    /// takes it: requests' fills, kept or not, the pre-warm's and the
+    /// read-ahead's.
+    fn admit(&self) -> MutexGuard<'_, ()> {
+        #[cfg(test)]
+        self.admitting.fetch_add(1, Ordering::SeqCst);
+        // Nothing to poison: it guards an order, not data.
+        let admitted = self
+            .admission
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        self.admitting.fetch_sub(1, Ordering::SeqCst);
+        admitted
     }
 
     /// Mark the cache as one the pre-warm fills ahead of its reads (#1335):
@@ -378,7 +419,12 @@ impl MessageCache {
     /// Whether `messages` messages of `bytes` together stay resident: their
     /// weight, each key counted with a long path ([`URL_ALLOWANCE`]),
     /// within one shard's budget, all of it for this one-shard cache. A
-    /// window read with `window` set ([`Self::get_with`]) then does.
+    /// window read with `window` set ([`Self::get_with`]) is then resident
+    /// for its next run, its fills concurrent or not: each is inserted and
+    /// kept as one step ([`Self::admit`]), so they never displace each
+    /// other, and the clock evicts every entry nobody read since it last
+    /// passed before one of theirs. An entry another request read since
+    /// can outlive the window's oldest message.
     pub(crate) fn holds(&self, messages: usize, bytes: u64) -> bool {
         let overhead = entry_weight(0, URL_ALLOWANCE + size_of::<MessageKey>());
         (messages as u64)
@@ -556,6 +602,7 @@ impl MessageCache {
         deadline::check()?;
         let key = MessageKey::new(path.as_ref(), entry);
         let mut validated = None;
+        let mut admitted = None;
         let fill = || {
             let bytes = reader::fetch_message_bytes(store, path, entry)?;
             deadline::check()?;
@@ -564,11 +611,15 @@ impl MessageCache {
             // Object stores can return a slice backed by the entire file.
             // Retain exactly this message's bytes so the byte budget is real.
             // Oversized values are never admitted: avoid copying those buffers.
-            Ok::<_, DataServerError>(if weight(&key, &bytes) <= self.cache.capacity_bytes() {
+            let bytes = if weight(&key, &bytes) <= self.cache.capacity_bytes() {
                 Bytes::copy_from_slice(&bytes)
             } else {
                 bytes
-            })
+            };
+            // Whichever claim inserts the bytes next, this request's or the
+            // single-flight's, does so under the lock, held through the keep.
+            admitted = Some(self.admit());
+            Ok::<_, DataServerError>(bytes)
         };
         let mut joined = false;
         let bytes = loop {
@@ -587,6 +638,7 @@ impl MessageCache {
                         // nothing: its fill will.
                         self.cache.record_bypass();
                         let bytes = fill()?;
+                        drop(admitted);
                         deadline::check()?;
                         return Ok((bytes, validated));
                     }
@@ -637,16 +689,27 @@ impl MessageCache {
             self.prewarmed.forget(&key);
             self.read_ahead.forget(&key);
             if window {
+                #[cfg(test)]
+                {
+                    let hook = self.before_keep.lock().unwrap().clone();
+                    if let Some(hook) = hook {
+                        hook(&key);
+                    }
+                }
                 self.cache.keep(key, bytes.clone());
             }
         }
+        // Inserted and kept as one step (#1425).
+        drop(admitted);
         deadline::check()?;
         Ok((bytes, validated))
     }
 
     /// Fill `claim` with what `fill` reads, counting a miss first, as
     /// [`ByteBoundedCache::get_or_insert_with`] does: a failed fill still
-    /// counts, and releases the claim for a later reader.
+    /// counts, and releases the claim for a later reader. A fill that reads
+    /// takes the admission lock last ([`Self::admit`]), and the claim is
+    /// filled under it.
     fn fill_claimed(
         &self,
         key: &MessageKey,
@@ -731,8 +794,10 @@ impl MessageCache {
             }
             self.read_ahead.update(&fills);
         }
-        self.cache
-            .insert(key.clone(), Bytes::copy_from_slice(&bytes));
+        let bytes = Bytes::copy_from_slice(&bytes);
+        let admitted = self.admit();
+        self.cache.insert(key.clone(), bytes);
+        drop(admitted);
         if !self.cache.contains_key(key) {
             self.read_ahead.forget(key);
         }
@@ -770,8 +835,10 @@ impl MessageCache {
         // An exact copy, as `get_with` admits; the byte cap keeps a
         // pre-warmed message far below the cache's capacity.
         let bytes = Bytes::copy_from_slice(&bytes);
+        let admitted = self.admit();
         let _ = fill.insert(bytes.clone());
         self.cache.keep(key.clone(), bytes);
+        drop(admitted);
         if self.cache.contains_key(key) {
             self.prewarmed.insert(key, &self.cache);
         }
