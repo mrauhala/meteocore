@@ -589,6 +589,17 @@ need no reload pruning.
   descriptor, its entry's title). The parameter list stays
   alphabetical; the SPA opens on the marked entry. An entry without a
   `tiles` block gets no layer switch, only "No map layer" and that link.
+- An entry with no `tiles` block that EDR serves (#414) lists EDR's
+  parameters (`get_parameter_descriptions`, same `{name, title, unit}`
+  shape, a parameter's own `get_parameter_available_times` as its
+  `temporal_extent`, no `default`), and `edr.position_url` when the engine
+  advertises `position`. With that URL the SPA gives the entry a switch: it
+  outlines the extent, and a map click runs the position query (path on the
+  page's origin, longitude wrapped into [-180, 180], `parameter-name` the
+  selected one, `datetime` the slider's) into a popup; one such entry is on
+  at a time, and vector popups wait while it is. Without one the parameters
+  are a folded list. Entries with raster tiles keep the map engine's list;
+  vector-only entries list none.
 - First enabling a preview collection fits its extent without animation,
   before setting its layers visible. Keep that order: a visible source during
   the initial flight requests intermediate zoom levels and can exhaust cold
