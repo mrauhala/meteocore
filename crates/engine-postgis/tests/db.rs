@@ -1574,6 +1574,424 @@ async fn events_pick_shape() {
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
 
+/// The Features fixture (#503): a naive-UTC time column keyed `(time, id)`,
+/// as a TimescaleDB hypertable is. Three events share 05:20, their ids
+/// ordering differently as text ("10" < "2" < "3") than as numbers; one has
+/// no geometry; two lie on either side of the antimeridian; one has a
+/// microsecond time; one is out of every window; two are recent, inside
+/// and outside the default one-hour window.
+const FEATURE_EVENTS: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.strikes (
+    id bigint NOT NULL,
+    time timestamp without time zone NOT NULL,
+    geom geometry(Point, 4326),
+    peak_current real,
+    cloud smallint,
+    PRIMARY KEY (time, id)
+);
+INSERT INTO __S__.strikes VALUES
+    (1, '2026-01-01 05:10:00', ST_SetSRID(ST_MakePoint(1, 1), 4326), 5, 0),
+    (2, '2026-01-01 05:20:00', ST_SetSRID(ST_MakePoint(2, 2), 4326), -12.5, 1),
+    (3, '2026-01-01 05:20:00', ST_SetSRID(ST_MakePoint(3, 3), 4326), 900, 0),
+    (10, '2026-01-01 05:20:00', ST_SetSRID(ST_MakePoint(4, 4), 4326), 7, 1),
+    (4, '2026-01-01 05:30:00', ST_SetSRID(ST_MakePoint(179.5, 15), 4326), 8, 0),
+    (5, '2026-01-01 05:40:00', ST_SetSRID(ST_MakePoint(-179.5, 15), 4326), 9, 1),
+    (6, '2026-01-01 05:50:00', NULL, 1, 0),
+    (7, '2026-01-01 06:30:00.123456', ST_SetSRID(ST_MakePoint(1, 1), 4326), 2, 0),
+    (8, '2025-12-31 00:00:00', ST_SetSRID(ST_MakePoint(1, 1), 4326), 3, 0),
+    (9, (now() AT TIME ZONE 'UTC') - interval '10 minutes', ST_SetSRID(ST_MakePoint(1, 1), 4326), 4, 0),
+    (11, (now() AT TIME ZONE 'UTC') - interval '2 hours', ST_SetSRID(ST_MakePoint(1, 1), 4326), 4, 0);
+CREATE INDEX ON __S__.strikes USING GIST (geom);
+ANALYZE;
+";
+
+/// `/items` of the events engine, on a blocking thread as the Features
+/// executor's query runtime runs it.
+async fn feature_page(
+    engine: &Arc<PostgisEngine>,
+    query: ds_core::feature::FeatureQuery,
+) -> Result<ds_core::feature::FeaturePage, DataServerError> {
+    use ds_core::feature_engine::FeatureEngine;
+    let engine = Arc::clone(engine);
+    tokio::task::spawn_blocking(move || engine.get_features(&query))
+        .await
+        .expect("feature page task")
+}
+
+/// The leading `<id>` of each feature id `<id>@<time>`.
+fn event_ids(page: &ds_core::feature::FeaturePage) -> Vec<String> {
+    page.features
+        .iter()
+        .map(|f| f.id.rsplit_once('@').expect("an event key").0.to_string())
+        .collect()
+}
+
+/// #503: Features `/items` on the events shape. Paging by cursor visits
+/// every event of the window once, newest first, ties on one time by id as
+/// text, a page boundary inside a tie included, `numberMatched` only on a
+/// first page that holds every match; `bbox` (edges included, across the
+/// antimeridian) and `datetime` (an instant, an open end) select as OGC
+/// does; no `datetime` reads the default window ending now; a feature
+/// carries its key as id, its point (or null) and its time, filtered
+/// parameter and type, and its id reads it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_features_shape() {
+    use ds_core::feature::{Bbox, DatetimeInterval, FeatureQuery, Geometry, PropertyValue};
+    use ds_core::feature_engine::FeatureEngine;
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc503_events";
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, FEATURE_EVENTS).await;
+    }
+    let mut cfg = config(
+        None,
+        PostgisObservationsConfig {
+            table: Some(format!("{schema}.strikes")),
+            time_col: Some("time".into()),
+            time_col_tz: Some("UTC".into()),
+            geom_col: Some("geom".into()),
+            id_col: Some("id".into()),
+            cloud_indicator_col: Some("cloud".into()),
+            peak_current_col: Some("peak_current".into()),
+            extent_bbox: Some([-180.0, 0.0, 180.0, 20.0]),
+            ..observations("events")
+        },
+    );
+    cfg.parameters = vec![PostgisParameterConfig {
+        name: "peak_current".into(),
+        label: "Peak current".into(),
+        unit: "kA".into(),
+        observed_property: None,
+        source_key: None,
+        valid_range: Some(vec![-300.0, 300.0]),
+        missing_values: vec![],
+    }];
+    let engine = engine(schema, &cfg).await;
+    assert!(engine.pages_by_cursor() && engine.reads_on_request());
+
+    let window = |start: &str, end: Option<&str>| DatetimeInterval {
+        start: Some(start.parse().unwrap()),
+        end: end.map(|e| e.parse().unwrap()),
+    };
+    let jan_1 = || window("2026-01-01T05:00:00Z", Some("2026-01-01T07:00:00Z"));
+    let newest_first = ["7", "6", "5", "4", "3", "2", "10", "1"];
+
+    // Two at a time: the third page ends inside the 05:20 tie.
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    let mut pages = 0;
+    loop {
+        let page = feature_page(
+            &engine,
+            FeatureQuery {
+                datetime: Some(jan_1()),
+                limit: 2,
+                cursor: cursor.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a page");
+        // No page of several is counted: no statement counts the window.
+        assert_eq!(page.number_matched, None, "page {pages}");
+        assert_eq!(page.number_returned, page.features.len());
+        assert_eq!(page.next_offset, None);
+        seen.extend(event_ids(&page));
+        pages += 1;
+        match page.next_cursor {
+            Some(next) => {
+                assert_eq!(Some(&next), page.features.last().map(|f| &f.id));
+                cursor = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(pages, 4);
+    assert_eq!(seen, newest_first);
+
+    // One page holding every match knows how many match, for free, and has
+    // no next page; one short of it has a next page and no count.
+    let all = feature_page(
+        &engine,
+        FeatureQuery {
+            datetime: Some(jan_1()),
+            limit: 8,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (all.number_matched, all.next_cursor.as_deref()),
+        (Some(8), None)
+    );
+    let short = feature_page(
+        &engine,
+        FeatureQuery {
+            datetime: Some(jan_1()),
+            limit: 7,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(short.number_matched, None);
+    assert_eq!(
+        short.next_cursor.as_deref(),
+        Some(short.features[6].id.as_str())
+    );
+
+    // The features themselves.
+    let by_id = |id: &str| {
+        all.features
+            .iter()
+            .find(|f| f.id.starts_with(&format!("{id}@")))
+            .unwrap_or_else(|| panic!("event {id}"))
+    };
+    let three = by_id("3");
+    assert_eq!(three.id, "3@2026-01-01T05:20:00Z");
+    assert_eq!(
+        three.properties.get("time"),
+        Some(&PropertyValue::String("2026-01-01T05:20:00Z".into()))
+    );
+    assert_eq!(
+        three.properties.get("peak_current"),
+        Some(&PropertyValue::Null),
+        "900 kA is out of range"
+    );
+    assert_eq!(
+        three.properties.get("type"),
+        Some(&PropertyValue::String("cloud-to-ground".into()))
+    );
+    assert!(
+        !three.properties.contains_key("peak_current_ka"),
+        "a parameter reads peak_current"
+    );
+    match &*three.geometry {
+        Geometry::Point { x, y } => assert_eq!((*x, *y), (3.0, 3.0)),
+        other => panic!("{other:?}"),
+    }
+    let two = by_id("2");
+    assert_eq!(
+        two.properties.get("peak_current"),
+        Some(&PropertyValue::Float(-12.5))
+    );
+    assert_eq!(
+        two.properties.get("type"),
+        Some(&PropertyValue::String("intra-cloud".into()))
+    );
+    assert!(matches!(*by_id("6").geometry, Geometry::Null));
+    assert_eq!(by_id("7").id, "7@2026-01-01T06:30:00.123456Z");
+
+    // `/items/{featureId}` reads each back, a non-canonical time too.
+    for feature in &all.features {
+        let id = feature.id.clone();
+        let engine = Arc::clone(&engine);
+        let back = tokio::task::spawn_blocking(move || engine.get_feature(&id))
+            .await
+            .unwrap()
+            .expect("the event by its id");
+        assert_eq!(back.id, feature.id);
+        assert_eq!(back.properties, feature.properties);
+    }
+    for (id, found) in [
+        ("7@2026-01-01T06:30:00.123456000Z", true),
+        ("7@2026-01-01T08:30:00.123456+02:00", true),
+        ("7@2026-01-01T06:30:00.123Z", false),
+        ("99@2026-01-01T05:20:00Z", false),
+        // A `bigint` id holds no `x`: not found without a query.
+        ("x@2026-01-01T05:20:00Z", false),
+        ("3", false),
+    ] {
+        let engine = Arc::clone(&engine);
+        let result = tokio::task::spawn_blocking(move || engine.get_feature(id))
+            .await
+            .unwrap();
+        match (found, result) {
+            (true, Ok(f)) => assert_eq!(f.id, "7@2026-01-01T06:30:00.123456Z"),
+            (false, Err(DataServerError::FeatureNotFound(_))) => {}
+            (_, other) => panic!("{id}: {other:?}"),
+        }
+    }
+    // The by-id statement is a lookup on the `(time, id)` primary key, both
+    // columns in its index condition (the planner told not to scan the
+    // eleven rows instead).
+    {
+        use engine_postgis::query::{build_events_feature, EventIdMatch};
+        let config = engine.config();
+        let built = build_events_feature(
+            config.events().expect("an events shape"),
+            &config.parameters,
+            &["peak_current"],
+            ("2026-01-01T05:20:00Z".parse().unwrap(), "3"),
+            EventIdMatch::Column,
+        )
+        .unwrap();
+        let mut params = params_as_refs(&built.params);
+        let id = 3_i64;
+        params[1] = &id;
+        client
+            .batch_execute("SET enable_seqscan = off")
+            .await
+            .unwrap();
+        let plan: Vec<String> = client
+            .query(&format!("EXPLAIN {}", built.sql), &params)
+            .await
+            .expect("EXPLAIN the by-id statement")
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        client.batch_execute("RESET enable_seqscan").await.unwrap();
+        let plan = plan.join("\n");
+        assert!(plan.contains("strikes_pkey"), "{plan}");
+        assert!(
+            plan.lines().any(|l| l.contains("Index Cond")
+                && l.contains("\"time\" =")
+                && l.contains("id = ")),
+            "{plan}"
+        );
+    }
+
+    // `bbox`: edges included; across the antimeridian, both sides.
+    let in_box = |bbox: [f64; 4], datetime: DatetimeInterval| {
+        feature_page(
+            &engine,
+            FeatureQuery {
+                bbox: Some(Bbox::new(bbox[0], bbox[1], bbox[2], bbox[3]).unwrap()),
+                datetime: Some(datetime),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+    };
+    let page = in_box([2.0, 2.0, 3.0, 3.0], jan_1()).await.unwrap();
+    assert_eq!(event_ids(&page), ["3", "2"]);
+    assert_eq!(page.number_matched, Some(2));
+    let page = in_box([170.0, 10.0, -170.0, 20.0], jan_1()).await.unwrap();
+    assert_eq!(
+        event_ids(&page),
+        ["5", "4"],
+        "the seam box holds both sides"
+    );
+    let page = in_box([-170.0, 10.0, 170.0, 20.0], jan_1()).await.unwrap();
+    assert!(
+        event_ids(&page).is_empty(),
+        "the box between them holds neither"
+    );
+
+    // `datetime`: an instant selects that time; an open end runs on.
+    let at = |datetime: DatetimeInterval| {
+        feature_page(
+            &engine,
+            FeatureQuery {
+                datetime: Some(datetime),
+                limit: 100,
+                ..Default::default()
+            },
+        )
+    };
+    let instant = window("2026-01-01T05:20:00Z", Some("2026-01-01T05:20:00Z"));
+    assert_eq!(event_ids(&at(instant).await.unwrap()), ["3", "2", "10"]);
+    let open = at(window("2026-01-01T05:45:00Z", None)).await.unwrap();
+    assert_eq!(event_ids(&open), ["9", "11", "7", "6"]);
+
+    // No `datetime`: the default hour ending now.
+    let recent = feature_page(&engine, FeatureQuery::default())
+        .await
+        .unwrap();
+    assert_eq!(event_ids(&recent), ["9"]);
+    assert_eq!(recent.number_matched, Some(1));
+
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
+/// #503: an id column the engine binds in no type of its own (`uuid`) is
+/// compared as text after the time column's probe: the event is found by its
+/// id, another id or a malformed one is not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_feature_by_a_uuid_key() {
+    use ds_core::feature_engine::FeatureEngine;
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc503_uuid";
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(
+            &client,
+            schema,
+            "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.strikes (
+    id uuid NOT NULL,
+    time timestamptz NOT NULL,
+    geom geometry(Point, 4326),
+    peak_current real,
+    PRIMARY KEY (time, id)
+);
+INSERT INTO __S__.strikes VALUES
+    ('6f1c8b0e-3a52-4d7e-9a0b-1d2e3f405162', '2026-01-01 05:20:00+00', ST_SetSRID(ST_MakePoint(1, 1), 4326), 5),
+    ('00000000-0000-0000-0000-000000000001', '2026-01-01 05:20:00+00', ST_SetSRID(ST_MakePoint(2, 2), 4326), 6);
+ANALYZE;
+",
+        )
+        .await;
+    }
+    let mut cfg = config(
+        None,
+        PostgisObservationsConfig {
+            table: Some(format!("{schema}.strikes")),
+            time_col: Some("time".into()),
+            geom_col: Some("geom".into()),
+            id_col: Some("id".into()),
+            extent_bbox: Some([0.0, 0.0, 10.0, 10.0]),
+            ..observations("events")
+        },
+    );
+    cfg.parameters = vec![PostgisParameterConfig {
+        name: "peak_current".into(),
+        label: "Peak current".into(),
+        unit: "kA".into(),
+        observed_property: None,
+        source_key: None,
+        valid_range: None,
+        missing_values: vec![],
+    }];
+    let engine = engine(schema, &cfg).await;
+    for (id, found) in [
+        (
+            "6f1c8b0e-3a52-4d7e-9a0b-1d2e3f405162@2026-01-01T05:20:00Z",
+            true,
+        ),
+        (
+            "6f1c8b0e-3a52-4d7e-9a0b-1d2e3f405163@2026-01-01T05:20:00Z",
+            false,
+        ),
+        ("not-a-uuid@2026-01-01T05:20:00Z", false),
+    ] {
+        let engine = Arc::clone(&engine);
+        let result = tokio::task::spawn_blocking(move || engine.get_feature(id))
+            .await
+            .unwrap();
+        match (found, result) {
+            (true, Ok(feature)) => assert_eq!(feature.id, id),
+            (false, Err(DataServerError::FeatureNotFound(_))) => {}
+            (_, other) => panic!("{id}: {other:?}"),
+        }
+    }
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
 #[path = "support/schema_validation.rs"]
 mod schema_validation;
 

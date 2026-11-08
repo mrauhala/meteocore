@@ -1136,9 +1136,10 @@ impl FeatureEngine for BufrEngine {
         let number_returned = page.len();
         Ok(FeaturePage {
             features: page,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset: (end < number_matched).then_some(end),
+            next_cursor: None,
         })
     }
 
@@ -1227,7 +1228,7 @@ mod tests {
             ..Default::default()
         };
         let page = e.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 1);
+        assert_eq!(page.number_matched, Some(1));
         assert_eq!(page.features[0].id, "gap-station");
         // The station is the EDR location of its id (#1143).
         assert_eq!(
@@ -1239,7 +1240,7 @@ mod tests {
         query
             .property_filters
             .push(("name".into(), "no such station".into()));
-        assert_eq!(e.get_features(&query).unwrap().number_matched, 0);
+        assert_eq!(e.get_features(&query).unwrap().number_matched, Some(0));
 
         let matched = |start: Option<DateTime<Utc>>, end: Option<DateTime<Utc>>| {
             e.get_features(&FeatureQuery {

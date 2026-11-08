@@ -2047,6 +2047,7 @@ async fn render_vector_tile(
         // change nothing the client can observe.
         sortby: Vec::new(),
         property_filters: Vec::new(),
+        cursor: None,
     };
 
     let page = engine

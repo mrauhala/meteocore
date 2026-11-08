@@ -878,10 +878,8 @@ pub fn build_events_pick(
     let table = fq_table(&shape.table)?;
     let time_col = quote_ident(&shape.time_col)?;
     let geom = quote_ident(&shape.geom_col)?;
-    let coordinates = crate::validation::coordinates(&geom);
     let geometry_check = crate::validation::geometry_check(&geom);
     let id = quote_ident(&shape.id_col)?;
-    let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
     let tz = shape.time_col_tz.as_deref();
     let mut params = vec![
         SqlParam::Timestamp(time_range.0),
@@ -890,23 +888,7 @@ pub fn build_events_pick(
         SqlParam::Int(row_limit as i64),
     ];
 
-    let mut projection = format!("{time_select} AS time, {coordinates}, {id}::text AS mc_id");
-    for key in source_keys {
-        let col = quote_ident(key)?;
-        let value = filtered_value(&col, value_filter(parameters, key), &mut params);
-        projection.push_str(&format!(", {value} AS {col}"));
-    }
-    for (col, alias) in [
-        (&shape.cloud_indicator_col, "mc_cloud_indicator"),
-        (&shape.peak_current_col, "mc_peak_current"),
-    ] {
-        if let Some(name) = col {
-            projection.push_str(&format!(
-                ", {}::double precision AS {alias}",
-                quote_ident(name)?
-            ));
-        }
-    }
+    let mut projection = event_projection(shape, parameters, source_keys, &mut params)?;
     projection.push_str(&format!(
         ", count(*) OVER () AS mc_matched, {geometry_check} AS mc_geometry_valid"
     ));
@@ -920,6 +902,213 @@ pub fn build_events_pick(
          AND {geom} && ST_GeomFromText($3, 4326) \
          AND ST_Intersects({geom}, ST_GeomFromText($3, 4326)) \
          ORDER BY {time_col} DESC, {id} LIMIT $4"
+    ));
+    Ok(BuiltQuery::new(sql, params))
+}
+
+/// The columns one event row is read from (#1100, #503), shared by the
+/// GetFeatureInfo pick and the Features statements so the event decoder
+/// reads one layout: `time` as `timestamptz`, its coordinates, its id as
+/// text (`mc_id`), one cast column per requested source key (value filters
+/// applied, #1210, their binds appended to `params`), and the declared
+/// attribute columns as `mc_cloud_indicator` / `mc_peak_current` (own
+/// aliases, so a parameter reading the same column does not collide). The
+/// caller appends anything else and the geometry check, last.
+fn event_projection(
+    shape: &EventsShape,
+    parameters: &[ValidatedParameter],
+    source_keys: &[&str],
+    params: &mut Vec<SqlParam>,
+) -> Result<String, BuildError> {
+    let time_col = quote_ident(&shape.time_col)?;
+    let geom = quote_ident(&shape.geom_col)?;
+    let coordinates = crate::validation::coordinates(&geom);
+    let id = quote_ident(&shape.id_col)?;
+    let time_select = time_select_expr(&time_col, shape.time_col_tz.as_deref());
+    let mut projection = format!("{time_select} AS time, {coordinates}, {id}::text AS mc_id");
+    for key in source_keys {
+        let col = quote_ident(key)?;
+        let value = filtered_value(&col, value_filter(parameters, key), params);
+        projection.push_str(&format!(", {value} AS {col}"));
+    }
+    for (col, alias) in [
+        (&shape.cloud_indicator_col, "mc_cloud_indicator"),
+        (&shape.peak_current_col, "mc_peak_current"),
+    ] {
+        if let Some(name) = col {
+            projection.push_str(&format!(
+                ", {}::double precision AS {alias}",
+                quote_ident(name)?
+            ));
+        }
+    }
+    Ok(projection)
+}
+
+/// Most events one Features page of an events collection reads (#503). The
+/// Features API caps `limit` at 1 000; this bounds any other caller.
+pub const MAX_EVENTS_PAGE: usize = 10_000;
+
+/// What an events Features request selects (#503): the time bounds, both
+/// ends included and `None` open; a CRS84 `[west, south, east, north]` box,
+/// edges included, where `west > east` crosses the antimeridian; and the
+/// event key `(time, id as text)` a page starts after, in the page order
+/// `time DESC, id DESC`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EventsSelection<'a> {
+    pub start: Option<DateTime<Utc>>,
+    pub end: Option<DateTime<Utc>>,
+    pub bbox: Option<[f64; 4]>,
+    pub after: Option<(DateTime<Utc>, &'a str)>,
+}
+
+/// Append `value` to `params` and return its placeholder.
+fn push_bind(params: &mut Vec<SqlParam>, value: SqlParam) -> String {
+    params.push(value);
+    format!("${}", params.len())
+}
+
+/// The `WHERE` clause of `selection` (empty for no condition), its binds
+/// appended to `params`. Every predicate compares the bare column, the
+/// bind converted ([`time_filter_rhs`]), so the time and GiST indexes stay
+/// usable. The bbox is `&&` against `ST_MakeEnvelope` (edges included, as
+/// Features' `bbox` is), split in two at ±180 when it crosses the
+/// antimeridian. The page start is a keyset predicate on `(time, id)`: the
+/// time bound alone is an index range, the `OR` resolves ties on one time.
+fn events_where(
+    shape: &EventsShape,
+    selection: &EventsSelection<'_>,
+    params: &mut Vec<SqlParam>,
+) -> Result<String, BuildError> {
+    let time_col = quote_ident(&shape.time_col)?;
+    let geom = quote_ident(&shape.geom_col)?;
+    let id = quote_ident(&shape.id_col)?;
+    let tz = shape.time_col_tz.as_deref();
+    let mut conditions = Vec::new();
+    if let Some(start) = selection.start {
+        let bind = push_bind(params, SqlParam::Timestamp(start));
+        conditions.push(format!("{time_col} >= {}", time_filter_rhs(&bind, tz)));
+    }
+    if let Some(end) = selection.end {
+        let bind = push_bind(params, SqlParam::Timestamp(end));
+        conditions.push(format!("{time_col} <= {}", time_filter_rhs(&bind, tz)));
+    }
+    if let Some([west, south, east, north]) = selection.bbox {
+        let crosses = west > east;
+        let w = push_bind(params, SqlParam::Float(west));
+        let s = push_bind(params, SqlParam::Float(south));
+        let e = push_bind(params, SqlParam::Float(east));
+        let n = push_bind(params, SqlParam::Float(north));
+        conditions.push(if crosses {
+            format!(
+                "({geom} && ST_MakeEnvelope({w}, {s}, 180, {n}, 4326) \
+                 OR {geom} && ST_MakeEnvelope(-180, {s}, {e}, {n}, 4326))"
+            )
+        } else {
+            format!("{geom} && ST_MakeEnvelope({w}, {s}, {e}, {n}, 4326)")
+        });
+    }
+    if let Some((time, key)) = selection.after {
+        let bind = push_bind(params, SqlParam::Timestamp(time));
+        let time = time_filter_rhs(&bind, tz);
+        let key = push_bind(params, SqlParam::Text(key.to_string()));
+        conditions.push(format!(
+            "{time_col} <= {time} AND ({time_col} < {time} OR {} < {key})",
+            event_id_order(&id)
+        ));
+    }
+    Ok(if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    })
+}
+
+/// An event id as the Features statements order and compare it (#503): as
+/// text in byte order, whatever the column's type, so a cursor carries it
+/// as text and every page orders it the same way.
+fn event_id_order(id: &str) -> String {
+    format!("{id}::text COLLATE \"C\"")
+}
+
+/// One Features page of an events collection (#503): the events of
+/// `selection`, newest first, ties on one time by id, at most `row_limit`
+/// rows (`LIMIT $N`, the last bind; the caller asks one more than the page
+/// to know whether another follows). Rows are [`event_projection`]'s
+/// layout, the geometry check last. The table is aliased, and the order
+/// names its time column through the alias: a bare name matching the
+/// `time` output column would order by the converted output expression of
+/// a naive column, which no index provides.
+pub fn build_events_features(
+    shape: &EventsShape,
+    parameters: &[ValidatedParameter],
+    selection: &EventsSelection<'_>,
+    source_keys: &[&str],
+    row_limit: usize,
+) -> Result<BuiltQuery, BuildError> {
+    let table = fq_table(&shape.table)?;
+    let time_col = quote_ident(&shape.time_col)?;
+    let geom = quote_ident(&shape.geom_col)?;
+    let geometry_check = crate::validation::geometry_check(&geom);
+    let id = quote_ident(&shape.id_col)?;
+    let mut params = Vec::new();
+    let filter = events_where(shape, selection, &mut params)?;
+    let projection = event_projection(shape, parameters, source_keys, &mut params)?;
+    let limit = push_bind(&mut params, SqlParam::Int(row_limit as i64));
+    let order = event_id_order(&format!("mc_events.{id}"));
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{projection}, {geometry_check} AS mc_geometry_valid \
+         FROM {table} AS mc_events{filter} \
+         ORDER BY mc_events.{time_col} DESC, {order} DESC LIMIT {limit}"
+    ));
+    let limit_idx = params.len() - 1;
+    Ok(BuiltQuery::new(sql, params).with_row_limit(limit_idx, source_keys.len().max(1)))
+}
+
+/// How `/items/{featureId}` compares an event key's id (#503).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventIdMatch {
+    /// The bare column against `$2`, which PostgreSQL types as the column:
+    /// with the time, an equality on the whole `(time, id)` key, which its
+    /// primary-key index answers. The caller binds `$2` in that type.
+    Column,
+    /// The id as text, for a column type the caller cannot bind: the time
+    /// equality is the index condition, the id a filter over the events at
+    /// that instant.
+    Text,
+}
+
+/// The event of key `(time, id)` (#503), for `/items/{featureId}`: an
+/// equality on the time column and on the id ([`EventIdMatch`]), `$1` and
+/// `$2`, the id bound as text until the caller rebinds it. At most one row,
+/// in [`event_projection`]'s layout, the geometry check last.
+pub fn build_events_feature(
+    shape: &EventsShape,
+    parameters: &[ValidatedParameter],
+    source_keys: &[&str],
+    (time, key): (DateTime<Utc>, &str),
+    id_match: EventIdMatch,
+) -> Result<BuiltQuery, BuildError> {
+    let table = fq_table(&shape.table)?;
+    let time_col = quote_ident(&shape.time_col)?;
+    let geom = quote_ident(&shape.geom_col)?;
+    let geometry_check = crate::validation::geometry_check(&geom);
+    let id = quote_ident(&shape.id_col)?;
+    let tz = shape.time_col_tz.as_deref();
+    let mut params = Vec::new();
+    let time = time_filter_rhs(&push_bind(&mut params, SqlParam::Timestamp(time)), tz);
+    let key = push_bind(&mut params, SqlParam::Text(key.to_string()));
+    let projection = event_projection(shape, parameters, source_keys, &mut params)?;
+    let mut sql = String::from("SELECT ");
+    sql.push_str(&format!(
+        "{projection}, {geometry_check} AS mc_geometry_valid \
+         FROM {table} \
+         WHERE {time_col} = {time} AND {} = {key} LIMIT 1",
+        match id_match {
+            EventIdMatch::Column => id,
+            EventIdMatch::Text => event_id_order(&id),
+        }
     ));
     Ok(BuiltQuery::new(sql, params))
 }
@@ -2753,6 +2942,232 @@ mod tests {
             ),
             Err(BuildError::EmptyPolygonWkt)
         ));
+    }
+
+    /// #503: a Features page reads the pick's columns, the selection's
+    /// conditions on the bare columns (binds converted), newest first with
+    /// ties by id as text in byte order, the time named through the table
+    /// alias, and the `LIMIT` as the last bind.
+    #[test]
+    fn events_features_page_sql_and_binds() {
+        let mut current = param("peak_current", "Peak current", "kA", "pc", "peak_current");
+        current.filter = ValueFilter {
+            range: Some((-300.0, 300.0)),
+            missing: Vec::new(),
+        };
+        let start = t(2026, 7, 11, 17);
+        let end = t(2026, 7, 11, 18);
+        let after = t(2026, 7, 11, 17) + TimeDelta::minutes(30);
+        let selection = EventsSelection {
+            start: Some(start),
+            end: Some(end),
+            bbox: Some([21.0, 59.0, 29.0, 66.0]),
+            after: Some((after, "4711")),
+        };
+        let q = build_events_features(
+            &lightning_shape_with(Some("cloud_indicator"), None),
+            &[current],
+            &selection,
+            &["peak_current"],
+            101,
+        )
+        .unwrap();
+        let sql = &q.sql;
+        assert!(
+            sql.starts_with(
+                "SELECT (\"time\" AT TIME ZONE 'UTC') AS time, CASE WHEN ST_GeometryType(\"the_geom\")"
+            ),
+            "{sql}"
+        );
+        assert!(sql.contains("\"id\"::text AS mc_id"), "{sql}");
+        assert!(sql.contains(
+            "CASE WHEN \"peak_current\"::double precision >= $9 AND \"peak_current\"::double precision <= $10 THEN \"peak_current\"::double precision END AS \"peak_current\""
+        ), "{sql}");
+        assert!(sql.contains("\"cloud_indicator\"::double precision AS mc_cloud_indicator"));
+        assert!(
+            sql.contains("AS mc_geometry_valid FROM \"public\".\"lightning\" AS mc_events WHERE "),
+            "{sql}"
+        );
+        assert!(sql.contains("\"time\" >= ($1 AT TIME ZONE 'UTC')"), "{sql}");
+        assert!(sql.contains("\"time\" <= ($2 AT TIME ZONE 'UTC')"), "{sql}");
+        assert!(
+            sql.contains("\"the_geom\" && ST_MakeEnvelope($3, $4, $5, $6, 4326)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "\"time\" <= ($7 AT TIME ZONE 'UTC') AND (\"time\" < ($7 AT TIME ZONE 'UTC') OR \"id\"::text COLLATE \"C\" < $8)"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with(
+                "ORDER BY mc_events.\"time\" DESC, mc_events.\"id\"::text COLLATE \"C\" DESC LIMIT $11"
+            ),
+            "{sql}"
+        );
+        assert_eq!(sql.matches("SELECT").count(), 1);
+        assert_eq!(
+            q.params,
+            [
+                SqlParam::Timestamp(start),
+                SqlParam::Timestamp(end),
+                SqlParam::Float(21.0),
+                SqlParam::Float(59.0),
+                SqlParam::Float(29.0),
+                SqlParam::Float(66.0),
+                SqlParam::Timestamp(after),
+                SqlParam::Text("4711".into()),
+                // The filter's binds, then the LIMIT.
+                SqlParam::Float(-300.0),
+                SqlParam::Float(300.0),
+                SqlParam::Int(101),
+            ]
+        );
+        assert_eq!(q.row_limit(), Some(101));
+        assert_eq!(q.values_per_row, 1);
+    }
+
+    /// #503: open bounds and no bbox leave their conditions out; nothing at
+    /// all leaves no `WHERE`. A timestamptz column compares the binds bare.
+    #[test]
+    fn events_features_open_selection_has_no_condition() {
+        let mut shape = lightning_shape();
+        shape.time_col_tz = None;
+        let q = build_events_features(
+            &shape,
+            &[],
+            &EventsSelection::default(),
+            &["peak_current"],
+            11,
+        )
+        .unwrap();
+        assert!(!q.sql.contains("WHERE"), "{}", q.sql);
+        assert!(!q.sql.contains("AT TIME ZONE"), "{}", q.sql);
+        assert!(
+            q.sql.contains(
+                "FROM \"public\".\"lightning\" AS mc_events ORDER BY mc_events.\"time\" DESC"
+            ),
+            "{}",
+            q.sql
+        );
+        assert_eq!(q.params, [SqlParam::Int(11)]);
+
+        let since = EventsSelection {
+            start: Some(t(2026, 7, 11, 17)),
+            ..Default::default()
+        };
+        let q = build_events_features(&shape, &[], &since, &[], 11).unwrap();
+        assert!(
+            q.sql.contains(" WHERE \"time\" >= $1 ORDER BY "),
+            "{}",
+            q.sql
+        );
+    }
+
+    /// #503, seam test: a bbox whose west edge is east of its east edge
+    /// (170, 10, -170, 20) is two envelopes, 170..180 and -180..-170, so an
+    /// event stored on either side of the antimeridian is in it.
+    #[test]
+    fn events_features_bbox_across_the_antimeridian_is_two_envelopes() {
+        let selection = EventsSelection {
+            bbox: Some([170.0, 10.0, -170.0, 20.0]),
+            ..Default::default()
+        };
+        let q = build_events_features(&lightning_shape(), &[], &selection, &[], 5).unwrap();
+        assert!(
+            q.sql.contains(
+                " WHERE (\"the_geom\" && ST_MakeEnvelope($1, $2, 180, $4, 4326) \
+                 OR \"the_geom\" && ST_MakeEnvelope(-180, $2, $3, $4, 4326)) ORDER BY "
+            ),
+            "{}",
+            q.sql
+        );
+        assert_eq!(
+            q.params[..4],
+            [
+                SqlParam::Float(170.0),
+                SqlParam::Float(10.0),
+                SqlParam::Float(-170.0),
+                SqlParam::Float(20.0),
+            ]
+        );
+    }
+
+    /// #503: `/items/{featureId}` is an equality on the `(time, id)` key:
+    /// the bare id column where the caller binds the column's type, so the
+    /// primary-key index answers both; the id as text otherwise. The id is
+    /// the second bind either way, never SQL text.
+    #[test]
+    fn events_feature_by_key() {
+        let at = t(2026, 7, 11, 17);
+        let by = |id_match| {
+            build_events_feature(
+                &lightning_shape(),
+                &[],
+                &["peak_current"],
+                (at, "a'b"),
+                id_match,
+            )
+            .unwrap()
+        };
+        let column = by(EventIdMatch::Column);
+        assert!(
+            column
+                .sql
+                .ends_with("WHERE \"time\" = ($1 AT TIME ZONE 'UTC') AND \"id\" = $2 LIMIT 1"),
+            "{}",
+            column.sql
+        );
+        let text = by(EventIdMatch::Text);
+        assert!(
+            text.sql.ends_with(
+                "WHERE \"time\" = ($1 AT TIME ZONE 'UTC') AND \"id\"::text COLLATE \"C\" = $2 LIMIT 1"
+            ),
+            "{}",
+            text.sql
+        );
+        for q in [&column, &text] {
+            assert!(q.sql.contains("\"id\"::text AS mc_id"));
+            assert!(q
+                .sql
+                .contains("AS mc_geometry_valid FROM \"public\".\"lightning\""));
+            assert_eq!(
+                q.params,
+                [SqlParam::Timestamp(at), SqlParam::Text("a'b".into())]
+            );
+        }
+    }
+
+    /// The pick reads the same column layout the Features statements do: one
+    /// projection builder, so the shared decoder cannot drift from either.
+    #[test]
+    fn events_pick_and_features_share_the_projection() {
+        let shape = lightning_shape_with(Some("cloud"), Some("current"));
+        let pick = build_events_pick(
+            &shape,
+            &[],
+            "POLYGON((0 0,1 0,1 1,0 1,0 0))",
+            (t(2026, 7, 11, 17), t(2026, 7, 11, 18)),
+            &["peak_current"],
+            6,
+        )
+        .unwrap();
+        let page = build_events_features(
+            &shape,
+            &[],
+            &EventsSelection::default(),
+            &["peak_current"],
+            6,
+        )
+        .unwrap();
+        let columns = |sql: &str| {
+            sql.split_once(", count(*) OVER ()")
+                .map(|(c, _)| c.to_string())
+        };
+        let pick_columns = columns(&pick.sql).unwrap();
+        let (page_columns, _) = page.sql.split_once(", (\"the_geom\" IS NULL").unwrap();
+        assert_eq!(pick_columns, page_columns);
     }
 
     #[test]

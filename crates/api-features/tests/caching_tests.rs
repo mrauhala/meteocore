@@ -63,10 +63,11 @@ impl FeatureEngine for MockFeatureEngine {
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         let features: Vec<Feature> = self.features.iter().take(query.limit).cloned().collect();
         Ok(FeaturePage {
-            number_matched: self.features.len(),
+            number_matched: Some(self.features.len()),
             number_returned: features.len(),
             features,
             next_offset: None,
+            next_cursor: None,
         })
     }
 

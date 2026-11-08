@@ -1325,10 +1325,13 @@ fn pvol_engine_exposes_sites_as_features() {
 
     // Inventory page: one Point Feature per site; fivih (Vihti) must be present.
     let page = FeatureEngine::get_features(&engine, &FeatureQuery::default()).unwrap();
-    assert!(page.number_matched >= 1, "at least the Vihti site");
+    assert!(
+        page.number_matched.is_some_and(|n| n >= 1),
+        "at least the Vihti site"
+    );
     assert_eq!(page.number_returned, page.features.len());
     assert_eq!(
-        FeatureEngine::feature_count(&engine),
+        Some(FeatureEngine::feature_count(&engine)),
         page.number_matched,
         "feature_count agrees with the unpaged match count"
     );

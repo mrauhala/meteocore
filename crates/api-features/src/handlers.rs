@@ -433,12 +433,17 @@ pub(crate) fn items_openapi_paths(
     let mut paths = Map::new();
     for config in configs {
         let id = &config.id;
+        // A collection pages by offset or by its `next` link's cursor (#503).
+        let paging = match state.engines.get(id) {
+            Some(engine) if engine.pages_by_cursor() => "cursor",
+            _ => "offset",
+        };
         let mut parameters = vec![
             component_ref("parameters", name, "bbox"),
             component_ref("parameters", name, "bbox-crs"),
             component_ref("parameters", name, "crs"),
             component_ref("parameters", name, "limit"),
-            component_ref("parameters", name, "offset"),
+            component_ref("parameters", name, paging),
             component_ref("parameters", name, "datetime"),
             component_ref("parameters", name, "sortby"),
             feature_format_parameter(),
@@ -576,6 +581,18 @@ pub(crate) fn openapi_components(name: ComponentName) -> Value {
                     "minimum": 0,
                     "default": 0
                 }
+            }),
+        ),
+        // A collection whose items page by cursor (#503) takes it in place of
+        // `offset`. Not from a standard: Part 1 leaves `next` links opaque.
+        (
+            "cursor",
+            json!({
+                "name": "cursor",
+                "in": "query",
+                "required": false,
+                "schema": {"type": "string"},
+                "description": "Where the page starts: the cursor of the previous page's `next` link. Opaque; follow the link rather than building one."
             }),
         ),
         (
@@ -915,6 +932,7 @@ fn html_controls(engine: &dyn FeatureEngine) -> crate::html::FeatureControls {
         // The control `/items` accepts `datetime` with (#1143), not whether
         // the collection advertises a span.
         temporal: engine.has_time_dimension(),
+        cursor_paging: engine.pages_by_cursor(),
     }
 }
 
@@ -997,7 +1015,10 @@ pub async fn items(
         Err(rejected) => return Err(rejected.error),
     };
 
-    let page = match engine.get_features(&query) {
+    // In place for an engine that answers from memory; on the query runtime
+    // for one that reads a database per call (#503).
+    let read = query.clone();
+    let page = match crate::executor::read(engine, move |e| e.get_features(&read)).await {
         Ok(page) => page,
         Err(e) => return Ok(engine_failure(&e, "items")),
     };
@@ -1021,6 +1042,7 @@ pub async fn items(
         &id,
         limit,
         offset,
+        query.cursor.as_deref(),
         &filters,
         "",
         root,
@@ -1151,6 +1173,29 @@ fn items_request(
 
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     let offset = params.offset.unwrap_or(0);
+    // A collection pages one way (#503). One paged by cursor starts a page
+    // where the previous one's `next` link says, so an offset is a 400 (a
+    // zero offset, as the HTML form sends, is the first page). One paged by
+    // offset has no cursor to start from: `cursor` is a 400 there.
+    let cursor = match (params.cursor, engine.pages_by_cursor()) {
+        (Some(_), false) => {
+            return Err(Rejected::at(
+                "cursor",
+                bad_request_msg(&format!(
+                    "Collection '{id}' pages by offset; cursor is not supported"
+                )),
+            ))
+        }
+        (_, true) if offset > 0 => {
+            return Err(Rejected::at(
+                "offset",
+                bad_request_msg(&format!(
+                "Collection '{id}' pages by cursor: follow the next link; offset is not supported"
+            )),
+            ))
+        }
+        (cursor, _) => cursor,
+    };
 
     // Cache-Control policy (#499): a settled window (closed datetime interval
     // entirely in the past) gets the long policy, everything else the short
@@ -1170,6 +1215,7 @@ fn items_request(
             datetime,
             sortby,
             property_filters: params.property_filters,
+            cursor,
         },
         crs,
         limit,
@@ -1271,7 +1317,8 @@ pub async fn item(
         }
     };
     let crs = response_crs(params.crs.as_deref(), wanted)?;
-    let feature = match engine.get_feature(&feature_id) {
+    let wanted_id = feature_id.clone();
+    let feature = match crate::executor::read(engine, move |e| e.get_feature(&wanted_id)).await {
         Ok(feature) => feature,
         Err(e) => return Ok(engine_failure(&e, "item")),
     };
@@ -1341,7 +1388,11 @@ pub(crate) fn collection_parts(
     // Part 2: exactly the CRSs `/items` accepts in `crs` and `bbox-crs`.
     fields.insert("crs".into(), json!(crate::crs::supported_uris()));
     fields.insert("storageCrs".into(), json!(FeatureCrs::Crs84.uri()));
-    fields.insert("numberItems".into(), json!(engine.feature_count()));
+    // Left out for a collection that cannot count its items from memory
+    // (an event table, #503).
+    if let Some(items) = engine.number_items() {
+        fields.insert("numberItems".into(), json!(items));
+    }
 
     // Add spatial + temporal extent if available. A Features collection
     // contributes a bbox and (for time-aware engines like CAP) a temporal

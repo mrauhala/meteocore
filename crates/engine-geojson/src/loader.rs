@@ -214,9 +214,10 @@ impl FeatureEngine for GeoJsonEngine {
 
             Ok(FeaturePage {
                 features,
-                number_matched,
+                number_matched: Some(number_matched),
                 number_returned,
                 next_offset,
+                next_cursor: None,
             })
         } else {
             let number_matched = self.features.len();
@@ -237,9 +238,10 @@ impl FeatureEngine for GeoJsonEngine {
 
             Ok(FeaturePage {
                 features,
-                number_matched,
+                number_matched: Some(number_matched),
                 number_returned,
                 next_offset,
+                next_cursor: None,
             })
         }
     }
@@ -580,7 +582,7 @@ mod tests {
                 })
                 .unwrap();
             let ids: Vec<String> = page.features.iter().map(|f| f.id.clone()).collect();
-            assert_eq!(page.number_matched, ids.len());
+            assert_eq!(page.number_matched, Some(ids.len()));
             ids
         };
         assert_eq!(ids(7.0, 1.0, 9.0, 3.0), ["lake"]);
@@ -607,16 +609,16 @@ mod tests {
                 ..Default::default()
             };
             let page = engine.get_features(&query).unwrap();
-            assert_eq!(page.number_matched, 1);
+            assert_eq!(page.number_matched, Some(1));
             assert_eq!(page.features[0].id, "city.1");
             query.offset = 1;
             let page = engine.get_features(&query).unwrap();
-            assert_eq!(page.number_matched, 1);
+            assert_eq!(page.number_matched, Some(1));
             assert!(page.features.is_empty());
             query
                 .property_filters
                 .push(("missing".into(), "anything".into()));
-            assert_eq!(engine.get_features(&query).unwrap().number_matched, 0);
+            assert_eq!(engine.get_features(&query).unwrap().number_matched, Some(0));
         }
     }
 
@@ -722,7 +724,7 @@ mod tests {
                 ..Default::default()
             };
             let page = engine.get_features(&query).unwrap();
-            assert_eq!(page.number_matched, 2);
+            assert_eq!(page.number_matched, Some(2));
             assert_eq!(page.features.len(), 1);
             let second_id = page.features[0].id.clone();
             query.offset = 0;
@@ -732,10 +734,10 @@ mod tests {
             assert_eq!(ids, vec!["first", "second"]);
             query.offset = 2;
             let page = engine.get_features(&query).unwrap();
-            assert_eq!(page.number_matched, 2);
+            assert_eq!(page.number_matched, Some(2));
             assert!(page.features.is_empty());
             query.property_filters = vec![("labels".into(), "absent".into())];
-            assert_eq!(engine.get_features(&query).unwrap().number_matched, 0);
+            assert_eq!(engine.get_features(&query).unwrap().number_matched, Some(0));
         }
     }
 
@@ -779,7 +781,7 @@ mod tests {
         };
         let page = engine.get_features(&query).unwrap();
         // Should match city.1 (point at 24.9,60.1) and area.1 (bbox 24-25, 60-61)
-        assert_eq!(page.number_matched, 2);
+        assert_eq!(page.number_matched, Some(2));
     }
 
     #[test]
@@ -791,7 +793,7 @@ mod tests {
             ..Default::default()
         };
         let page = engine.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 0);
+        assert_eq!(page.number_matched, Some(0));
     }
 
     #[test]
@@ -803,7 +805,7 @@ mod tests {
             ..Default::default()
         };
         let page = engine.get_features(&query).unwrap();
-        assert_eq!(page.number_matched, 3);
+        assert_eq!(page.number_matched, Some(3));
         assert_eq!(page.number_returned, 2);
         assert_eq!(page.next_offset, Some(2));
 

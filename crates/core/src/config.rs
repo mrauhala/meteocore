@@ -5268,21 +5268,18 @@ impl ServerConfig {
                     ))
                 })?;
                 validate_postgis(id, postgis)?;
-                // The events shape serves EDR + the raster map APIs (#504
-                // age-colored strike layer). Its FeatureEngine surface is
-                // #503 — without this check an `apis = ["features"]` events
-                // collection would load cleanly and silently serve an empty
-                // station inventory. Station shapes serve every API: their
+                // The events shape serves EDR, Features (one feature per
+                // event, #503) and the raster map APIs (#504 age-colored
+                // strike layer; its `tiles` are that layer's raster tiles,
+                // never vector tiles). Station shapes serve every API: their
                 // map layers draw each station as a marker coloured by its
                 // latest value (#1063).
                 if postgis.observations.shape == "events" {
-                    if let Some(api) = collection
-                        .apis
-                        .iter()
-                        .find(|a| !matches!(a.as_str(), "edr" | "wms" | "maps" | "tiles"))
-                    {
+                    if let Some(api) = collection.apis.iter().find(|a| {
+                        !matches!(a.as_str(), "edr" | "features" | "wms" | "maps" | "tiles")
+                    }) {
                         return Err(crate::error::DataServerError::Config(format!(
-                            "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (edr/wms/maps/tiles; \"features\" arrives with #503)"
+                            "Collection '{id}': apis entry '{api}' is not supported for observations.shape 'events' (edr/features/wms/maps/tiles)"
                         )));
                     }
                 } else if postgis.map.is_some() {
@@ -8602,17 +8599,31 @@ unit = "1"
         );
     }
 
+    /// #503: an events collection serves Features, alone or beside EDR and
+    /// the map APIs; an API it has no surface for is still a load error.
     #[test]
-    fn postgis_events_rejects_non_edr_apis() {
+    fn postgis_events_allows_features_and_rejects_other_apis() {
         let tmp = TempDir::new().unwrap();
+        for apis in [
+            "[\"features\"]",
+            "[\"edr\", \"features\"]",
+            "[\"edr\", \"features\", \"wms\", \"maps\", \"tiles\"]",
+        ] {
+            let toml =
+                lightning_events_toml().replace("apis = [\"edr\"]", &format!("apis = {apis}"));
+            let path = write_config(tmp.path(), "config.toml", &toml);
+            let (config, _) = ServerConfig::from_file(path.to_str().unwrap())
+                .unwrap_or_else(|e| panic!("apis = {apis}: {e}"));
+            assert!(config.collections[0].apis.contains(&"features".to_string()));
+        }
         let toml =
-            lightning_events_toml().replace("apis = [\"edr\"]", "apis = [\"edr\", \"features\"]");
+            lightning_events_toml().replace("apis = [\"edr\"]", "apis = [\"edr\", \"3dtiles\"]");
         let path = write_config(tmp.path(), "config.toml", &toml);
         let err = ServerConfig::from_file(path.to_str().unwrap())
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("'features' is not supported for observations.shape 'events'"),
+            err.contains("'3dtiles' is not supported for observations.shape 'events'"),
             "got: {err}"
         );
     }

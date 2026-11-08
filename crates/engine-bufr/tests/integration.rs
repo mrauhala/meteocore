@@ -340,7 +340,7 @@ fn features_station_points_bbox_datetime_and_sortby() {
             ..FeatureQuery::default()
         })
         .unwrap();
-    assert_eq!(page.number_matched, 1);
+    assert_eq!(page.number_matched, Some(1));
     assert_eq!(page.features[0].id, SMHI);
 
     // datetime: only rw-rma reported at 08:20.
@@ -353,7 +353,7 @@ fn features_station_points_bbox_datetime_and_sortby() {
             ..FeatureQuery::default()
         })
         .unwrap();
-    assert_eq!(page.number_matched, 1);
+    assert_eq!(page.number_matched, Some(1));
     assert_eq!(page.features[0].id, "0-20000-0-64384");
 
     // sortby last_report desc puts rw-rma first; paging is stable.

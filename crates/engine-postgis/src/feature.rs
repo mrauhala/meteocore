@@ -1,23 +1,32 @@
-//! `FeatureEngine` impl for `PostgisEngine`. Feature = station.
+//! `FeatureEngine` impl for `PostgisEngine`: feature = station on the
+//! station shapes, feature = event on the `events` shape (#503).
 //!
-//! Feature metadata (id, geometry, properties) lives in the
+//! Stations: feature metadata (id, geometry, properties) lives in the
 //! [`MetadataCache`]; feature lookups therefore never touch the pool.
 //! Properties are already coerced from `pg_type` at refresh time —
 //! arrays, `json`/`jsonb`, enums, timestamps, and any other types that
 //! don't map cleanly to [`PropertyValue`] are rejected at startup so
 //! operators see the mismatch early.
 //!
-//! Paging semantics mirror `CsvEngine::get_features`: `bbox` + `limit` +
-//! `offset`; `number_matched` counts the full filtered set (pre-paging)
-//! so consumers can compute total pages.
+//! Station paging semantics mirror `CsvEngine::get_features`: `bbox` +
+//! `limit` + `offset`; `number_matched` counts the full filtered set
+//! (pre-paging) so consumers can compute total pages.
 //!
 //! `feature = station` is inherently time-agnostic in v1 (temporal
 //! features are an explicit non-goal per the plan doc), so
 //! `has_time_dimension` is false and the API layer answers a `datetime`
 //! filter with 400 rather than ignoring it.
+//!
+//! Events are read from the table per request
+//! ([`PostgisEngine::event_features`]), so the engine says so
+//! (`reads_on_request`: the API runs it on the query runtime) and pages by
+//! a keyset cursor on the table's `(time, id)` key ([`EventKey`]).
+//!
+//! [`PropertyValue`]: ds_core::feature::PropertyValue
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, Feature, FeaturePage, FeatureQuery, Geometry};
 use ds_core::feature_engine::FeatureEngine;
@@ -25,12 +34,45 @@ use ds_core::feature_engine::FeatureEngine;
 use crate::engine::PostgisEngine;
 use crate::metadata::FeatureStation;
 
+/// An event's key (#503): its time and its `id_col` value as text, the
+/// table's `(time, id)` key. It is the event's feature id and the cursor of
+/// the page after it, written `<id>@<time>`, the time RFC 3339 UTC with as
+/// many fraction digits as it has (the `<parameter>@<time>@…` form of the
+/// station grid's ids). The id may hold `@` itself: the time follows the
+/// last one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventKey {
+    pub time: DateTime<Utc>,
+    pub id: String,
+}
+
+impl EventKey {
+    /// The key a feature id or cursor writes; `None` for any other string.
+    pub fn parse(s: &str) -> Option<Self> {
+        let (id, time) = s.rsplit_once('@')?;
+        let time = DateTime::parse_from_rfc3339(time).ok()?.with_timezone(&Utc);
+        Some(Self {
+            time,
+            id: id.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for EventKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}@{}", self.id, crate::engine::rfc3339(self.time))
+    }
+}
+
 impl FeatureEngine for PostgisEngine {
     fn filterables(&self) -> ds_core::feature::FilterableProperties {
         self.cache().load().filterables.clone()
     }
 
     fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        if let Some(shape) = self.config().events() {
+            return self.event_features(shape, query);
+        }
         self.reject_invalid_schema()?;
         let meta = self.cache().load();
         let filtered: Vec<&FeatureStation> = meta
@@ -62,13 +104,17 @@ impl FeatureEngine for PostgisEngine {
 
         Ok(FeaturePage {
             features,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset,
+            next_cursor: None,
         })
     }
 
     fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        if let Some(shape) = self.config().events() {
+            return self.event_feature(shape, feature_id);
+        }
         self.reject_invalid_schema()?;
         let meta = self.cache().load();
         let i = *meta
@@ -78,18 +124,59 @@ impl FeatureEngine for PostgisEngine {
         Ok(station_to_feature(&meta.feature_stations[i]))
     }
 
+    /// The cached stations; never a database count, so an event table,
+    /// which the snapshot does not count, is `0` and leaves `numberItems`
+    /// out ([`Self::number_items`]).
     fn feature_count(&self) -> usize {
         self.cache().load().feature_stations.len()
+    }
+
+    fn number_items(&self) -> Option<usize> {
+        self.config()
+            .events()
+            .is_none()
+            .then(|| self.feature_count())
+    }
+
+    fn pages_by_cursor(&self) -> bool {
+        self.config().events().is_some()
+    }
+
+    fn reads_on_request(&self) -> bool {
+        self.config().events().is_some()
+    }
+
+    fn summary_properties(&self) -> &[&'static str] {
+        if self.config().events().is_some() {
+            &["time"]
+        } else {
+            &[]
+        }
+    }
+
+    fn items_description(&self) -> Option<&'static str> {
+        self.config()
+            .events()
+            .map(|_| "One point per event, newest first. Without datetime, the events of the collection's default window ending now.")
     }
 
     fn spatial_extent(&self) -> Option<[f64; 4]> {
         self.cache().load().spatial_extent
     }
 
-    /// The station inventory has no time dimension: `datetime` is a 400
-    /// (#682). Observations are EDR's.
+    /// Events: the first event to the latest one not after the last
+    /// refresh. The station inventory has none.
+    fn temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.config()
+            .events()
+            .and_then(|_| self.cache().load().temporal_extent)
+    }
+
+    /// Events carry their time and `datetime` selects them (#503). The
+    /// station inventory has no time dimension: `datetime` is a 400 (#682).
+    /// Observations are EDR's.
     fn has_time_dimension(&self) -> bool {
-        false
+        self.config().events().is_some()
     }
 
     fn data_version(&self) -> u64 {
@@ -188,5 +275,62 @@ mod tests {
         assert!(!bbox_contains(Some(&bbox), 15.0, 5.0));
         // None bbox accepts everything.
         assert!(bbox_contains(None, -90.0, 90.0));
+    }
+
+    /// #503: an event key writes `<id>@<time>` and reads back the same key,
+    /// a microsecond time exactly, an id holding `@` whole.
+    #[test]
+    fn event_key_round_trips_through_its_id() {
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        for (key, written) in [
+            (
+                EventKey {
+                    time: at("2026-01-01T05:30:00Z"),
+                    id: "17".into(),
+                },
+                "17@2026-01-01T05:30:00Z",
+            ),
+            (
+                EventKey {
+                    time: at("2026-01-01T05:30:00.123456Z"),
+                    id: "a@b".into(),
+                },
+                "a@b@2026-01-01T05:30:00.123456Z",
+            ),
+            (
+                EventKey {
+                    time: at("2026-01-01T05:30:00.120Z"),
+                    id: String::new(),
+                },
+                "@2026-01-01T05:30:00.120Z",
+            ),
+        ] {
+            assert_eq!(key.to_string(), written);
+            assert_eq!(EventKey::parse(written), Some(key));
+        }
+        // Another offset reads as its UTC instant.
+        assert_eq!(
+            EventKey::parse("9@2026-01-01T07:30:00+02:00"),
+            Some(EventKey {
+                time: at("2026-01-01T05:30:00Z"),
+                id: "9".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn event_key_rejects_what_no_event_key_writes() {
+        for s in [
+            "",
+            "17",
+            "17@",
+            "17@yesterday",
+            "17@2026-01-01",
+            "17@2026-01-01T05:30:00",
+            "2026-01-01T05:30:00Z",
+            "17@2026-01-01T05:30:00Z@x",
+        ] {
+            assert_eq!(EventKey::parse(s), None, "{s:?}");
+        }
     }
 }

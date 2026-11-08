@@ -15,8 +15,8 @@ reads them in place.
 
 - A background loop refreshes a metadata snapshot (locations, extents,
   station properties) every `metadata_refresh_secs`. Location lists,
-  Features and extents come from it; values and events are read per
-  request.
+  station features and extents come from it; values and events are read
+  per request.
 - Identifiers are validated at load and quoted; values are bind parameters.
 - Before serving data, each refresh checks the mapped time and geometry
   columns in the database. Advisory privilege and index findings go to the
@@ -29,7 +29,7 @@ reads them in place.
 | `long` | Row per value: station, time, parameter, value | `locations`, `position`, `area`, `radius` | Station inventory | Vector (MVT); raster with the map layers | [Station layer](#station-map-layers) per parameter |
 | `wide` | Row per station and time, column per parameter | same | same | same | same |
 | `per_parameter` | Table per parameter: station, time, value | same | same | same | same |
-| `events` | Point events with own time and geometry (lightning) | `area`, `radius` | – | Raster | Age layer `lightning_age`, unit `min` |
+| `events` | Point events with own time and geometry (lightning) | `area`, `radius` | One feature per event, paged by cursor | Raster | Age layer `lightning_age`, unit `min` |
 
 ## Configuration
 
@@ -113,8 +113,8 @@ missing_values = [-32766]    # optional, at most 16 codes
 | `time_col_tz` | all | Zone of a `timestamp without time zone` column, e.g. `"UTC"` |
 | `geom_col` | all | Observation point geometry; required for `events` |
 | `locations_window` | station shapes | Window for observation-derived locations: an ISO 8601 duration (default `"PT24H"`) or `"all"` |
-| `id_col`, `extent_bbox` | `events` | Required: tiebreak column; advertised `[west, south, east, north]` |
-| `default_datetime` | `events` | EDR window without `datetime`, and the map window; default `"PT1H"` |
+| `id_col`, `extent_bbox` | `events` | Required: with the time, the event's key (unique, never NULL); advertised `[west, south, east, north]` |
+| `default_datetime` | `events` | EDR and Features window without `datetime`, and the map window; default `"PT1H"` |
 
 Locations come from the registry, from `observations.geom_col`, or both. A
 registry alone advertises every station, with or without data. Observation
@@ -225,10 +225,12 @@ same in all three.
 
 ### Event collection
 
-Top-level fields and `[postgis]` as above, with
-`apis = ["edr", "wms", "maps", "tiles"]` and no `[postgis.stations]`:
+Top-level fields and `[postgis]` as above, with any of `edr`, `features`,
+`wms`, `maps` and `tiles` in `apis` and no `[postgis.stations]`:
 
 ```toml
+apis = ["edr", "features", "wms", "maps", "tiles"]
+
 [postgis.observations]
 shape = "events"
 table = "public.lightning"
@@ -274,6 +276,33 @@ A nowcast `lightning_source` reads the same table. Optional
 `cloud_indicator_col` (0 cloud-to-ground, 1 intra-cloud), `peak_current_col`
 (signed kA) and `coverage_bbox` (where detection is guaranteed) feed it.
 
+With `features` in `apis`, Features `/items` serves one feature per event
+(#503): its point (null for a NULL or empty geometry) and the properties
+GetFeatureInfo answers. Its id is the event's key, `<id>@<time>`, such as
+`4711@2026-06-08T12:00:00.123456Z`, and `/items/{featureId}` reads it back
+with one lookup on the `(time, id)` primary key. An id that is not of that
+form, or whose id part the column cannot hold (`abc` for a `bigint`), is a
+404 without a query. Integer and text id columns are compared in their
+own type; another type (`uuid`) is compared as text, after the time
+column's index probe.
+
+- `bbox` (edges included, across the antimeridian too) and `datetime`
+  select in SQL; without `datetime`, the `default_datetime` window ending
+  now. No `sortby` and no property filters.
+- Newest first, ties on one time by id as text. A page is one statement
+  that starts after the cursor in its `next` link, the last event's key,
+  through the `(time, id)` index: no offset scan. `offset` is a 400.
+- No statement counts. `numberMatched` is reported only on a first page
+  that holds every match, and left out of every other page.
+- The reads run on the shared query runtime, never a request worker, with
+  the role's `statement_timeout` and the Features 30 s deadline.
+- `numberItems` is left out of the collection: the table is not counted.
+  The temporal extent is the snapshot's.
+- `tiles` stays the strike layer's raster tiles; there are no vector tiles
+  of events.
+- Index the table on `(time, id)`, a TimescaleDB hypertable's key, and its
+  geometry with GiST. The key must be unique and the id never NULL.
+
 ## Queries and budgets
 
 - `position` picks the nearest station within 25 km. An instant `datetime`
@@ -285,9 +314,9 @@ A nowcast `lightning_source` reads the same table. Optional
   out of `area`/`radius`. An empty area is an empty collection.
 - Registry-only areas use `ST_Within` (boundary excluded); observation-derived
   ones test the cached locations (boundary included).
-- Features: `bbox`, paging and property filters; `datetime`/`sortby` are 400.
-  With `edr` in `apis`, each station links (`rel="related"`) to its EDR
-  location.
+- Station Features: `bbox`, paging and property filters; `datetime`/`sortby`
+  are 400. With `edr` in `apis`, each station links (`rel="related"`) to its
+  EDR location. Event Features: see [Event collection](#event-collection).
 
 A response holds at most 500 000 values (NULLs and filtered values
 included) and an area at most 200 000 stations. Windows up to 12 hours run

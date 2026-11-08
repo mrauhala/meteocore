@@ -253,9 +253,10 @@ impl FeatureEngine for StationGridEngine {
         let end = query.offset.saturating_add(number_returned);
         Ok(FeaturePage {
             features,
-            number_matched: matched,
+            number_matched: Some(matched),
             number_returned,
             next_offset: (end < matched).then_some(end),
+            next_cursor: None,
         })
     }
 

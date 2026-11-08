@@ -418,6 +418,7 @@ pub async fn items(
         datetime: params.datetime,
         sortby: Vec::new(),
         property_filters: Vec::new(),
+        cursor: None,
     };
 
     let (body, etag) = execute_query(false, move |_budget| {
@@ -429,6 +430,7 @@ pub async fn items(
             &id,
             query.limit,
             query.offset,
+            None,
             &filters,
             "",
             &root,

@@ -82,9 +82,10 @@ impl FeatureEngine for CellEngine {
         if cutoff.is_some_and(|t| t < oldest) {
             return Ok(FeaturePage {
                 features: vec![],
-                number_matched: 0,
+                number_matched: Some(0),
                 number_returned: 0,
                 next_offset: None,
+                next_cursor: None,
             });
         }
         let frame = match cutoff {
@@ -108,8 +109,9 @@ impl FeatureEngine for CellEngine {
         Ok(FeaturePage {
             number_returned: page.len(),
             features: page,
-            number_matched: matched,
+            number_matched: Some(matched),
             next_offset: None,
+            next_cursor: None,
         })
     }
 
@@ -173,9 +175,10 @@ impl FeatureEngine for EmptyCellEngine {
     fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         Ok(FeaturePage {
             features: vec![],
-            number_matched: 0,
+            number_matched: Some(0),
             number_returned: 0,
             next_offset: None,
+            next_cursor: None,
         })
     }
 
@@ -974,10 +977,11 @@ impl FeatureEngine for GappyEngine {
             _ => vec![],
         };
         Ok(FeaturePage {
-            number_matched: features.len(),
+            number_matched: Some(features.len()),
             number_returned: features.len(),
             features,
             next_offset: None,
+            next_cursor: None,
         })
     }
     fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
@@ -1073,9 +1077,10 @@ impl FeatureEngine for QuietEngine {
     fn get_features(&self, _q: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         Ok(FeaturePage {
             features: vec![],
-            number_matched: 0,
+            number_matched: Some(0),
             number_returned: 0,
             next_offset: None,
+            next_cursor: None,
         })
     }
     fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {
@@ -1615,8 +1620,9 @@ impl FeatureEngine for ManyCellEngine {
         Ok(FeaturePage {
             number_returned: page.len(),
             features: page,
-            number_matched: n,
+            number_matched: Some(n),
             next_offset: None,
+            next_cursor: None,
         })
     }
 

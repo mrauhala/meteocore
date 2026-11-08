@@ -101,9 +101,10 @@ impl FeatureEngine for Fixture {
     fn get_features(&self, _: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
         Ok(FeaturePage {
             features: vec![fixture_feature()],
-            number_matched: 1,
+            number_matched: Some(1),
             number_returned: 1,
             next_offset: None,
+            next_cursor: None,
         })
     }
     fn get_feature(&self, id: &str) -> Result<Feature, DataServerError> {

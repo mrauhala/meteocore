@@ -3139,10 +3139,11 @@ impl EngineHandle {
     /// implement both over one collection. `None` for engines without
     /// features or without EDR, and where the features are another resource:
     /// a PVOL network's site inventory (its EDR collections are per-site
-    /// views), the PostGIS events shape, whose events are not features
-    /// yet (#503), and a station grid's leave-one-out residuals, which
-    /// describe its analysis rather than the gridded data EDR serves
-    /// (#1206).
+    /// views), the PostGIS events shape, whose features page by cursor and
+    /// read the table per request (#503) where EDR `items` pages by offset
+    /// on the EDR executor, so they are served by Features `/items` only,
+    /// and a station grid's leave-one-out residuals, which describe its
+    /// analysis rather than the gridded data EDR serves (#1206).
     fn edr_items_engine(&self) -> Option<Arc<dyn ds_core::feature_engine::FeatureEngine>> {
         match self {
             Self::Csv(e) => Some(e.clone()),
@@ -11212,7 +11213,7 @@ prewarm_sweeps = 0
                 ..Default::default()
             })
             .unwrap();
-        assert_eq!(page.number_matched, 192);
+        assert_eq!(page.number_matched, Some(192));
         super::update_station_grid_residual_gauges(engines);
         let rmse = super::STATION_GRID_LOO_RMSE
             .with_label_values(&labels)
@@ -13643,6 +13644,18 @@ colormap = "radar_fmi"
             wiring(&events),
             super::StationMapWiring {
                 raster_apis: vec!["wms", "tiles"],
+                station_layers: false,
+                vector_tiles: false,
+            }
+        );
+        // #503: with `features` too, the events' `tiles` stay the strike
+        // layer's raster tiles. Their features page by cursor through
+        // Features `/items`; vector tiles of them are not served.
+        events.apis = ["edr", "features", "tiles"].map(String::from).to_vec();
+        assert_eq!(
+            wiring(&events),
+            super::StationMapWiring {
+                raster_apis: vec!["tiles"],
                 station_layers: false,
                 vector_tiles: false,
             }

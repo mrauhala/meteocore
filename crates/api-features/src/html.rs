@@ -80,6 +80,9 @@ pub(crate) struct FeatureControls {
     pub summary: Vec<String>,
     /// Whether `/items` takes `datetime` (`FeatureEngine::has_time_dimension`).
     pub temporal: bool,
+    /// Whether `/items` pages by cursor, not offset
+    /// (`FeatureEngine::pages_by_cursor`, #503).
+    pub cursor_paging: bool,
 }
 
 fn href_for<'a>(doc: &'a Value, rel: &str) -> &'a str {
@@ -253,8 +256,12 @@ fn item_paging(doc: &Value, count: usize) -> String {
     let limit = number("limit", 100);
     let offset = number("offset", 0);
     let matched = doc["numberMatched"].as_u64();
+    // A page that starts at a cursor (#503) does not know its position.
+    let at_cursor = pairs.iter().any(|(k, _)| k == "cursor");
     let range = if count == 0 {
         "No items on this page".into()
+    } else if at_cursor {
+        format!("{count} shown")
     } else {
         format!(
             "{}–{} shown",
@@ -286,7 +293,10 @@ fn item_paging(doc: &Value, count: usize) -> String {
             )
         })
         .collect();
-    format!("<div class=\"item-paging\"><span>{range} · {} matched</span><label class=\"per-page enhanced\">Per page<select data-page-size>{options}</select></label>{}</div>",matched.map_or("Unknown".into(),|n|n.to_string()),ui::pagination(&links))
+    // A page without `numberMatched` (#503: an uncounted cursor page) says
+    // only what it shows.
+    let matched = matched.map_or_else(String::new, |n| format!(" · {n} matched"));
+    format!("<div class=\"item-paging\"><span>{range}{matched}</span><label class=\"per-page enhanced\">Per page<select data-page-size>{options}</select></label>{}</div>",ui::pagination(&links))
 }
 
 /// A feature's `related` links as buttons (#1143): where it leads next,
@@ -466,7 +476,14 @@ fn query_form(doc: &Value, controls: &FeatureControls, invalid: Option<Invalid<'
         _ => "",
     };
     out.push_str(&format!("<details class=\"filters\" data-disclosure=\"item-filters\"{open}><summary>Paging</summary><div class=\"fields\">"));
-    for (key, default) in [("limit", "100"), ("offset", "0")] {
+    // A collection paged by cursor (#503) moves on by its `next` link: no
+    // offset to enter.
+    let paging: &[(&str, &str)] = if controls.cursor_paging {
+        &[("limit", "100")]
+    } else {
+        &[("limit", "100"), ("offset", "0")]
+    };
+    for &(key, default) in paging {
         let field = ui::input(
             key,
             if value(key).is_empty() {
@@ -1322,14 +1339,16 @@ mod tests {
         let page = FeaturePage {
             features: vec![],
             number_returned: 0,
-            number_matched: 5,
+            number_matched: Some(5),
             next_offset: Some(2),
+            next_cursor: None,
         };
         let mut doc = feature_page_to_geojson(
             &page,
             "test",
             1,
             1,
+            None,
             &filters,
             "",
             "",
@@ -1435,14 +1454,16 @@ mod tests {
         let page = FeaturePage {
             features: vec![],
             number_returned: 0,
-            number_matched: 23,
+            number_matched: Some(23),
             next_offset: None,
+            next_cursor: None,
         };
         let mut doc = feature_page_to_geojson(
             &page,
             "a",
             10,
             90,
+            None,
             "&name=x",
             "",
             "/features",

@@ -294,7 +294,7 @@ fn pagination_is_stable() {
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(p1.number_matched, 5);
+    assert_eq!(p1.number_matched, Some(5));
     assert_eq!(p1.number_returned, 2);
     assert_eq!(p1.next_offset, Some(2));
     // Same query is deterministic (records sorted by id).
@@ -699,7 +699,7 @@ fn empty_source_keeps_standard_cap_fields_filterable() {
             ..Default::default()
         })
         .unwrap();
-    assert_eq!(page.number_matched, 0);
+    assert_eq!(page.number_matched, Some(0));
     assert_eq!(page.number_returned, 0);
 }
 
@@ -740,26 +740,26 @@ fn property_filters_match_producer_values_and_lists_with_spacetime_and_paging() 
         ..Default::default()
     };
     let page = eng.get_features(&query).unwrap();
-    assert_eq!(page.number_matched, 1);
+    assert_eq!(page.number_matched, Some(1));
     assert!(page.features[0].id.contains("helsinki-flood"));
     query.offset = 1;
     let page = eng.get_features(&query).unwrap();
-    assert_eq!(page.number_matched, 1);
+    assert_eq!(page.number_matched, Some(1));
     assert_eq!(page.number_returned, 0);
     assert_eq!(page.next_offset, None);
     query.offset = 0;
     query.property_filters[0].1 = "Flooding".into();
     assert_eq!(
         eng.get_features(&query).unwrap().number_matched,
-        0,
+        Some(0),
         "no substring match"
     );
     query.property_filters[0].1 = "12; Flooding".into();
     query.bbox = Some(Bbox::new(0.0, 0.0, 1.0, 1.0).unwrap());
-    assert_eq!(eng.get_features(&query).unwrap().number_matched, 0);
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, Some(0));
     query.bbox = None;
     query.datetime = Some(instant(at(2000, 1, 1, 0)));
-    assert_eq!(eng.get_features(&query).unwrap().number_matched, 0);
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, Some(0));
 }
 
 #[test]
@@ -809,7 +809,7 @@ fn awareness_codes_select_three_types_across_capitalization_before_paging() {
         ..Default::default()
     };
     let page = eng.get_features(&query).unwrap();
-    assert_eq!(page.number_matched, 6);
+    assert_eq!(page.number_matched, Some(6));
     for feature in &page.features {
         assert!(matches!(
             feature.properties["awareness_type_code"],
@@ -819,17 +819,17 @@ fn awareness_codes_select_three_types_across_capitalization_before_paging() {
     query.limit = 2;
     query.offset = 2;
     let page = eng.get_features(&query).unwrap();
-    assert_eq!(page.number_matched, 6);
+    assert_eq!(page.number_matched, Some(6));
     assert_eq!(page.number_returned, 2);
     query
         .property_filters
         .push(("awareness_type_code".into(), "4".into()));
-    assert_eq!(eng.get_features(&query).unwrap().number_matched, 0);
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, Some(0));
     query.property_filters = vec![("awareness_type_code".into(), "3".into())];
     query.offset = 0;
-    assert_eq!(eng.get_features(&query).unwrap().number_matched, 2);
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, Some(2));
     query.property_filters = vec![("awareness_type".into(), "3; Thunderstorm".into())];
-    assert_eq!(eng.get_features(&query).unwrap().number_matched, 1);
+    assert_eq!(eng.get_features(&query).unwrap().number_matched, Some(1));
 }
 
 // ---------------------------------------------------------------------------

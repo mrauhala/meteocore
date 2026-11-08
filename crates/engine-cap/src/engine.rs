@@ -907,9 +907,10 @@ impl ds_core::feature_engine::FeatureEngine for CapEngine {
 
         Ok(FeaturePage {
             features,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset,
+            next_cursor: None,
         })
     }
 

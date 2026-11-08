@@ -367,6 +367,7 @@ impl MeteoCoreMcp {
                 datetime,
                 sortby,
                 property_filters: Vec::new(),
+                cursor: None,
             })
             .map_err(query_failed)?;
 
@@ -396,9 +397,11 @@ impl MeteoCoreMcp {
                 (page_of_qualifying, Some((matching, below)))
             }
         };
-        // Cells past the read cap were never checked against the floor.
+        // Cells past the read cap were never checked against the floor. A
+        // nowcast always counts its cells; an uncounted page is all there is.
+        let matched = page.number_matched.unwrap_or(page.features.len());
         let floor_unchecked = match min_significance {
-            Some(_) => page.number_matched.saturating_sub(page.features.len()),
+            Some(_) => matched.saturating_sub(page.features.len()),
             None => 0,
         };
 
@@ -461,7 +464,7 @@ impl MeteoCoreMcp {
             "note": storm_cells_note(
                 observed.as_deref().filter(|_| after_newest_frame),
                 floor_unchecked,
-                page.number_matched,
+                matched,
             ),
         })
         .to_string())

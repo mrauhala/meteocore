@@ -225,7 +225,7 @@ fn per_area_notifications_merge_hints_and_bbox_fallback_fills_the_rest() {
             ..FeatureQuery::default()
         })
         .unwrap();
-    assert_eq!(page.number_matched, 2);
+    assert_eq!(page.number_matched, Some(2));
 }
 
 #[test]

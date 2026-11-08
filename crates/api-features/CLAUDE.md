@@ -48,6 +48,25 @@ without reading code.
   shared 503, and `Internal` a generic 500. `get_features` runs on the request worker
   with no deadline, so an engine must answer from memory or fail fast,
   never block (the station grid's residuals answer 503 while computing).
+  The one exception is an engine whose `reads_on_request` is true (PostGIS
+  `events`, #503): both reads go through `executor::read`, onto
+  ds-executor's shared query runtime under this crate's own admission and
+  30 s deadline, the twin of api-edr's `executor`. Never call such an
+  engine directly from a handler: route every new engine call through
+  `executor::read`.
+- **Two ways to page (#503).** An engine pages by `offset`, or by cursor
+  when `pages_by_cursor` (a source read in key order, where an offset would
+  re-read every row before it). `items_request` turns `cursor` down on the
+  first kind and a non-zero `offset` on the second; `feature_page_to_geojson`
+  links `next` with the page's `next_cursor` and gives a cursor page no
+  `prev`. A cursor is the engine's: this crate only percent-encodes it.
+  `numberItems` comes from `number_items`, `None` leaving it out.
+- **`FeaturePage::number_matched` is optional (#503).** `None` leaves
+  `numberMatched` out of the document (never `null`; OGC makes it a
+  recommendation), and the HTML page then states only what it shows. Every
+  offset-paged engine reports `Some`. `feature_page_to_geojson` keeps the
+  members in their old order, so a counted page's bytes and ETag are as
+  before (`number_matched_is_written_only_when_known`).
 - **Part 2 CRS lives in `src/crs.rs`** (#685). `crs::SUPPORTED` is both the
   advertised collection `crs` list and the set `/items` accepts in `crs` and
   `bbox-crs` — change them together. Projection math comes from

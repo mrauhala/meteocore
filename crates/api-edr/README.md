@@ -449,7 +449,8 @@ steps before included, and the `MC_NETCDF_EDR_QUERY_MB` and
 
 CAP and GeoJSON collections have no `EdrEngine`. Radius and location lists
 need no engine code of their own; items serve the engine's own
-`FeatureEngine`.
+`FeatureEngine`. PostGIS events serve their features through Features
+`/items` only: those page by cursor (#503), EDR `items` by offset.
 
 | Derived parameter | Engines |
 |---|---|

@@ -2731,9 +2731,10 @@ impl FeatureEngine for NowcastEngine {
         let empty = || {
             Ok(FeaturePage {
                 features: Vec::new(),
-                number_matched: 0,
+                number_matched: Some(0),
                 number_returned: 0,
                 next_offset: None,
+                next_cursor: None,
             })
         };
         let Some(snapshot) = select_snapshot(&state.cell_history, query.datetime.as_ref()) else {
@@ -2773,9 +2774,10 @@ impl FeatureEngine for NowcastEngine {
             .then(|| query.offset + number_returned);
         Ok(FeaturePage {
             features: page,
-            number_matched,
+            number_matched: Some(number_matched),
             number_returned,
             next_offset,
+            next_cursor: None,
         })
     }
 

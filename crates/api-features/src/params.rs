@@ -10,6 +10,9 @@ pub struct ItemsQueryParams {
     pub bbox: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+    /// Where a page starts on a collection that pages by cursor (#503): a
+    /// `next` link's value, opaque here.
+    pub cursor: Option<String>,
     pub datetime: Option<String>,
     pub sortby: Option<String>,
     /// Part 2 output CRS (a URI; parsed by [`crate::crs::FeatureCrs::parse`]).
@@ -44,6 +47,7 @@ pub fn is_reserved_parameter(name: &str) -> bool {
             | "datetime"
             | "limit"
             | "offset"
+            | "cursor"
             | "sortby"
             | "f"
             | "crs"
@@ -75,6 +79,7 @@ impl ItemsQueryParams {
                 "sortby" => params.sortby = Some(value),
                 "crs" => params.crs = Some(value),
                 "bbox-crs" => params.bbox_crs = Some(value),
+                "cursor" => params.cursor = Some(value),
                 "limit" | "offset" => {
                     let n = value.parse().map_err(|_| {
                         ParameterError::new(&name, format!("{name} must be a non-negative integer"))
