@@ -329,6 +329,68 @@ async fn a_full_cache_keeps_every_window_holds_approves() {
     assert_eq!(held(largest), (largest, 2));
 }
 
+/// #1425: a window fill paused between its insert and its keep, as a
+/// field job preempted there is, costs the window nothing. In a 20 MiB
+/// cache of messages the size of the ECMWF sample, whose cold ring has
+/// room for one, full of an earlier window, the window `holds` approves
+/// is 36 messages. Unordered, the window's next fill evicted the paused
+/// one, still unread, from the cold ring; its keep then put it back past
+/// the hot ring's target, and evicting back to the target took two
+/// entries for the one it added: 35 of the 36 stayed, whichever fill but
+/// the last paused. Each insert and its keep are one step
+/// ([`MessageCache::admit`]): the next fill waits for the keep.
+#[test]
+fn a_window_fill_paused_before_its_keep_costs_the_window_nothing() {
+    let size = ECMWF.len();
+    let observed = instrumented(Duration::ZERO);
+    let store = DataStore::new(observed.clone());
+    let path = Path::from("steps.grib2");
+    run_fetches(put(&observed, &path, &vec![1; 73 * size]));
+    let at = |step: usize| MessageEntry {
+        offset: (step * size) as u64,
+        ..entry(Some(size))
+    };
+    let accept = |_: &[u8]| Ok::<_, DataServerError>(());
+    let cache = MessageCache::new(20).unwrap();
+    let read = |steps: std::ops::Range<usize>| {
+        for step in steps {
+            cache
+                .get_with(&store, &path, &at(step), true, accept)
+                .unwrap();
+        }
+    };
+    // The earlier window: as many messages as the cache holds, and one.
+    read(0..37);
+    let window = 37..73;
+    let messages = window.len();
+    assert!(cache.holds(messages, (messages * size) as u64));
+    assert!(!cache.holds(messages + 1, ((messages + 1) * size) as u64));
+    // The window's first fill pauses before its keep.
+    let first = MessageKey::new(path.as_ref(), &at(window.start));
+    let (inserted, paused) = std::sync::mpsc::channel();
+    let (resume, resumed) = std::sync::mpsc::channel::<()>();
+    let resumed = Mutex::new(resumed);
+    *cache.before_keep.lock().unwrap() = Some(Arc::new(move |filled: &MessageKey| {
+        if *filled == first {
+            inserted.send(()).unwrap();
+            resumed.lock().unwrap().recv().unwrap();
+        }
+    }));
+    std::thread::scope(|scope| {
+        scope.spawn(|| read(window.start..window.start + 1));
+        paused.recv().unwrap();
+        let rest = scope.spawn(|| read(window.start + 1..window.end));
+        // The next fill waits for the keep; unordered, the rest of the
+        // window filled meanwhile.
+        until(|| rest.is_finished() || cache.admitting.load(Ordering::SeqCst) > 0);
+        resume.send(()).unwrap();
+    });
+    let resident = window
+        .filter(|&step| cache.is_resident(&MessageKey::new(path.as_ref(), &at(step))))
+        .count();
+    assert_eq!(resident, messages);
+}
+
 /// #1340 replay: once the message cache is full of earlier windows, a cold
 /// position query's window is resident for its next run, which reads
 /// nothing from storage. Not kept, its fills displaced each other in the

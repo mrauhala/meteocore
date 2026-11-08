@@ -835,10 +835,15 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// (#1340), counting no hit. For an entry the filler samples from its
     /// own copy now: unread, it waits in the cold ring and is evicted when
     /// later fills reach it. Marked read, it is promoted to the hot ring
-    /// instead. Concurrent fills can evict it before the mark, when their
-    /// burst outweighs the cold ring: it is then inserted again, which
-    /// `quick_cache` admits to the hot ring for a key it evicted recently,
-    /// and an insert never evicts its own entry. An entry heavier than the
+    /// instead. The mark is a lookup of its own, after the fill's insert:
+    /// another insert in between can evict the unread fill from the cold
+    /// ring. It is then inserted again, which `quick_cache` admits straight
+    /// to the hot ring for a key it evicted recently, past the ring's
+    /// target, and evicting back to the target can take an entry more than
+    /// the insert added: in a cache a window nearly fills, one of the
+    /// window's own (#1425). A caller that plans what stays resident makes
+    /// each insert and its keep one step against its other inserts, as the
+    /// GRIB message cache's admission lock does. An entry heavier than the
     /// hot target was refused, not evicted, and stays out. Fills not kept
     /// leave the cache resistant to a scan of one-off reads.
     pub fn keep(&self, key: K, value: V)

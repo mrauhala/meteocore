@@ -312,13 +312,19 @@ on the request path. Single-level and legacy views require exact metadata.
   0.1° field, which bounds a packed one: 0.97 from 1 GiB.
 - A window `holds` approved is filled with `get_with(.., window = true, ..)`,
   which `keep`s each fill (#1340). Marked read, quick_cache promotes it to
-  the hot ring instead of evicting it from the cold one; a fill that a
-  concurrent burst of fills evicted before the mark is inserted again,
-  which quick_cache admits to the hot ring. Unkept, a full 1 GiB cache held
-  only the last ~30 MiB of a window, and a repeated query took four runs to
-  stick. Map fills (`read`) are never kept: one-off reads must leave first.
+  the hot ring instead of evicting it from the cold one. Unkept, a full
+  1 GiB cache held only the last ~30 MiB of a window, and a repeated query
+  took four runs to stick. Map fills (`read`) are never kept: one-off reads
+  must leave first.
   `message_cache::tests::a_full_cache_keeps_a_cold_position_window_for_its_next_run`
   pins it through the real position path.
+- Every insert into the message cache takes `MessageCache::admit`'s lock,
+  a kept fill through its `keep` (#1425): requests' fills, kept or not,
+  the pre-warm's and the read-ahead's. Hold it across the insert and keep
+  only, never a fetch or a decode. A fill evicted by another insert before
+  its keep was put back past the hot ring's target, and trimming back cost
+  a window larger than the hot target one of its own messages
+  (`a_window_fill_paused_before_its_keep_costs_the_window_nothing`).
 - Pre-warm (#1335, `prewarm.rs`): position queries note per source the
   `ParameterKey` of every message they read (`RecentReads`, once per query
   in `sample_parameters`, at most 256 keys, memory only: after a restart
