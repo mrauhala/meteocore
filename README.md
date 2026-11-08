@@ -427,7 +427,7 @@ the shared root serves all three):
 /3dtiles/collections/{id}/voxel/content/*      Voxel glTF content chunks
 /3dtiles/viewer                                Bundled CesiumJS SPA with collection/quantity/representation/resolution pickers and time scrubber
 
-/preview                                       Built-in MapLibre SPA (cards + map for every collection)
+/preview                                       Built-in MapLibre SPA (cards + map for every collection; one without map tiles reads its EDR values at a map click)
 /preview/manifest.json                         Aggregated discovery JSON consumed by the SPA
 /preview/{*path}                               Embedded SPA assets (HTML, JS, CSS, vendored MapLibre)
 /workbench/{hash}/{file}                       The HTML pages' stylesheets and scripts, at immutable content-hashed URLs

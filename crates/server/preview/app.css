@@ -304,6 +304,38 @@ li.collection:last-child { margin-bottom: 4px; }
     word-break: break-word;
 }
 
+/* The parameters of an entry this map can neither draw nor query (#414). */
+.param-list {
+    margin-top: 10px;
+    font-size: 11.5px;
+}
+
+.param-list summary {
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: pointer;
+}
+
+.param-list summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+}
+
+.param-list ul {
+    margin: 6px 0 0;
+    padding-left: 16px;
+    max-height: 160px;
+    overflow-y: auto;
+    color: var(--text-dim);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    word-break: break-word;
+}
+
 /* ------------------------------------------------------------------ */
 /* Controls (style picker, time slider, etc.)                          */
 /* ------------------------------------------------------------------ */
@@ -359,6 +391,17 @@ li.collection:last-child { margin-bottom: 4px; }
     outline: 2px solid var(--accent);
     outline-offset: 1px;
     border-color: var(--accent);
+}
+
+.control-hint {
+    margin: 0;
+    font-size: 11px;
+    color: var(--text-faint);
+}
+
+/* A position query is switched on: a map click reads a value (#414). */
+.edr-query .maplibregl-canvas-container.maplibregl-interactive {
+    cursor: crosshair;
 }
 
 /* ------------------------------------------------------------------ */

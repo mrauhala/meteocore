@@ -14,6 +14,11 @@
 //   * Only an entry with map tiles gets a layer switch. One without says so
 //     and links to its collection page instead of offering a switch that
 //     draws nothing.
+//   * An entry without map tiles that EDR serves lists EDR's parameters
+//     (#414). When the manifest gives its position query URL, its switch
+//     outlines its extent, and a map click then reads the selected
+//     parameter at the point, at the slider's time, into a popup. One such
+//     entry is switched on at a time.
 //   * A multi-parameter entry opens on the engine's default parameter, the
 //     one the manifest marks `default` (what Maps and WMS draw without
 //     `parameter-name`), not on the alphabetical first.
@@ -66,6 +71,17 @@
     // Shared across every vector collection so a click in one collection
     // dismisses an open popup from another.
     let activePopup = null;
+
+    // The entry a map click reads, `{ collection, state, checkbox }`: one
+    // without map tiles whose position query is switched on (#414).
+    let queryTarget = null;
+    // The open popup of a position query, `{ popup, collection }`, read
+    // again at its point when that collection's parameter or time changes.
+    let queryPopup = null;
+
+    map.on('click', function (e) {
+        if (queryTarget) queryPosition(queryTarget.collection, queryTarget.state, e.lngLat);
+    });
 
     // Fetch the manifest in parallel with map initialization. Sources can't
     // be added until the style is parsed, so the card factory defers
@@ -254,8 +270,11 @@
 
         const displayTitle = collection.title || collection.id;
         const hasTiles = hasMapLayer(collection);
+        const parameters = Array.isArray(collection.parameters) ? collection.parameters : [];
+        // No map layer, but a map click can read its values (#414).
+        const queryable = !hasTiles && positionQueryPath(collection) !== null && parameters.length > 0;
         let checkbox = null;
-        if (hasTiles) {
+        if (hasTiles || queryable) {
             const toggle = document.createElement('label');
             toggle.className = 'switch';
             checkbox = document.createElement('input');
@@ -263,8 +282,11 @@
             checkbox.checked = false;
             // Each switch needs its own name: the label holds no text.
             // The same text is the hover tooltip for mouse users.
-            checkbox.setAttribute('aria-label', 'Show ' + displayTitle + ' on the map');
-            toggle.title = 'Show ' + displayTitle + ' on the map';
+            const action = hasTiles
+                ? 'Show ' + displayTitle + ' on the map'
+                : 'Read ' + displayTitle + ' values with a map click';
+            checkbox.setAttribute('aria-label', action);
+            toggle.title = action;
             toggle.appendChild(checkbox);
             const slider = document.createElement('span');
             slider.className = 'switch-slider';
@@ -336,6 +358,12 @@
         }
         if (meta.childNodes.length > 0) card.appendChild(meta);
 
+        // -- Parameters of an entry nothing on this map can draw or read:
+        //    EDR serves them without position queries. --
+        if (!hasTiles && !queryable && parameters.length > 0) {
+            card.appendChild(parameterList(parameters));
+        }
+
         // -- Layer controls (style picker, time slider, etc.) --
         const controlsHost = document.createElement('div');
         controlsHost.className = 'controls';
@@ -353,10 +381,11 @@
         // microtask sequence as the picker/toggle children (else style-pick
         // and slider can end up in opposite orders in throttled tabs where
         // `whenStyleReady` resolves asynchronously). Doing the slider attach
-        // inside the callback addresses both. Guard with a tile-presence
-        // check: an EDR-only collection has a `temporal_extent` but no tile
-        // layer to drive — surfacing a slider there is just noise.
-        if (hasTiles) {
+        // inside the callback addresses both. Guard with a layer check: an
+        // entry with neither map tiles nor a position query has a
+        // `temporal_extent` but nothing for a slider to drive. A position
+        // query's slider picks the time a map click reads.
+        if (hasTiles || queryable) {
             whenStyleReady(map, function () {
                 try {
                     if (collection.tiles && collection.tiles.raster) {
@@ -364,6 +393,9 @@
                     }
                     if (collection.tiles && collection.tiles.vector) {
                         layerHandles.push(attachVectorLayer(collection, controlsHost, state));
+                    }
+                    if (queryable) {
+                        layerHandles.push(attachPositionQuery(collection, controlsHost, state));
                     }
                     if (state.enabled) {
                         layerHandles.forEach(function (h) { h.setVisible(true); });
@@ -385,7 +417,7 @@
         //    collection's own page. --
         const footer = document.createElement('div');
         footer.className = 'card-footer';
-        if (hasTiles && collection.spatial_extent) {
+        if ((hasTiles || queryable) && collection.spatial_extent) {
             const zoomBtn = document.createElement('button');
             zoomBtn.type = 'button';
             zoomBtn.className = 'link';
@@ -396,10 +428,12 @@
             footer.appendChild(zoomBtn);
         }
         if (!hasTiles) {
-            const note = document.createElement('span');
-            note.className = 'no-layer';
-            note.textContent = 'No map layer';
-            footer.appendChild(note);
+            if (!queryable) {
+                const note = document.createElement('span');
+                note.className = 'no-layer';
+                note.textContent = 'No map layer';
+                footer.appendChild(note);
+            }
             const page = samePageOriginPath(collection.page_url);
             if (page) {
                 const pageLink = document.createElement('a');
@@ -417,6 +451,13 @@
         checkbox.addEventListener('change', function () {
             state.enabled = checkbox.checked;
             card.classList.toggle('active', state.enabled);
+            if (queryable) {
+                if (state.enabled) {
+                    setQueryTarget({ collection: collection, state: state, checkbox: checkbox });
+                } else {
+                    releaseQueryTarget(checkbox);
+                }
+            }
             if (state.enabled && !state.hasZoomed && collection.spatial_extent) {
                 // Reach the initial viewport before showing the source. Flying
                 // with it visible requests intermediate zoom levels as well as
@@ -566,31 +607,7 @@
         //    above the style picker so the controls flow top-to-bottom in a
         //    "narrow my view" order: parameter → style → time.
         if (Array.isArray(collection.parameters) && collection.parameters.length > 1) {
-            const paramLabel = document.createElement('label');
-            paramLabel.className = 'control-row';
-            const paramText = document.createElement('span');
-            paramText.className = 'control-label';
-            paramText.textContent = 'Parameter';
-            paramLabel.appendChild(paramText);
-
-            const paramSelect = document.createElement('select');
-            collection.parameters.forEach(function (p) {
-                const opt = document.createElement('option');
-                opt.value = p.name;
-                opt.textContent = parameterLabel(p);
-                if (p.name === state.parameter) opt.selected = true;
-                paramSelect.appendChild(opt);
-            });
-            paramSelect.addEventListener('change', function () {
-                if (state.parameter === paramSelect.value) return;
-                state.parameter = paramSelect.value;
-                if (state.rebindTimeAxis) {
-                    state.rebindTimeAxis(timeAxisFor(collection, state.parameter));
-                }
-                refreshSource();
-            });
-            paramLabel.appendChild(paramSelect);
-            controlsHost.appendChild(paramLabel);
+            controlsHost.appendChild(parameterPicker(collection, state, refreshSource));
         }
 
         // -- Style picker (only if there's a real choice) --
@@ -631,6 +648,53 @@
             },
             refreshForTime: refreshSource
         };
+    }
+
+    // The parameter select. A switch re-binds the time slider to the new
+    // parameter's own axis, then calls `onChange`.
+    function parameterPicker(collection, state, onChange) {
+        const paramLabel = document.createElement('label');
+        paramLabel.className = 'control-row';
+        const paramText = document.createElement('span');
+        paramText.className = 'control-label';
+        paramText.textContent = 'Parameter';
+        paramLabel.appendChild(paramText);
+
+        const paramSelect = document.createElement('select');
+        collection.parameters.forEach(function (p) {
+            const opt = document.createElement('option');
+            opt.value = p.name;
+            opt.textContent = parameterLabel(p);
+            if (p.name === state.parameter) opt.selected = true;
+            paramSelect.appendChild(opt);
+        });
+        paramSelect.addEventListener('change', function () {
+            if (state.parameter === paramSelect.value) return;
+            state.parameter = paramSelect.value;
+            if (state.rebindTimeAxis) {
+                state.rebindTimeAxis(timeAxisFor(collection, state.parameter));
+            }
+            onChange();
+        });
+        paramLabel.appendChild(paramSelect);
+        return paramLabel;
+    }
+
+    // A collection's parameters as a list, folded under their count.
+    function parameterList(parameters) {
+        const details = document.createElement('details');
+        details.className = 'param-list';
+        const summary = document.createElement('summary');
+        summary.textContent = parameters.length === 1 ? '1 parameter' : parameters.length + ' parameters';
+        details.appendChild(summary);
+        const list = document.createElement('ul');
+        parameters.forEach(function (p) {
+            const item = document.createElement('li');
+            item.textContent = parameterLabel(p);
+            list.appendChild(item);
+        });
+        details.appendChild(list);
+        return details;
     }
 
     // An option's text: the name and title once each, then the unit. A
@@ -745,6 +809,8 @@
         });
 
         map.on('click', layerIds, function (e) {
+            // While a position query is switched on, a click reads its value.
+            if (queryTarget) return;
             if (!e.features || e.features.length === 0) return;
             const feature = e.features[0];
             // MapLibre doesn't auto-dismiss; replace any existing popup.
@@ -792,6 +858,188 @@
         // doesn't trip CSP `connect-src 'self'`.
         template = template.replace(/^https?:\/\/[^/]+/i, '');
         return window.location.origin + template;
+    }
+
+    // ------------------------------------------------------------------
+    // Position query (an entry without map tiles, #414)
+    // ------------------------------------------------------------------
+
+    // The entry's EDR position query as a path on this page's origin, like
+    // its collection page link; null when EDR answers none.
+    function positionQueryPath(collection) {
+        return collection.edr ? samePageOriginPath(collection.edr.position_url) : null;
+    }
+
+    // The controls of an entry a map click reads: the parameter it reads,
+    // listed even when it is the only one, and the entry's extent outlined
+    // while it is switched on, since the map has no basemap to find the
+    // data by.
+    function attachPositionQuery(collection, controlsHost, state) {
+        controlsHost.appendChild(parameterPicker(collection, state, function () {
+            requery(collection, state);
+        }));
+        const hint = document.createElement('p');
+        hint.className = 'control-hint';
+        hint.textContent = 'Switch on, then click the map to read a value.';
+        controlsHost.appendChild(hint);
+
+        const layerId = 'edr-extent-' + collection.id;
+        if (collection.spatial_extent) {
+            map.addSource(layerId, { type: 'geojson', data: extentOutline(collection.spatial_extent) });
+            map.addLayer({
+                id: layerId,
+                type: 'line',
+                source: layerId,
+                layout: { visibility: 'none' },
+                paint: { 'line-color': '#60a5fa', 'line-width': 1.5, 'line-dasharray': [3, 2] }
+            });
+        }
+        return {
+            setVisible: function (visible) {
+                if (map.getLayer(layerId)) {
+                    map.setLayoutProperty(layerId, 'visibility', visible ? 'visible' : 'none');
+                }
+            },
+            refreshForTime: function () {
+                requery(collection, state);
+            }
+        };
+    }
+
+    // A bbox as a closed line. West > east crosses the antimeridian: the
+    // east edge is unwrapped past 180°, as `fitMapToExtent` does.
+    function extentOutline(extent) {
+        const west = extent[0];
+        const south = extent[1];
+        const east = extent[2] < west ? extent[2] + 360 : extent[2];
+        const north = extent[3];
+        return {
+            type: 'Feature',
+            properties: {},
+            geometry: {
+                type: 'LineString',
+                coordinates: [[west, south], [east, south], [east, north], [west, north], [west, south]]
+            }
+        };
+    }
+
+    // Make `target` the entry a map click reads. The previous one's switch
+    // goes off, and its change handler hides its outline.
+    function setQueryTarget(target) {
+        const previous = queryTarget;
+        queryTarget = target;
+        if (previous && previous.checkbox !== target.checkbox) {
+            previous.checkbox.checked = false;
+            previous.checkbox.dispatchEvent(new Event('change'));
+        }
+        map.getContainer().classList.add('edr-query');
+    }
+
+    function releaseQueryTarget(checkbox) {
+        if (!queryTarget || queryTarget.checkbox !== checkbox) return;
+        queryTarget = null;
+        map.getContainer().classList.remove('edr-query');
+    }
+
+    // Read the selected parameter at a clicked point through the entry's EDR
+    // position query, at the slider's time when it has one. The popup opens
+    // at once and fills in when the answer arrives; a later click, or a
+    // closed popup, drops an earlier answer.
+    function queryPosition(collection, state, lngLat) {
+        if (activePopup) activePopup.remove();
+        const popup = new maplibregl.Popup({ closeButton: true, maxWidth: '320px' })
+            .setLngLat(lngLat)
+            .setDOMContent(popupMessage(collection, 'Loading…'))
+            .addTo(map);
+        activePopup = popup;
+        queryPopup = { popup: popup, collection: collection };
+        popup.on('close', function () {
+            if (activePopup === popup) activePopup = null;
+            if (queryPopup && queryPopup.popup === popup) queryPopup = null;
+        });
+
+        // The world copy clicked can lie past ±180°: wrap into [-180, 180].
+        const point = lngLat.wrap();
+        const parameter = state.parameter;
+        fetch(positionQueryUrl(collection, parameter, currentTime(state), point))
+            .then(function (r) {
+                return r.json()
+                    .catch(function () { return null; })
+                    .then(function (body) { return { status: r.status, body: body }; });
+            })
+            .catch(function () { return { status: 0, body: null }; })
+            .then(function (answer) {
+                if (activePopup !== popup) return;
+                popup.setDOMContent(positionAnswer(collection, parameter, point, answer));
+            });
+    }
+
+    // Read the open popup's point again after a parameter or time change of
+    // the entry it belongs to.
+    function requery(collection, state) {
+        if (queryPopup && activePopup === queryPopup.popup && queryPopup.collection === collection) {
+            queryPosition(collection, state, queryPopup.popup.getLngLat());
+        }
+    }
+
+    function positionQueryUrl(collection, parameter, time, point) {
+        const coords = 'POINT(' + point.lng.toFixed(5) + ' ' + point.lat.toFixed(5) + ')';
+        const url = positionQueryPath(collection) + '?f=CoverageJSON&coords=' + encodeURIComponent(coords);
+        return appendTimeParam(appendParameterName(url, parameter), time);
+    }
+
+    // The popup body of a position query's answer: the value with its unit,
+    // its time and level when the coverage has them, and the point; a short
+    // message when there is no value.
+    function positionAnswer(collection, parameter, point, answer) {
+        if (answer.status === 404) return popupMessage(collection, 'No data at this point.');
+        if (answer.status !== 200 || !answer.body) {
+            if (!answer.status) return popupMessage(collection, 'Query failed.');
+            // A client error says why (an instant outside the data, …).
+            const detail = answer.status < 500 && answer.body && typeof answer.body.description === 'string'
+                ? ' ' + answer.body.description
+                : '';
+            return popupMessage(collection, 'Query failed (HTTP ' + answer.status + ').' + detail);
+        }
+        const reading = coverageReading(answer.body, parameter);
+        if (!reading) return popupMessage(collection, 'No data at this point.');
+
+        const p = collection.parameters.find(function (q) { return q.name === parameter; }) || { name: parameter };
+        const root = popupRoot(collection);
+        appendPopupRow(root, p.name, formatPropertyValue(reading.value) + (p.unit ? ' ' + p.unit : ''));
+        if (reading.time) appendPopupRow(root, 'time', formatSliderTime(reading.time));
+        if (reading.level !== null) appendPopupRow(root, 'level', String(reading.level));
+        appendPopupRow(root, 'point', formatLat(point.lat) + ', ' + formatLon(point.lng));
+        return root;
+    }
+
+    // The parameter's last non-null value in a CoverageJSON answer, a
+    // Coverage or the first of a CoverageCollection, with the time and
+    // level it is at. A range's values are row-major over its `axisNames`.
+    function coverageReading(doc, parameter) {
+        const coverage = Array.isArray(doc.coverages) ? doc.coverages[0] : doc;
+        const range = coverage && coverage.ranges ? coverage.ranges[parameter] : null;
+        if (!range || !Array.isArray(range.values)) return null;
+        const names = Array.isArray(range.axisNames) ? range.axisNames : [];
+        const shape = Array.isArray(range.shape) ? range.shape : [];
+        const axes = (coverage.domain && coverage.domain.axes) || {};
+        function indexOn(i, axis) {
+            const k = names.indexOf(axis);
+            if (k < 0) return 0;
+            let stride = 1;
+            for (let j = k + 1; j < shape.length; j++) stride *= shape[j];
+            return Math.floor(i / stride) % shape[k];
+        }
+        function axisValue(i, axis) {
+            const values = axes[axis] && Array.isArray(axes[axis].values) ? axes[axis].values : [];
+            const value = values[indexOn(i, axis)];
+            return value === undefined ? null : value;
+        }
+        for (let i = range.values.length - 1; i >= 0; i--) {
+            if (typeof range.values[i] !== 'number') continue;
+            return { value: range.values[i], time: axisValue(i, 't'), level: axisValue(i, 'z') };
+        }
+        return null;
     }
 
     // An RGB composite parameter (#819): its colours come from its channels,
@@ -958,14 +1206,41 @@
     // Popup
     // ------------------------------------------------------------------
 
-    function buildPopupBody(collection, feature) {
+    // A popup headed by the collection's title.
+    function popupRoot(collection) {
         const root = document.createElement('div');
         root.className = 'popup';
-
         const heading = document.createElement('h3');
         heading.textContent = collection.title || collection.id;
         root.appendChild(heading);
+        return root;
+    }
 
+    function appendPopupRow(root, key, value) {
+        const row = document.createElement('div');
+        row.className = 'popup-row';
+        const k = document.createElement('span');
+        k.className = 'k';
+        k.textContent = key;
+        const v = document.createElement('span');
+        v.className = 'v';
+        v.textContent = value;
+        row.appendChild(k);
+        row.appendChild(v);
+        root.appendChild(row);
+    }
+
+    // A popup holding one short message.
+    function popupMessage(collection, text) {
+        const root = popupRoot(collection);
+        const message = document.createElement('p');
+        message.className = 'popup-empty';
+        message.textContent = text;
+        root.appendChild(message);
+        return root;
+    }
+
+    function buildPopupBody(collection, feature) {
         const rows = [];
         if (feature.id !== undefined && feature.id !== null && feature.id !== '') {
             rows.push(['id', String(feature.id)]);
@@ -977,26 +1252,11 @@
                 rows.push([key, formatPropertyValue(props[key])]);
             });
 
-        if (rows.length === 0) {
-            const empty = document.createElement('p');
-            empty.className = 'popup-empty';
-            empty.textContent = 'No properties.';
-            root.appendChild(empty);
-            return root;
-        }
+        if (rows.length === 0) return popupMessage(collection, 'No properties.');
 
+        const root = popupRoot(collection);
         rows.forEach(function (kv) {
-            const row = document.createElement('div');
-            row.className = 'popup-row';
-            const k = document.createElement('span');
-            k.className = 'k';
-            k.textContent = kv[0];
-            const v = document.createElement('span');
-            v.className = 'v';
-            v.textContent = kv[1];
-            row.appendChild(k);
-            row.appendChild(v);
-            root.appendChild(row);
+            appendPopupRow(root, kv[0], kv[1]);
         });
         return root;
     }

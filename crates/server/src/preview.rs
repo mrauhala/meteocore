@@ -486,7 +486,8 @@ fn build_entry(
         );
     }
     let has_raster_tiles = tile_block.contains_key("raster");
-    if !tile_block.is_empty() {
+    let has_tiles = !tile_block.is_empty();
+    if has_tiles {
         entry["tiles"] = Value::Object(tile_block);
     }
 
@@ -494,17 +495,74 @@ fn build_entry(
         entry["styles"] = json!(style_list(styles));
     }
 
-    // Parameter list for the per-collection dropdown in /preview. Only emit
-    // for raster-tile-backed collections — FeatureEngine is not parameterised,
-    // and there's no rendering pathway today for switching parameters on a
-    // pure-EDR collection from the SPA.
+    // Parameter list for the per-collection dropdown in /preview. A
+    // collection with raster tiles lists what its map engine renders. One
+    // with no map tiles at all that EDR serves lists EDR's parameters, plus
+    // the URL of its position query when EDR answers one: the SPA reads the
+    // selected parameter there at a clicked point (#414). A vector layer's
+    // FeatureEngine is not parameterised.
     if has_raster_tiles {
         if let Some(params) = collection_parameters(id, config, edr, maps, tiles, wms) {
             entry["parameters"] = json!(params);
         }
+    } else if !has_tiles {
+        if let Some(engine) = edr.engines.get(id) {
+            let params = edr_parameters(id, config, engine.as_ref());
+            if !params.is_empty() {
+                entry["parameters"] = json!(params);
+            }
+            if let Some(url) = edr_position_url(id, base_url, engine.as_ref()) {
+                entry["edr"] = json!({ "position_url": url });
+            }
+        }
     }
 
     entry
+}
+
+/// EDR's parameters as `parameters: [{name, title, unit}]`, the shape of
+/// [`collection_parameters`]' entries, for a collection without map tiles
+/// (#414). Sorted by name. A parameter with timesteps of its own
+/// (`EdrEngine::get_parameter_available_times`) carries them as
+/// `temporal_extent`, as a map parameter's own axis does: the SPA queries
+/// the time its slider shows, and the collection axis is the union.
+fn edr_parameters(
+    id: &str,
+    config: Option<&CollectionConfig>,
+    engine: &dyn ds_core::edr_engine::EdrEngine,
+) -> Vec<Value> {
+    let mut descriptions: Vec<_> = engine.get_parameter_descriptions().into_iter().collect();
+    descriptions.sort_by(|a, b| a.0.cmp(&b.0));
+    descriptions
+        .into_iter()
+        .map(|(name, description)| {
+            let mut entry = json!({
+                "name": name,
+                "title": description.label,
+                "unit": description.unit,
+            });
+            if let Some(times) = engine.get_parameter_available_times(&name) {
+                entry["temporal_extent"] = parameter_temporal_extent(id, config, None, &times);
+            }
+            entry
+        })
+        .collect()
+}
+
+/// The collection's EDR position query, `{base}/edr/collections/{id}/position`,
+/// when its engine answers position queries: what the SPA requests on a map
+/// click for a collection without map tiles (#414).
+fn edr_position_url(
+    id: &str,
+    base_url: &str,
+    engine: &dyn ds_core::edr_engine::EdrEngine,
+) -> Option<String> {
+    let edr = api_common::mounts::EDR;
+    engine
+        .supported_query_types()
+        .iter()
+        .any(|query| query == "position")
+        .then(|| format!("{base_url}{edr}/collections/{id}/position"))
 }
 
 /// The APIs that serve `id`, in a fixed order: membership of each API's
@@ -581,7 +639,8 @@ fn collection_page_url(id: &str, base_url: &str, apis: &[&str]) -> Option<String
 ///
 /// **Caller invariant:** this is only invoked when the collection has
 /// raster tiles (see `build_entry`'s `if has_raster_tiles` guard), so a
-/// `MapEngine` is always registered. Two branches:
+/// `MapEngine` is always registered; a collection with no map tiles at all
+/// lists EDR's parameters instead ([`edr_parameters`]). Two branches:
 ///
 /// 1. `raster_info().parameters` non-empty (multi-parameter engines like
 ///    GRIB / multi-param QueryData): that list is the renderable source of
@@ -635,7 +694,7 @@ fn collection_parameters(
             }
             if let Some(times) = engine.parameter_times(&name) {
                 entry["temporal_extent"] =
-                    parameter_temporal_extent(id, config, engine.as_ref(), &times);
+                    parameter_temporal_extent(id, config, engine.default_time(), &times);
             }
             entry
         })
@@ -649,7 +708,7 @@ fn collection_parameters(
         });
         if let Some(times) = engine.parameter_times(&composite.name) {
             entry["temporal_extent"] =
-                parameter_temporal_extent(id, config, engine.as_ref(), &times);
+                parameter_temporal_extent(id, config, engine.default_time(), &times);
         }
         out.push(entry);
     }
@@ -672,14 +731,14 @@ fn default_parameter_name(info: &ds_core::map_engine::RasterInfo) -> Option<Stri
         .then(|| default.to_string())
 }
 
-/// One parameter's own time axis in the manifest's `temporal_extent` shape.
+/// One parameter's own time axis in the manifest's `temporal_extent` shape;
+/// `default_time` is the map engine's `default_time()`, `None` without one.
 fn parameter_temporal_extent(
     id: &str,
     config: Option<&CollectionConfig>,
-    engine: &dyn ds_core::map_engine::MapEngine,
+    default_time: Option<chrono::DateTime<chrono::Utc>>,
     times: &[chrono::DateTime<chrono::Utc>],
 ) -> Value {
-    let default_time = engine.default_time();
     let mut values = times.to_vec();
     apply_preview_window(id, config, &mut values, default_time);
     let interval = values.first().zip(values.last()).map(|(a, b)| (*a, *b));
@@ -2931,6 +2990,180 @@ mod tests {
         assert!(c.get("page_url").is_none());
     }
 
+    /// An EDR engine with named `(name, label, unit)` parameters, the query
+    /// types it answers and, optionally, one parameter's own timesteps.
+    struct ParamEdr {
+        parameters: Vec<(&'static str, &'static str, &'static str)>,
+        queries: Vec<&'static str>,
+        own_times: Option<(&'static str, Vec<DateTime<Utc>>)>,
+    }
+
+    impl EdrEngine for ParamEdr {
+        fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+            Ok(LocationSnapshot::empty())
+        }
+        fn query_location(
+            &self,
+            _: &str,
+            _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+            _: Option<&[String]>,
+            _: Option<&[f64]>,
+            _: Option<DateTime<Utc>>,
+        ) -> Result<CoverageResponse, DataServerError> {
+            unimplemented!()
+        }
+        fn get_parameters(&self) -> Vec<String> {
+            self.parameters.iter().map(|p| p.0.to_string()).collect()
+        }
+        fn get_parameter_descriptions(
+            &self,
+        ) -> HashMap<String, ds_core::model::ParameterDescription> {
+            self.parameters
+                .iter()
+                .map(|&(name, label, unit)| {
+                    let description = ds_core::model::ParameterDescription {
+                        label: label.into(),
+                        unit: unit.into(),
+                        observed_property: name.into(),
+                        standard_name: None,
+                    };
+                    (name.to_string(), description)
+                })
+                .collect()
+        }
+        fn get_parameter_available_times(&self, parameter: &str) -> Option<Vec<DateTime<Utc>>> {
+            self.own_times
+                .as_ref()
+                .filter(|(name, _)| *name == parameter)
+                .map(|(_, times)| times.clone())
+        }
+        fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+            None
+        }
+        fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+            Some([20.0, 60.0, 30.0, 70.0])
+        }
+        fn supported_query_types(&self) -> Vec<String> {
+            self.queries.iter().map(|q| q.to_string()).collect()
+        }
+    }
+
+    /// A collection without map tiles that EDR serves lists EDR's
+    /// parameters, in the shape of a map collection's, and the URL of its
+    /// position query when EDR answers one (#414): the SPA reads a value
+    /// there on a map click. A collection with raster tiles keeps the
+    /// parameters its map engine renders, and no `edr` block.
+    #[test]
+    fn manifest_lists_edr_parameters_of_a_collection_without_map_tiles() {
+        let mut edr = empty_edr();
+        let mut tiles = empty_tiles();
+        tiles.base_url = "https://api.example.com".into();
+
+        // EDR only, answering position queries; `msl` has its own steps.
+        edr.engines.insert(
+            "obs".into(),
+            Arc::new(ParamEdr {
+                parameters: vec![("t2m", "Air temperature", "°C"), ("msl", "Pressure", "hPa")],
+                queries: vec!["position", "area"],
+                own_times: Some(("msl", vec![t("2026-06-01T06:00:00Z")])),
+            }),
+        );
+        edr.collections
+            .insert("obs".into(), config("obs", &["edr"]));
+
+        // EDR only, answering only `locations`.
+        edr.engines.insert(
+            "stations".into(),
+            Arc::new(ParamEdr {
+                parameters: vec![("rain", "Rain", "mm")],
+                queries: vec!["locations"],
+                own_times: None,
+            }),
+        );
+        edr.collections
+            .insert("stations".into(), config("stations", &["edr"]));
+
+        // EDR and raster tiles: the map engine's parameters, unchanged.
+        edr.engines.insert(
+            "fc".into(),
+            Arc::new(ParamEdr {
+                parameters: vec![
+                    ("2t", "2 metre temperature", "K"),
+                    ("tp", "Precipitation", "m"),
+                ],
+                queries: vec!["position"],
+                own_times: None,
+            }),
+        );
+        edr.collections
+            .insert("fc".into(), config("fc", &["edr", "tiles"]));
+        tiles.map_engines.insert(
+            "fc".into(),
+            Arc::new(RasterMock {
+                parameters: vec![ds_core::map_engine::ParameterInfo {
+                    name: "2t".into(),
+                    title: "Temperature".into(),
+                    unit: "K".into(),
+                }],
+                ..RasterMock::default()
+            }),
+        );
+        tiles
+            .collections
+            .insert("fc".into(), config("fc", &["edr", "tiles"]));
+
+        let state = make_state(edr, empty_features(), empty_maps(), tiles, empty_wms());
+        let m = build_manifest(&state, 0, 100);
+        let by_id: HashMap<&str, &Value> = m["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["id"].as_str().unwrap(), c))
+            .collect();
+
+        let obs = by_id["obs"];
+        assert_eq!(obs["apis"], json!(["edr"]));
+        assert!(obs.get("tiles").is_none(), "no map layer");
+        let params = obs["parameters"].as_array().expect("EDR parameters");
+        assert_eq!(
+            params
+                .iter()
+                .map(|p| (&p["name"], &p["title"], &p["unit"]))
+                .collect::<Vec<_>>(),
+            [
+                (&json!("msl"), &json!("Pressure"), &json!("hPa")),
+                (&json!("t2m"), &json!("Air temperature"), &json!("°C")),
+            ]
+        );
+        assert_eq!(
+            params[0]["temporal_extent"]["values"],
+            json!([t("2026-06-01T06:00:00Z").to_rfc3339()])
+        );
+        assert!(params[1].get("temporal_extent").is_none());
+        assert_eq!(
+            obs["edr"]["position_url"],
+            "https://api.example.com/edr/collections/obs/position"
+        );
+
+        let stations = by_id["stations"];
+        assert_eq!(
+            stations["parameters"],
+            json!([{ "name": "rain", "title": "Rain", "unit": "mm" }])
+        );
+        assert!(
+            stations.get("edr").is_none(),
+            "no position query to run on a click"
+        );
+
+        let fc = by_id["fc"];
+        assert!(fc["tiles"]["raster"].is_object());
+        assert_eq!(
+            fc["parameters"],
+            json!([{ "name": "2t", "title": "2 metre temperature", "unit": "K" }])
+        );
+        assert!(fc.get("edr").is_none());
+    }
+
     // -----------------------------------------------------------------------
     // Static-asset handler tests
     // -----------------------------------------------------------------------
@@ -3314,6 +3547,24 @@ mod tests {
                 body_str.contains(needle),
                 "app.js no longer reads the manifest field behind `{needle}`"
             );
+        }
+    }
+
+    /// Companion to `manifest_lists_edr_parameters_of_a_collection_without_map_tiles`
+    /// (#414): the SPA runs the manifest's position query, on this page's
+    /// origin, at the clicked longitude wrapped into [-180, 180]. Literal
+    /// source text, with the tradeoff described in
+    /// `app_js_rewrites_ogc_tile_placeholders_for_maplibre`.
+    #[test]
+    fn app_js_runs_the_edr_position_query_on_a_map_click() {
+        let js = PreviewAssets::get("app.js").unwrap();
+        let js = std::str::from_utf8(&js.data).unwrap();
+        for needle in [
+            "samePageOriginPath(collection.edr.position_url)",
+            "lngLat.wrap()",
+            "'POINT('",
+        ] {
+            assert!(js.contains(needle), "app.js lost `{needle}`");
         }
     }
 
