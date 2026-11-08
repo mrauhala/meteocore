@@ -332,6 +332,15 @@ and never under an instance.
   **ignores** a well-formed `z` (`/req/edr/z-response` A, a SHALL); a
   malformed one is a 400. Do not reintroduce the old 400 — WMS/Maps/Tiles
   `ELEVATION`/`elevation` keep theirs, EDR does not.
+- A `z` list, and the levels `Rn/min/step` expands to, reach the engine in
+  the order `get_vertical_extent().levels` runs, each once
+  (`resolve_z_levels` through `ds_core::vertical::in_axis_order`, #1434):
+  CoverageJSON 1.0 §9.6.1.1 makes an axis's values monotonic, and a listed
+  subset then reads like the answer without `z`. Engines that match a list
+  against their own levels (GRIB `selected_levels`, NetCDF `query_levels`,
+  ODIM `snap_levels`) order it with the same helper, so a direct call
+  answers the same. Each keeps its own direction: bottom first on GRIB and
+  NetCDF, lowest sweep first on ODIM PVOL.
 - A `datetime` list `T1,T2,T3` (`params::parse_datetime`) is one engine
   query per instant `(t, t)`, merged by `src/datetime_list.rs`. Every data
   query handler calls the engine through `datetime_list::run`; a new one

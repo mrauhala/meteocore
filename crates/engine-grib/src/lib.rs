@@ -1314,8 +1314,8 @@ impl GribEngine {
         // Without `z`: the run's first level, the first `selected_levels`
         // keeps, as a run's levels are a set. Read directly: every map
         // request, cache hits included, selects its frame's message through
-        // here (#1334), and listing a model view's 137 levels checks each
-        // against every other.
+        // here (#1334), and listing a model view's 137 levels copies them
+        // all.
         if z.is_none() {
             if self.vertical_kind().is_none() {
                 return Ok(None);

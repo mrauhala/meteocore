@@ -9,7 +9,7 @@
 //! - **Steps** are an area's: without `datetime` the step a map without
 //!   `TIME` draws (the newest run's last), else every step in the window of
 //!   the run EDR selects; an instance pins the run.
-//! - **Levels:** `z`'s (each one the collection's, in request order), or
+//! - **Levels:** `z`'s (each one the collection's, in the axis's order), or
 //!   every level. `resolution-z` asks for that many evenly spaced positions
 //!   from the lowest selected level to the highest, each taking the nearest
 //!   selected level's values (`ds_core::cube`); a level no position takes

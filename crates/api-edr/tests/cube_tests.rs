@@ -452,9 +452,14 @@ async fn z_comes_from_the_parameter_or_a_six_number_bbox() {
         // An explicit z overrides it.
         ("bbox=0,0,500,1,1,1000&z=250", Some(vec![250.0])),
         ("bbox=0,0,1,1&z=700/300", Some(vec![700.0, 500.0])),
-        // The EDR 1.2 z grammar: open and recurring intervals.
+        // The EDR 1.2 z grammar: open and recurring intervals; a list, the
+        // recurring one's too, in the advertised levels' order (#1434).
         ("bbox=0,0,1,1&z=../700", Some(vec![700.0, 500.0, 250.0])),
-        ("bbox=0,0,1,1&z=R2/500/350", Some(vec![500.0, 850.0])),
+        ("bbox=0,0,1,1&z=R2/500/350", Some(vec![850.0, 500.0])),
+        (
+            "bbox=0,0,1,1&z=500,1000,850",
+            Some(vec![1000.0, 850.0, 500.0]),
+        ),
     ] {
         let (status, _, body) = get(&app, &format!("/collections/model/cube?{query}")).await;
         assert_eq!(status, StatusCode::OK, "{query}: {body}");

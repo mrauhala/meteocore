@@ -121,9 +121,13 @@ pub trait EdrEngine: Send + Sync {
     ///
     /// `z` selects vertical levels: `None` returns every level (a profile),
     /// `Some([v])` pins one level, `Some([v1, v2, …])` selects several.
-    /// Engines with no vertical dimension never see one: the EDR layer
-    /// ignores a `z` sent to a collection without a vertical extent (EDR 1.2
-    /// `/req/edr/z-response` A).
+    /// The EDR layer sends a list in the order of
+    /// [`Self::get_vertical_extent`]'s levels, each once, and an engine
+    /// matching it against its own levels answers in that order too
+    /// ([`crate::vertical::in_axis_order`], #1434: a CoverageJSON axis is
+    /// monotonic). Engines with no vertical dimension never see one: the
+    /// EDR layer ignores a `z` sent to a collection without a vertical
+    /// extent (EDR 1.2 `/req/edr/z-response` A).
     ///
     /// `reference_time` selects a forecast model run (see [`Self::get_instances`]):
     /// `None` ⇒ the latest run (the default and only behaviour for non-forecast

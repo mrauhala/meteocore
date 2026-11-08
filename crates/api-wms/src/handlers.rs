@@ -356,6 +356,108 @@ struct MapLayer {
     info: Arc<ds_core::map_engine::RasterInfo>,
 }
 
+/// How many of a collection's layers a `LayerNotDefined` hint names
+/// ([`layer_not_defined`]) before "and N more".
+const HINT_LAYER_LIMIT: usize = 20;
+
+/// The `{id}` collection's map engine, if GetCapabilities lists its layers:
+/// it is in both the engine and the collection registry, as
+/// [`crate::capabilities::get_capabilities_xml`] requires. The server fills
+/// them only with collections whose `apis` lists `wms`.
+fn advertised_collection<'a>(state: &'a WmsState, id: &str) -> Option<&'a Arc<dyn MapEngine>> {
+    state
+        .engines
+        .get(id)
+        .filter(|_| state.collections.contains_key(id))
+}
+
+/// Whether GetCapabilities names a layer `layer`: a child layer
+/// `{id}/{name}`, or the one layer `{id}` of a collection without children.
+fn is_advertised_layer(state: &WmsState, layer: &str) -> bool {
+    let (id, name) = match layer.split_once('/') {
+        Some((id, name)) => (id, Some(name)),
+        None => (layer, None),
+    };
+    let Some(engine) = advertised_collection(state, id) else {
+        return false;
+    };
+    let info = engine.raster_info_shared();
+    let composites = engine.composites();
+    match name {
+        Some(name) => crate::capabilities::child_layer_names(&info, &composites)
+            .is_some_and(|mut children| children.any(|child| child == name)),
+        None => !crate::capabilities::has_child_layers(&info, &composites),
+    }
+}
+
+/// The first `:` of `layer` as `/`: the one rewrite a `LayerNotDefined`
+/// hint suggests, for a client that names `collection:parameter`.
+pub(crate) fn colon_as_slash(layer: &str) -> Option<String> {
+    layer.contains(':').then(|| layer.replacen(':', "/", 1))
+}
+
+/// The hint suggesting `candidate`, the [`colon_as_slash`] rewrite of a
+/// name that is no layer.
+pub(crate) fn did_you_mean(candidate: &str) -> String {
+    format!("Did you mean '{candidate}'? Layer names use '/' between collection and parameter.")
+}
+
+/// `LayerNotDefined` for `layer`, a name GetMap, GetFeatureInfo or
+/// GetLegendGraphic serves no layer by, with [`layer_hint`]'s hint.
+pub(crate) fn layer_not_defined(state: &WmsState, layer: &str) -> WmsError {
+    WmsError::layer_not_found_with_hint(layer, layer_hint(state, layer).as_deref())
+}
+
+/// The hint a `LayerNotDefined` for `layer` gives (#118):
+///
+/// - When its first `:` as `/` is a layer GetCapabilities names, that
+///   layer: clients name `collection:parameter`, and MeteoCore's layers are
+///   `collection/parameter`.
+/// - Else, when the name is `collection/…` or `collection:…` and
+///   GetCapabilities lists `collection`, its layer names, sorted, the first
+///   [`HINT_LAYER_LIMIT`] of them and how many more.
+///
+/// Nothing else: no similarity matching. Both rules read one collection the
+/// name itself spells out, and name only layers GetCapabilities already
+/// lists, so the error tells a client nothing it could not read there. The
+/// hint is text: the ServiceExceptionReport writer escapes it.
+fn layer_hint(state: &WmsState, layer: &str) -> Option<String> {
+    if let Some(candidate) =
+        colon_as_slash(layer).filter(|candidate| is_advertised_layer(state, candidate))
+    {
+        return Some(did_you_mean(&candidate));
+    }
+    // The collection the name spells out: as GetMap parses it (before the
+    // first '/'), else before the first ':'.
+    let (id, engine) = [
+        layer.split_once('/').map(|(id, _)| id),
+        layer.split_once(':').map(|(id, _)| id),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(|id| advertised_collection(state, id).map(|engine| (id, engine)))?;
+    let info = engine.raster_info_shared();
+    let composites = engine.composites();
+    let listed = match crate::capabilities::child_layer_names(&info, &composites) {
+        None => id.to_string(),
+        Some(children) => {
+            let mut names: Vec<&str> = children.collect();
+            names.sort_unstable();
+            let shown = names
+                .iter()
+                .take(HINT_LAYER_LIMIT)
+                .map(|name| format!("{id}/{name}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            match names.len().saturating_sub(HINT_LAYER_LIMIT) {
+                0 => shown,
+                more => format!("{shown} and {more} more"),
+            }
+        }
+    };
+    Some(format!("Layers of collection '{id}': {listed}."))
+}
+
 /// Resolve one GetMap layer and its style: `LayerNotDefined` for a layer
 /// this server does not serve (an unknown collection, or an unknown
 /// parameter of `collection/param`), `StyleNotDefined` for a style the
@@ -371,7 +473,7 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
     let engine = state
         .engines
         .get(&collection_id)
-        .ok_or_else(|| WmsError::layer_not_found(layer))?
+        .ok_or_else(|| layer_not_defined(state, layer))?
         .clone();
 
     // An RGB composite layer (#819) has no style map: its colours
@@ -412,7 +514,7 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
                 style,
             )
             .map_err(|error| match error {
-                ds_render::LayerStyleError::UnknownLayer => WmsError::layer_not_found(layer),
+                ds_render::LayerStyleError::UnknownLayer => layer_not_defined(state, layer),
                 ds_render::LayerStyleError::UnknownStyle(offered) => {
                     WmsError::StyleNotDefined(format!(
                         "Style '{style}' not defined for layer '{layer}'. Available: {}",
@@ -433,25 +535,14 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
     // advertised list (mirroring Maps + Tiles). Without this, an
     // unknown parameter would silently render whatever the engine
     // defaults to and cache that result under the invalid name —
-    // ServiceException is the correct OGC response here.
+    // ServiceException is the correct OGC response here. Its message
+    // lists the collection's layers, as GetCapabilities names them (#118).
     if let Some(pname) = layer_parameter.as_deref() {
         if composite.is_none()
             && !info.parameters.is_empty()
             && !info.parameters.iter().any(|p| p.name == pname)
         {
-            let composites = engine.composites();
-            let mut supported: Vec<&str> = info
-                .parameters
-                .iter()
-                .map(|p| p.name.as_str())
-                .chain(composites.iter().map(|c| c.name.as_str()))
-                .collect();
-            supported.sort_unstable();
-            return Err(WmsError::LayerNotDefined(format!(
-                "Parameter '{pname}' is not available for layer \
-                 '{collection_id}'. Available: {}",
-                supported.join(", ")
-            )));
+            return Err(layer_not_defined(state, layer));
         }
     }
 
@@ -1181,7 +1272,7 @@ pub async fn wms_handler(
                 style_name,
             )
             .map_err(|error| match error {
-                ds_render::LayerStyleError::UnknownLayer => WmsError::layer_not_found(layer_name),
+                ds_render::LayerStyleError::UnknownLayer => layer_not_defined(&state, layer_name),
                 ds_render::LayerStyleError::UnknownStyle(_) => WmsError::StyleNotDefined(format!(
                     "Style '{style_name}' not defined for layer '{layer_name}'"
                 )),

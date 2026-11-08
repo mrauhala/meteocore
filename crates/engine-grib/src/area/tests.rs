@@ -129,7 +129,7 @@ fn assert_value(actual: Option<f64>, expected: Option<f64>) {
 }
 
 #[test]
-fn area_preserves_requested_level_order_missing_fields_units_and_polygon_holes() {
+fn area_orders_levels_like_the_axis_with_missing_fields_units_and_polygon_holes() {
     for kind in [GribLevelType::Pressure, GribLevelType::Model] {
         let missing = [(0, 2), (1, 0)];
         let (source, mut owner) = fixture(Some(kind), 2, 3, &missing);
@@ -169,7 +169,13 @@ fn area_preserves_requested_level_order_missing_fields_units_and_polygon_holes()
         assert_eq!(y, vec![0.0, 1.0]);
         // Without `datetime`, the run's one step, on a `t` axis (#1412).
         assert_eq!(t, vec![time(0)]);
-        assert_eq!(z.values, levels);
+        // Requested 2, 0, 1; answered in the run's bottom-first axis order,
+        // each level's values with it (#1434).
+        let axis_order = [2, 1, 0];
+        let axis_levels: Vec<_> = axis_order
+            .map(|level| f64::from(level_value(Some(kind), level)))
+            .into();
+        assert_eq!(z.values, axis_levels);
         for param in 0..2 {
             let name = parameter(param);
             let range = &result.ranges[&name];
@@ -179,7 +185,7 @@ fn area_preserves_requested_level_order_missing_fields_units_and_polygon_holes()
                 result.parameters[&name].unit,
                 if param == 0 { "°C" } else { "%" }
             );
-            for (slot, level) in [2, 0, 1].into_iter().enumerate() {
+            for (slot, level) in axis_order.into_iter().enumerate() {
                 for (pixel, offset) in [Some(4.0), Some(6.0), Some(0.0), None]
                     .into_iter()
                     .enumerate()

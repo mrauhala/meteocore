@@ -72,7 +72,16 @@ impl WmsError {
     }
 
     pub fn layer_not_found(layer: &str) -> Self {
-        WmsError::LayerNotDefined(format!("Layer '{layer}' does not exist"))
+        Self::layer_not_found_with_hint(layer, None)
+    }
+
+    /// [`Self::layer_not_found`], followed by a `hint` at the layer the
+    /// client may have meant (#118, `handlers::layer_not_defined`).
+    pub fn layer_not_found_with_hint(layer: &str, hint: Option<&str>) -> Self {
+        WmsError::LayerNotDefined(match hint {
+            Some(hint) => format!("Layer '{layer}' does not exist. {hint}"),
+            None => format!("Layer '{layer}' does not exist"),
+        })
     }
 
     pub fn operation_not_supported(op: &str) -> Self {

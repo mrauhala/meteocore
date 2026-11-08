@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use ds_core::config::{CollectionConfig, LicenseConfig};
 use ds_core::edr_engine::EdrEngine;
-use ds_core::map_engine::{default_request_time, MapEngine, RasterInfo};
+use ds_core::map_engine::{default_request_time, CompositeDef, MapEngine, RasterInfo};
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
@@ -96,7 +96,7 @@ pub fn get_capabilities_xml(
         if let Some(engine) = engines.get(id) {
             let info = engine.raster_info_shared();
 
-            if info.parameters.len() > 1 || !engine.composites().is_empty() {
+            if has_child_layers(&info, &engine.composites()) {
                 // Multi-parameter engine: parent layer (not requestable) with
                 // nested child layers per parameter, then one per RGB
                 // composite (#819). Each child resolves its own style map,
@@ -140,6 +140,29 @@ pub fn get_capabilities_xml(
     let _ = writer.write_event(Event::End(BytesEnd::new("WMS_Capabilities")));
 
     writer.into_inner()
+}
+
+/// Whether GetCapabilities writes a collection as an unnamed parent layer
+/// with a named child layer `{id}/{name}` per parameter, then per RGB
+/// composite (#819), rather than as the one named layer `{id}`.
+pub(crate) fn has_child_layers(info: &RasterInfo, composites: &[CompositeDef]) -> bool {
+    info.parameters.len() > 1 || !composites.is_empty()
+}
+
+/// The `{name}`s of a collection's child layers `{id}/{name}`, in the order
+/// GetCapabilities writes them, or `None` for a collection written as the
+/// one layer `{id}` ([`has_child_layers`]). A `LayerNotDefined` hint names
+/// these layers (#118), so it lists no layer GetCapabilities does not.
+pub(crate) fn child_layer_names<'a>(
+    info: &'a RasterInfo,
+    composites: &'a [CompositeDef],
+) -> Option<impl Iterator<Item = &'a str>> {
+    has_child_layers(info, composites).then(|| {
+        info.parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .chain(composites.iter().map(|composite| composite.name.as_str()))
+    })
 }
 
 /// Write the `<Service>` section in WMS 1.3.0 schema order: `Name`, `Title`,
