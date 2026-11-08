@@ -62,6 +62,9 @@ struct MockOptions {
     /// While set, answer `/items` with 400, as a host refuses a request it
     /// cannot serve.
     refusing: Option<Arc<AtomicBool>>,
+    /// List only this many of the items, oldest first, so a later poll
+    /// discovers the rest once it is raised.
+    listed: Option<Arc<AtomicUsize>>,
 }
 
 /// One end of a STAC `datetime` interval, `None` where it is open (`..`).
@@ -180,6 +183,7 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         items_gate,
         host_down,
         refusing,
+        listed,
     } = options;
     let is_down = move || {
         host_down
@@ -231,6 +235,9 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
         let refuse = refusing
             .as_ref()
             .is_some_and(|refusing| refusing.load(Ordering::SeqCst));
+        let shown = listed
+            .as_ref()
+            .map_or(usize::MAX, |listed| listed.load(Ordering::SeqCst));
         async move {
             if let Some(gate) = &items_gate {
                 pass(gate).await;
@@ -258,6 +265,7 @@ async fn mock_stac_with(count: usize, options: MockOptions) -> MockStac {
             }
             let mut features: Vec<&serde_json::Value> = features
                 .iter()
+                .take(shown)
                 .filter(|(t, _)| {
                     window.is_none_or(|(start, end)| {
                         start.is_none_or(|start| start <= *t) && end.is_none_or(|end| *t <= end)
@@ -450,13 +458,34 @@ fn poll_loop_future_is_send(engine: &GeoTiffEngine) {
     assert_send(engine.poll_loop());
 }
 
+/// The fixture's grid, as `gdalinfo` gives it: `Size is 480, 360`.
+const FIXTURE_GRID: [u32; 2] = [480, 360];
+
+/// Assert that `info` describes the fixture's grid: TM35FIN, 480 x 360.
+fn assert_fixture_grid(info: &ds_core::map_engine::RasterInfo, what: &str) {
+    assert_eq!(info.native_crs, "EPSG:3067", "{what}");
+    assert_eq!(info.grid_size, Some(FIXTURE_GRID), "{what}");
+    let grid = info.native_grid.as_ref().expect("a native grid");
+    assert_eq!(
+        (grid.epsg(), grid.size()),
+        (Some(3067), FIXTURE_GRID),
+        "{what}"
+    );
+}
+
+/// #322: the first poll lists the items and preloads their headers, so the
+/// `RasterInfo` snapshot that GetCapabilities and `/collections` read has the
+/// asset's CRS and grid before any request, and reading it fetches nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn poll_preloads_new_stac_items_before_any_request() {
-    let (items_url, allowlist, times) = mock_stac(3).await;
-    let engine = stac_engine(items_url, allowlist);
+    let mock = mock_stac_with(3, MockOptions::default()).await;
+    let times = mock.times.clone();
+    let engine = stac_engine(mock.items_url.clone(), mock.allowlist.clone());
     // Startup reads the collection extent only: no items, placeholder CRS.
     assert!(engine.catalog.load().entries.is_empty());
-    assert_eq!(engine.raster_info().native_crs, "CRS:84");
+    let cold = engine.raster_info();
+    assert_eq!(cold.native_crs, "CRS:84");
+    assert_eq!((cold.grid_size, cold.native_grid), (None, None));
 
     engine.poll_cycle().await;
 
@@ -465,13 +494,92 @@ async fn poll_preloads_new_stac_items_before_any_request() {
         times,
         "every discovered item is loaded by the poll, before any request"
     );
-    // The snapshot reflects the loaded metadata with no render (#322).
+    let polled = asset_requests(&mock);
     let info = engine.raster_info();
-    assert_eq!(info.native_crs, "EPSG:3067");
-    assert!(info.grid_size.is_some());
+    assert_fixture_grid(&info, "after the first poll");
+    assert_eq!(info.times, times);
+    assert_eq!(
+        asset_requests(&mock),
+        polled,
+        "the snapshot fetches nothing"
+    );
     // A second poll discovers nothing new and has nothing to preload.
     engine.poll_cycle().await;
     assert_eq!(loaded_times(&engine), times);
+    assert_eq!(asset_requests(&mock), polled);
+}
+
+/// #322: a first poll whose header reads all fail leaves only stubs, and the
+/// next poll discovers nothing new. That poll still loads one item's header,
+/// the newest, so the snapshot gets the asset's CRS and grid without a
+/// request. A poll tries no item twice: the first one's preload had tried
+/// every item it listed. Once an item is loaded, polls load nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_poll_loads_one_header_while_no_item_has_metadata() {
+    let options = MockOptions {
+        sized: true,
+        range_fault: Some(RangeFault::Unavailable),
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(3, options).await;
+    let times = mock.times.clone();
+    let engine = stac_engine(mock.items_url.clone(), mock.allowlist.clone());
+
+    engine.poll_cycle().await;
+    assert!(loaded_times(&engine).is_empty());
+    assert_eq!(engine.raster_info().native_crs, "CRS:84");
+    assert_eq!(asset_requests(&mock), 3, "one header read per new item");
+
+    *mock.range_fault.lock().unwrap() = None;
+    engine.poll_cycle().await;
+    assert_eq!(loaded_times(&engine), [times[2]], "the newest item loads");
+    assert_eq!(asset_requests(&mock), 4, "one header read");
+    assert_fixture_grid(&engine.raster_info(), "after the poll that loaded one");
+
+    engine.poll_cycle().await;
+    assert_eq!(
+        asset_requests(&mock),
+        4,
+        "a loaded item: nothing more to load"
+    );
+}
+
+/// #322: a catalog swap that leaves no loaded entry keeps the CRS and grid
+/// the snapshot had, rather than falling back to the `CRS:84` placeholder.
+/// Here a `max_files = 1` catalog trims its one loaded item for a newer one
+/// whose header read fails. The next poll lists nothing new and loads that
+/// item's header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_swap_that_leaves_no_loaded_entry_keeps_the_known_grid() {
+    let listed = Arc::new(AtomicUsize::new(1));
+    let options = MockOptions {
+        sized: true,
+        listed: Some(Arc::clone(&listed)),
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(3, options).await;
+    let times = mock.times.clone();
+    let engine = stac_engine_with(mock.items_url.clone(), mock.allowlist.clone(), 0, Some(1));
+
+    engine.poll_cycle().await;
+    assert_eq!(loaded_times(&engine), [times[0]]);
+    assert_fixture_grid(&engine.raster_info(), "the first poll");
+
+    listed.store(3, Ordering::SeqCst);
+    *mock.range_fault.lock().unwrap() = Some(RangeFault::Unavailable);
+    engine.poll_cycle().await;
+    assert!(
+        loaded_times(&engine).is_empty(),
+        "only the new stub is left"
+    );
+    let info = engine.raster_info();
+    assert_eq!(info.times, [times[2]]);
+    assert_fixture_grid(&info, "a swap to stubs only");
+
+    *mock.range_fault.lock().unwrap() = None;
+    engine.poll_cycle().await;
+    assert_eq!(loaded_times(&engine), [times[2]]);
+    assert_fixture_grid(&engine.raster_info(), "the stub loaded");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
