@@ -353,15 +353,26 @@ impl PostgisEngine {
     }
 
     /// Requests only consult this atomic state; database validation runs on refresh.
+    ///
+    /// A collection whose tables no refresh has validated yet (the database
+    /// unreachable since boot, or the first refresh still running) is not
+    /// ready: [`DataServerError::ResourceExhausted`], a 503 with
+    /// `Retry-After: 1` in every API, logged at WARN (#1446). A confirmed
+    /// mismatch stays the 500: retrying does not fix a configuration.
     pub(crate) fn require_validated(&self) -> Result<(), DataServerError> {
         match self.schema_state.load(Ordering::Acquire) {
             SCHEMA_VALID => Ok(()),
             SCHEMA_INVALID => Err(DataServerError::Engine(
                 crate::validation::SCHEMA_ERROR.into(),
             )),
-            _ => Err(DataServerError::Engine(
-                crate::validation::PENDING_ERROR.into(),
-            )),
+            _ => {
+                tracing::warn!(
+                    collection = %self.collection_id,
+                    "postgis: {}; answering 503 until a refresh validates the tables",
+                    crate::validation::PENDING_ERROR
+                );
+                Err(DataServerError::ResourceExhausted)
+            }
         }
     }
 
@@ -594,17 +605,13 @@ impl PostgisEngine {
         };
         let mut features = Vec::with_capacity(rows.len());
         for row in &rows {
-            let event = EventRecord::decode(&self.config, shape, &key_refs, row)?;
             // A degenerate geometry (ST_X of POINT EMPTY) has no position:
             // counted, as the database counted it, but not listed.
-            let Some((lon, lat)) = event.position else {
-                continue;
-            };
-            features.push(PickedFeature {
-                id: event.id,
-                geometry: Arc::new(Geometry::Point { x: lon, y: lat }),
-                properties: event.properties,
-            });
+            if let Some(feature) =
+                EventRecord::decode(&self.config, shape, &key_refs, row)?.into_picked()
+            {
+                features.push(feature);
+            }
         }
         Ok(PickedFeatures {
             features,
@@ -766,6 +773,11 @@ impl PostgisEngine {
     }
 }
 
+/// The property a GetFeatureInfo pick of an event adds after the ones
+/// Features reports (#1446): the event's Features id, `<id>@<time>`, while
+/// the pick's own id stays the bare `id_col` value WMS clients already read.
+const PICK_FEATURE_ID: &str = "feature_id";
+
 /// One event row of `query::event_projection`'s layout (#1100, #503): what
 /// GetFeatureInfo and Features report of an event, decoded in one place.
 struct EventRecord {
@@ -825,14 +837,37 @@ impl EventRecord {
         })
     }
 
+    /// The event's key, `<id>@<time>` ([`crate::feature::EventKey`]): its
+    /// Features id.
+    fn key(&self) -> crate::feature::EventKey {
+        crate::feature::EventKey {
+            time: self.time,
+            id: self.id.clone(),
+        }
+    }
+
+    /// The event as a GetFeatureInfo pick (#1100): its id is the bare
+    /// `id_col` value, its properties [`Self::decode`]'s and then
+    /// [`PICK_FEATURE_ID`], its key, which `/items/{featureId}` reads back
+    /// (#1446). `None` for a degenerate geometry, which has no position to
+    /// list.
+    fn into_picked(self) -> Option<PickedFeature> {
+        let (x, y) = self.position?;
+        let key = self.key().to_string();
+        let mut properties = self.properties;
+        properties.push((PICK_FEATURE_ID.to_string(), PropertyValue::String(key)));
+        Some(PickedFeature {
+            id: self.id,
+            geometry: Arc::new(Geometry::Point { x, y }),
+            properties,
+        })
+    }
+
     /// The event as a Features feature (#503): its id is its key
     /// ([`crate::feature::EventKey`]), its geometry the point, or null for a
     /// degenerate one (listed and counted, as the database counted it).
     fn into_feature(self) -> Feature {
-        let key = crate::feature::EventKey {
-            time: self.time,
-            id: self.id,
-        };
+        let key = self.key();
         Feature {
             id: key.to_string(),
             geometry: Arc::new(match self.position {
@@ -1756,18 +1791,16 @@ fn run_stations_in_polygon_sync(
     let built = build_stations_in_polygon(cfg, polygon_wkt)
         .map_err(|e| DataServerError::Engine(format!("build_stations_in_polygon: {e}")))?;
     let pool = engine.pool.clone();
-    let sql = built.sql;
-    let params = built.params;
     block_on_async(async move {
         let client = pool
             .get()
             .await
             .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
-        let refs = params_as_refs(&params);
+        let refs = params_as_refs(&built.params);
         let rows = client
-            .query(&sql, &refs)
+            .query(&built.sql, &refs)
             .await
-            .map_err(|e| DataServerError::Engine(format!("stations_in_polygon failed: {e}")))?;
+            .map_err(|e| map_pg_error(e, &built))?;
 
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
@@ -1804,18 +1837,16 @@ fn resolve_nearest_station(
     let built = build_position(cfg, lon, lat, DEFAULT_POSITION_RADIUS_M)
         .map_err(|e| DataServerError::Engine(format!("build_position: {e}")))?;
     let pool = engine.pool.clone();
-    let sql = built.sql;
-    let params = built.params;
     block_on_async(async move {
         let client = pool
             .get()
             .await
             .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
-        let refs = params_as_refs(&params);
+        let refs = params_as_refs(&built.params);
         let opt = client
-            .query_opt(&sql, &refs)
+            .query_opt(&built.sql, &refs)
             .await
-            .map_err(|e| DataServerError::Engine(format!("query_position failed: {e}")))?;
+            .map_err(|e| map_pg_error(e, &built))?;
         let Some(row) = opt else {
             return Err(DataServerError::LocationNotFound(format!(
                 "no station within {DEFAULT_POSITION_RADIUS_M:.0} m of ({lon}, {lat})"
@@ -1859,15 +1890,42 @@ fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     2.0 * EARTH_RADIUS_M * a.sqrt().atan2((1.0 - a).sqrt())
 }
 
+/// The error a failed statement answers (#1446), logged at WARN with its SQL
+/// template and the database's error, neither of which reaches the client.
+/// A statement the database canceled (SQLSTATE 57014, `query_canceled`:
+/// the role's `statement_timeout`, or an operator's cancel) is
+/// [`DataServerError::DeadlineExceeded`], the answer every engine gives a
+/// read past its time budget: 503 with `Retry-After: 1`, EDR's 504. Any
+/// other database error is the opaque 500.
 pub(crate) fn map_pg_error(e: tokio_postgres::Error, q: &BuiltQuery) -> DataServerError {
+    let error = pg_error(e.code());
     // Keep the SQL template out of the client-facing message; only log it.
-    tracing::warn!(
-        sql = %q.sql,
-        n_params = q.params.len(),
-        error = %e,
-        "postgis query failed"
-    );
-    DataServerError::Engine("database query failed".into())
+    if matches!(error, DataServerError::DeadlineExceeded) {
+        tracing::warn!(
+            sql = %q.sql,
+            n_params = q.params.len(),
+            error = %e,
+            "postgis query canceled (statement timeout)"
+        );
+    } else {
+        tracing::warn!(
+            sql = %q.sql,
+            n_params = q.params.len(),
+            error = %e,
+            "postgis query failed"
+        );
+    }
+    error
+}
+
+/// [`map_pg_error`]'s answer for a database error of SQLSTATE `code`
+/// (`None` for a connection or protocol error, which has none).
+fn pg_error(code: Option<&tokio_postgres::error::SqlState>) -> DataServerError {
+    if code == Some(&tokio_postgres::error::SqlState::QUERY_CANCELED) {
+        DataServerError::DeadlineExceeded
+    } else {
+        DataServerError::Engine("database query failed".into())
+    }
 }
 
 // ─── row assembly ──────────────────────────────────────────────────────────
@@ -2362,6 +2420,55 @@ mod tests {
         assert_eq!(out.matches(',').count(), 4);
     }
 
+    /// #1446: a pick keeps the bare id and every property Features reports,
+    /// in order, and adds the event's Features id last, the string
+    /// `/items/{featureId}` reads back. An event without a position is not
+    /// listed.
+    #[test]
+    fn a_pick_adds_the_features_id_after_the_features_properties() {
+        let time: DateTime<Utc> = "2026-01-01T05:30:00.123456Z".parse().unwrap();
+        let record = |position| EventRecord {
+            time,
+            position,
+            id: "17".into(),
+            properties: vec![
+                ("time".into(), PropertyValue::String(rfc3339(time))),
+                ("peak_current".into(), PropertyValue::Float(-12.5)),
+            ],
+        };
+        let feature = record(Some((24.5, 60.25))).into_feature();
+        let picked = record(Some((24.5, 60.25)))
+            .into_picked()
+            .expect("a position");
+        assert_eq!(picked.id, "17");
+        assert_eq!(feature.id, "17@2026-01-01T05:30:00.123456Z");
+        assert_eq!(
+            picked.properties,
+            vec![
+                (
+                    "time".to_string(),
+                    PropertyValue::String("2026-01-01T05:30:00.123456Z".into())
+                ),
+                ("peak_current".to_string(), PropertyValue::Float(-12.5)),
+                (
+                    "feature_id".to_string(),
+                    PropertyValue::String(feature.id.clone())
+                ),
+            ]
+        );
+        assert_eq!(feature.properties.len(), 2, "Features is unchanged");
+        assert!(!feature.properties.contains_key("feature_id"));
+        assert_eq!(
+            crate::feature::EventKey::parse(&feature.id).map(|k| k.to_string()),
+            Some(feature.id.clone())
+        );
+        assert!(matches!(
+            *picked.geometry,
+            Geometry::Point { x, y } if (x, y) == (24.5, 60.25)
+        ));
+        assert!(record(None).into_picked().is_none());
+    }
+
     /// #1100: a pick's region is one polygon of the 13 pixels a strike's
     /// disc reaches the picked pixel from, two across the antimeridian (its
     /// copy a turn back), and a strike's `type` follows the documented cloud
@@ -2646,10 +2753,93 @@ mod tests {
         assert_eq!(EventIdBind::of(&Type::NUMERIC, "17"), None);
     }
 
+    /// #1446: a statement the database canceled for its `statement_timeout`
+    /// (SQLSTATE 57014) is the deadline every engine answers a read past its
+    /// budget with, and a request before the first refresh validated the
+    /// tables is "not ready": both 503s that ask for a retry (EDR answers a
+    /// deadline 504), never the opaque 500 they were. Any other database
+    /// error, and a confirmed schema mismatch, stay the 500. The APIs answer
+    /// by class (`api-features/tests/engine_errors_tests.rs`,
+    /// `api-edr/tests/openapi_tests.rs`).
+    #[test]
+    fn statement_timeout_and_pending_validation_are_503s() {
+        use ds_core::error::ErrorClass;
+        use ds_core::feature::FeatureQuery;
+        use ds_core::feature_engine::FeatureEngine;
+        use tokio_postgres::error::SqlState;
+
+        let timeout = pg_error(Some(&SqlState::QUERY_CANCELED));
+        assert!(matches!(timeout, DataServerError::DeadlineExceeded));
+        assert_eq!(timeout.class(), ErrorClass::DeadlineExceeded);
+        assert_eq!(timeout.class().status_code(), 503);
+        assert!(timeout.class().is_transient());
+        for code in [
+            Some(&SqlState::UNDEFINED_COLUMN),
+            Some(&SqlState::INSUFFICIENT_PRIVILEGE),
+            None,
+        ] {
+            let error = pg_error(code);
+            assert!(
+                matches!(error, DataServerError::Engine(ref m) if m == "database query failed"),
+                "{code:?}: {error:?}"
+            );
+            assert_eq!(error.class(), ErrorClass::Internal);
+        }
+
+        // This pool reaches no database: every answer below comes before one.
+        let not_ready = |error: DataServerError| {
+            assert!(
+                matches!(error, DataServerError::ResourceExhausted),
+                "{error:?}"
+            );
+            assert_eq!(error.class(), ErrorClass::Busy);
+            assert_eq!(error.class().status_code(), 503);
+        };
+        let events = engine_with(events_engine_config());
+        let polygon = "POLYGON((20 60,21 60,21 61,20 61,20 60))";
+        let (start, end): (DateTime<Utc>, DateTime<Utc>) = (
+            "2026-01-01T05:00:00Z".parse().unwrap(),
+            "2026-01-01T06:00:00Z".parse().unwrap(),
+        );
+        let window = Some((start, end));
+        not_ready(
+            events
+                .query_area(polygon, window, None, None, None)
+                .unwrap_err(),
+        );
+        not_ready(events.get_features(&FeatureQuery::default()).unwrap_err());
+        not_ready(
+            ds_core::events::EventSource::recent_events(&events, start, end, 10).unwrap_err(),
+        );
+        let mut stations = events_engine_config();
+        stations.location_source = crate::schema::LocationSource::Stations(dummy_stations());
+        stations.observations = dummy_long_obs();
+        let stations = engine_with(stations);
+        not_ready(
+            stations
+                .query_location("a", window, None, None, None)
+                .unwrap_err(),
+        );
+        not_ready(
+            stations
+                .query_area(polygon, window, None, None, None)
+                .unwrap_err(),
+        );
+
+        // A confirmed mismatch is a configuration to fix, not a retry.
+        stations
+            .schema_state
+            .store(SCHEMA_INVALID, Ordering::Release);
+        let invalid = stations
+            .query_location("a", window, None, None, None)
+            .unwrap_err();
+        assert_eq!(invalid.class(), ErrorClass::Internal, "{invalid:?}");
+    }
+
     /// #503: what the events Features surface turns down before it reads: a
     /// cursor it did not write, an offset, a sort or a filter are 400s, an
     /// id that is no event key a 404. Then, before the schema is validated,
-    /// a well-formed request is the pending error; this pool reaches no
+    /// a well-formed request is the pending 503; this pool reaches no
     /// database, so none of these touched one.
     #[test]
     fn events_features_reject_before_reading() {
@@ -2708,7 +2898,7 @@ mod tests {
             );
         }
 
-        let pending = |err: DataServerError| matches!(err, DataServerError::Engine(ref m) if m == crate::validation::PENDING_ERROR);
+        let pending = |err: DataServerError| matches!(err, DataServerError::ResourceExhausted);
         assert!(pending(
             engine.get_features(&FeatureQuery::default()).unwrap_err()
         ));
