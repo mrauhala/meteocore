@@ -41,6 +41,16 @@ injection risk.**
   that axis), `OperationNotSupported`, and for GetFeatureInfo
   `LayerNotQueryable` and `InvalidPoint`. `MissingParameterValue` /
   `InvalidParameterValue` are for what the table does not cover.
+- `LayerNotDefined` hints (#118): build the error with
+  `handlers::layer_not_defined`, never `WmsError::layer_not_found` alone,
+  wherever a request names a layer (GetMap and GetFeatureInfo `LAYERS`,
+  GetLegendGraphic `LAYER`; `QUERY_LAYERS` has its own, against `LAYERS`).
+  Two rules only: the first `:` as `/` when GetCapabilities names that
+  layer ("Did you mean"), else the layers of the collection the name
+  spells out, sorted and capped at `HINT_LAYER_LIMIT` (20). Never match by
+  similarity (a probe oracle), and list only what
+  `capabilities::child_layer_names` gives, the names GetCapabilities
+  writes. The hint is text through the report writer's escaping.
 - A `LAYERS` list is checked name by name before `LAYER_LIMIT` (5)
   refuses more: `resolve_map_layer` runs on every `(layer, style)` pair
   (`GetMapParams::layers`), so an undefined one is `LayerNotDefined` /

@@ -304,7 +304,7 @@ async fn the_speed_is_a_layer_and_the_direction_is_not() {
     let body = String::from_utf8_lossy(&body);
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(
-        body.contains("LayerNotDefined") && body.contains("Available: u, v, ws"),
+        body.contains("LayerNotDefined") && body.contains(": uv/u, uv/v, uv/ws."),
         "{body}"
     );
 }

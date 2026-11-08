@@ -403,6 +403,14 @@ A request error is a WMS 1.3.0 `ServiceExceptionReport` served as
 | `InvalidParameterValue` | Any other invalid value: `VERSION`, size, `BBOX`, `STYLES` count, `TRANSPARENT`, `BGCOLOR`, `QUALITY`, `FEATURE_COUNT`, more than five layers |
 | `OperationNotSupported` | An unknown `REQUEST` |
 
+A `LayerNotDefined` message carries a hint when the name is close to a
+layer by a fixed rule. A name whose first `:` as `/` is a layer, such as
+`radar:rr` for `radar/rr`, gets "Did you mean 'radar/rr'? Layer names use
+'/' between collection and parameter." Otherwise a name `collection/…` or
+`collection:…` of a served collection lists that collection's layers,
+sorted, the first 20 and how many more. Both hints name only layers
+GetCapabilities lists, and nothing is matched by similarity.
+
 An internal error is HTTP 500 with code `Internal` and a generic message.
 An overloaded or timed-out request is HTTP 503 with code `Internal`,
 "Server busy, try again later" and `Retry-After: 1`. A request whose object
