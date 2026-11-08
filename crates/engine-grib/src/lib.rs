@@ -1447,7 +1447,8 @@ impl GribEngine {
     /// decoded-grid cache; [`GridFill::Bypass`] uses a resident grid or
     /// waits for a fill already in flight, else reads the field without
     /// inserting it (#1297). Both fill the compressed-message cache when it
-    /// is enabled.
+    /// is enabled. Either waits for another reader's fill no longer than the
+    /// request's deadline (#1399).
     fn fetch_grid_by_entry(
         &self,
         grib_url: &str,
@@ -1463,9 +1464,13 @@ impl GribEngine {
             .map(Arc::new)
         };
         let grid = match (&self.source.grid_cache, fill) {
-            (Some(cache), GridFill::Insert) => {
-                cache.get_or_insert_with(grib_url, entry.offset, load)?
-            }
+            (Some(cache), GridFill::Insert) => cache.get_or_insert_until(
+                grib_url,
+                entry.offset,
+                ds_core::deadline::current(),
+                load,
+                || DataServerError::DeadlineExceeded,
+            )?,
             (Some(cache), GridFill::Bypass) => {
                 // Wait for another reader's fill no longer than the query.
                 let wait = ds_core::deadline::current()

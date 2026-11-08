@@ -344,7 +344,11 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   `get_or_join`, which reads a resident value or joins a fill in flight
   without ever inserting: a reader that must not evict, #1297); call
   sites keep their key type, weight fn, `MC_*_CACHE_MB` env var name and
-  defaults. Don't hand-roll a `quick_cache` byte-weighted cache — before
+  defaults. A request-path fill that does I/O, which another request may
+  be waiting on, goes through `get_or_insert_with_until(key,
+  ds_core::deadline::current(), ..)`: the wait ends at the request
+  deadline with `DeadlineExceeded` and no fill starts past it (#1399).
+  Don't hand-roll a `quick_cache` byte-weighted cache — before
   extraction the same ~40 lines were copy-pasted 12×. In `server/src/
   admin.rs`, a global cache's `/metrics` family is one `CacheMetricSet`
   static + one `update()` call in `metrics_handler`. The budget is split

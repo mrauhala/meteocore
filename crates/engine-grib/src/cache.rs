@@ -883,6 +883,27 @@ impl GridCache {
         self.cache.get_or_insert_with(&key, load)
     }
 
+    /// [`Self::get_or_insert_with`] for a reader with a deadline (#1399):
+    /// another reader's fill of the message is waited on until `deadline`,
+    /// then `expired()`, and that fill lands for the readers after it. No
+    /// fill starts past the deadline. `None` waits as long as the fill
+    /// takes ([`ByteBoundedCache::get_or_insert_with_until`]).
+    pub fn get_or_insert_until<E>(
+        &self,
+        url: &str,
+        offset: u64,
+        deadline: Option<std::time::Instant>,
+        load: impl FnOnce() -> Result<Arc<DecodedGrid>, E>,
+        expired: impl FnOnce() -> E,
+    ) -> Result<Arc<DecodedGrid>, E> {
+        let key = GridKey {
+            url: Arc::from(url),
+            offset,
+        };
+        self.cache
+            .get_or_insert_with_until(&key, deadline, load, expired)
+    }
+
     /// Insert a decoded grid into the cache.
     pub fn insert(&self, url: &str, offset: u64, grid: Arc<DecodedGrid>) {
         let key = GridKey {

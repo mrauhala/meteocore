@@ -363,3 +363,75 @@ fn the_plan_bypasses_only_a_window_the_cache_cannot_hold() {
         );
     }
 }
+
+/// #1399: a reader waiting for another's fill of a decoded grid, as every
+/// map and every query whose window fits the cache does, waits no longer
+/// than its deadline, and the fill lands for the next reader. Without a
+/// deadline the waiter gets the filled grid.
+#[test]
+fn a_wait_for_another_grid_fill_ends_at_the_deadline() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let source = fixture();
+    let engine = view(&source, small_cache());
+    let catalog = engine.catalog();
+    let file = catalog.latest_run().unwrap().steps.values().next().unwrap();
+    let entry = file.messages.iter().find(|m| m.param == "TMP").unwrap();
+    let url = file.message_url(entry);
+    let read = |deadline: Option<Instant>| {
+        let _deadline = ds_core::deadline::enter(deadline);
+        engine.fetch_grid_by_entry(url, entry, GridFill::Insert)
+    };
+    let grid = read(None).unwrap();
+    // Another reader's fill of the grid, held until released.
+    let fill = |release: mpsc::Receiver<()>, started: mpsc::Sender<()>| {
+        cache(&engine).get_or_insert_with(url, entry.offset, || {
+            started.send(()).unwrap();
+            release.recv().unwrap();
+            Ok::<_, DataServerError>(grid.clone())
+        })
+    };
+
+    cache(&engine).clear();
+    std::thread::scope(|scope| {
+        let (release_tx, release_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let filler = scope.spawn(|| fill(release_rx, started_tx));
+        started_rx.recv().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        scope.spawn(move || {
+            let start = Instant::now();
+            let read = read(Some(start + Duration::from_millis(200)));
+            done_tx.send((read, start.elapsed())).unwrap();
+        });
+        let waited = done_rx.recv_timeout(Duration::from_secs(3));
+        release_tx.send(()).unwrap();
+        let (read, elapsed) = waited.expect("the reader waited past its deadline");
+        assert!(
+            matches!(read, Err(DataServerError::DeadlineExceeded)),
+            "{:?}",
+            read.err()
+        );
+        assert!(elapsed >= Duration::from_millis(200), "{elapsed:?}");
+        assert!(filler.join().unwrap().is_ok());
+    });
+    assert!(Arc::ptr_eq(&read(None).unwrap(), &grid), "the fill landed");
+
+    cache(&engine).clear();
+    std::thread::scope(|scope| {
+        let (release_tx, release_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let filler = scope.spawn(|| fill(release_rx, started_tx));
+        started_rx.recv().unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        scope.spawn(move || done_tx.send(read(None)).unwrap());
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "without a deadline the reader waits for the fill"
+        );
+        release_tx.send(()).unwrap();
+        let waited = done_rx.recv().unwrap().expect("the filled grid");
+        assert!(Arc::ptr_eq(&waited, &grid));
+        assert!(filler.join().unwrap().is_ok());
+    });
+}

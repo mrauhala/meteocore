@@ -959,6 +959,50 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         }
     }
 
+    /// [`Self::get_or_insert_with`] for a caller with a deadline, such as a
+    /// request (#1399): another caller's fill is waited on until `deadline`,
+    /// then `expired()` is returned and that fill runs on for the callers
+    /// after it. Nor is a fill claimed at or past `deadline`, one a failed
+    /// owner hands over included: `expired()`, and the claim goes to the
+    /// next caller. A resident value is returned whatever the time.
+    /// `deadline: None` is [`Self::get_or_insert_with`], an unbounded wait.
+    ///
+    /// The deadline bounds the wait, not `with`: the caller bounds its own
+    /// I/O and compute. Counts as [`Self::get_or_insert_with`] does; an
+    /// expiry counts nothing.
+    pub fn get_or_insert_with_until<Q, E>(
+        &self,
+        key: &Q,
+        deadline: Option<std::time::Instant>,
+        with: impl FnOnce() -> Result<V, E>,
+        expired: impl FnOnce() -> E,
+    ) -> Result<V, E>
+    where
+        Q: Hash + Equivalent<K> + ToOwned<Owned = K> + ?Sized,
+    {
+        let Some(deadline) = deadline else {
+            return self.get_or_insert_with(key, with);
+        };
+        let wait = deadline.saturating_duration_since(std::time::Instant::now());
+        match self.inner.cache.get_value_or_guard(key, Some(wait)) {
+            quick_cache::sync::GuardResult::Value(value) => {
+                self.record_hit();
+                Ok(value)
+            }
+            quick_cache::sync::GuardResult::Guard(claim) => {
+                if std::time::Instant::now() >= deadline {
+                    drop(claim);
+                    return Err(expired());
+                }
+                self.inner.miss(key);
+                let value = with()?;
+                self.inner.fill(key, claim, value.clone());
+                Ok(value)
+            }
+            quick_cache::sync::GuardResult::Timeout => Err(expired()),
+        }
+    }
+
     /// Look up a value or claim its single-flight fill without counting a hit
     /// or miss. A zero timeout probes without waiting for an existing owner.
     ///
@@ -1698,6 +1742,95 @@ mod tests {
         assert_eq!(cache.stats(), (1, 2));
         assert_eq!(cache.churn().bypasses, 1);
         assert!(!cache.contains_key(&format!("{:?}", Err::<Vec<u8>, _>("offline"))));
+    }
+
+    /// A caller with a deadline waits for another caller's fill until the
+    /// deadline, and the fill runs on for the next caller; with no deadline
+    /// it waits for the fill's value (#1399).
+    #[test]
+    fn a_wait_for_another_fill_ends_at_the_deadline() {
+        use std::{
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        let key = "slow".to_string();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        std::thread::scope(|scope| {
+            let (cache, key) = (&cache, &key);
+            let owner = scope.spawn(move || {
+                cache.get_or_insert_with(key, || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok::<_, &str>(vec![42])
+                })
+            });
+            started_rx.recv().unwrap();
+            let wait = |deadline: Option<Instant>| {
+                let start = Instant::now();
+                let value = cache.get_or_insert_with_until(
+                    key,
+                    deadline,
+                    || Err("a waiter must not fill"),
+                    || "expired",
+                );
+                (value, start.elapsed())
+            };
+            let (bounded_tx, bounded_rx) = mpsc::channel();
+            scope.spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(100);
+                bounded_tx.send(wait(Some(deadline))).unwrap();
+            });
+            let bounded = bounded_rx.recv_timeout(Duration::from_secs(2));
+            // Without a deadline the wait lasts as long as the fill does.
+            let (joiner_tx, joiner_rx) = mpsc::channel();
+            scope.spawn(move || joiner_tx.send(wait(None)).unwrap());
+            let early = joiner_rx.recv_timeout(Duration::from_millis(50));
+            release_tx.send(()).unwrap();
+            let (value, waited) = bounded.expect("the waiter outlasted its deadline");
+            assert_eq!(value, Err("expired"));
+            assert!(waited >= Duration::from_millis(100), "{waited:?}");
+            assert!(early.is_err(), "the joiner returned before the fill");
+            assert_eq!(owner.join().unwrap(), Ok(vec![42]));
+            assert_eq!(joiner_rx.recv().unwrap().0, Ok(vec![42]));
+        });
+        // The fill still landed: the next caller, past its deadline, hits.
+        let past = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            cache.get_or_insert_with_until(&key, Some(past), || Err("resident"), || "expired"),
+            Ok(vec![42])
+        );
+        // The owner's miss, the joiner's and the late caller's hits; the
+        // expiry counts nothing.
+        assert_eq!(cache.stats(), (2, 1));
+    }
+
+    /// Past its deadline a caller claims no fill, and leaves the key free
+    /// for the next one; within it, it fills as `get_or_insert_with` does.
+    #[test]
+    fn no_fill_is_claimed_past_the_deadline() {
+        use std::time::{Duration, Instant};
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        let key = "cold".to_string();
+        let past = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            cache.get_or_insert_with_until(
+                &key,
+                Some(past),
+                || Ok::<_, &str>(vec![1]),
+                || "expired"
+            ),
+            Err("expired")
+        );
+        assert!(!cache.contains_key(&key));
+        assert_eq!(cache.stats(), (0, 0));
+        let soon = Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            cache.get_or_insert_with_until(&key, Some(soon), || Ok(vec![2]), || "expired"),
+            Ok(vec![2])
+        );
+        assert_eq!(cache.get(&key), Some(vec![2]));
     }
 
     #[test]
