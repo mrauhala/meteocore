@@ -1794,12 +1794,13 @@ mod tests {
                 && message.contains("fewer pressure levels (z)"),
             "each level a read of its own: {message}"
         );
-        // `z` in request order, each once; a level the collection lacks is
-        // dropped, and none of them is a 400.
+        // `z` in the axis's order, bottom first, each once, whatever the
+        // list's (#1434); a level the collection lacks is dropped, and none
+        // of them is a 400.
         let z = [500.0, 1000.0, 500.0, 600.0];
         let some = NetcdfEngine::select(&catalog, None, None, None, Some(&z), true).unwrap();
-        assert_eq!(some.levels, [2, 0]);
-        assert_eq!(some.vertical().map(|z| z.values), Some(vec![500.0, 1000.0]));
+        assert_eq!(some.levels, [0, 2]);
+        assert_eq!(some.vertical().map(|z| z.values), Some(vec![1000.0, 500.0]));
         let decodes = engine.field_decodes();
         ask(Some(&z), bytes(2 * 2 * 2 * FIXTURE_FIELD)).unwrap();
         assert_eq!(engine.field_decodes() - decodes, 8);

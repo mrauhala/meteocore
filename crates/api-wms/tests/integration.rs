@@ -6129,7 +6129,8 @@ mod composites {
         let unknown = get(&app, &get_map("sat/nope", "CRS:84", "0,40,10,50", "")).await;
         assert_eq!(unknown.status, StatusCode::BAD_REQUEST);
         let body = String::from_utf8(unknown.body.to_vec()).unwrap();
-        assert!(body.contains("Available: a, b, rgb"), "{body}");
+        // The layers GetCapabilities names, composites among them (#118).
+        assert!(body.contains(": sat/a, sat/b, sat/rgb."), "{body}");
 
         // The bands' own layers still render with their styles.
         let band = get(

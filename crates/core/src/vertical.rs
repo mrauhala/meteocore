@@ -150,8 +150,38 @@ impl VerticalKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VerticalDimension {
     pub kind: VerticalKind,
-    /// Available level values, in the engine's natural order.
+    /// Available level values, monotonic, in the order the engine answers
+    /// without `z`: bottom first on pressure and model levels (GRIB,
+    /// NetCDF), lowest first on radar elevation angles (ODIM PVOL). A `z`
+    /// list is put in this order ([`in_axis_order`]).
     pub levels: Vec<f64>,
+}
+
+/// `requested` levels in the order `axis` runs, each once (#1434).
+///
+/// CoverageJSON 1.0 §9.6.1.1 makes an axis's values monotonic, and an EDR
+/// `z` list (`z=500,1000,850`, a repeat, or the levels `Rn/min/step`
+/// expands to) may name its levels in any order. Sorted the way the
+/// collection lists its levels, descending when `axis` ends below where it
+/// starts (a bottom-first pressure axis) and ascending otherwise (radar
+/// elevation angles, or an axis of fewer than two levels), a listed subset
+/// reads in the same order as the answer without `z`. Nothing is matched
+/// here: a value `axis` lacks stays, for the engine to drop
+/// (`/req/edr/z-response` B, #969).
+///
+/// api-edr orders every `z` list with it before an engine sees one, and an
+/// engine matching a list against its own levels orders it the same way
+/// first, so the engine answers the same whoever calls it.
+pub fn in_axis_order(requested: &[f64], axis: &[f64]) -> Vec<f64> {
+    let mut levels = requested.to_vec();
+    levels.sort_by(f64::total_cmp);
+    levels.dedup();
+    let descending =
+        matches!((axis.first(), axis.last()), (Some(first), Some(last)) if last < first);
+    if descending {
+        levels.reverse();
+    }
+    levels
 }
 
 impl VerticalDimension {
@@ -176,5 +206,37 @@ impl VerticalDimension {
         let mut iter = self.levels.iter().copied();
         let first = iter.next()?;
         Some(iter.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1434: a list follows the axis's direction, bottom first on a
+    /// pressure axis and lowest first on elevation angles, each level once;
+    /// a level the axis lacks stays for the engine to drop.
+    #[test]
+    fn in_axis_order_follows_the_axis_and_drops_repeats() {
+        let pressure = [1000.0, 850.0, 500.0];
+        assert_eq!(
+            in_axis_order(&[500.0, 1000.0, 850.0], &pressure),
+            [1000.0, 850.0, 500.0]
+        );
+        assert_eq!(
+            in_axis_order(&[850.0, 925.0, 850.0], &pressure),
+            [925.0, 850.0]
+        );
+        let angles = [0.3, 0.7, 1.5];
+        assert_eq!(
+            in_axis_order(&[1.5, 0.3, 0.7, 0.3], &angles),
+            [0.3, 0.7, 1.5]
+        );
+        // `-0.0` and `0.0` are one level, as `==` matches them.
+        assert_eq!(in_axis_order(&[0.0, -0.0, 0.5], &angles).len(), 2);
+        // Without a direction to follow, ascending.
+        for axis in [&[][..], &[850.0]] {
+            assert_eq!(in_axis_order(&[850.0, 500.0], axis), [500.0, 850.0]);
+        }
     }
 }

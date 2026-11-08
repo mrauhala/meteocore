@@ -720,8 +720,9 @@ fn a_series_at_every_level_is_one_request_per_variable_and_step() {
 
 /// `z` of two levels far apart (1000 and 500 hPa, stored 12 and 7) is one
 /// hyperslab over the stored levels between them, at a point, each level
-/// answering its own values in the order `z` names them; the other order
-/// reads the same hyperslabs, from the chunk cache. Over a window too wide
+/// answering its own values in the axis order, bottom first, whichever
+/// order `z` names them in (#1434); the other order reads the same
+/// hyperslabs, from the chunk cache. Over a window too wide
 /// for the levels between to be cheap, the two levels are read one by one,
 /// each its own window.
 #[test]
@@ -736,8 +737,8 @@ fn levels_far_apart_are_read_together_while_the_window_is_small() {
         assert_eq!(through_dap, ask(&local), "z {z:?}");
         for (_, ranges) in through_dap.unwrap() {
             let values = &ranges["air_temperature_pl"].1;
-            let at_1000 = values[z.iter().position(|&l| l == 1000.0).unwrap()].unwrap();
-            let at_500 = values[z.iter().position(|&l| l == 500.0).unwrap()].unwrap();
+            // Bottom first: 1000 hPa, then 500 hPa.
+            let (at_1000, at_500) = (values[0].unwrap(), values[1].unwrap());
             assert!(
                 ((at_500 - at_1000) - 25.0).abs() < 1e-3,
                 "0.05 K per hPa: {values:?}"

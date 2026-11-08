@@ -93,8 +93,10 @@ curvilinear grids placed by 2-D latitude/longitude (#1174).
   bytes and GetFeatureInfo's reported level). Exact, as GRIB, though WMS
   capabilities say `nearestValue="1"` on every `ELEVATION` dimension (a
   radar volume does draw the nearest sweep).
-- **EDR levels:** `Layout::query_levels(z)`: `z`'s levels kept in request
-  order, each once, a missing one dropped, none ⇒ 400; without `z`, every
+- **EDR levels:** `Layout::query_levels(z)`: `z`'s levels kept in the
+  axis's order, bottom first, each once, whatever the list's order
+  (`ds_core::vertical::in_axis_order`, #1434: a CoverageJSON axis is
+  monotonic), a missing one dropped, none ⇒ 400; without `z`, every
   level (clause F, as GRIB). Responses: one level ⇒ `PointSeries` with a
   one-value `z`; several ⇒ a `VerticalProfile` per step; area ⇒ a `z` axis
   even for one (`[t, z, y, x]`).

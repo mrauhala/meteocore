@@ -495,17 +495,18 @@ mod tests {
                     panic!()
                 };
                 assert_eq!((*x, *y), (point as f64, 1.0 - point as f64));
-                assert_eq!(z.values, [500.0, 850.0]);
+                // Bottom first, whatever the list's order (#1434).
+                assert_eq!(z.values, [850.0, 500.0]);
                 let range = &profile.ranges["TMP"];
                 assert_eq!(range.shape, [2]);
                 assert_eq!(range.axis_names, ["z"]);
                 let offset = point as f64 * 6.0;
+                assert!((range.values[0].unwrap() - (6.85 + step as f64 + offset)).abs() < 1e-9);
                 if step == 0 {
-                    assert!((range.values[0].unwrap() - (-23.15 + offset)).abs() < 1e-9);
+                    assert!((range.values[1].unwrap() - (-23.15 + offset)).abs() < 1e-9);
                 } else {
-                    assert_eq!(range.values[0], None);
+                    assert_eq!(range.values[1], None);
                 }
-                assert!((range.values[1].unwrap() - (6.85 + step as f64 + offset)).abs() < 1e-9);
             }
         }
     }

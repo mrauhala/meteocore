@@ -368,8 +368,9 @@ pub struct TrajectoryAxes<'a> {
     /// The collection's (or selected run's) vertical levels; `None` without
     /// a vertical axis, when a Z coordinate and `z` are ignored.
     pub vertical: Option<&'a VerticalDimension>,
-    /// The request's `z` levels, already validated by the engine; `None`
-    /// selects every level of `vertical`. Never set with a Z path.
+    /// The request's `z` levels, already validated by the engine and in
+    /// `vertical`'s order (#1434); `None` selects every level of
+    /// `vertical`. Never set with a Z path.
     pub z: Option<&'a [f64]>,
 }
 
@@ -513,10 +514,12 @@ impl TrajectoryPlan {
                 )]
             }
             Some(vertical) => {
-                // One coverage per distinct level, in request order. `z` is
-                // an uncapped request list and the budgets below come after
-                // this, so dedup in O(n): `+ 0.0` folds -0.0 into 0.0 so the
-                // key agrees with `==` (non-finite levels never get here).
+                // One coverage per distinct level, in the order `z` comes:
+                // the engine's selected levels, in its axis's order
+                // (`vertical::in_axis_order`, #1434). `z` may be an uncapped
+                // list and the budgets below come after this, so dedup in
+                // O(n): `+ 0.0` folds -0.0 into 0.0 so the key agrees with
+                // `==` (non-finite levels never get here).
                 let mut levels: Vec<f64> = Vec::new();
                 let mut seen = std::collections::HashSet::new();
                 for &l in axes.z.unwrap_or(&vertical.levels) {
