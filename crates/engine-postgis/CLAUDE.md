@@ -408,8 +408,13 @@ in step when changing this lifecycle.
   alias in any new ordered events statement.
 - The feature id and the cursor are the same string, `EventKey`:
   `<id>@<time>`, RFC 3339 UTC `AutoSi`, so a microsecond time round-trips
-  exactly; parsed at the last `@`. An unparseable id is a 404 and an
-  unparseable cursor a 400, both before any query.
+  exactly; parsed at the last `@`. **One event, one id:** `EventKey::parse`
+  takes only the string `Display` writes back (no `+02:00` or `.000Z`
+  time) and no NUL, which no PostgreSQL text bind holds (it was a 22021
+  database error, a 500). An integer id is bound only in its own form
+  (`017`, `+17` are no `bigint` id), and `event_feature` 404s a row whose
+  id is not the one asked for (a padded `char(n)`). A rejected id is a 404
+  and a rejected cursor a 400, both before any query.
 - **`/items/{featureId}` is a primary-key lookup, never a scan**
   (`run_event_by_key_sync`). It prepares `time = $1 AND id = $2` on the
   bare id column, so PostgreSQL types `$2` as the column, and binds the id
@@ -426,7 +431,10 @@ in step when changing this lifecycle.
 - `bbox` is `&&` against `ST_MakeEnvelope` binds, edges included; west >
   east is two envelopes split at ±180. Without `datetime`,
   `events_default_range`, the one home of the window EDR's area query
-  uses too.
+  uses too. `default_datetime(now)` names that window for api-features,
+  which passes it explicitly on every page of a chain: the engine's own
+  fallback slides with the clock, and a chain that relied on it lost its
+  oldest events (#503 review). Keep both on `events_default_range_at`.
 - `number_items` is `None` (no table count; `feature_count` is the cached
   stations, `0`), `temporal_extent` the snapshot's, `filterables` and
   `sortables` empty. EDR `items` is not wired for events (`admin.rs`
@@ -472,6 +480,8 @@ in step when changing this lifecycle.
   as a 404, and the by-id statement's plan an `Index Cond` on the
   primary key. `events_feature_by_a_uuid_key` (`mc503_uuid`): the text
   fallback for an id type with no bind of its own.
+  `events_features_default_window_chain` (`mc503_chain`): a chain on the
+  named default window, events inserted between pages, each visited once.
 - The timing test prints both paths by stations × steps on a TimescaleDB
   hypertable, each path's time to the value-budget 400 for a week over
   20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It

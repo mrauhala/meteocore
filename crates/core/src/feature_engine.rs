@@ -71,6 +71,21 @@ pub trait FeatureEngine: Send + Sync {
         false
     }
 
+    /// The interval `/items` reads when a request has no `datetime`, for an
+    /// engine whose features are then the window ending `now` (engine-postgis
+    /// `events`, its `default_datetime`, #503). The API layer resolves it
+    /// once per request and passes it as [`FeatureQuery::datetime`], and the
+    /// request's `next` and `prev` links carry it as an explicit `datetime`,
+    /// so every page of a chain reads one fixed interval. Recomputed per
+    /// page, the window would slide, and newest first its lower edge would
+    /// cut off the oldest features the chain still had to reach. `None`
+    /// (the default): no such window, and a query without `datetime` is
+    /// answered as before.
+    fn default_datetime(&self, now: DateTime<Utc>) -> Option<DatetimeInterval> {
+        let _ = now;
+        None
+    }
+
     /// Feature properties this engine can sort on, in the order they should be
     /// advertised. Empty (the default) means sorting is not supported and the
     /// API layer rejects `sortby` with a 400.

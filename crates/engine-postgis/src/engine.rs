@@ -702,8 +702,9 @@ impl PostgisEngine {
 
     /// Features `/items/{featureId}` on the events shape (#503): the event of
     /// the id's `(time, id)` key, a primary-key lookup
-    /// ([`run_event_by_key_sync`]). An id that is no event key, or whose id
-    /// part the id column's type cannot hold, is not found, without a query.
+    /// ([`run_event_by_key_sync`]). An id that is no event key as this engine
+    /// writes it ([`crate::feature::EventKey::parse`]), or whose id part the
+    /// id column's type cannot hold, is not found, without a query.
     pub(crate) fn event_feature(
         &self,
         shape: &EventsShape,
@@ -731,13 +732,29 @@ impl PostgisEngine {
             self.check_geometry_row(row)?;
         }
         let row = rows.first().ok_or_else(not_found)?;
-        Ok(EventRecord::decode(&self.config, shape, &key_refs, row)?.into_feature())
+        let feature = EventRecord::decode(&self.config, shape, &key_refs, row)?.into_feature();
+        // One event, one id: an id the column only compares equal to (a
+        // padded `char(n)`) names no feature, as a non-canonical time does.
+        if feature.id != feature_id {
+            return Err(not_found());
+        }
+        Ok(feature)
     }
 
     /// The window an events query without `datetime` reads: the configured
     /// `default_datetime` ending now, both ends included. One home for EDR's
     /// area query and Features (#503), so they cannot drift.
     fn events_default_range(&self) -> (DateTime<Utc>, DateTime<Utc>) {
+        self.events_default_range_at(Utc::now())
+    }
+
+    /// [`Self::events_default_range`] ending at `now`: what
+    /// `FeatureEngine::default_datetime` names for the Features API to fix
+    /// one interval for a whole `next` chain (#503).
+    pub(crate) fn events_default_range_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> (DateTime<Utc>, DateTime<Utc>) {
         // `events_default_window` is always Some for an events config
         // (resolve sets it unconditionally); the fallback shares the
         // resolve-time constant.
@@ -745,7 +762,6 @@ impl PostgisEngine {
             .config
             .events_default_window
             .unwrap_or_else(|| chrono::Duration::hours(crate::config::DEFAULT_EVENTS_WINDOW_HOURS));
-        let now = Utc::now();
         (now - window, now)
     }
 }
@@ -1648,6 +1664,7 @@ fn run_single_query_sync(pool: &Pool, built: BuiltQuery) -> Result<Vec<Row>, Dat
 }
 
 /// An event key's id bound in its column's type (#503).
+#[derive(Debug, PartialEq)]
 enum EventIdBind {
     I64(i64),
     I32(i32),
@@ -1657,13 +1674,18 @@ enum EventIdBind {
 
 impl EventIdBind {
     /// `id` in the type PostgreSQL gave `$2` (the id column's); `None` for a
-    /// type this engine binds as text instead.
+    /// type this engine binds as text instead. An integer is taken only in
+    /// the form the column writes it (`17`, never `017` or `+17`), so one
+    /// event has one id; `Some(None)` is an id no row of the column has.
     fn of(ty: &tokio_postgres::types::Type, id: &str) -> Option<Option<Self>> {
         use tokio_postgres::types::Type;
+        fn canonical<T: std::str::FromStr + ToString>(id: &str) -> Option<T> {
+            id.parse::<T>().ok().filter(|v| v.to_string() == id)
+        }
         Some(match *ty {
-            Type::INT8 => id.parse().ok().map(Self::I64),
-            Type::INT4 => id.parse().ok().map(Self::I32),
-            Type::INT2 => id.parse().ok().map(Self::I16),
+            Type::INT8 => canonical(id).map(Self::I64),
+            Type::INT4 => canonical(id).map(Self::I32),
+            Type::INT2 => canonical(id).map(Self::I16),
             Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => {
                 Some(Self::Text(id.to_string()))
             }
@@ -2569,6 +2591,15 @@ mod tests {
         assert!(events.sortables().is_empty());
         assert_eq!(events.summary_properties(), ["time"]);
         assert!(events.items_description().is_some());
+        // The window a chain without `datetime` reads, named for the API.
+        let now: DateTime<Utc> = "2026-01-01T06:00:00Z".parse().unwrap();
+        assert_eq!(
+            events.default_datetime(now),
+            Some(ds_core::feature::DatetimeInterval {
+                start: Some("2026-01-01T05:00:00Z".parse().unwrap()),
+                end: Some(now),
+            })
+        );
 
         let mut stations = events_engine_config();
         stations.location_source = crate::schema::LocationSource::Stations(dummy_stations());
@@ -2583,6 +2614,36 @@ mod tests {
         assert_eq!(FeatureEngine::temporal_extent(&stations), None);
         assert!(stations.summary_properties().is_empty());
         assert!(stations.items_description().is_none());
+        assert_eq!(stations.default_datetime(now), None);
+    }
+
+    /// #503: an id is bound in its column's type only in the form that
+    /// type writes, so `017` and `+17` name no `bigint` event and one event
+    /// has one id; a type without a bind of its own is compared as text.
+    #[test]
+    fn event_id_binds_in_its_column_type_only_canonically() {
+        use tokio_postgres::types::Type;
+        assert_eq!(
+            EventIdBind::of(&Type::INT8, "17"),
+            Some(Some(EventIdBind::I64(17)))
+        );
+        assert_eq!(
+            EventIdBind::of(&Type::INT4, "-3"),
+            Some(Some(EventIdBind::I32(-3)))
+        );
+        assert_eq!(
+            EventIdBind::of(&Type::INT2, "7"),
+            Some(Some(EventIdBind::I16(7)))
+        );
+        for id in ["017", "+17", " 17", "17 ", "1e3", "abc", "", "99999999999"] {
+            assert_eq!(EventIdBind::of(&Type::INT4, id), Some(None), "{id:?}");
+        }
+        assert_eq!(
+            EventIdBind::of(&Type::TEXT, "017"),
+            Some(Some(EventIdBind::Text("017".into())))
+        );
+        assert_eq!(EventIdBind::of(&Type::UUID, "017"), None);
+        assert_eq!(EventIdBind::of(&Type::NUMERIC, "17"), None);
     }
 
     /// #503: what the events Features surface turns down before it reads: a
@@ -2602,6 +2663,16 @@ mod tests {
             },
             FeatureQuery {
                 cursor: Some("17@yesterday".into()),
+                ..Default::default()
+            },
+            // No text bind holds a NUL; the database would answer a 500.
+            FeatureQuery {
+                cursor: Some("\0@2026-01-01T00:00:00Z".into()),
+                ..Default::default()
+            },
+            // Not the cursor this engine writes for that key.
+            FeatureQuery {
+                cursor: Some("17@2026-01-01T07:30:00+02:00".into()),
                 ..Default::default()
             },
             FeatureQuery {
@@ -2624,11 +2695,18 @@ mod tests {
                 "{query:?}: {err:?}"
             );
         }
-        let err = FeatureEngine::get_feature(&engine, "17").unwrap_err();
-        assert!(
-            matches!(err, DataServerError::FeatureNotFound(_)),
-            "{err:?}"
-        );
+        for id in [
+            "17",
+            "\0@2026-01-01T00:00:00Z",
+            "17@2026-01-01T07:30:00+02:00",
+            "17@2026-01-01T05:30:00.000Z",
+        ] {
+            let err = FeatureEngine::get_feature(&engine, id).unwrap_err();
+            assert!(
+                matches!(err, DataServerError::FeatureNotFound(_)),
+                "{id:?}: {err:?}"
+            );
+        }
 
         let pending = |err: DataServerError| matches!(err, DataServerError::Engine(ref m) if m == crate::validation::PENDING_ERROR);
         assert!(pending(

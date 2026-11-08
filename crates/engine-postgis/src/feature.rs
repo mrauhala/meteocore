@@ -47,14 +47,24 @@ pub struct EventKey {
 }
 
 impl EventKey {
-    /// The key a feature id or cursor writes; `None` for any other string.
+    /// The key a feature id or cursor writes, exactly as it writes it; `None`
+    /// for any other string, before any query. An id is never a NUL (no
+    /// PostgreSQL text holds one, so binding it would be a database error),
+    /// and the time is the canonical form: `9@2026-01-01T07:30:00+02:00`
+    /// names the same instant as a key does but is not a key, so one event
+    /// has one id. The id part's own canonical form is its column's
+    /// ([`crate::engine`]'s by-key lookup).
     pub fn parse(s: &str) -> Option<Self> {
         let (id, time) = s.rsplit_once('@')?;
+        if id.contains('\0') {
+            return None;
+        }
         let time = DateTime::parse_from_rfc3339(time).ok()?.with_timezone(&Utc);
-        Some(Self {
+        let key = Self {
             time,
             id: id.to_string(),
-        })
+        };
+        (key.to_string() == s).then_some(key)
     }
 }
 
@@ -177,6 +187,18 @@ impl FeatureEngine for PostgisEngine {
     /// Observations are EDR's.
     fn has_time_dimension(&self) -> bool {
         self.config().events().is_some()
+    }
+
+    /// Events: the `default_datetime` window ending `now`, the one EDR's
+    /// area query reads without `datetime`, named so the Features API fixes
+    /// it for a whole `next` chain (#503).
+    fn default_datetime(&self, now: DateTime<Utc>) -> Option<ds_core::feature::DatetimeInterval> {
+        self.config().events()?;
+        let (start, end) = self.events_default_range_at(now);
+        Some(ds_core::feature::DatetimeInterval {
+            start: Some(start),
+            end: Some(end),
+        })
     }
 
     fn data_version(&self) -> u64 {
@@ -308,14 +330,6 @@ mod tests {
             assert_eq!(key.to_string(), written);
             assert_eq!(EventKey::parse(written), Some(key));
         }
-        // Another offset reads as its UTC instant.
-        assert_eq!(
-            EventKey::parse("9@2026-01-01T07:30:00+02:00"),
-            Some(EventKey {
-                time: at("2026-01-01T05:30:00Z"),
-                id: "9".into(),
-            })
-        );
     }
 
     #[test]
@@ -329,6 +343,17 @@ mod tests {
             "17@2026-01-01T05:30:00",
             "2026-01-01T05:30:00Z",
             "17@2026-01-01T05:30:00Z@x",
+            // The same instant written another way is no key (#503 review):
+            // one event, one id.
+            "9@2026-01-01T07:30:00+02:00",
+            "9@2026-01-01T05:30:00.000Z",
+            "9@2026-01-01T05:30:00.123000Z",
+            "9@2026-01-01t05:30:00z",
+            "9@2026-01-01T05:30:00+00:00",
+            // No PostgreSQL text holds a NUL: binding one is a database
+            // error, so it is no key, before any query.
+            "\0@2026-01-01T05:30:00Z",
+            "1\u{0}2@2026-01-01T05:30:00Z",
         ] {
             assert_eq!(EventKey::parse(s), None, "{s:?}");
         }

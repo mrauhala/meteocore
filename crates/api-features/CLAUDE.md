@@ -61,6 +61,14 @@ without reading code.
   links `next` with the page's `next_cursor` and gives a cursor page no
   `prev`. A cursor is the engine's: this crate only percent-encodes it.
   `numberItems` comes from `number_items`, `None` leaving it out.
+- **A default window is named once per request (#503).** Without
+  `datetime`, `items_request` asks `FeatureEngine::default_datetime(now)`
+  (whole seconds) and passes the answer as the query's `datetime`;
+  `feature_page_to_geojson` takes `PageLinks { this, onward }`, `self`
+  carrying the request and `next`/`prev` that interval. Never let a chain
+  recompute a window ending now per page: newest first, it drops the
+  oldest features the chain has yet to reach
+  (`a_default_window_chain_reads_one_fixed_interval`).
 - **`FeaturePage::number_matched` is optional (#503).** `None` leaves
   `numberMatched` out of the document (never `null`; OGC makes it a
   recommendation), and the HTML page then states only what it shows. Every

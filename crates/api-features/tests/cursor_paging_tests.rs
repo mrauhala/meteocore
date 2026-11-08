@@ -374,3 +374,171 @@ async fn the_html_page_of_a_cursor_page_counts_what_it_shows_and_asks_no_offset(
     assert!(html.contains("3–4 shown · 5 matched"));
     assert!(html.contains("name=\"offset\""));
 }
+
+/// Events every six seconds over the hour before `base`, newest first, paged
+/// by a cursor that is the event's time. Without `datetime` the engine's own
+/// answer is the hour ending its clock, and the clock runs ten minutes on at
+/// every read, as a long chain's would; every read also brings a new event at
+/// the clock. It names its default window, as engine-postgis events do.
+struct Sliding {
+    clock: Mutex<chrono::DateTime<chrono::Utc>>,
+    events: Mutex<Vec<chrono::DateTime<chrono::Utc>>>,
+    windows: Mutex<Vec<Option<ds_core::feature::DatetimeInterval>>>,
+}
+
+const HOUR: chrono::TimeDelta = chrono::TimeDelta::hours(1);
+
+impl Sliding {
+    fn new(base: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            clock: Mutex::new(base),
+            events: Mutex::new(
+                (0..590)
+                    .map(|k| base - chrono::TimeDelta::seconds(6 * k))
+                    .collect(),
+            ),
+            windows: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+fn rfc3339(t: chrono::DateTime<chrono::Utc>) -> String {
+    t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+}
+
+impl FeatureEngine for Sliding {
+    fn get_features(&self, query: &FeatureQuery) -> Result<FeaturePage, DataServerError> {
+        self.windows.lock().unwrap().push(query.datetime.clone());
+        let mut clock = self.clock.lock().unwrap();
+        let (start, end) = match &query.datetime {
+            Some(d) => (d.start.unwrap(), d.end.unwrap()),
+            None => (*clock - HOUR, *clock),
+        };
+        *clock += chrono::TimeDelta::minutes(10);
+        let mut events = self.events.lock().unwrap();
+        events.insert(0, *clock);
+        let after: Option<chrono::DateTime<chrono::Utc>> =
+            query.cursor.as_deref().map(|c| c.parse().unwrap());
+        let selected: Vec<_> = events
+            .iter()
+            .filter(|t| **t >= start && **t <= end && after.is_none_or(|a| **t < a))
+            .take(query.limit + 1)
+            .copied()
+            .collect();
+        let more = selected.len() > query.limit;
+        let features: Vec<Feature> = selected
+            .iter()
+            .take(query.limit)
+            .map(|t| Feature {
+                id: rfc3339(*t),
+                geometry: Arc::new(Geometry::Point { x: 25.0, y: 60.0 }),
+                properties: Arc::new(HashMap::new()),
+                related: Vec::new(),
+            })
+            .collect();
+        Ok(FeaturePage {
+            number_matched: None,
+            number_returned: features.len(),
+            next_offset: None,
+            next_cursor: more.then(|| features.last().unwrap().id.clone()),
+            features,
+        })
+    }
+
+    fn get_feature(&self, feature_id: &str) -> Result<Feature, DataServerError> {
+        Err(DataServerError::FeatureNotFound(feature_id.into()))
+    }
+
+    fn pages_by_cursor(&self) -> bool {
+        true
+    }
+
+    fn default_datetime(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<ds_core::feature::DatetimeInterval> {
+        Some(ds_core::feature::DatetimeInterval {
+            start: Some(now - HOUR),
+            end: Some(now),
+        })
+    }
+}
+
+/// #503: a chain started without `datetime` reads one fixed interval. The
+/// API names the engine's default window before the first read, and `next`
+/// carries it as an explicit `datetime`, so the engine's sliding clock and
+/// the events arriving between pages change nothing: every event of the
+/// first page's window is visited exactly once, the oldest included. Without
+/// that, each page read the hour ending a later clock, and the chain lost
+/// its oldest events. `self` repeats the request, and a page whose window
+/// ends now keeps the short `Cache-Control`.
+#[tokio::test]
+async fn a_default_window_chain_reads_one_fixed_interval() {
+    use chrono::SubsecRound;
+    let base = chrono::Utc::now().trunc_subsecs(0);
+    let engine = Arc::new(Sliding::new(base));
+    let state = FeaturesState {
+        engines: HashMap::from([(
+            "events".to_string(),
+            engine.clone() as Arc<dyn FeatureEngine>,
+        )]),
+        collections: HashMap::from([("events".to_string(), collection("events"))]),
+        discovery: Default::default(),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+        vector_tileset_ids: Default::default(),
+        collection_pages: Default::default(),
+    };
+    let app = api_features::router(Arc::new(ArcSwap::from_pointee(state)));
+
+    let mut uri = "/collections/events/items?limit=100".to_string();
+    let mut seen = Vec::new();
+    let mut first = true;
+    loop {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            response.headers()["cache-control"],
+            ds_core::http_cache::CACHE_CONTROL_SHORT,
+            "{uri}"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let doc: Value = serde_json::from_slice(&body).unwrap();
+        if first {
+            let this = link(&doc, "self").unwrap();
+            assert!(
+                !this.contains("datetime"),
+                "self repeats the request: {this}"
+            );
+            first = false;
+        }
+        seen.extend(ids(&doc));
+        let Some(next) = link(&doc, "next") else {
+            break;
+        };
+        assert!(next.contains("&datetime="), "{next}");
+        uri = next.strip_prefix("/features").unwrap().to_string();
+    }
+    let windows = engine.windows.lock().unwrap().clone();
+    assert!(windows.len() >= 6, "{} pages", windows.len());
+    assert!(windows[0].is_some(), "the first read is the named window");
+    assert!(
+        windows.iter().all(|w| *w == windows[0]),
+        "every page reads it: {windows:?}"
+    );
+    let window = windows[0].clone().unwrap();
+    let expected: Vec<String> = (0..590)
+        .map(|k| base - chrono::TimeDelta::seconds(6 * k))
+        .filter(|t| *t >= window.start.unwrap() && *t <= window.end.unwrap())
+        .map(rfc3339)
+        .collect();
+    assert_eq!(expected.len(), 590, "the fixture lies in the window");
+    assert_eq!(
+        seen, expected,
+        "each event once, newest first, the oldest kept"
+    );
+}

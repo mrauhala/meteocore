@@ -599,7 +599,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    (api-features then runs it on the shared query runtime, never a request
    worker), and page it by cursor (`pages_by_cursor`,
    `FeaturePage::next_cursor`) rather than by an offset the source would
-   re-read (#503).
+   re-read (#503). If its features without `datetime` are a window ending
+   now, name it from `default_datetime`: api-features fixes that interval
+   for the whole `next` chain instead of letting each page slide it.
    **If a `FeatureEngine`'s ids are opaque** (alert identifiers, track
    numbers), implement `label` from the feature's own values and
    `summary_properties`; a station whose EDR location has its id, or a site

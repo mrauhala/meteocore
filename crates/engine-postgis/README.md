@@ -280,15 +280,18 @@ With `features` in `apis`, Features `/items` serves one feature per event
 (#503): its point (null for a NULL or empty geometry) and the properties
 GetFeatureInfo answers. Its id is the event's key, `<id>@<time>`, such as
 `4711@2026-06-08T12:00:00.123456Z`, and `/items/{featureId}` reads it back
-with one lookup on the `(time, id)` primary key. An id that is not of that
-form, or whose id part the column cannot hold (`abc` for a `bigint`), is a
-404 without a query. Integer and text id columns are compared in their
+with one lookup on the `(time, id)` primary key. An id is written one way
+only: an id that is not of that form, the same key written another way
+(`017@…`, a `+02:00` time), an id holding a NUL, or one the column cannot
+hold (`abc` for a `bigint`) is a 404 without a query, and as a cursor a
+400. Integer and text id columns are compared in their
 own type; another type (`uuid`) is compared as text, after the time
 column's index probe.
 
 - `bbox` (edges included, across the antimeridian too) and `datetime`
   select in SQL; without `datetime`, the `default_datetime` window ending
-  now. No `sortby` and no property filters.
+  now, which the `next` link then names explicitly, so every page of a
+  chain reads that one interval. No `sortby` and no property filters.
 - Newest first, ties on one time by id as text. A page is one statement
   that starts after the cursor in its `next` link, the last event's key,
   through the `(time, id)` index: no offset scan. `offset` is a 400.

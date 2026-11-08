@@ -122,7 +122,9 @@ Each control parameter may appear once; a repeat is a 400.
 Property filters:
 
 - A name must be in the engine's `filterables`; an unknown name is a 400 that
-  lists the valid ones. The control names above cannot be property filters.
+  lists the valid ones. The control names above cannot be property filters,
+  on any collection: since `cursor` became one (#503), a property named
+  `cursor` has no equality filter either.
   `/features/api` lists each collection's filter names as query parameters.
 - Names are case-sensitive and matching is exact: no wildcards, substrings or
   type coercion. Numbers match their canonical form (`12`, `1.5`), booleans
@@ -181,6 +183,13 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
   the cursor is not on a later page. Such a page has no `prev`, and its HTML
   shows how many it holds rather than a range, and the match count only
   when the response has one.
+- Without `datetime`, an engine whose features are then a window ending
+  now (`default_datetime`: PostGIS events) has that window named once, in
+  whole seconds, before the first read: the page reads it, and `next` and
+  `prev` carry it as an explicit `datetime=start/end`, so a chain reads one
+  fixed interval rather than a window that slides on and drops its oldest
+  features. `self` repeats the request. Such a window ends now, so its
+  pages are `max-age=60` until it ended an hour ago.
 - Each feature has `self` and `collection` links, plus a `related` link for
   each resource its engine names and an API here serves.
 - A feature's `title` property is its engine's label, unless the feature
@@ -296,8 +305,10 @@ api-tiles vector-tile cache key.
   EDR, `type` from `cloud_indicator_col` and `peak_current_ka` from
   `peak_current_col` when declared and no parameter reads it; the
   properties GetFeatureInfo answers. Its id is its `(time, id)` key,
-  `<id_col value>@<time>`, and `/items/{featureId}` reads that event back
-  by its primary key; a malformed id is a 404. A page is one statement
+  `<id_col value>@<time>`, written one way only, and `/items/{featureId}`
+  reads that event back by its primary key. Any other string, the same key
+  written another way (`017@…`, a `+02:00` time) or an id with a NUL, is a
+  404 without a query; as a cursor it is a 400. A page is one statement
   starting after the cursor's key, and no statement counts: `numberMatched`
   is there only on a first page that holds every match. No vector tiles: their `tiles` are the strike
   layer's raster tiles. Late strikes: a closed `datetime` that ended at

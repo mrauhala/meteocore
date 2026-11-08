@@ -1802,12 +1802,19 @@ async fn events_features_shape() {
         assert_eq!(back.properties, feature.properties);
     }
     for (id, found) in [
-        ("7@2026-01-01T06:30:00.123456000Z", true),
-        ("7@2026-01-01T08:30:00.123456+02:00", true),
+        ("7@2026-01-01T06:30:00.123456Z", true),
+        // The same key written another way names no feature: one event,
+        // one id (#503 review).
+        ("7@2026-01-01T06:30:00.123456000Z", false),
+        ("7@2026-01-01T08:30:00.123456+02:00", false),
+        ("07@2026-01-01T06:30:00.123456Z", false),
+        ("+7@2026-01-01T06:30:00.123456Z", false),
         ("7@2026-01-01T06:30:00.123Z", false),
         ("99@2026-01-01T05:20:00Z", false),
-        // A `bigint` id holds no `x`: not found without a query.
+        // A `bigint` id holds no `x`, and no id a NUL: not found, without a
+        // query (a NUL bound as text was a database error, a 500).
         ("x@2026-01-01T05:20:00Z", false),
+        ("\0@2026-01-01T05:20:00Z", false),
         ("3", false),
     ] {
         let engine = Arc::clone(&engine);
@@ -1912,6 +1919,111 @@ async fn events_features_shape() {
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
 
+/// #503 review: a chain without `datetime` reads one interval. The window
+/// is named once, as api-features names it from `default_datetime`, and every
+/// page reads it explicitly while events keep arriving between pages, newer
+/// and older. Each event of the first page's window is visited exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_features_default_window_chain() {
+    use chrono::SubsecRound;
+    use ds_core::feature::FeatureQuery;
+    use ds_core::feature_engine::FeatureEngine;
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc503_chain";
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(
+            &client,
+            schema,
+            "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.strikes (
+    id bigint NOT NULL,
+    time timestamptz NOT NULL,
+    geom geometry(Point, 4326),
+    peak_current real,
+    PRIMARY KEY (time, id)
+);
+INSERT INTO __S__.strikes
+SELECT k, now() - k * interval '5 minutes', ST_SetSRID(ST_MakePoint(1, 1), 4326), k
+FROM generate_series(1, 11) AS k;
+INSERT INTO __S__.strikes VALUES
+    (100, now() - interval '70 minutes', ST_SetSRID(ST_MakePoint(1, 1), 4326), 1);
+ANALYZE;
+",
+        )
+        .await;
+    }
+    let mut cfg = config(
+        None,
+        PostgisObservationsConfig {
+            table: Some(format!("{schema}.strikes")),
+            time_col: Some("time".into()),
+            geom_col: Some("geom".into()),
+            id_col: Some("id".into()),
+            extent_bbox: Some([0.0, 0.0, 10.0, 10.0]),
+            ..observations("events")
+        },
+    );
+    cfg.parameters = vec![PostgisParameterConfig {
+        name: "peak_current".into(),
+        label: "Peak current".into(),
+        unit: "kA".into(),
+        observed_property: None,
+        source_key: None,
+        valid_range: None,
+        missing_values: vec![],
+    }];
+    let engine = engine(schema, &cfg).await;
+    let window = engine
+        .default_datetime(Utc::now().trunc_subsecs(0))
+        .expect("an events collection names its default window");
+    let mut seen = Vec::new();
+    let mut cursor = None;
+    for page_number in 0.. {
+        let page = feature_page(
+            &engine,
+            FeatureQuery {
+                datetime: Some(window.clone()),
+                limit: 3,
+                cursor: cursor.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a page");
+        seen.extend(event_ids(&page));
+        // Between pages: one strike newer than the window, one older.
+        let newer = 1000 + 2 * page_number;
+        exec(
+            &client,
+            schema,
+            &format!(
+                "INSERT INTO __S__.strikes VALUES \
+                 ({newer}, now() + interval '1 second', ST_SetSRID(ST_MakePoint(1, 1), 4326), 1), \
+                 ({}, now() - interval '2 hours', ST_SetSRID(ST_MakePoint(1, 1), 4326), 1);",
+                newer + 1
+            ),
+        )
+        .await;
+        match page.next_cursor {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let expected: Vec<String> = (1..=11).map(|k| k.to_string()).collect();
+    assert_eq!(
+        seen, expected,
+        "every event of the window once, newest first"
+    );
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
 /// #503: an id column the engine binds in no type of its own (`uuid`) is
 /// compared as text after the time column's probe: the event is found by its
 /// id, another id or a malformed one is not.
@@ -1978,6 +2090,12 @@ ANALYZE;
             false,
         ),
         ("not-a-uuid@2026-01-01T05:20:00Z", false),
+        // Upper case is the same uuid but not its id; a NUL is no id.
+        (
+            "6F1C8B0E-3A52-4D7E-9A0B-1D2E3F405162@2026-01-01T05:20:00Z",
+            false,
+        ),
+        ("\0@2026-01-01T05:20:00Z", false),
     ] {
         let engine = Arc::clone(&engine);
         let result = tokio::task::spawn_blocking(move || engine.get_feature(id))

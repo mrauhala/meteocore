@@ -240,8 +240,32 @@ pub fn preserved_query(
     q
 }
 
+/// The filter/sort fragments (from [`preserved_query`]) a page's links
+/// carry. A plain `&str` is both.
+#[derive(Debug, Clone, Copy)]
+pub struct PageLinks<'a> {
+    /// What `self` carries: the request's own query.
+    pub this: &'a str,
+    /// What `next` and `prev` carry instead, when the page read another
+    /// interval than the request named: an engine's default window, named so
+    /// the chain stays on it (#503). `None`: the same as `self`.
+    pub onward: Option<&'a str>,
+}
+
+impl<'a> From<&'a str> for PageLinks<'a> {
+    fn from(this: &'a str) -> Self {
+        Self { this, onward: None }
+    }
+}
+
+impl<'a> From<&'a String> for PageLinks<'a> {
+    fn from(this: &'a String) -> Self {
+        Self::from(this.as_str())
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // pagination links need every query axis
-pub fn feature_page_to_geojson(
+pub fn feature_page_to_geojson<'a>(
     page: &FeaturePage,
     collection_id: &str,
     limit: usize,
@@ -253,7 +277,7 @@ pub fn feature_page_to_geojson(
     // Filter/sort fragment from `preserved_query`, carried onto every
     // pagination link. Without it, following `rel="next"` — the pattern OGC
     // recommends — silently drops the caller's filters and ordering.
-    filters: &str,
+    filters: impl Into<PageLinks<'a>>,
     timestamp: &str,
     root: &str,
     crs: &ResponseCrs,
@@ -266,28 +290,31 @@ pub fn feature_page_to_geojson(
         .collect();
     // The CRS rides along with the filters: a `next` page in another CRS
     // would mix coordinate systems in one result set.
-    let filters = match crs.link_query() {
+    let with_crs = |filters: &str| match crs.link_query() {
         q if q.is_empty() => filters.to_owned(),
         q => format!("{filters}&{q}"),
     };
+    let filters = filters.into();
+    let this = with_crs(filters.this);
+    let onward = filters.onward.map_or_else(|| this.clone(), with_crs);
 
-    let at_cursor = |cursor: &str| {
+    let at_cursor = |cursor: &str, filters: &str| {
         let cursor: String = form_urlencoded::byte_serialize(cursor.as_bytes()).collect();
         format!("{root}/collections/{collection_id}/items?cursor={cursor}&limit={limit}{filters}")
     };
-    let at_offset = |offset: usize| {
+    let at_offset = |offset: usize, filters: &str| {
         format!("{root}/collections/{collection_id}/items?offset={offset}&limit={limit}{filters}")
     };
 
     let mut links = vec![json!({
-        "href": cursor.map_or_else(|| at_offset(offset), at_cursor),
+        "href": cursor.map_or_else(|| at_offset(offset, &this), |c| at_cursor(c, &this)),
         "rel": "self",
         "type": "application/geo+json"
     })];
 
     let next = match (&page.next_cursor, page.next_offset) {
-        (Some(cursor), _) => Some(at_cursor(cursor)),
-        (None, Some(next)) => Some(at_offset(next)),
+        (Some(cursor), _) => Some(at_cursor(cursor, &onward)),
+        (None, Some(next)) => Some(at_offset(next, &onward)),
         (None, None) => None,
     };
     if let Some(next) = next {
@@ -308,7 +335,7 @@ pub fn feature_page_to_geojson(
             None => prev_offset,
         };
         links.push(json!({
-            "href": at_offset(prev_offset),
+            "href": at_offset(prev_offset, &onward),
             "rel": "prev",
             "type": "application/geo+json"
         }));

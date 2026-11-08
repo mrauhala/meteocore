@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::{Extension, Json};
-use chrono::Utc;
+use chrono::{SubsecRound, Utc};
 use serde_json::{json, Map, Value};
 
 use api_common::{JsonError, JsonQuery, Mount};
@@ -21,7 +21,9 @@ use crate::params::{
     parse_bbox_values, parse_datetime, parse_sortby, ItemQueryParams, ItemsQueryParams,
     DEFAULT_LIMIT, MAX_LIMIT,
 };
-use crate::response::{feature_page_to_geojson, feature_to_geojson, preserved_query, Annotations};
+use crate::response::{
+    feature_page_to_geojson, feature_to_geojson, preserved_query, Annotations, PageLinks,
+};
 
 /// Shared state for the Features API: a registry of collection engines + metadata.
 #[derive(Clone)]
@@ -992,6 +994,7 @@ pub async fn items(
     };
     let ItemsRequest {
         query,
+        requested_datetime,
         crs,
         limit,
         offset,
@@ -1031,19 +1034,29 @@ pub async fn items(
     // Carry the caller's filters and ordering onto the pagination links:
     // following `rel="next"` is the OGC-recommended pattern, and a next link
     // that drops them silently serves page 2 unfiltered and unsorted.
-    let filters = preserved_query(
-        query.bbox.as_ref(),
-        query.datetime.as_ref(),
-        &query.sortby,
-        &query.property_filters,
-    );
+    // `self` repeats the request; `next` and `prev` carry the interval the
+    // page read, which is the engine's named default window when the request
+    // gave none (#503), so the chain stays on it.
+    let links = |datetime: Option<&ds_core::feature::DatetimeInterval>| {
+        preserved_query(
+            query.bbox.as_ref(),
+            datetime,
+            &query.sortby,
+            &query.property_filters,
+        )
+    };
+    let filters = links(requested_datetime.as_ref());
+    let onward = (requested_datetime != query.datetime).then(|| links(query.datetime.as_ref()));
     let mut doc = feature_page_to_geojson(
         &page,
         &id,
         limit,
         offset,
         query.cursor.as_deref(),
-        &filters,
+        PageLinks {
+            this: &filters,
+            onward: onward.as_deref(),
+        },
         "",
         root,
         &crs,
@@ -1089,6 +1102,9 @@ pub async fn items(
 /// A validated `/items` request.
 struct ItemsRequest {
     query: FeatureQuery,
+    /// The `datetime` the request gave, which its `self` link repeats; the
+    /// query's may be the engine's named default window instead (#503).
+    requested_datetime: Option<ds_core::feature::DatetimeInterval>,
     crs: ResponseCrs,
     limit: usize,
     offset: usize,
@@ -1197,15 +1213,26 @@ fn items_request(
         (cursor, _) => cursor,
     };
 
+    // Without `datetime`, an engine whose features are then the window ending
+    // now (PostGIS events, #503) has it named here, once: the engine reads
+    // that interval and the `next`/`prev` links carry it, so a chain reads
+    // one fixed interval. Recomputed per page, the window would slide and,
+    // newest first, cut off the oldest events the chain had yet to reach.
+    // Whole seconds, so the links of requests within one second agree.
+    let now = Utc::now();
+    let requested = datetime;
+    let datetime = requested
+        .clone()
+        .or_else(|| engine.default_datetime(now.trunc_subsecs(0)));
+
     // Cache-Control policy (#499): a settled window (closed datetime interval
     // entirely in the past) gets the long policy, everything else the short
-    // one — captured before `datetime` moves into the query.
+    // one. A named default window ends now, so it is never settled.
     let (window_start, window_end) = datetime
         .as_ref()
         .map(|d| (d.start, d.end))
         .unwrap_or((None, None));
-    let cache_control =
-        ds_core::http_cache::data_cache_control(window_start, window_end, Utc::now());
+    let cache_control = ds_core::http_cache::data_cache_control(window_start, window_end, now);
 
     Ok(ItemsRequest {
         query: FeatureQuery {
@@ -1217,6 +1244,7 @@ fn items_request(
             property_filters: params.property_filters,
             cursor,
         },
+        requested_datetime: requested,
         crs,
         limit,
         offset,
