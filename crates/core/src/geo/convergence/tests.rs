@@ -20,7 +20,7 @@ fn assert_pins(crs: &Crs, cases: &[(f64, f64, f64)]) {
         let got = convergence.degrees(lon, lat).unwrap();
         assert!(
             (got - want).abs() < PROJ_TOLERANCE,
-            "{crs:?} at ({lon}, {lat}): {got} ≠ {want}"
+            "convergence differs from the PROJ pin"
         );
     }
 }
@@ -87,7 +87,10 @@ fn lambert_conic_turns_by_the_cone_constant() {
     // Every latitude alike: γ depends on longitude only.
     for lat in [55.0, 60.0, 70.0] {
         let got = convergence.degrees(25.0, lat).unwrap();
-        assert!((got - hand).abs() < 1e-12, "{lat}: {got}");
+        assert!(
+            (got - hand).abs() < 1e-12,
+            "the LCC convergence depends on longitude only"
+        );
     }
     // PROJ, both sides of the meridian.
     assert_pins(
@@ -257,7 +260,7 @@ fn every_formula_is_the_turn_of_its_own_projection() {
                 let off = (gamma + north_on_grid + 180.0).rem_euclid(360.0) - 180.0;
                 assert!(
                     off.abs() < 1e-5,
-                    "{crs:?} at ({lon}, {lat}): γ {gamma}, north on the grid {north_on_grid}"
+                    "convergence disagrees with the forward projection's grid north"
                 );
             }
         }

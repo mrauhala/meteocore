@@ -361,7 +361,7 @@ fn assert_turned(result: &QueryResult, positions: &[(f64, f64)]) {
         let got = directions[i].unwrap();
         assert!(
             (got - want).abs() < 1e-9,
-            "value {i} at ({lon}, {lat}): {got} ≠ {want} (γ {gamma})"
+            "a value is not turned by the convergence at its own position"
         );
         assert_eq!(speeds[i], Some(u.hypot(v)));
         assert!((speeds[i].unwrap() - speed).abs() < 1e-12);
