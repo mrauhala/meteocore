@@ -1307,10 +1307,13 @@ fn parse_z_recurring(rest: &str) -> Result<ZSelector, DataServerError> {
 
 /// Resolve a [`ZSelector`] into the concrete level list an engine samples.
 ///
-/// - `Levels` pass through unchanged for the engine to match against its
-///   own levels, keeping only those it has (`/req/edr/z-response` B):
-///   ODIM PVOL a sweep within 0.05° of a requested angle, GRIB an exact
-///   level. None matching is the engine's 400, worded like the interval's.
+/// - `Levels` are put in the order the extent's levels run, each once
+///   ([`ds_core::vertical::in_axis_order`], #1434: CoverageJSON 1.0
+///   §9.6.1.1 makes an axis monotonic), then left for the engine to match
+///   against its own levels, keeping only those it has
+///   (`/req/edr/z-response` B): ODIM PVOL a sweep within 0.05° of a
+///   requested angle, GRIB an exact level. None matching is the engine's
+///   400, worded like the interval's.
 /// - `Interval { min, max }` expands to the collection's advertised levels
 ///   that fall within `[min, max]` (inclusive; an open end is infinite, so
 ///   it reaches the extreme level). An interval that selects no advertised
@@ -1325,7 +1328,10 @@ pub fn resolve_z_levels(
     extent: Option<&ds_core::vertical::VerticalDimension>,
 ) -> Result<Vec<f64>, DataServerError> {
     match sel {
-        ZSelector::Levels(v) => Ok(v.clone()),
+        ZSelector::Levels(v) => Ok(ds_core::vertical::in_axis_order(
+            v,
+            extent.map_or(&[], |e| e.levels.as_slice()),
+        )),
         ZSelector::Interval { min, max } => {
             let levels = extent.map(|e| e.levels.as_slice()).ok_or_else(|| {
                 DataServerError::InvalidParameter(
@@ -2095,6 +2101,26 @@ mod tests {
             resolve_z_levels(&sel, Some(&pressure_extent())).unwrap(),
             vec![1000.0, 850.0, 700.0]
         );
+    }
+
+    /// #1434: CoverageJSON 1.0 §9.6.1.1 requires a monotonic axis, so a
+    /// list, or the levels a recurring interval expands to, reaches the
+    /// engine in the order the collection's levels run, each once: bottom
+    /// first on a pressure axis, lowest first on elevation angles. A level
+    /// the collection lacks stays for the engine to drop (#969).
+    #[test]
+    fn resolve_z_levels_orders_a_list_like_the_axis() {
+        let resolve = |z: &str, extent: &VerticalDimension| {
+            resolve_z_levels(&parse_z(Some(z)).unwrap().unwrap(), Some(extent)).unwrap()
+        };
+        let pressure = pressure_extent();
+        assert_eq!(resolve("500,1000,850", &pressure), [1000.0, 850.0, 500.0]);
+        assert_eq!(resolve("850,850", &pressure), [850.0]);
+        assert_eq!(resolve("500,925,850,500", &pressure), [925.0, 850.0, 500.0]);
+        assert_eq!(resolve("R3/500/150", &pressure), [800.0, 650.0, 500.0]);
+        let angles = VerticalDimension::new(VerticalKind::ElevationAngle, vec![0.3, 0.7, 1.5]);
+        assert_eq!(resolve("1.5,0.3,0.7,0.3", &angles), [0.3, 0.7, 1.5]);
+        assert_eq!(resolve("R2/1.5/-0.8", &angles), [0.7, 1.5]);
     }
 
     fn t(s: &str) -> DateTime<Utc> {

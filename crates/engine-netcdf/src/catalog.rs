@@ -12,7 +12,7 @@ use ds_core::map_engine::{ParameterInfo, RasterInfo};
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::{CurvilinearGrid, SourceGrid};
 use ds_core::units::{cf_display_conversion, DisplayConversion};
-use ds_core::vertical::{VerticalDimension, VerticalKind};
+use ds_core::vertical::{in_axis_order, VerticalDimension, VerticalKind};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 use ds_storage::ObjectVersion;
 
@@ -259,10 +259,12 @@ impl Layout {
 
     /// The levels an EDR query reads, as indices into the vertical axis's
     /// levels: every level without `z` (`/req/edr/z-response` F, as
-    /// engine-grib's level views answer); else those `z` names, in request
-    /// order and each once, a level the collection lacks dropped
-    /// (clause B), and none of them a 400. `[0]` without a vertical axis,
-    /// where api-edr has already ignored any `z` (clause A).
+    /// engine-grib's level views answer); else those `z` names, in the
+    /// axis's order, bottom first, and each once, whatever the list's order
+    /// (`in_axis_order`, #1434: a CoverageJSON axis is monotonic), a level
+    /// the collection lacks dropped (clause B), and none of them a 400.
+    /// `[0]` without a vertical axis, where api-edr has already ignored any
+    /// `z` (clause A).
     pub(crate) fn query_levels(&self, z: Option<&[f64]>) -> Result<Vec<usize>, DataServerError> {
         let Some(vertical) = &self.vertical else {
             return Ok(vec![0]);
@@ -270,14 +272,10 @@ impl Layout {
         let Some(z) = z else {
             return Ok((0..vertical.levels.len()).collect());
         };
-        let mut levels = Vec::with_capacity(z.len());
-        for value in z {
-            if let Some(i) = vertical.levels.iter().position(|level| level == value) {
-                if !levels.contains(&i) {
-                    levels.push(i);
-                }
-            }
-        }
+        let levels: Vec<usize> = in_axis_order(z, &vertical.levels)
+            .iter()
+            .filter_map(|value| vertical.levels.iter().position(|level| level == value))
+            .collect();
         if levels.is_empty() {
             return Err(DataServerError::InvalidParameter(format!(
                 "The requested vertical levels select none of this collection's pressure \

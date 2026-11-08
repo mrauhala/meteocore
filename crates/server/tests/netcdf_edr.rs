@@ -435,12 +435,14 @@ async fn netcdf_pressure_level_responses_validate() {
     let point = "coords=POINT(13.83%2062.55)";
     let queries = [
         ("one level", format!("position?{point}&z=850&parameter-name=air_temperature_pl,wind_speed_pl")),
-        ("level list", format!("position?{point}&z=500,1000&datetime=2026-10-15T10:00:00Z&parameter-name=air_temperature_pl")),
+        ("level list", format!("position?{point}&z=500,1000,850,500&datetime=2026-10-15T10:00:00Z&parameter-name=air_temperature_pl")),
+        ("level list in order", format!("position?{point}&z=1000,850,500&datetime=2026-10-15T10:00:00Z&parameter-name=air_temperature_pl")),
         ("every level", format!("position?{point}&parameter-name=geopotential_pl")),
         ("z interval", format!("position?{point}&z=400/900&datetime=2026-10-15T07:00:00Z")),
         ("recurring z", format!("position?{point}&z=R2/500/350&datetime=2026-10-15T09:00:00Z&parameter-name=wind_speed_pl")),
         ("datetime list", format!("position?{point}&z=300&datetime=2026-10-15T07:00:00Z,2026-10-15T10:00:00Z&parameter-name=air_temperature_pl")),
         ("area levels", "area?coords=10,58,20,64&z=1000,300&datetime=2026-10-15T09:00:00Z/2026-10-15T10:00:00Z&parameter-name=air_temperature_pl,wind_speed_pl".to_string()),
+        ("area levels reversed", "area?coords=10,58,20,64&z=300,1000&datetime=2026-10-15T09:00:00Z/2026-10-15T10:00:00Z&parameter-name=air_temperature_pl,wind_speed_pl".to_string()),
         ("area one level", "area?coords=POLYGON((5%2055,30%2055,5%2068,5%2055))&z=500&parameter-name=geopotential_pl".to_string()),
         ("radius", "radius?coords=POINT(15%2063)&within=300&within-units=km&z=850&parameter-name=wind_speed_pl".to_string()),
         ("instance", format!("instances/2026-10-15T06:00:00Z/position?{point}&z=850,500&parameter-name=air_temperature_pl")),
@@ -468,11 +470,18 @@ async fn netcdf_pressure_level_responses_validate() {
     assert_eq!(list["type"], "CoverageCollection");
     let profile = &list["coverages"][0];
     assert_eq!(profile["domain"]["domainType"], "VerticalProfile");
-    assert_eq!(z(profile), serde_json::json!([500.0, 1000.0]), "z's order");
+    // #1434: a list answers bottom first, each level once, as without `z`,
+    // its values moving with the axis: the same body as the ordered list.
+    assert_eq!(
+        z(profile),
+        serde_json::json!([1000.0, 850.0, 500.0]),
+        "z's order"
+    );
     assert_eq!(
         profile["ranges"]["air_temperature_pl"]["axisNames"],
         serde_json::json!(["z"])
     );
+    assert_eq!(list, &answers["level list in order"]);
     let every = &answers["every level"];
     let coverages = every["coverages"].as_array().unwrap();
     assert_eq!(coverages.len(), 2, "a profile per step");
@@ -486,7 +495,7 @@ async fn netcdf_pressure_level_responses_validate() {
     );
     assert_eq!(
         z(&answers["recurring z"]["coverages"][0]),
-        serde_json::json!([500.0, 850.0])
+        serde_json::json!([850.0, 500.0])
     );
     assert_eq!(
         times(&answers["datetime list"]),
@@ -494,6 +503,7 @@ async fn netcdf_pressure_level_responses_validate() {
     );
     let area = &answers["area levels"];
     assert_eq!(z(area), serde_json::json!([1000.0, 300.0]));
+    assert_eq!(area, &answers["area levels reversed"]);
     assert_eq!(
         area["ranges"]["wind_speed_pl"]["axisNames"],
         serde_json::json!(["t", "z", "y", "x"])

@@ -1878,8 +1878,9 @@ fn derived_wind_pairs_the_components_level_by_level() {
     .unwrap() else {
         panic!("a profile");
     };
+    // Bottom first, whatever the list's order (#1434).
     let values = &profiles[0].ranges["wind_speed_pl"].values;
-    for (value, hpa) in values.iter().zip([300.0, 850.0]) {
+    for (value, hpa) in values.iter().zip([850.0, 300.0]) {
         let value = value.unwrap();
         assert!(
             (value - hypot(hpa)).abs() < 1e-3,
@@ -1891,7 +1892,7 @@ fn derived_wind_pairs_the_components_level_by_level() {
             .unwrap();
         assert!((drawn - value).abs() < 1e-3, "{hpa}: {drawn} {value}");
     }
-    assert!(values[0].unwrap() > values[1].unwrap(), "faster aloft");
+    assert!(values[1].unwrap() > values[0].unwrap(), "faster aloft");
 }
 
 /// A pressure axis stored in Pa (`level`, 50000/85000/100000 Pa, top first)
@@ -2863,7 +2864,8 @@ fn derived_dew_point_from_temperature_and_relative_humidity() {
     };
     let inputs = profile(pl.as_ref(), &["air_temperature_pl", "relative_humidity_pl"]);
     let result = profile(&derived, &["dew_point_temperature_pl"]);
-    for (i, hpa) in [300.0, 850.0].into_iter().enumerate() {
+    // Bottom first, whatever the list's order (#1434).
+    for (i, hpa) in [850.0, 300.0].into_iter().enumerate() {
         let t = inputs.ranges["air_temperature_pl"].values[i].unwrap();
         let rh = inputs.ranges["relative_humidity_pl"].values[i].unwrap();
         let value = result.ranges["dew_point_temperature_pl"].values[i].unwrap();
