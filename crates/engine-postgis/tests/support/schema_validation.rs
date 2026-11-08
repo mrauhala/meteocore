@@ -42,7 +42,7 @@ fn resolve(cfg: &PostgisConfig) -> PostgisEngineConfig {
     PostgisEngineConfig::resolve(cfg).unwrap()
 }
 
-fn dsn_option(dsn: &str, uri: &str, keyword: &str) -> String {
+pub(super) fn dsn_option(dsn: &str, uri: &str, keyword: &str) -> String {
     if dsn.starts_with("postgres://") || dsn.starts_with("postgresql://") {
         format!("{dsn}{}{uri}", if dsn.contains('?') { '&' } else { '?' })
     } else {
@@ -298,7 +298,11 @@ async fn validation_deadline_bounds_view_work() {
     assert!(engine.refresh_metadata().await.is_err());
     assert!(started.elapsed() < Duration::from_secs(8));
     assert_eq!(engine.live_health(), Some(LiveHealth::ValidationPending));
-    assert!(engine.recent_events(t0() - hours(1), t0(), 10).is_err());
+    // Not validated yet: the 503 to retry (#1446).
+    assert!(matches!(
+        engine.recent_events(t0() - hours(1), t0(), 10),
+        Err(DataServerError::ResourceExhausted)
+    ));
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE").await;
 }
 
@@ -335,7 +339,10 @@ async fn database_down_at_boot_is_validated_on_recovery() {
     let engine = unrefreshed("recovered", config);
     assert!(engine.refresh_metadata().await.is_err());
     assert_eq!(engine.live_health(), Some(LiveHealth::ValidationPending));
-    assert!(engine.query_location("a", None, None, None, None).is_err());
+    assert!(matches!(
+        engine.query_location("a", None, None, None, None),
+        Err(DataServerError::ResourceExhausted)
+    ));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     let proxy = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();

@@ -93,6 +93,24 @@ pub const SET_BASED_MAX_WINDOW: TimeDelta = TimeDelta::hours(12);
 /// statement's other output names.
 const STATION_ALIAS: &str = "mc_station";
 
+/// The alias an observation table takes in every ordered statement, and the
+/// one an events table takes (#1446). The order names its columns through
+/// it: the select lists emit `... AS time`, for a naive column its converted
+/// expression, and `<fk>::text AS id`, and PostgreSQL resolves a bare
+/// `ORDER BY "time"` or `DISTINCT ON ("id")` to such an output column of the
+/// same name. That is an order no index provides, so a statement sorts its
+/// whole window before its `LIMIT`, and in a time zone's spring-forward gap
+/// it is not the order the `WHERE` bounds read. The stations table is named
+/// in full instead ([`build_locations`]): an operator's `where_clause` may
+/// name it.
+const OBS_ALIAS: &str = "mc_obs";
+const EVENTS_ALIAS: &str = "mc_events";
+
+/// `column` (quoted) named through `table`, an alias or a quoted table name.
+fn qualified(table: &str, column: &str) -> String {
+    format!("{table}.{column}")
+}
+
 /// Default search radius for nearest-station position queries (25 km).
 pub const DEFAULT_POSITION_RADIUS_M: f64 = 25_000.0;
 
@@ -268,8 +286,10 @@ pub fn build_locations(cfg: &PostgisEngineConfig) -> Result<BuiltQuery, BuildErr
             sql.push_str(&format!(" WHERE {w}"));
         }
     }
+    // The table's own `id_col`, not the `id` output column (#1446).
     sql.push_str(&format!(
-        " ORDER BY {id} LIMIT {}",
+        " ORDER BY {} LIMIT {}",
+        qualified(&table, &id),
         location_fetch_rows(cfg)
     ));
 
@@ -377,13 +397,16 @@ fn obs_locations_query(
     let coordinates = crate::validation::coordinates(&geom);
     let geometry_check = crate::validation::geometry_check(&geom);
     let mut params: Vec<SqlParam> = Vec::new();
+    // The table's `fk`, not the `id` output column, in `DISTINCT ON` and
+    // `ORDER BY` alike (#1446).
+    let key = qualified(OBS_ALIAS, &fk);
     // SELECT kept in a plain literal; the format! templates below interpolate
     // only already-quoted identifiers and contain no flagged SQL verb.
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
-        "DISTINCT ON ({fk}) {fk}::text AS id, \
+        "DISTINCT ON ({key}) {fk}::text AS id, \
          {coordinates}, {geometry_check} AS mc_geometry_valid \
-         FROM {table_fq} \
+         FROM {table_fq} AS {OBS_ALIAS} \
          WHERE {geom} IS NOT NULL"
     ));
     // Recent-window filter: only stations seen since `since`. Restricts the scan
@@ -396,7 +419,7 @@ fn obs_locations_query(
         sql.push_str(&format!(" AND {time} >= {rhs}"));
         params.push(SqlParam::Timestamp(ts));
     }
-    sql.push_str(&format!(" ORDER BY {fk} LIMIT {fetch_rows}"));
+    sql.push_str(&format!(" ORDER BY {key} LIMIT {fetch_rows}"));
     Ok(BuiltQuery::new(sql, params))
 }
 
@@ -506,7 +529,11 @@ pub fn build_stations_in_polygon(
             sql.push_str(&format!(" AND ({w})"));
         }
     }
-    sql.push_str(&format!(" ORDER BY {id} LIMIT {MAX_STATIONS_IN_POLYGON}"));
+    // The table's own `id_col`, not the `id` output column (#1446).
+    sql.push_str(&format!(
+        " ORDER BY {} LIMIT {MAX_STATIONS_IN_POLYGON}",
+        qualified(&table, &id)
+    ));
 
     Ok(BuiltQuery::new(
         sql,
@@ -554,11 +581,13 @@ impl StationSelect<'_> {
         }
     }
 
-    /// The `ORDER BY` list. Quoted `fk` and `time` columns.
+    /// The `ORDER BY` list: quoted `fk` and `time` columns, named through
+    /// [`OBS_ALIAS`] (#1446).
     fn order_by(self, fk: &str, time: &str) -> String {
+        let time = qualified(OBS_ALIAS, time);
         match self {
-            StationSelect::One(_) => time.to_string(),
-            StationSelect::Set(_) => format!("{fk}, {time}"),
+            StationSelect::One(_) => time,
+            StationSelect::Set(_) => format!("{}, {time}", qualified(OBS_ALIAS, fk)),
         }
     }
 }
@@ -793,12 +822,24 @@ fn build_observations(
 
 // ─── events (non-station event tables) ─────────────────────────────────────
 
+/// The `ORDER BY` list of the events area, pick and window statements:
+/// newest first by the table's time column, ties by its id, both named
+/// through [`EVENTS_ALIAS`] (#1446). `time_col` and `id` are quoted.
+fn events_newest_first(time_col: &str, id: &str) -> String {
+    format!(
+        "{} DESC, {}",
+        qualified(EVENTS_ALIAS, time_col),
+        qualified(EVENTS_ALIAS, id)
+    )
+}
+
 /// Events-shape area query (#113): one statement fetching every event inside
 /// the polygon × time window. Each returned row is one event —
 /// `(time, lon, lat, <one column per requested source_key>)` — so
 /// `values_per_row` is the requested-column count for the response budget.
 /// `ORDER BY time DESC, <id>` keeps results deterministic (newest first, id
-/// tiebreak on equal timestamps); `LIMIT $4` is the budget in rows.
+/// tiebreak on equal timestamps; [`events_newest_first`]); `LIMIT $4` is the
+/// budget in rows.
 ///
 /// The `::double precision` cast on every parameter column also normalises
 /// `numeric`-typed columns (e.g. a `numeric(3,1)` accuracy radius) to `f64`
@@ -842,14 +883,15 @@ pub fn build_events_area(
     projection.push_str(&format!(", {geometry_check} AS mc_geometry_valid"));
     let rhs_lo = time_filter_rhs("$1", tz);
     let rhs_hi = time_filter_rhs("$2", tz);
+    let order = events_newest_first(&time_col, &id);
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "{projection} \
-         FROM {table} \
+         FROM {table} AS {EVENTS_ALIAS} \
          WHERE {time_col} >= {rhs_lo} AND {time_col} <= {rhs_hi} \
          AND {geom} && ST_GeomFromText($3, 4326) \
          AND ST_Intersects({geom}, ST_GeomFromText($3, 4326)) \
-         ORDER BY {time_col} DESC, {id} LIMIT $4"
+         ORDER BY {order} LIMIT $4"
     ));
     Ok(BuiltQuery::new(sql, params).with_row_limit(3, source_keys.len().max(1)))
 }
@@ -894,14 +936,15 @@ pub fn build_events_pick(
     ));
     let rhs_lo = time_filter_rhs("$1", tz);
     let rhs_hi = time_filter_rhs("$2", tz);
+    let order = events_newest_first(&time_col, &id);
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "{projection} \
-         FROM {table} \
+         FROM {table} AS {EVENTS_ALIAS} \
          WHERE {time_col} > {rhs_lo} AND {time_col} <= {rhs_hi} \
          AND {geom} && ST_GeomFromText($3, 4326) \
          AND ST_Intersects({geom}, ST_GeomFromText($3, 4326)) \
-         ORDER BY {time_col} DESC, {id} LIMIT $4"
+         ORDER BY {order} LIMIT $4"
     ));
     Ok(BuiltQuery::new(sql, params))
 }
@@ -1036,9 +1079,9 @@ fn event_id_order(id: &str) -> String {
 /// rows (`LIMIT $N`, the last bind; the caller asks one more than the page
 /// to know whether another follows). Rows are [`event_projection`]'s
 /// layout, the geometry check last. The table is aliased, and the order
-/// names its time column through the alias: a bare name matching the
-/// `time` output column would order by the converted output expression of
-/// a naive column, which no index provides.
+/// names its columns through the alias ([`EVENTS_ALIAS`]): a bare name
+/// matching the `time` output column would order by the converted output
+/// expression of a naive column, which no index provides.
 pub fn build_events_features(
     shape: &EventsShape,
     parameters: &[ValidatedParameter],
@@ -1055,12 +1098,13 @@ pub fn build_events_features(
     let filter = events_where(shape, selection, &mut params)?;
     let projection = event_projection(shape, parameters, source_keys, &mut params)?;
     let limit = push_bind(&mut params, SqlParam::Int(row_limit as i64));
-    let order = event_id_order(&format!("mc_events.{id}"));
+    let time = qualified(EVENTS_ALIAS, &time_col);
+    let order = event_id_order(&qualified(EVENTS_ALIAS, &id));
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "{projection}, {geometry_check} AS mc_geometry_valid \
-         FROM {table} AS mc_events{filter} \
-         ORDER BY mc_events.{time_col} DESC, {order} DESC LIMIT {limit}"
+         FROM {table} AS {EVENTS_ALIAS}{filter} \
+         ORDER BY {time} DESC, {order} DESC LIMIT {limit}"
     ));
     let limit_idx = params.len() - 1;
     Ok(BuiltQuery::new(sql, params).with_row_limit(limit_idx, source_keys.len().max(1)))
@@ -1173,12 +1217,13 @@ pub fn build_events_window(
             }
         }
     }
+    let order = events_newest_first(&time_col, &id);
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "{time_select} AS time, {coordinates}{attr_cols}, {geometry_check} AS mc_geometry_valid \
-         FROM {table} \
+         FROM {table} AS {EVENTS_ALIAS} \
          WHERE {time_col} > {rhs_lo} AND {time_col} <= {rhs_hi} \
-         ORDER BY {time_col} DESC, {id} LIMIT $3"
+         ORDER BY {order} LIMIT $3"
     ));
     let params = vec![
         SqlParam::Timestamp(time_range.0),
@@ -1233,7 +1278,7 @@ fn build_location_long(
         "{lead}{time_select} AS time, \
          {param_col} AS parameter, \
          {value} AS value \
-         FROM {table} \
+         FROM {table} AS {OBS_ALIAS} \
          WHERE {station_pred}{conditions} ORDER BY {order} LIMIT ${}",
         limit_idx + 1
     ));
@@ -1291,7 +1336,7 @@ fn build_location_wide(
     let mut sql = String::from("SELECT ");
     sql.push_str(&format!(
         "{projection} \
-         FROM {table} \
+         FROM {table} AS {OBS_ALIAS} \
          WHERE {station_pred}{conditions} ORDER BY {order} LIMIT ${}",
         limit_idx + 1
     ));
@@ -1347,7 +1392,7 @@ fn build_location_per_parameter(
         sql.push_str(&format!(
             "{lead}{time_select} AS time, \
              {value} AS value \
-             FROM {table_fq} \
+             FROM {table_fq} AS {OBS_ALIAS} \
              WHERE {station_pred}{conditions} ORDER BY {order} LIMIT ${}",
             limit_idx + 1
         ));
@@ -1773,7 +1818,8 @@ mod tests {
 
         let q = build_locations(&cfg).unwrap();
         assert!(
-            q.sql.ends_with("ORDER BY \"wigos_id\" LIMIT 4"),
+            q.sql
+                .ends_with("ORDER BY \"public\".\"stations\".\"wigos_id\" LIMIT 4"),
             "{}",
             q.sql
         );
@@ -1783,7 +1829,7 @@ mod tests {
         assert_eq!(qs.len(), 2);
         for q in &qs {
             assert!(
-                q.sql.ends_with("ORDER BY \"wigos_id\" LIMIT 4"),
+                q.sql.ends_with("ORDER BY mc_obs.\"wigos_id\" LIMIT 4"),
                 "{}",
                 q.sql
             );
@@ -1806,7 +1852,9 @@ mod tests {
         assert_eq!(qs.len(), 2);
         for q in &qs {
             assert!(q.params.is_empty());
-            assert!(q.sql.starts_with("SELECT DISTINCT ON (\"wigos_id\")"));
+            assert!(q
+                .sql
+                .starts_with("SELECT DISTINCT ON (mc_obs.\"wigos_id\")"));
             assert!(q.sql.contains("ST_Y(\"the_geom\")"));
             assert!(q.sql.contains("ST_X(\"the_geom\")"));
             assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
@@ -1830,7 +1878,7 @@ mod tests {
             // for the naive-UTC column so the index/chunk-pruning stays usable.
             assert!(q.sql.contains("AND \"time\" >= ($1 AT TIME ZONE 'UTC')"));
             assert!(q.sql.contains(&format!(
-                "ORDER BY \"wigos_id\" LIMIT {}",
+                "ORDER BY mc_obs.\"wigos_id\" LIMIT {}",
                 cfg.max_locations + 1
             )));
             assert_eq!(q.params, vec![SqlParam::Timestamp(since)]);
@@ -1968,11 +2016,13 @@ mod tests {
         let qs = build_locations_from_observations(&cfg, None).unwrap();
         assert_eq!(qs.len(), 1);
         let q = &qs[0];
-        assert!(q.sql.starts_with("SELECT DISTINCT ON (\"wigos_id\")"));
+        assert!(q
+            .sql
+            .starts_with("SELECT DISTINCT ON (mc_obs.\"wigos_id\")"));
         assert!(q.sql.contains("\"wigos_id\"::text AS id"));
         assert!(q.sql.contains("WHERE \"the_geom\" IS NOT NULL"));
         assert!(q.sql.contains(&format!(
-            "ORDER BY \"wigos_id\" LIMIT {}",
+            "ORDER BY mc_obs.\"wigos_id\" LIMIT {}",
             cfg.max_locations + 1
         )));
         assert!(!q.sql.contains(" UNION "));
@@ -2233,14 +2283,15 @@ mod tests {
             q.sql.starts_with(
                 "SELECT \"fmisid\"::text AS mc_station, \"obstime\" AS time, \
                  \"param_name\" AS parameter, \"value\"::double precision AS value \
-                 FROM \"public\".\"observations\" WHERE \"fmisid\" = ANY($1)"
+                 FROM \"public\".\"observations\" AS mc_obs WHERE \"fmisid\" = ANY($1)"
             ),
             "{}",
             q.sql
         );
         assert!(q.sql.contains("\"param_name\" = ANY($4)"));
         assert!(
-            q.sql.ends_with("ORDER BY \"fmisid\", \"obstime\" LIMIT $5"),
+            q.sql
+                .ends_with("ORDER BY mc_obs.\"fmisid\", mc_obs.\"obstime\" LIMIT $5"),
             "{}",
             q.sql
         );
@@ -2312,7 +2363,7 @@ mod tests {
         assert!(!q.sql.contains(">= $"), "{}", q.sql);
         assert!(
             q.sql
-                .ends_with("ORDER BY \"station_id\", \"valid_time\" LIMIT $2"),
+                .ends_with("ORDER BY mc_obs.\"station_id\", mc_obs.\"valid_time\" LIMIT $2"),
             "{}",
             q.sql
         );
@@ -2345,7 +2396,8 @@ mod tests {
             }
             assert!(q.sql.contains("\"time\" >= ($2 AT TIME ZONE 'UTC')"));
             assert!(
-                q.sql.ends_with("ORDER BY \"wigos_id\", \"time\" LIMIT $4"),
+                q.sql
+                    .ends_with("ORDER BY mc_obs.\"wigos_id\", mc_obs.\"time\" LIMIT $4"),
                 "{}",
                 q.sql
             );
@@ -2498,7 +2550,7 @@ mod tests {
         );
         assert!(q.sql.contains("\"param_name\" = ANY($4)"), "{}", q.sql);
         assert!(
-            q.sql.ends_with("ORDER BY \"obstime\" LIMIT $9"),
+            q.sql.ends_with("ORDER BY mc_obs.\"obstime\" LIMIT $9"),
             "{}",
             q.sql
         );
@@ -2601,7 +2653,7 @@ mod tests {
         );
         assert!(
             q.sql
-                .ends_with("ORDER BY \"station_id\", \"valid_time\" LIMIT $8"),
+                .ends_with("ORDER BY mc_obs.\"station_id\", mc_obs.\"valid_time\" LIMIT $8"),
             "{}",
             q.sql
         );
@@ -2760,7 +2812,12 @@ mod tests {
             .sql
             .contains("ST_Intersects(\"the_geom\", ST_GeomFromText($3, 4326))"));
         // Deterministic newest-first ordering with id tiebreak; bound LIMIT.
-        assert!(q.sql.contains("ORDER BY \"time\" DESC, \"id\" LIMIT $4"));
+        assert!(q
+            .sql
+            .contains("FROM \"public\".\"lightning\" AS mc_events WHERE "));
+        assert!(q
+            .sql
+            .contains("ORDER BY mc_events.\"time\" DESC, mc_events.\"id\" LIMIT $4"));
 
         assert_eq!(q.params.len(), 4);
         assert_eq!(
@@ -2900,7 +2957,8 @@ mod tests {
             q.sql
         );
         assert!(
-            q.sql.ends_with("ORDER BY \"time\" DESC, \"id\" LIMIT $4"),
+            q.sql
+                .ends_with("ORDER BY mc_events.\"time\" DESC, mc_events.\"id\" LIMIT $4"),
             "{}",
             q.sql
         );
@@ -3210,7 +3268,9 @@ mod tests {
         assert!(!partial.sql.contains("peak_current"));
         // Half-open window and newest-first truncation are unchanged.
         assert!(q.sql.contains("\"time\" > ($1 AT TIME ZONE 'UTC')"));
-        assert!(q.sql.contains("ORDER BY \"time\" DESC"));
+        assert!(q
+            .sql
+            .contains("ORDER BY mc_events.\"time\" DESC, mc_events.\"id\" LIMIT $3"));
     }
 
     #[test]
@@ -3252,6 +3312,140 @@ mod tests {
         );
         // The statement still ends at the single LIMIT bind — nothing escaped.
         assert_eq!(q.sql.matches("SELECT").count(), 1);
+    }
+
+    /// The `ORDER BY` list of `sql`, and its `DISTINCT ON` list if it has one.
+    fn order_lists(sql: &str) -> Vec<&str> {
+        let mut lists = Vec::new();
+        if let Some((_, rest)) = sql.split_once("DISTINCT ON (") {
+            lists.push(rest.split_once(')').unwrap().0);
+        }
+        let (_, order) = sql.rsplit_once(" ORDER BY ").expect("an ordered statement");
+        lists.push(order.split_once(" LIMIT ").map_or(order, |(list, _)| list));
+        lists
+    }
+
+    /// #1446: every ordered statement names its order's columns through the
+    /// table, never by a bare name an output column captures. The select
+    /// lists emit `... AS time`, for a naive column its converted expression,
+    /// and `<id>::text AS id`; PostgreSQL resolves a bare `ORDER BY "time"` or
+    /// `"id"` (and `DISTINCT ON`) to those output columns, an order no index
+    /// provides and that need not be the order the `WHERE` bounds read.
+    #[test]
+    fn ordered_statements_name_their_columns_through_the_table() {
+        let window = (t(2026, 7, 11, 17), t(2026, 7, 11, 18));
+        let wkt = "POLYGON((0 0,1 0,1 1,0 1,0 0))";
+        let mut statements = Vec::new();
+
+        // Events: a naive `time` column, an `id` column.
+        let shape = lightning_shape();
+        let events = [
+            build_events_area(&shape, &[], wkt, window, &["peak_current"], 10).unwrap(),
+            build_events_pick(&shape, &[], wkt, window, &["peak_current"], 10).unwrap(),
+            build_events_window(&shape, window, 10, WindowAttrs::Include).unwrap(),
+        ];
+        for q in &events {
+            assert!(
+                q.sql
+                    .contains(" FROM \"public\".\"lightning\" AS mc_events WHERE "),
+                "{}",
+                q.sql
+            );
+            assert_eq!(
+                order_lists(&q.sql),
+                ["mc_events.\"time\" DESC, mc_events.\"id\""],
+                "{}",
+                q.sql
+            );
+        }
+        statements.extend(events);
+
+        // Station observations: per-parameter tables with a naive `time`
+        // column, for one station and for a set.
+        let cfg = nexus_per_parameter_cfg();
+        let one = build_location(&cfg, "s", Some(window), &[], 10).unwrap();
+        let set = build_area_set(&cfg, &ids(&["s", "t"]), Some(window), &[], 10).unwrap();
+        for (q, table) in one.iter().zip(["airtemperature", "wind_speed"]) {
+            assert!(
+                q.sql
+                    .contains(&format!(" FROM \"public\".\"{table}\" AS mc_obs WHERE ")),
+                "{}",
+                q.sql
+            );
+            assert_eq!(order_lists(&q.sql), ["mc_obs.\"time\""], "{}", q.sql);
+        }
+        for q in &set {
+            assert_eq!(
+                order_lists(&q.sql),
+                ["mc_obs.\"wigos_id\", mc_obs.\"time\""],
+                "{}",
+                q.sql
+            );
+        }
+        statements.extend(one);
+        statements.extend(set);
+        for cfg in [long_cfg(), wide_cfg()] {
+            statements.extend(build_location(&cfg, "s", Some(window), &[], 10).unwrap());
+            statements.extend(build_area_set(&cfg, &ids(&["s"]), None, &[], 10).unwrap());
+        }
+
+        // Location lists beside `<id>::text AS id`: a stations table and an
+        // observation table whose key column is named `id`. The stations
+        // table keeps its own name (an operator's `where_clause` may name
+        // it); an observation table has no clause and takes the alias.
+        let mut cfg = nexus_per_parameter_cfg();
+        let LocationSource::Stations(stations) = &mut cfg.location_source else {
+            unreachable!()
+        };
+        stations.id_col = "id".into();
+        stations.where_clause = Some("stations.active".into());
+        if let ObservationSchema::PerParameter(pp) = &mut cfg.observations {
+            for table in &mut pp.tables {
+                table.station_fk_col = "id".into();
+            }
+        }
+        let registry = [
+            build_locations(&cfg).unwrap(),
+            build_stations_in_polygon(&cfg, wkt).unwrap(),
+        ];
+        for q in &registry {
+            assert!(q.sql.contains("\"id\"::text AS id"), "{}", q.sql);
+            assert!(
+                q.sql.contains(" FROM \"public\".\"stations\" WHERE "),
+                "no alias hides the table from the clause: {}",
+                q.sql
+            );
+            assert!(q.sql.contains("stations.active"), "{}", q.sql);
+            assert_eq!(
+                order_lists(&q.sql),
+                ["\"public\".\"stations\".\"id\""],
+                "{}",
+                q.sql
+            );
+        }
+        statements.extend(registry);
+        let derived = build_locations_from_observations(&cfg, Some(window.0)).unwrap();
+        for q in &derived {
+            assert!(q.sql.contains(" AS mc_obs WHERE "), "{}", q.sql);
+            assert_eq!(
+                order_lists(&q.sql),
+                ["mc_obs.\"id\"", "mc_obs.\"id\""],
+                "{}",
+                q.sql
+            );
+        }
+        statements.extend(derived);
+
+        // Whatever the shape, no order sorts by a converted or cast output.
+        for q in &statements {
+            for list in order_lists(&q.sql) {
+                assert!(
+                    !list.contains("AT TIME ZONE") && !list.contains("::"),
+                    "{}",
+                    q.sql
+                );
+            }
+        }
     }
 
     // ---- temporal extent ---------------------------------------------------

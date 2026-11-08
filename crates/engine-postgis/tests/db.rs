@@ -1426,9 +1426,9 @@ ANALYZE;
 /// `(TIME - PT1H, TIME]` (05:00 out, 06:01 out), on 0.01° pixels a disc of
 /// radius 2 around each strike's own pixel (a click on its edge pixel finds
 /// it, one just past does not), newest first, `limit` kept and every strike
-/// counted, each with its time, id, filtered parameter and `type`; a pixel
-/// beside the antimeridian finds the strike stored at -179.998 through the
-/// region's copy.
+/// counted, each with its time, id, filtered parameter, `type` and Features
+/// id (#1446); a pixel beside the antimeridian finds the strike stored at
+/// -179.998 through the region's copy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn events_pick_shape() {
     use ds_core::feature::PropertyValue;
@@ -1517,6 +1517,11 @@ async fn events_pick_shape() {
             (
                 "type".to_string(),
                 PropertyValue::String("cloud-to-ground".into())
+            ),
+            // Its Features id, last (#1446); the pick's id stays the bare id.
+            (
+                "feature_id".to_string(),
+                PropertyValue::String("1@2026-01-01T05:30:00Z".into())
             ),
         ],
         "a parameter reads peak_current, so no peak_current_ka"
@@ -2121,3 +2126,6 @@ mod indexes;
 
 #[path = "support/temporal_extent.rs"]
 mod temporal_extent;
+
+#[path = "support/order_and_timeouts.rs"]
+mod order_and_timeouts;
