@@ -16,7 +16,7 @@ use ds_core::feature::{Bbox, MAX_AREA_VALUES};
 use ds_core::geo::{Crs, Ellipsoid, GeoTransform};
 use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
 
-use crate::area::{AreaGrid, AreaPlan};
+use crate::area::{lon_arc, AreaGrid, AreaPlan};
 use crate::GeoTiffEngine;
 
 /// Tile side of the written fixtures; their sizes are multiples of it.
@@ -427,6 +427,16 @@ fn reached_share(
     hit as f64 / inside as f64
 }
 
+/// Whether `(lon, lat)` lies on the raster farther than [`EDGE_PX`] from its
+/// edge, where a cell must hold its pixel.
+fn surely_on_raster(gt: &GeoTransform, lon: f64, lat: f64) -> bool {
+    let (col, row) = gt.world_to_pixel_f64(lon, lat);
+    col >= EDGE_PX
+        && row >= EDGE_PX
+        && col < f64::from(gt.width) - EDGE_PX
+        && row < f64::from(gt.height) - EDGE_PX
+}
+
 /// Every cell of `result` whose centre lies on the raster holds its own
 /// pixel's value, and every other cell is null; within [`EDGE_PX`] of the
 /// raster's edge, either.
@@ -434,19 +444,12 @@ fn assert_cells_on_the_raster_are_filled(fixture: &Fixture, result: &QueryResult
     let (x, y) = axes(result);
     let values = values(result);
     let gt = fixture.geo_transform();
-    let on_raster = |lon: f64, lat: f64| {
-        let (col, row) = gt.world_to_pixel_f64(lon, lat);
-        col >= EDGE_PX
-            && row >= EDGE_PX
-            && col < f64::from(gt.width) - EDGE_PX
-            && row < f64::from(gt.height) - EDGE_PX
-    };
     let mut wrong = 0;
     for (j, &lat) in y.iter().enumerate() {
         for (i, &lon) in x.iter().enumerate() {
             let value = values[j * x.len() + i];
             let right = pixel_values(&gt, lon, lat).contains(&value)
-                || (value.is_none() && !on_raster(lon, lat));
+                || (value.is_none() && !surely_on_raster(&gt, lon, lat));
             wrong += usize::from(!right);
         }
     }
@@ -920,4 +923,149 @@ fn a_geographic_area_is_its_native_window_unchanged() {
         engine.query_area("170,10,-170,20", one, None, None, None),
         Err(DataServerError::InvalidParameter(_))
     ));
+}
+
+/// Re-review of #1435: a bbox inside the raster's CRS84 envelope but off
+/// the rotated raster, in a corner of the envelope it leaves empty, has no
+/// cell on the raster. It is the 400 it was before, from the plan before
+/// any read, not a 200 grid of nulls.
+#[test]
+fn a_bbox_in_an_empty_corner_of_the_envelope_misses_the_raster() {
+    let fixture = Fixture::new("corner", tm35fin(), [20.0, 67.5, 24.0, 68.8], 250.0);
+    let gt = fixture.geo_transform();
+    let [west, south, east, north] = gt.footprint_envelope().unwrap();
+    let off_raster = |[w, s, e, n]: [f64; 4]| {
+        [
+            (w, s),
+            (e, s),
+            (e, n),
+            (w, n),
+            ((w + e) / 2.0, (s + n) / 2.0),
+        ]
+        .iter()
+        .all(|&(lon, lat)| gt.world_to_pixel(lon, lat).is_none())
+    };
+    // A 0.05° × 0.02° box just inside each corner of the envelope.
+    let corners = [
+        [west + 0.005, south + 0.005, west + 0.055, south + 0.025],
+        [east - 0.055, south + 0.005, east - 0.005, south + 0.025],
+        [east - 0.055, north - 0.025, east - 0.005, north - 0.005],
+        [west + 0.005, north - 0.025, west + 0.055, north - 0.005],
+    ];
+    let empty: Vec<[f64; 4]> = corners.into_iter().filter(|&b| off_raster(b)).collect();
+    assert!(!empty.is_empty(), "a rotated raster leaves a corner empty");
+    for [w, s, e, n] in empty {
+        let coords = format!("{w},{s},{e},{n}");
+        match fixture.area(&coords) {
+            Err(DataServerError::InvalidParameter(msg)) => {
+                assert!(msg.contains("does not intersect the raster"), "{msg}");
+            }
+            Err(e) => panic!("{coords}: expected the 400, got {e:?}"),
+            Ok(result) => panic!(
+                "{coords}: expected the 400, got {} cells",
+                values(&result).len()
+            ),
+        }
+    }
+}
+
+/// Re-review of #1435: a bbox nearly a whole turn wide whose gap lies inside
+/// the raster's envelope meets it in two pieces. The answer is the shorter
+/// arc joining them, the envelope's side, not the arc round the bbox.
+#[test]
+fn two_pieces_join_on_the_envelope_side() {
+    let close = |arc: Option<(f64, f64)>, (west, east): (f64, f64)| {
+        let (w, e) = arc.unwrap_or_else(|| panic!("no arc, expected {west}..{east}"));
+        assert!(
+            (w - west).abs() < 1e-9 && (e - east).abs() < 1e-9,
+            "{w}..{e}, expected {west}..{east}"
+        );
+    };
+    // A raster at 170–190°E: the bbox's gap 179°E–179°W lies inside it.
+    close(
+        lon_arc((-179.0, 358.0), (170.0, 20.0), Some(180.0)),
+        (170.0, 190.0),
+    );
+    // A bbox ending at the raster's west edge: that zero-width piece goes.
+    close(
+        lon_arc((-180.0, 350.0), (170.0, 20.0), Some(180.0)),
+        (180.0, 190.0),
+    );
+    // TM35FIN, 25,60,24,61 over a raster at 23.9–26.1°E: the raster's
+    // side, the gap 24–25°E inside it.
+    close(
+        lon_arc((25.0, 359.0), (23.9, 2.2), Some(27.0)),
+        (23.9, 26.1),
+    );
+    // One piece, a bbox inside the envelope, and none.
+    close(lon_arc((24.5, 1.0), (24.0, 2.0), Some(27.0)), (24.5, 25.5));
+    assert_eq!(lon_arc((100.0, 10.0), (24.0, 2.0), Some(27.0)), None);
+
+    // The same through the engine: the cells span the raster, not the bbox,
+    // and those whose footprint lies wholly in the gap are null.
+    let seam = Fixture::new(
+        "two-pieces",
+        tm_at(180.0),
+        [170.0, 10.0, 190.0, 20.0],
+        10_000.0,
+    );
+    let [w, _, e, _] = seam.geo_transform().footprint_envelope().unwrap();
+    for (coords, gap) in [
+        ("-179,10,179,20", (179.0, 181.0)),
+        ("-180,10,170,20", (170.0, 180.0)),
+    ] {
+        let result = seam.area(coords).unwrap();
+        let (x, y) = axes(&result);
+        // About 21° of 0.09° cells, not the bbox's 350° or more.
+        let unrolled = |lon: f64| if lon < 0.0 { lon + 360.0 } else { lon };
+        assert!(x.len() < 300, "{coords}: {} cells wide", x.len());
+        assert!(
+            unrolled(x[0]) >= w && unrolled(x[x.len() - 1]) <= e,
+            "{coords}"
+        );
+        let values = values(&result);
+        let half = (x[1] - x[0]) / 2.0;
+        for (i, &lon) in x.iter().enumerate() {
+            if unrolled(lon) - half > gap.0 && unrolled(lon) + half < gap.1 {
+                assert!(
+                    (0..y.len()).all(|j| values[j * x.len() + i].is_none()),
+                    "{coords}: cells at {lon} lie in the bbox's gap"
+                );
+            }
+        }
+        assert!(values.iter().any(Option::is_some), "{coords}");
+        eprintln!("{coords} over 170–190°E: {} × {} cells", x.len(), y.len());
+    }
+
+    let tm35 = Fixture::new(
+        "two-pieces-tm35",
+        tm35fin(),
+        [24.0, 60.0, 26.0, 61.0],
+        1_000.0,
+    );
+    let result = tm35.area("25,60,24,61").unwrap();
+    let (x, y) = axes(&result);
+    let values = values(&result);
+    let gt = tm35.geo_transform();
+    let [w, _, e, _] = gt.footprint_envelope().unwrap();
+    assert!(
+        x[0] >= w && x[x.len() - 1] <= e,
+        "the cells span the raster"
+    );
+    for (j, &lat) in y.iter().enumerate() {
+        for (i, &lon) in x.iter().enumerate() {
+            let value = values[j * x.len() + i];
+            let half = (x[1] - x[0]) / 2.0;
+            if lon - half > 24.0 && lon + half < 25.0 {
+                assert_eq!(value, None, "({lon}, {lat}) lies in the bbox's gap");
+            } else {
+                assert!(
+                    pixel_values(&gt, lon, lat).contains(&value)
+                        || (value.is_none() && !surely_on_raster(&gt, lon, lat)),
+                    "({lon}, {lat}) holds {value:?}"
+                );
+            }
+        }
+    }
+    eprintln!("25,60,24,61 over 24–26°E: {} × {} cells", x.len(), y.len());
 }

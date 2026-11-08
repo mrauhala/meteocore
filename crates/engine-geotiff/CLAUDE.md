@@ -508,17 +508,23 @@ on the first matching entry's grid (#1435), at native resolution: no
   2.5 M cell 400, now 218 k). The 4° × 1.3° box at 68°N on 250 m TM35FIN
   is 684 × 581 cells and reaches 99.6 % of the pixels in it.
 - **Read window:** `area::source_window`, the pixels the cells take, from
-  the projection grid's own positions: exact by construction, `None` when
-  no cell lies on the raster (nulls, nothing read). Never
-  `GeoTransform::bbox_to_pixels` of the bbox: its 21 samples per edge miss
-  a parallel's projected bulge at the central meridian on a wide bbox, and
-  the rows it missed answered as nulls.
+  the projection grid's own positions: exact by construction. No cell on
+  the raster, a bbox in a corner of the envelope that a rotated raster
+  leaves empty, is the same 400 "Requested bbox does not intersect the
+  raster" from `plan`, before any read or STAC load, never a 200 grid of
+  nulls. Never `GeoTransform::bbox_to_pixels` of the bbox: its 21 samples
+  per edge miss a parallel's projected bulge at the central meridian on a
+  wide bbox, and the rows it missed answered as nulls.
 - **Frame:** `area::lon_arc` intersects the bbox's and the envelope's
   longitude arcs and places the result within half a turn of the source's
   central longitude: an antimeridian-crossing bbox is one arc, not the long
   way round (which made the whole raster answer as nulls), and an LCC
   forward, not periodic in longitude (#1114), gets the longitudes it is
-  meant for.
+  meant for. A bbox nearly a whole turn wide whose gap lies inside the
+  envelope meets it in two pieces: the answer is the shorter arc joining
+  them, the envelope's side, its gap's cells masked, never the arc round the
+  bbox (-179,10,179,20 over a raster at 170–190°E: 220 cells wide, not
+  3925). A zero-width piece beside a real one is dropped.
 
 `AreaGrid::new` settles the answer's extent and cell count without
 allocating either; `AreaGrid::plan` runs every budget on them before the

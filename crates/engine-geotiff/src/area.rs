@@ -60,8 +60,8 @@ pub(crate) struct AreaPlan {
     pub(crate) x: Vec<f64>,
     pub(crate) y: Vec<f64>,
     /// The native window `(col_start, row_start, col_end, row_end)` each
-    /// timestep reads; `None` when no cell lies on the raster.
-    pub(crate) window: Option<(u32, u32, u32, u32)>,
+    /// timestep reads.
+    pub(crate) window: (u32, u32, u32, u32),
     /// A projected source's cell → source pixel map; `None` for a
     /// geographic source, whose window is the answer.
     pub(crate) projection: Option<ProjectionGrid>,
@@ -132,7 +132,7 @@ impl AreaGrid {
                     geo_transform,
                     x,
                     y,
-                    window: Some(window),
+                    window,
                     projection: None,
                 })
             }
@@ -145,17 +145,20 @@ impl AreaGrid {
                 let axes = cells.sample_grid(regular.step.0, regular.step.1, nx.max(ny));
                 debug_assert_eq!(axes.dims(), (nx, ny));
                 let projection = regular.projection(&geo_transform, axes.dims(), collection);
-                let window = source_window(&projection, axes.dims(), &geo_transform);
-                if let Some(window) = window {
-                    let (window_nx, window_ny) = window_dims(window);
-                    let pixels = window_nx * window_ny;
-                    if pixels > MAX_AREA_VALUES {
-                        return Err(DataServerError::QueryTooLarge(format!(
-                            "Area query would read {pixels} source pixels ({window_ny} × \
-                             {window_nx} of the native grid) for each timestep; the limit is \
-                             {MAX_AREA_VALUES} — narrow the polygon"
-                        )));
-                    }
+                // No cell on the raster: a bbox in a corner of the envelope
+                // a rotated raster leaves empty misses the raster, the 400 it
+                // always was, never a grid of nulls (and on a STAC source no
+                // cold item loads for it).
+                let window = source_window(&projection, axes.dims(), &geo_transform)
+                    .ok_or_else(misses_raster)?;
+                let (window_nx, window_ny) = window_dims(window);
+                let pixels = window_nx * window_ny;
+                if pixels > MAX_AREA_VALUES {
+                    return Err(DataServerError::QueryTooLarge(format!(
+                        "Area query would read {pixels} source pixels ({window_ny} × \
+                         {window_nx} of the native grid) for each timestep; the limit is \
+                         {MAX_AREA_VALUES} — narrow the polygon"
+                    )));
                 }
                 Ok(AreaPlan {
                     geo_transform,
@@ -170,10 +173,16 @@ impl AreaGrid {
 }
 
 impl AreaPlan {
-    /// The native window's `(nx, ny)` pixels, `(0, 0)` without one.
+    /// The native window's `(nx, ny)` pixels.
     pub(crate) fn window_dims(&self) -> (usize, usize) {
-        self.window.map_or((0, 0), window_dims)
+        window_dims(self.window)
     }
+}
+
+/// The 400 of an area query whose bbox misses the raster, as
+/// `crate::area_pixel_window` gives it for a geographic source.
+fn misses_raster() -> DataServerError {
+    DataServerError::InvalidParameter("Requested bbox does not intersect the raster".into())
 }
 
 /// A pixel window's `(nx, ny)`.
@@ -208,14 +217,12 @@ impl RegularGrid {
     /// Never coarsened to `MAX_AREA_DIM`: GeoTIFF answers at native
     /// resolution and refuses an area over budget (#858).
     fn new(geo_transform: &GeoTransform, bbox: &Bbox) -> Result<Self, DataServerError> {
-        let miss = || {
-            DataServerError::InvalidParameter("Requested bbox does not intersect the raster".into())
-        };
-        let [env_west, env_south, env_east, env_north] =
-            geo_transform.footprint_envelope().ok_or_else(miss)?;
+        let [env_west, env_south, env_east, env_north] = geo_transform
+            .footprint_envelope()
+            .ok_or_else(misses_raster)?;
         let (south, north) = (bbox.south.max(env_south), bbox.north.min(env_north));
         if south > north {
-            return Err(miss());
+            return Err(misses_raster());
         }
         let bbox_span = if bbox.crosses_antimeridian() {
             bbox.east + 360.0 - bbox.west
@@ -227,7 +234,7 @@ impl RegularGrid {
             (env_west, env_east - env_west),
             central_longitude(&geo_transform.crs),
         )
-        .ok_or_else(miss)?;
+        .ok_or_else(misses_raster)?;
 
         let centre = ((west + east) / 2.0, (south + north) / 2.0);
         let (column_m, row_m) = pixel_ground_size(geo_transform, centre)
@@ -315,7 +322,8 @@ impl RegularGrid {
 /// The native window holding every pixel a cell of `projection` takes, as
 /// [`crate::resample_nearest`] takes it: the floor of each cell's
 /// interpolated source position, on the raster. Exact by construction,
-/// whatever the bbox's shape; `None` when no cell lies on the raster.
+/// whatever the bbox's shape; `None` when no cell lies on the raster,
+/// which [`AreaGrid::plan`] answers as a bbox missing the raster.
 fn source_window(
     projection: &ProjectionGrid,
     (nx, ny): (usize, usize),
@@ -348,9 +356,14 @@ fn source_window(
 /// `(west, east)` with `west <= east`, placed within half a turn of the
 /// source's central longitude `centre` where it has one, where its forward
 /// transform is meant to be evaluated: a Lambert conformal conic's is not
-/// periodic in longitude (#1114). Two pieces, when the arcs meet at both
-/// ends, give their hull; none give `None`.
-fn lon_arc(
+/// periodic in longitude (#1114). None give `None`.
+///
+/// Two pieces, when the arcs meet at both ends (a bbox nearly a whole turn
+/// wide, its gap inside the envelope), give the shorter of the two arcs
+/// joining them: the envelope's side, never one reaching round the bbox
+/// past the raster. The rectangle mask nulls the gap's cells. A zero-width
+/// piece, an arc touching the other's end, is no piece beside a real one.
+pub(crate) fn lon_arc(
     (bbox_start, bbox_span): (f64, f64),
     (env_start, env_span): (f64, f64),
     centre: Option<f64>,
@@ -374,7 +387,18 @@ fn lon_arc(
         let wrapped_end = bbox_start + offset + env_span - 360.0;
         let second = (wrapped_end >= bbox_start).then(|| (bbox_start, bbox_end.min(wrapped_end)));
         match (first, second) {
-            (Some((_, end)), Some((start, _))) => (start, end),
+            (Some(first), Some(second)) if second.1 <= second.0 => first,
+            (Some(first), Some(second)) if first.1 <= first.0 => second,
+            // The arc on from the first piece through the bbox's seam to
+            // the second, a turn on, or the one back across the bbox's
+            // interior: whichever is shorter.
+            (Some(first), Some(second)) => {
+                if second.1 + 360.0 - first.0 <= first.1 - second.0 {
+                    (first.0, second.1 + 360.0)
+                } else {
+                    (second.0, first.1)
+                }
+            }
             (Some(arc), None) | (None, Some(arc)) => arc,
             (None, None) => return None,
         }

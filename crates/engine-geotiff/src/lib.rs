@@ -2429,11 +2429,7 @@ impl GeoTiffEngine {
                 }
             };
             precision = precision.max(Some(metadata.value_precision()));
-            // No cell on the raster: nothing to read.
-            let Some((col_start, row_start, col_end, row_end)) = plan.window else {
-                all_values.extend(std::iter::repeat_n(None, nx * ny));
-                continue;
-            };
+            let (col_start, row_start, col_end, row_end) = plan.window;
 
             let read = reader::read_bbox(
                 source,
@@ -2531,7 +2527,7 @@ fn mask_area(
 ) {
     let (nx, ny) = (plan.x.len(), plan.y.len());
     let inside: Vec<bool> = match (&plan.projection, plan.window) {
-        (None, Some((col_start, row_start, _, _))) => (0..ny)
+        (None, (col_start, row_start, _, _)) => (0..ny)
             .flat_map(|iy| (0..nx).map(move |ix| (ix, iy)))
             .map(|(ix, iy)| {
                 let (lon, lat) = plan
