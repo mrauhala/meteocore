@@ -378,6 +378,12 @@ layer gets that parameter's palette. An RGB composite's legend lists its
 three channels instead of a colour bar. `QUALITY` is ignored: a JPEG legend
 is encoded at quality 85, a WebP legend lossless.
 
+`LAYER` takes the names GetMap draws, through the same check: a name GetMap
+answers with `LayerNotDefined`, such as an unknown or misspelled parameter
+of a multi-parameter collection, is a 400 `LayerNotDefined` with the same
+hint here too. It used to return the collection's legend, which can belong
+to another parameter.
+
 ## Exceptions
 
 A request error is a WMS 1.3.0 `ServiceExceptionReport` served as
@@ -392,7 +398,7 @@ A request error is a WMS 1.3.0 `ServiceExceptionReport` served as
 
 | Code | When |
 |---|---|
-| `LayerNotDefined` | Unknown layer or parameter; a `QUERY_LAYERS` layer not in `LAYERS` |
+| `LayerNotDefined` | Unknown layer or parameter, in GetMap, GetFeatureInfo and GetLegendGraphic alike; a `QUERY_LAYERS` layer not in `LAYERS` |
 | `StyleNotDefined` | A style the layer does not offer |
 | `InvalidCRS` | A CRS other than the five above |
 | `InvalidFormat` | Unsupported `FORMAT` or `INFO_FORMAT` |
