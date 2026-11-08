@@ -108,6 +108,7 @@ fn cube_is_steps_by_levels_by_the_native_bbox() {
         y,
         t: Some(t),
         z: Some(z),
+        ..
     } = result.domain
     else {
         panic!("expected a Grid with t and z")
@@ -295,6 +296,7 @@ fn resolution_resamples_by_nearest_neighbour_and_reads_only_sampled_levels() {
         y,
         t: Some(t),
         z: Some(z),
+        ..
     } = result.domain
     else {
         panic!("expected a Grid with t and z")
@@ -486,6 +488,7 @@ fn an_area_interval_has_the_cube_layout() {
         y,
         t: Some(t),
         z: Some(levels),
+        ..
     } = &area.domain
     else {
         panic!("expected t and z axes")

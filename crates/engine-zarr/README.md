@@ -118,7 +118,7 @@ or map window. Nothing is converted or copied first.
   point, after one fetch of every point's cold chunks. A point off the
   grid is null.
 - `area` returns a CRS84 grid over the polygon's bounding box at the
-  store's resolution, at most 256 cells per axis. Cells outside the polygon
+  store's resolution while the answer fits the 1 M-value budget, evenly coarser past it (the domain's `meteocore:resolution` member then gives the native and served cell size). Cells outside the polygon
   are null; a polygon outside the extent is a 404. A box crossing the
   antimeridian is read as two windows. `radius` is answered as an area.
 - `trajectory` takes a WKT `LINESTRING` (also `Z`, `M`, `ZM`), densified at

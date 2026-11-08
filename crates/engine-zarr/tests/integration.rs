@@ -364,6 +364,40 @@ fn area_query_budgets_the_native_read() {
     assert_eq!(qr.ranges["t"].shape, vec![1, 100, 100]);
 }
 
+/// #1436: an area wider than 256 native cells is answered at the store's
+/// native resolution while it fits the value budget, no longer coarsened
+/// to 256 × 256, and a native answer carries no resolution member.
+#[test]
+fn area_query_wider_than_256_cells_answers_at_native_resolution() {
+    let dir = tempfile::tempdir().unwrap();
+    // 0.125° cells, exact in binary so the outer cell centres meet the
+    // outer nodes exactly: 600 columns from 0° E, 320 rows down from 60° N.
+    let lats: Vec<f64> = (0..320).map(|i| 59.9375 - i as f64 * 0.125).collect();
+    let lons: Vec<f64> = (0..600).map(|i| 0.0625 + i as f64 * 0.125).collect();
+    write_grid_store(dir.path(), &lats, &lons, &["t"]);
+    let cfg = ZarrConfig {
+        data_path: Some(dir.path().to_string_lossy().into_owned()),
+        ..config(None)
+    };
+    let e = ZarrEngine::new("wide", &cfg).unwrap();
+    let qr = single(e.query_area("0,20,75,60", None, None, None, None).unwrap());
+    assert_eq!(qr.ranges["t"].shape, vec![1, 320, 600]);
+    let ds_core::model::DomainDescription::Grid {
+        x, y, coarsened, ..
+    } = &qr.domain
+    else {
+        panic!("expected a Grid domain");
+    };
+    assert_eq!(*coarsened, None, "native: no resolution member");
+    assert_eq!((x[0], x[1], x[599]), (0.0625, 0.1875, 74.9375));
+    assert_eq!((y[0], y[1], y[319]), (59.9375, 59.8125, 20.0625));
+    // The store's 0 K everywhere, served in °C.
+    assert!(qr.ranges["t"]
+        .values
+        .iter()
+        .all(|v| *v == Some(celsius(0.0))));
+}
+
 /// engine-zarr registers its own `zstd` codec; zarrs' `zstd` feature is off.
 /// A V3 array whose codecs name `zstd`, as zarr-python writes it, with a
 /// frame from the zstd library rather than the engine's encoder, opens and

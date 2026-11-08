@@ -794,13 +794,18 @@ cube is an area's steps and cells, never coarsened, sampled bilinearly,
   GetFeatureInfo passes the run and step its map resolved
   (`resolve_reference_time`, `resolve_time`), so it reads that field.
 - **Sampling:** `ds_core::resample::SourceGrid::position` projects a point,
-  or an area cell centre, once (Critical Rule 5); `value_at` samples it as
+  or an area cell centre, once (Critical Rule 5); an area grid of more than
+  `ds_core::feature::MAX_EXACT_AREA_CELLS` (256²) over a projected or
+  curvilinear grid takes the map's coarse `SourceGrid::output_map`
+  position instead (#1436). `value_at` samples it as
   the map does (bilinear in x/y, nearest at a nodata neighbour, the half
   cell past the edges), and `Layout::to_display` converts it as the map
   converts a pixel (#1209). A point off the grid is null, not an error. An
   area is a CRS84 grid over the polygon's bbox at the extent's mean degree
-  size per cell (`crs84_bbox_spans` ÷ cells), ≤ `MAX_AREA_DIM`, masked by
-  `cell_mask`, as engine-querydata's; a polygon missing the extent is 404.
+  size per cell (`crs84_bbox_spans` ÷ cells) while the answer fits
+  `MAX_AREA_VALUES`, evenly coarser past it (`QueryPolygon::fit_grid`,
+  #1436), masked by `cell_mask`, as engine-querydata's; a polygon missing
+  the extent is 404.
   A point or cell off the grid (`SourceGrid::covers`, the rule `value_at`
   applies) is dropped before sampling, and a query with none on the grid
   reads no field: `POINT(-100 10)` on remote MEPS costs no fetch.

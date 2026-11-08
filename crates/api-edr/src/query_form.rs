@@ -188,9 +188,10 @@ impl QueryForm {
                 .get_spatial_extent()
                 .and_then(ds_core::geo::crs84_extent),
         );
-        let description = data_query_variables(query_type, station, trajectory)
-            .and_then(|v| v["description"].as_str().map(str::to_owned))
-            .unwrap_or_default();
+        let description =
+            data_query_variables(query_type, station, trajectory, engine.coarsens_areas())
+                .and_then(|v| v["description"].as_str().map(str::to_owned))
+                .unwrap_or_default();
         Self {
             query_type: query_type.to_owned(),
             action,

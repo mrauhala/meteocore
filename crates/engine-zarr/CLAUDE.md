@@ -3,10 +3,12 @@
 Zarr V2/V3 multidimensional-array engine (cloud-native, CF conventions),
 tracked in #125. Phases 1–3 ship today: local + remote (S3/HTTP) stores,
 WGS84 lat-lon grids, multi-variable EDR position queries (bilinear), EDR
-area/radius (a CRS84 `Grid` over the polygon bbox at native resolution,
-≤ 256 cells per axis, 1M-value budget, ONE `read_window_span` subset retrieval
+area/radius (a CRS84 `Grid` over the polygon bbox at native resolution
+while it fits the 1M-value budget, evenly coarser past it, #1436 — in
+practice native, since the native read below has the same budget — ONE
+`read_window_span` subset retrieval
 per variable for the whole timestep span — two across the antimeridian —
-cells outside the polygon masked to null — `QueryPolygon::sample_grid`,
+cells outside the polygon masked to null — `QueryPolygon::fit_grid`,
 #671; the NATIVE read is budgeted too via `Catalog::window_dims`, and at
 most 8 variables per request since each is a sequential blocking read — up to 16 subsets across the antimeridian, each potentially many network reads; across the seam the two windows do not
 bracket each other, so cells within half a native cell of ±180° on a

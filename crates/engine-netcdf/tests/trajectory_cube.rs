@@ -206,7 +206,7 @@ fn assert_cube_reads_like_position(
     parameters: &[&str],
     run: Option<DateTime<Utc>>,
 ) -> usize {
-    let DomainDescription::Grid { x, y, t, z } = &result.domain else {
+    let DomainDescription::Grid { x, y, t, z, .. } = &result.domain else {
         panic!("not a Grid: {:?}", result.domain)
     };
     let times = t.as_ref().expect("a cube always has a t axis");
@@ -652,7 +652,7 @@ fn a_pressure_level_cube_samples_each_cell_like_position() {
         2 * 2 * 2,
         "steps × levels × variables"
     );
-    let DomainDescription::Grid { x, y, t, z } = &cube.domain else {
+    let DomainDescription::Grid { x, y, t, z, .. } = &cube.domain else {
         panic!("{:?}", cube.domain)
     };
     assert_eq!(t.as_deref(), Some(&[nine, ten][..]));
@@ -778,7 +778,7 @@ fn a_surface_cube_is_an_area_with_a_time_axis() {
             )
             .unwrap(),
     );
-    let DomainDescription::Grid { x, y, t, z } = &cube.domain else {
+    let DomainDescription::Grid { x, y, t, z, .. } = &cube.domain else {
         unreachable!()
     };
     assert!(z.is_none(), "no vertical axis: z ignored");

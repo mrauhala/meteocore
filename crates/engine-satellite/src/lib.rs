@@ -31,9 +31,7 @@ use ds_cache::CacheEntry;
 use ds_core::config::SatelliteConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{
-    check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, MAX_AREA_DIM,
-};
+use ds_core::feature::{parse_area_coords, parse_point_coords};
 use ds_core::map_engine::{
     select_common_time, CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile,
 };
@@ -1036,6 +1034,11 @@ impl<'a> PixelReader<'a> {
 /// on async request workers; a scan the cache evicted is fetched through
 /// `Source::fetch`, which is safe there.
 impl EdrEngine for SatelliteEngine {
+    /// Area and radius answers are fitted to the value budget (#1436).
+    fn coarsens_areas(&self) -> bool {
+        true
+    }
+
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         Ok(LocationSnapshot::empty())
     }
@@ -1202,10 +1205,11 @@ impl EdrEngine for SatelliteEngine {
             pixels = pixels.saturating_add(per_scan.saturating_mul(own.len() as u64));
         }
         Self::check_decode_budget(pixels)?;
-        let axes = polygon.sample_grid(resolution, resolution, MAX_AREA_DIM);
+        // Native resolution while the answer fits the budget, evenly
+        // coarser past it (#1436). Only the output grid grows: the blocks
+        // decoded are the bbox's whatever its cell size.
+        let axes = polygon.fit_grid(resolution, resolution, times.len(), plan.len())?;
         let (nx, ny) = axes.dims();
-        check_area_budget(times.len(), ny, nx, plan.len())?;
-        check_mask_budget(nx * ny, &polygon)?;
         let mask = polygon.cell_mask(&axes);
 
         let span = if b.crosses_antimeridian() {
@@ -1268,6 +1272,7 @@ impl EdrEngine for SatelliteEngine {
                 y: axes.y,
                 t: Some(times),
                 z: None,
+                coarsened: axes.coarsened,
             },
             parameters: descriptions,
             ranges,

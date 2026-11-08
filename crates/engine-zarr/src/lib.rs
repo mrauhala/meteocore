@@ -44,7 +44,7 @@ use ds_poll::{FirstTick, Shutdown};
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{check_area_budget, check_mask_budget, parse_area_coords, MAX_AREA_DIM};
+use ds_core::feature::{check_area_budget, parse_area_coords};
 use ds_core::instances::{self, RunInfo};
 
 /// Most variables one EDR area request may address. Each is a separate
@@ -402,6 +402,11 @@ fn select_time_idx(
 }
 
 impl EdrEngine for ZarrEngine {
+    /// Area and radius answers are fitted to the value budget (#1436).
+    fn coarsens_areas(&self) -> bool {
+        true
+    }
+
     /// Forecast model runs as EDR instances (#337): one per reference-axis
     /// entry, each with its own valid times (run + leads). Empty for a
     /// non-forecast store.
@@ -519,7 +524,8 @@ impl EdrEngine for ZarrEngine {
     }
 
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the store's
-    /// native resolution (each dimension ≤ `MAX_AREA_DIM`), every cell
+    /// native resolution while it fits the value budget, evenly coarser
+    /// past it (`QueryPolygon::fit_grid`, #1436), every cell
     /// bilinearly sampled from one windowed read per variable and timestep,
     /// cells outside the polygon masked to null (#671). The steps the
     /// datetime window selects (every step without one) are always a `t`
@@ -571,10 +577,10 @@ impl EdrEngine for ZarrEngine {
             )));
         }
 
-        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
+        // Native resolution while the answer fits the budget, evenly
+        // coarser past it (#1436).
+        let axes = polygon.fit_grid(res_lon, res_lat, time_idx.len(), selected.len())?;
         let (nx, ny) = axes.dims();
-        check_area_budget(time_idx.len(), ny, nx, selected.len())?;
-        check_mask_budget(nx * ny, &polygon)?;
         let mask = polygon.cell_mask(&axes);
 
         // An antimeridian-crossing bbox (west > east) is read as two
@@ -600,11 +606,11 @@ impl EdrEngine for ZarrEngine {
             *time_idx.iter().min().expect("non-empty"),
             *time_idx.iter().max().expect("non-empty"),
         );
-        // The output grid is coarsened to MAX_AREA_DIM per axis, but the
-        // store read covers the bbox at NATIVE resolution × the whole span:
-        // budget that too, or a global bbox on a fine store would pull the
-        // entire array through the blocking bridge before the output budget
-        // ever applied.
+        // The output grid may be coarsened to fit the budget, but the store
+        // read covers the bbox at NATIVE resolution × the whole span: budget
+        // that too, or a global bbox on a fine store would pull the entire
+        // array through the blocking bridge before the output budget ever
+        // applied. A finer output grid reads nothing more.
         let (read_cols, read_rows) = bboxes
             .iter()
             .filter_map(|bb| cat.window_dims(*bb))
@@ -645,15 +651,34 @@ impl EdrEngine for ZarrEngine {
                 .into_iter()
                 .flatten()
                 .collect();
+            // The 1-D lon/lat axes make the window position separable: each
+            // output column's and row's fractional window pixel once per
+            // seam side (every step of a side shares its axes), not two
+            // axis searches per cell and step.
+            let positions: Vec<(Vec<f64>, Vec<f64>)> = windows
+                .iter()
+                .map(|side| match side.first() {
+                    Some(window) => (
+                        axes.x.iter().map(|&x| window.frac_px(x, 0.0).0).collect(),
+                        axes.y.iter().map(|&y| window.frac_px(0.0, y).1).collect(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                })
+                .collect();
             let mut values: Vec<Option<f64>> = Vec::with_capacity(time_idx.len() * ny * nx);
             for &ti in &time_idx {
                 ds_core::deadline::check()?;
                 let step = ti - t0;
-                for (iy, &y) in axes.y.iter().enumerate() {
+                for iy in 0..ny {
                     ds_core::deadline::check()?;
-                    for (ix, &x) in axes.x.iter().enumerate() {
+                    for ix in 0..nx {
                         values.push(if mask[axes.index(ix, iy)] {
-                            windows.iter().find_map(|side| side[step].sample(x, y))
+                            windows
+                                .iter()
+                                .zip(&positions)
+                                .find_map(|(side, (cols, rows))| {
+                                    side[step].bilinear_at(cols[ix], rows[iy])
+                                })
                         } else {
                             None
                         });
@@ -686,6 +711,7 @@ impl EdrEngine for ZarrEngine {
                 y: axes.y,
                 t: Some(out_times),
                 z: None,
+                coarsened: axes.coarsened,
             },
             parameters: params_map,
             ranges,

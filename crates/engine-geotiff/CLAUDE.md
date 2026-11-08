@@ -478,7 +478,7 @@ depends on the kind:
 Position + area queries. Nearest-neighbour sampling of the source grid.
 
 Area (and radius) answers the native pixel window of the polygon's bbox, like
-GRIB: no `MAX_AREA_DIM` coarsening, which would need overview selection and a
+GRIB: no `QueryPolygon::fit_grid` coarsening (#1436), which would need overview selection and a
 strided polygon mask. `query_bbox` checks the shared
 `ds_core::feature::check_area_budget` over `timesteps × ny × nx` before it
 allocates the result or reads a file, so an over-budget area is a 400 naming

@@ -1125,7 +1125,7 @@ fn edr_area_is_a_crs84_grid_sampled_like_the_map() {
             )
             .unwrap(),
     );
-    let DomainDescription::Grid { x, y, t, z } = &result.domain else {
+    let DomainDescription::Grid { x, y, t, z, .. } = &result.domain else {
         panic!("not a Grid: {:?}", result.domain);
     };
     // The newest run's last step, as a map without `TIME` draws.
@@ -1791,7 +1791,7 @@ fn edr_z_selects_the_levels_a_query_reads() {
         )
     };
     let both = area(&[1000.0, 300.0]);
-    let DomainDescription::Grid { x, y, t, z } = &both.domain else {
+    let DomainDescription::Grid { x, y, t, z, .. } = &both.domain else {
         panic!("{:?}", both.domain);
     };
     assert_eq!(t.as_ref().map(Vec::len), Some(2));

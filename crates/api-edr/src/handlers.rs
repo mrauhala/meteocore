@@ -3896,11 +3896,14 @@ fn temporal_extent_json(
 /// multi-coverage, so they have no PNG plot, the point queries of a station
 /// collection add GeoJSON (#929), those and its area add CSV (#1066), and
 /// only a radar cross-section trajectory renders as a PNG — an along-path
-/// one (#926) is CoverageJSON only.
+/// one (#926) is CoverageJSON only. `coarsens_areas`
+/// (`EdrEngine::coarsens_areas`) adds to the area and radius descriptions
+/// how their grid is fitted to the value budget (#1436).
 pub(crate) fn data_query_variables(
     query_type: &str,
     station_series: bool,
     trajectory: TrajectoryShape,
+    coarsens_areas: bool,
 ) -> Option<serde_json::Value> {
     let (title, description) = match query_type {
         "locations" => (
@@ -3942,6 +3945,16 @@ pub(crate) fn data_query_variables(
              latitude, at the levels z selects; resolution-x, -y and -z resample it.",
         ),
         _ => return None,
+    };
+    let description = if coarsens_areas && matches!(query_type, "area" | "radius") {
+        format!(
+            "{description} The grid is at the source's native resolution while the response \
+             fits {MAX_AREA_VALUES} values (timesteps × cells × parameters); past that it is \
+             coarsened evenly to fit, and the domain's meteocore:resolution member then gives \
+             the native and served cell size in degrees."
+        )
+    } else {
+        description.to_owned()
     };
     // The same list the handler negotiates over (#929).
     let output_formats: Vec<&str> = query_formats(query_type, station_series, trajectory)
@@ -4013,6 +4026,7 @@ struct CollectionMetadata<'a> {
     query_types: Vec<String>,
     station_series: bool,
     trajectory: TrajectoryShape,
+    coarsens_areas: bool,
     has_instances: bool,
     /// The instance documents' `parameter_names`, the same for every run:
     /// built by the first instance document, cloned by the rest.
@@ -4043,6 +4057,7 @@ impl<'a> CollectionMetadata<'a> {
             query_types: engine.supported_query_types(),
             station_series: engine.serves_station_series(),
             trajectory: engine.trajectory_shape(),
+            coarsens_areas: engine.coarsens_areas(),
             has_instances: engine.has_instances(),
             instance_parameter_names: std::cell::OnceCell::new(),
         }
@@ -4162,9 +4177,12 @@ impl<'a> CollectionMetadata<'a> {
         let mut data_queries = serde_json::Map::new();
         for qt in query_types {
             // Every routed query type's path segment is its name.
-            let Some(mut variables) =
-                data_query_variables(qt, self.station_series, self.trajectory)
-            else {
+            let Some(mut variables) = data_query_variables(
+                qt,
+                self.station_series,
+                self.trajectory,
+                self.coarsens_areas,
+            ) else {
                 continue;
             };
             if qt == "cube" {
@@ -4302,6 +4320,36 @@ mod tests {
     use axum::response::IntoResponse;
 
     use super::*;
+
+    /// #1436: a collection whose engine fits its area grid to the value
+    /// budget says so in its area and radius descriptions; one that does
+    /// not (GRIB, GeoTIFF, stations) keeps the plain description, and no
+    /// other query type changes.
+    #[test]
+    fn area_descriptions_say_when_the_grid_is_coarsened() {
+        let description = |query_type: &str, coarsens: bool| {
+            data_query_variables(query_type, false, TrajectoryShape::AlongPath, coarsens).unwrap()
+                ["description"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        for query_type in ["area", "radius"] {
+            let fitted = description(query_type, true);
+            assert!(
+                fitted.contains("native resolution")
+                    && fitted.contains("1000000 values")
+                    && fitted.contains("meteocore:resolution"),
+                "{fitted}"
+            );
+            assert!(!description(query_type, false).contains("meteocore:resolution"));
+        }
+        assert_eq!(
+            description("position", true),
+            description("position", false)
+        );
+        assert_eq!(description("cube", true), description("cube", false));
+    }
 
     /// A log sink a `fmt` subscriber writes its lines to.
     #[derive(Clone, Default)]

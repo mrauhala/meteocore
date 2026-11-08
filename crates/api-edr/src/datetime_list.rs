@@ -27,6 +27,7 @@
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
+use ds_core::feature::AreaShare;
 use ds_core::model::{CoverageResponse, DomainDescription, NdArray, QueryResult, VerticalCoord};
 
 use crate::params::DatetimeSelector;
@@ -62,6 +63,11 @@ pub fn run(
 /// first instant's error is the answer. Any other error fails the request,
 /// as it would for that instant alone. The merged response is bounded by
 /// [`MAX_LIST_VALUES`], and `expired` is checked before every instant.
+///
+/// An engine that fits an area grid to the value budget fits each
+/// instant's to its share of it ([`AreaShare::answers`], #1436): every
+/// instant then gets the same grid, so the answers join along `t`, and
+/// together they fit the list's budget instead of each filling it.
 pub fn query_instants(
     instants: &[DateTime<Utc>],
     expired: impl Fn() -> bool,
@@ -70,6 +76,7 @@ pub fn query_instants(
     let mut responses = Vec::with_capacity(instants.len());
     let mut no_data = None;
     let mut values = 0usize;
+    let _share = AreaShare::answers(instants.len());
     for &t in instants {
         if expired() {
             return Err(DataServerError::DeadlineExceeded);
@@ -230,15 +237,17 @@ fn same_series(a: &QueryResult, b: &QueryResult) -> bool {
                 x: ax,
                 y: ay,
                 z: az,
+                coarsened: ac,
                 ..
             },
             DomainDescription::Grid {
                 x: bx,
                 y: by,
                 z: bz,
+                coarsened: bc,
                 ..
             },
-        ) => ax == bx && ay == by && same_z(az, bz),
+        ) => ax == bx && ay == by && same_z(az, bz) && ac == bc,
         _ => false,
     };
     same_place
@@ -288,14 +297,16 @@ fn same_domain(a: &DomainDescription, b: &DomainDescription) -> bool {
                 y: ay,
                 t: at,
                 z: az,
+                coarsened: ac,
             },
             D::Grid {
                 x: bx,
                 y: by,
                 t: bt,
                 z: bz,
+                coarsened: bc,
             },
-        ) => ax == bx && ay == by && at == bt && same_z(az, bz),
+        ) => ax == bx && ay == by && at == bt && same_z(az, bz) && ac == bc,
         (
             D::VerticalProfile {
                 x: ax,
@@ -467,6 +478,7 @@ mod tests {
                 y: vec![60.0, 61.0],
                 t: step.map(|hour| vec![at(hour)]),
                 z,
+                coarsened: None,
             },
             parameters: param(),
             ranges: HashMap::from([(
@@ -601,6 +613,47 @@ mod tests {
         let mut expected = vec![Some(1.0); 4];
         expected.extend(vec![Some(2.0); 4]);
         assert_eq!(values(&q), expected);
+    }
+
+    /// #1436: an engine fitting its area grid to the value budget fits each
+    /// instant's to the list's share of it, so every instant gets the same
+    /// grid and the list fits the budget a lone instant would have filled.
+    #[test]
+    fn instants_share_the_area_budget() {
+        let polygon = ds_core::feature::parse_area_coords("0,0,40,20").unwrap();
+        let alone = polygon.fit_grid(0.01, 0.01, 1, 1).unwrap().dims();
+        let mut grids = Vec::new();
+        let got = query_instants(
+            &[at(1), at(2), at(3), at(4)],
+            || false,
+            |(t, _)| {
+                let axes = polygon.fit_grid(0.01, 0.01, 1, 1)?;
+                grids.push(axes.dims());
+                let (nx, ny) = axes.dims();
+                let mut q = step_grid(Some(t.hour()), 1.0, None);
+                q.domain = DomainDescription::Grid {
+                    x: axes.x,
+                    y: axes.y,
+                    t: Some(vec![t]),
+                    z: None,
+                    coarsened: axes.coarsened,
+                };
+                let range = q.ranges.get_mut("temperature").unwrap();
+                range.shape = vec![1, ny, nx];
+                range.values = vec![Some(1.0); nx * ny];
+                Ok(CoverageResponse::Single(q))
+            },
+        );
+        let CoverageResponse::Single(q) = got.unwrap() else {
+            panic!("the instants' grids join along t");
+        };
+        assert_eq!(grids.len(), 4);
+        assert!(grids.iter().all(|&g| g == grids[0]), "{grids:?}");
+        let (nx, ny) = grids[0];
+        assert!(4 * nx * ny <= MAX_LIST_VALUES && nx * ny < alone.0 * alone.1);
+        assert_eq!(q.ranges["temperature"].shape, vec![4, ny, nx]);
+        // Outside the list a query has the whole budget again.
+        assert_eq!(polygon.fit_grid(0.01, 0.01, 1, 1).unwrap().dims(), alone);
     }
 
     /// A gridded engine answers each instant with a one-step grid at the

@@ -242,6 +242,7 @@ impl GribEngine {
                     kind,
                     values: z_axis,
                 }),
+                coarsened: None,
             },
             parameters: descriptions,
             ranges,

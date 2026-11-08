@@ -2378,7 +2378,7 @@ impl GeoTiffEngine {
         // The shared per-response budget (#673) over EVERY matching timestep,
         // before the `timesteps × ny × nx` result is allocated or a file read
         // (#858). The answer stays at native resolution, like GRIB: no
-        // `MAX_AREA_DIM` coarsening, so an over-budget window is the 400.
+        // `fit_grid` coarsening, so an over-budget window is the 400.
         ds_core::feature::check_area_budget(entries.len(), ny, nx, 1)?;
 
         // Build x and y axis values (pixel centers).
@@ -2447,6 +2447,7 @@ impl GeoTiffEngine {
             y: y_values,
             t: Some(times),
             z: None,
+            coarsened: None,
         };
         let shape = vec![entries.len(), ny, nx];
         let axis_names = vec!["t".to_string(), "y".to_string(), "x".to_string()];

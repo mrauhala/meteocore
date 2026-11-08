@@ -1,9 +1,13 @@
+use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
+use std::marker::PhantomData;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
 use crate::error::DataServerError;
+use crate::model::GridResolution;
 
 /// GeoJSON-style geometry.
 #[derive(Debug, Clone)]
@@ -346,19 +350,31 @@ pub fn check_mask_budget(cells: usize, polygon: &QueryPolygon) -> Result<(), Dat
     Ok(())
 }
 
-/// Per-dimension cap of a gridded engine's EDR area grid (cells per axis);
-/// a wider bbox is *coarsened* to this, never refused. An output-grid cap,
-/// used by ODIM, QueryData, Satellite and Zarr; GRIB and GeoTIFF answer at
-/// native resolution, bounded only by [`MAX_AREA_VALUES`].
-pub const MAX_AREA_DIM: usize = 256;
 /// Total value budget of one gridded area response across timesteps ×
 /// cells × parameters (≈ 8 MB of CoverageJSON). One home for every gridded
 /// engine — GRIB, GeoTIFF, ODIM, QueryData, Zarr, nowcast — so the budget
-/// cannot drift per engine (#672 review, #673). PostGIS keeps its own
+/// cannot drift per engine (#672 review, #673). The engines that sample an
+/// area onto a CRS84 grid ([`QueryPolygon::fit_grid`]: ODIM, QueryData,
+/// Satellite, Zarr, NetCDF, station grids) answer at native resolution
+/// while it fits and coarsen evenly past it (#1436); GRIB and GeoTIFF
+/// answer their native cells and refuse past it. PostGIS keeps its own
 /// `MAX_RESPONSE_VALUES`: that bounds SQL rows fetched across *every* query
 /// type (position, location, area), not a grid. EDR serves the resulting
 /// `QueryTooLarge` as HTTP 400 `BadRequest`.
 pub const MAX_AREA_VALUES: usize = 1_000_000;
+
+/// The most area cells an engine places on a projected or curvilinear
+/// source one by one, each with its own forward transform or inverse
+/// lookup: the 256 × 256 the old per-axis cap allowed, so every answer of
+/// that size samples each cell centre exactly as a position query samples
+/// the point, as it always did, at the projection cost it always had. A
+/// larger grid, which fitting to the value budget allows up to a million
+/// cells (#1436), places its cells through a coarse output→source map
+/// (`SourceGrid::output_map`, `ProjectionGrid`) within its 0.2-pixel
+/// interpolation budget: one transform per cell would then dominate the
+/// answer (Critical Rule 5). A lat/lon source's placement is affine and
+/// always exact.
+pub const MAX_EXACT_AREA_CELLS: usize = 256 * 256;
 
 /// Most values one EDR position response may carry, every MULTIPOINT point
 /// and parameter included. The API refuses a larger one; an engine that
@@ -389,23 +405,25 @@ pub fn check_area_budget(
 }
 
 /// Cell-centre axes of a regular CRS84 grid over an area query's polygon
-/// bbox, at (roughly) a source's native resolution. The shared shape of a
-/// gridded engine's EDR *area* / *radius* result (#671): a CoverageJSON
-/// `Grid` must be rectangular, so the domain is the bbox and the engine
-/// masks cells outside the polygon to null via [`QueryPolygon::cell_mask`].
+/// bbox, at a source's native resolution or, past the value budget, evenly
+/// coarser ([`QueryPolygon::fit_grid`]). The shared shape of a gridded
+/// engine's EDR *area* / *radius* result (#671): a CoverageJSON `Grid` must
+/// be rectangular, so the domain is the bbox and the engine masks cells
+/// outside the polygon to null via [`QueryPolygon::cell_mask`].
 ///
 /// `x` ascends west→east, `y` descends north→south (index 0 = north),
 /// matching raster row order and the `[t, y, x]` NdArray layout. An
 /// antimeridian-crossing bbox (`west > east`, see [`Bbox`]) spans the seam:
 /// `x` keeps ascending through +180 and is wrapped into `(-180, 180]`, so
-/// the values are not monotonic in that one case. Each dimension is
-/// clamped to `[1, max_dim]`, so a bbox much wider than the source
-/// resolution allows is *coarsened*, never refused — the total-value
-/// budget is [`check_area_budget`].
+/// the values are not monotonic in that one case.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AreaGridAxes {
     pub x: Vec<f64>,
     pub y: Vec<f64>,
+    /// The native and served cell sizes when the grid is coarser than the
+    /// source, `None` at native resolution: the engine puts it on its
+    /// `Grid` domain as is, and EDR tells the client (#1436).
+    pub coarsened: Option<Box<GridResolution>>,
 }
 
 impl AreaGridAxes {
@@ -421,12 +439,118 @@ impl AreaGridAxes {
     }
 }
 
+thread_local! {
+    /// `(answers, extra parameters)` of the [`AreaShare`] scope in force.
+    static AREA_SHARE: Cell<(usize, usize)> = const { Cell::new((1, 0)) };
+}
+
+/// A scope telling [`QueryPolygon::fit_grid`] that the area answers an
+/// engine computes on this thread are not the whole response (#1436), so a
+/// grid fitted to the value budget alone would fit the answer but not the
+/// response, and turn a request that fits at a coarser grid into a 400:
+///
+/// - [`AreaShare::answers`]: the response joins this many answers like the
+///   next one (a `datetime` list's instants, each queried alone), so each
+///   gets that share of the budget and every instant the same grid;
+/// - [`AreaShare::extra_parameters`]: the response carries this many ranges
+///   more than the engine is asked for (the derived parameters a wrapper
+///   adds after the engine answers, less the inputs it drops).
+///
+/// The scopes nest (answers multiply, parameters add) and restore the
+/// previous one on drop or unwind; like [`crate::deadline::enter`] the
+/// guard must stay on the thread that made it, which is the thread the
+/// engine's synchronous query runs on.
+pub struct AreaShare {
+    previous: (usize, usize),
+    _thread: PhantomData<Rc<()>>,
+}
+
+impl AreaShare {
+    /// The response holds `answers` answers like the next one.
+    pub fn answers(answers: usize) -> Self {
+        let previous = AREA_SHARE.get();
+        AREA_SHARE.set((previous.0.saturating_mul(answers.max(1)), previous.1));
+        Self {
+            previous,
+            _thread: PhantomData,
+        }
+    }
+
+    /// Each answer gains `parameters` ranges after the engine returns it.
+    pub fn extra_parameters(parameters: usize) -> Self {
+        let previous = AREA_SHARE.get();
+        AREA_SHARE.set((previous.0, previous.1.saturating_add(parameters)));
+        Self {
+            previous,
+            _thread: PhantomData,
+        }
+    }
+}
+
+impl Drop for AreaShare {
+    fn drop(&mut self) {
+        AREA_SHARE.set(self.previous);
+    }
+}
+
+/// Cells of a `span`-wide axis at `res` per cell: one when `res` is not a
+/// positive number, saturating for an absurdly fine one.
+fn native_cells(span: f64, res: f64) -> usize {
+    if !(res.is_finite() && res > 0.0) {
+        return 1;
+    }
+    ((span / res).ceil() as usize).max(1)
+}
+
+/// The largest `nx × ny ≤ cells` grid with each axis at most its native
+/// count, coarsened by as even a factor on both axes as whole cells allow,
+/// so the cells keep the native aspect (#1436). The native grid when it
+/// fits. Rounding hurts the axis with fewer cells most: both roundings of
+/// it are tried, the other axis taking what the budget leaves, and the more
+/// even pair wins (on a tie the one with more cells). An axis already at one
+/// cell stays there and the other takes the whole budget.
+fn fit_dims(native_x: usize, native_y: usize, cells: usize) -> (usize, usize) {
+    let (native_x, native_y, cells) = (native_x.max(1), native_y.max(1), cells.max(1));
+    if native_x.saturating_mul(native_y) <= cells {
+        return (native_x, native_y);
+    }
+    // The factor that coarsens both axes alike to exactly `cells`.
+    let factor = (native_x as f64 * native_y as f64 / cells as f64).sqrt();
+    let x_short = native_x <= native_y;
+    let (short, long) = if x_short {
+        (native_x, native_y)
+    } else {
+        (native_y, native_x)
+    };
+    let ideal = short as f64 / factor;
+    let unevenness = |(s, l): (usize, usize)| {
+        let (fs, fl) = (short as f64 / s as f64, long as f64 / l as f64);
+        fs.max(fl) / fs.min(fl)
+    };
+    let (s, l) = [ideal.floor(), ideal.ceil()]
+        .into_iter()
+        .map(|s| {
+            let s = (s as usize).clamp(1, short);
+            (s, (cells / s).clamp(1, long))
+        })
+        .filter(|&(s, l)| s.saturating_mul(l) <= cells)
+        .min_by(|&a, &b| {
+            unevenness(a)
+                .total_cmp(&unevenness(b))
+                .then((b.0 * b.1).cmp(&(a.0 * a.1)))
+        })
+        .unwrap_or((1, cells.min(long)));
+    if x_short {
+        (s, l)
+    } else {
+        (l, s)
+    }
+}
+
 impl QueryPolygon {
-    /// See [`AreaGridAxes`]. `res_lon_deg` / `res_lat_deg` are the source's
-    /// cell sizes in degrees (non-positive or non-finite values are treated
-    /// as "one cell").
-    pub fn sample_grid(&self, res_lon_deg: f64, res_lat_deg: f64, max_dim: usize) -> AreaGridAxes {
-        let max_dim = max_dim.max(1);
+    /// The bbox's longitude and latitude spans in degrees, across the
+    /// antimeridian when it crosses it.
+    fn spans(&self) -> (f64, f64) {
         let Bbox {
             west,
             south,
@@ -438,16 +562,65 @@ impl QueryPolygon {
         } else {
             east - west
         };
-        let cells = |span: f64, res: f64| -> usize {
-            if !(res.is_finite() && res > 0.0) {
-                return 1;
-            }
-            ((span / res).ceil() as usize).clamp(1, max_dim)
-        };
-        let nx = cells(lon_span, res_lon_deg);
-        let ny = cells(north - south, res_lat_deg);
+        (lon_span, north - south)
+    }
+
+    /// The area grid of a source with cells `res_lon_deg` × `res_lat_deg`
+    /// degrees (a projected source's mean cell size; a non-positive or
+    /// non-finite value is one cell along that axis), for an answer of
+    /// `timesteps` × `parameters` ranges: the one helper every engine that
+    /// samples an area onto a CRS84 grid calls (#1436). See
+    /// [`AreaGridAxes`] for its shape.
+    ///
+    /// Native resolution whenever the response fits [`MAX_AREA_VALUES`]
+    /// and, for a polygon that is not a rectangle, the mask fits
+    /// [`MAX_MASK_EDGE_TESTS`]. Past either budget the grid is coarsened
+    /// evenly to the largest that fits both ([`fit_dims`]), and
+    /// [`AreaGridAxes::coarsened`] says so. The response counted is the
+    /// engine's answer under the [`AreaShare`] scope in force. Only when
+    /// not even one cell fits (more timesteps × parameters than the budget,
+    /// or more polygon vertices than the mask budget) is it the
+    /// `QueryTooLarge` of [`check_area_budget`] / [`check_mask_budget`].
+    pub fn fit_grid(
+        &self,
+        res_lon_deg: f64,
+        res_lat_deg: f64,
+        timesteps: usize,
+        parameters: usize,
+    ) -> Result<AreaGridAxes, DataServerError> {
+        let (answers, extra) = AREA_SHARE.get();
+        let timesteps = timesteps.max(1).saturating_mul(answers.max(1));
+        let parameters = parameters.max(1).saturating_add(extra);
+        // Even one cell costs a value per timestep and parameter.
+        check_area_budget(timesteps, 1, 1, parameters)?;
+        let mut cells = MAX_AREA_VALUES / timesteps.saturating_mul(parameters);
+        if !self.is_rectangle() {
+            check_mask_budget(1, self)?;
+            cells = cells.min(MAX_MASK_EDGE_TESTS / self.vertex_count().max(1));
+        }
+        let (lon_span, lat_span) = self.spans();
+        let native = (
+            native_cells(lon_span, res_lon_deg),
+            native_cells(lat_span, res_lat_deg),
+        );
+        let (nx, ny) = fit_dims(native.0, native.1, cells);
+        let mut axes = self.grid_axes(nx, ny);
+        if (nx, ny) != native {
+            axes.coarsened = Some(Box::new(GridResolution {
+                native: [res_lon_deg, res_lat_deg],
+                served: [lon_span / nx as f64, lat_span / ny as f64],
+            }));
+        }
+        Ok(axes)
+    }
+
+    /// The cell centres of an `nx` × `ny` grid over the bbox.
+    fn grid_axes(&self, nx: usize, ny: usize) -> AreaGridAxes {
+        let (nx, ny) = (nx.max(1), ny.max(1));
+        let (lon_span, lat_span) = self.spans();
+        let (west, north) = (self.bbox.west, self.bbox.north);
         let cell_w = lon_span / nx as f64;
-        let cell_h = (north - south) / ny as f64;
+        let cell_h = lat_span / ny as f64;
         AreaGridAxes {
             x: (0..nx)
                 .map(|ix| {
@@ -462,6 +635,7 @@ impl QueryPolygon {
             y: (0..ny)
                 .map(|iy| north - (iy as f64 + 0.5) * cell_h)
                 .collect(),
+            coarsened: None,
         }
     }
 
@@ -2229,13 +2403,13 @@ mod tests {
     fn sample_grid_crosses_the_antimeridian() {
         let poly = parse_area_coords("170,10,-170,20").unwrap();
         assert!(poly.bbox.crosses_antimeridian());
-        let axes = poly.sample_grid(5.0, 5.0, 256);
+        let axes = poly.fit_grid(5.0, 5.0, 1, 1).unwrap();
         assert_eq!(axes.x, vec![172.5, 177.5, -177.5, -172.5]);
         assert_eq!(axes.y, vec![17.5, 12.5]);
         let mask = poly.cell_mask(&axes);
         assert!(mask.iter().all(|&m| m), "every centre lies in the bbox");
         // Coarsened to one cell: its centre is the seam itself.
-        let one = poly.sample_grid(0.0, 0.0, 256);
+        let one = poly.fit_grid(0.0, 0.0, 1, 1).unwrap();
         assert_eq!(one.x, vec![180.0]);
         assert!(poly.cell_mask(&one)[0]);
     }
@@ -2248,12 +2422,12 @@ mod tests {
             "POLYGON((10 50, 11 50, 11 51, 10 51, 10 50),(10.2 50.2, 10.8 50.2, 10.8 50.8, 10.2 50.8, 10.2 50.2))",
         )
         .unwrap();
-        let axes = poly.sample_grid(1.0, 1.0, 256);
+        let axes = poly.fit_grid(1.0, 1.0, 1, 1).unwrap();
         assert_eq!(axes.dims(), (1, 1));
         assert!(!poly.contains(axes.x[0], axes.y[0]));
         assert_eq!(poly.cell_mask(&axes), vec![true]);
         // At native resolution the centre test decides and no fallback fires.
-        let fine = poly.sample_grid(0.1, 0.1, 256);
+        let fine = poly.fit_grid(0.1, 0.1, 1, 1).unwrap();
         let mask = poly.cell_mask(&fine);
         assert!(mask.iter().any(|&m| m) && !mask.iter().all(|&m| m));
     }
@@ -2268,7 +2442,7 @@ mod tests {
             "POLYGON((10 50, 13 50, 13 53, 10 53, 10 50),(10.1 50.1, 12.9 50.1, 12.9 52.9, 10.1 52.9, 10.1 50.1))",
         )
         .unwrap();
-        let axes = poly.sample_grid(1.0, 1.0, 256);
+        let axes = poly.fit_grid(1.0, 1.0, 1, 1).unwrap();
         assert_eq!(axes.dims(), (3, 3));
         assert!(!axes
             .y
@@ -2318,7 +2492,7 @@ mod tests {
         assert!(tri.contains(11.0, 51.0), "on the hypotenuse");
         assert!(!tri.contains(11.0, 51.0000001));
         // Axes built inside a rectangle are all inside its mask.
-        let axes = rect.sample_grid(0.5, 0.5, 256);
+        let axes = rect.fit_grid(0.5, 0.5, 1, 1).unwrap();
         assert!(rect.cell_mask(&axes).iter().all(|&m| m));
     }
 
@@ -2490,15 +2664,183 @@ mod tests {
     #[test]
     fn sample_grid_axes_match_resolution_and_orientation() {
         let poly = parse_area_coords("POLYGON((10 50, 12 50, 12 51, 10 51, 10 50))").unwrap();
-        let axes = poly.sample_grid(0.5, 0.25, 256);
+        let axes = poly.fit_grid(0.5, 0.25, 1, 1).unwrap();
         assert_eq!(axes.x, vec![10.25, 10.75, 11.25, 11.75]);
         assert_eq!(axes.y, vec![50.875, 50.625, 50.375, 50.125]);
-        // Coarsened, never refused, when the bbox exceeds max_dim cells.
-        let coarse = poly.sample_grid(0.001, 0.001, 4);
-        assert_eq!((coarse.x.len(), coarse.y.len()), (4, 4));
-        // Degenerate resolution → one cell at the bbox centre.
-        let one = poly.sample_grid(0.0, f64::NAN, 256);
+        assert_eq!(axes.coarsened, None);
+        // Degenerate resolution → one cell at the bbox centre, which is
+        // the source's one cell, not a coarsened grid.
+        let one = poly.fit_grid(0.0, f64::NAN, 1, 1).unwrap();
         assert_eq!((one.x, one.y), (vec![11.0], vec![50.5]));
+        assert_eq!(one.coarsened, None);
+    }
+
+    /// #1436: native resolution whenever the answer fits the budget — the
+    /// issue's whole 0.0625° model domain (1360 × 640 cells, far past the
+    /// old 256 per axis) and a grid of exactly the budget included.
+    #[test]
+    fn fit_grid_answers_native_while_it_fits() {
+        let domain = parse_area_coords("POLYGON((-23 30,62 30,62 70,-23 70,-23 30))").unwrap();
+        let axes = domain.fit_grid(0.0625, 0.0625, 1, 1).unwrap();
+        assert_eq!(axes.dims(), (1360, 640));
+        assert_eq!(axes.coarsened, None);
+        assert!((axes.x[1] - axes.x[0] - 0.0625).abs() < 1e-12);
+        let exact = parse_area_coords("0,0,10,10").unwrap();
+        let axes = exact.fit_grid(0.01, 0.01, 1, 1).unwrap();
+        assert_eq!(axes.dims(), (1000, 1000));
+        assert_eq!(axes.coarsened, None);
+        // Two parameters halve the cells that fit: now it is coarsened.
+        assert!(exact
+            .fit_grid(0.01, 0.01, 1, 2)
+            .unwrap()
+            .coarsened
+            .is_some());
+    }
+
+    /// Past the budget the grid is the largest that fits, coarsened by the
+    /// same factor on both axes, and says so.
+    #[test]
+    fn fit_grid_coarsens_evenly_past_the_budget() {
+        let rect = parse_area_coords("0,0,40,20").unwrap();
+        // 4000 × 2000 native cells, 8 M.
+        let axes = rect.fit_grid(0.01, 0.01, 1, 1).unwrap();
+        assert_eq!(axes.dims(), (1414, 707));
+        let r = axes.coarsened.expect("coarsened");
+        assert_eq!(r.native, [0.01, 0.01]);
+        assert_eq!(r.served, [40.0 / 1414.0, 20.0 / 707.0]);
+        let (fx, fy) = (r.served[0] / r.native[0], r.served[1] / r.native[1]);
+        assert!((fx / fy - 1.0).abs() < 1e-3, "even: {fx} vs {fy}");
+        // The served step is the axes' own spacing.
+        assert!((axes.x[1] - axes.x[0] - r.served[0]).abs() < 1e-12);
+        assert!((axes.y[0] - axes.y[1] - r.served[1]).abs() < 1e-12);
+        // Timesteps × parameters share the budget.
+        for (timesteps, parameters) in [(4, 1), (2, 3), (24, 2), (999, 1)] {
+            let axes = rect.fit_grid(0.01, 0.01, timesteps, parameters).unwrap();
+            let (nx, ny) = axes.dims();
+            assert!(timesteps * parameters * nx * ny <= MAX_AREA_VALUES);
+            assert!(
+                timesteps * parameters * (nx + 1) * (ny + 1) > MAX_AREA_VALUES,
+                "the largest even grid: {nx} × {ny}"
+            );
+            let aspect = nx as f64 / ny as f64;
+            assert!((aspect - 2.0).abs() < 0.2, "{nx} × {ny}");
+        }
+    }
+
+    /// Every answer that fitted the old 256-per-axis cap still fits, with
+    /// as many cells up to one row's rounding: fitting to the budget never
+    /// refuses a request the cap served. (A grid the cap left native on one
+    /// axis can lose a few cells to even coarsening: 100 × 300 cells at 39
+    /// layers was 100 × 256 and is 92 × 278.)
+    #[test]
+    fn fit_grid_serves_at_least_the_old_capped_grid() {
+        let rect = parse_area_coords("0,-50,100,50").unwrap();
+        let natives = [1, 10, 100, 125, 200, 255, 256, 300, 1000, 4000, 100_000];
+        for nx0 in natives {
+            for ny0 in natives {
+                for layers in 1..=40 {
+                    let capped = nx0.min(256) * ny0.min(256);
+                    if layers * capped > MAX_AREA_VALUES {
+                        continue;
+                    }
+                    // A hair over 100/n, so the span holds exactly n cells.
+                    let res = |n: usize| 100.0 / n as f64 * (1.0 + 1e-12);
+                    let axes = rect.fit_grid(res(nx0), res(ny0), layers, 1).unwrap();
+                    let (nx, ny) = axes.dims();
+                    assert!(nx <= nx0 && ny <= ny0, "{nx0} × {ny0}: {nx} × {ny}");
+                    assert!(layers * nx * ny <= MAX_AREA_VALUES);
+                    assert!(
+                        nx * ny + nx.min(ny) > capped,
+                        "{nx0} × {ny0} × {layers}: {nx} × {ny} < the capped {capped}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fit_dims_handles_strips_and_single_cells() {
+        assert_eq!(fit_dims(1_000_000, 10, 1_000_000), (333_333, 3));
+        assert_eq!(fit_dims(10, 1_000_000, 1_000_000), (3, 333_333));
+        assert_eq!(fit_dims(300, 1, 100), (100, 1));
+        assert_eq!(fit_dims(1, 300, 100), (1, 100));
+        assert_eq!(fit_dims(5, 5, 1), (1, 1));
+        assert_eq!(fit_dims(7, 3, 21), (7, 3));
+        assert_eq!(fit_dims(usize::MAX, usize::MAX, 4), (2, 2));
+    }
+
+    /// Only when not even one cell fits is it the old 400.
+    #[test]
+    fn fit_grid_refuses_only_when_one_cell_cannot_fit() {
+        let rect = parse_area_coords("0,0,40,20").unwrap();
+        let one = rect.fit_grid(0.01, 0.01, 1000, 1000).unwrap();
+        assert_eq!(one.dims(), (1, 1));
+        assert!(one.coarsened.is_some());
+        match rect.fit_grid(0.01, 0.01, 1001, 1000) {
+            Err(DataServerError::QueryTooLarge(m)) => {
+                assert!(
+                    m.contains("1001 timesteps × 1 × 1 cells × 1000 parameters"),
+                    "{m}"
+                )
+            }
+            other => panic!("expected QueryTooLarge, got {other:?}"),
+        }
+    }
+
+    /// A polygon's mask costs cells × vertices: the grid is coarsened to
+    /// fit that budget too, so a complex polygon that fitted at 256 × 256
+    /// does not newly fail at native resolution. A rectangle's mask is free.
+    #[test]
+    fn fit_grid_respects_the_mask_budget() {
+        let circle =
+            parse_area_coords(&radius_polygon_wkt(25.0, 60.0, 400_000.0).unwrap()).unwrap();
+        let vertices = circle.vertex_count();
+        assert!(!circle.is_rectangle() && vertices > 20, "{vertices}");
+        let axes = circle.fit_grid(0.001, 0.001, 1, 1).unwrap();
+        let (nx, ny) = axes.dims();
+        assert!(check_mask_budget(nx * ny, &circle).is_ok());
+        assert!(check_mask_budget((nx + 1) * (ny + 1), &circle).is_err());
+        assert!(
+            nx * ny < MAX_AREA_VALUES,
+            "the mask budget binds: {nx} × {ny}"
+        );
+        assert!(axes.coarsened.is_some());
+        // The same bbox as a rectangle fills the value budget.
+        let b = circle.bbox;
+        let rect =
+            parse_area_coords(&format!("{},{},{},{}", b.west, b.south, b.east, b.north)).unwrap();
+        let (rx, ry) = rect.fit_grid(0.001, 0.001, 1, 1).unwrap().dims();
+        assert!(rx * ry > nx * ny && rx * ry <= MAX_AREA_VALUES);
+    }
+
+    /// A response joining several answers, or adding derived ranges, gives
+    /// each answer its share of the budget; the scopes nest and restore.
+    #[test]
+    fn area_share_scopes_split_the_budget() {
+        let rect = parse_area_coords("0,0,40,20").unwrap();
+        let cells = |r: &QueryPolygon| {
+            let (nx, ny) = r.fit_grid(0.01, 0.01, 1, 1).unwrap().dims();
+            nx * ny
+        };
+        let alone = cells(&rect);
+        {
+            let _instants = AreaShare::answers(4);
+            let quarter = cells(&rect);
+            assert!(
+                4 * quarter <= MAX_AREA_VALUES && quarter > alone / 5,
+                "{quarter}"
+            );
+            {
+                let _derived = AreaShare::extra_parameters(1);
+                let eighth = cells(&rect);
+                assert!(
+                    8 * eighth <= MAX_AREA_VALUES && eighth > alone / 9,
+                    "{eighth}"
+                );
+            }
+            assert_eq!(cells(&rect), quarter, "the inner scope restored");
+        }
+        assert_eq!(cells(&rect), alone, "the outer scope restored");
     }
 
     #[test]

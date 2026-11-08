@@ -2642,7 +2642,7 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
     else {
         panic!("expected a single coverage");
     };
-    let DomainDescription::Grid { x, y, t, z } = &cov.domain else {
+    let DomainDescription::Grid { x, y, t, z, .. } = &cov.domain else {
         panic!("expected a Grid domain");
     };
     assert_eq!(t.as_deref(), Some(&[anchor][..]));

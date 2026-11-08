@@ -160,6 +160,7 @@ fn area_preserves_requested_level_order_missing_fields_units_and_polygon_holes()
             y,
             t: Some(t),
             z: Some(z),
+            ..
         } = result.domain
         else {
             panic!()
@@ -794,6 +795,7 @@ async fn area_latency_replay() {
             y,
             t,
             z: Some(z),
+            ..
         } = result.domain
         else {
             panic!("expected a vertical grid");

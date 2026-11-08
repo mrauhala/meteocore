@@ -9,7 +9,7 @@ use ds_poll::{FirstTick, Shutdown};
 
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::{check_area_budget, check_mask_budget, parse_area_coords, MAX_AREA_DIM};
+use ds_core::feature::{parse_area_coords, MAX_EXACT_AREA_CELLS};
 use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
@@ -237,6 +237,11 @@ impl QueryDataEngine {
 }
 
 impl EdrEngine for QueryDataEngine {
+    /// Area and radius answers are fitted to the value budget (#1436).
+    fn coarsens_areas(&self) -> bool {
+        true
+    }
+
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         Ok(LocationSnapshot::empty())
     }
@@ -392,8 +397,9 @@ impl EdrEngine for QueryDataEngine {
     }
 
     /// Area query: a CRS84 `Grid` over the polygon's bbox at the source's
-    /// native resolution (each dimension ≤ `MAX_AREA_DIM`), every cell
-    /// bilinearly interpolated from the run's grid and cells outside the
+    /// native resolution while it fits the value budget, evenly coarser
+    /// past it (`QueryPolygon::fit_grid`, #1436), every cell bilinearly
+    /// interpolated from the run's grid and cells outside the
     /// polygon masked to null (#671). The steps the datetime window selects
     /// (every step without one) are always a `t` axis, one included: `[t, y,
     /// x]` (#1412).
@@ -434,27 +440,63 @@ impl EdrEngine for QueryDataEngine {
         let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(extent);
         let res_lon = lon_span / data.grid.nx.max(1) as f64;
         let res_lat = lat_span / data.grid.ny.max(1) as f64;
-        let axes = polygon.sample_grid(res_lon, res_lat, MAX_AREA_DIM);
+        // Native resolution while the answer fits the budget, evenly
+        // coarser past it (#1436).
+        let axes = polygon.fit_grid(res_lon, res_lat, time_indices.len(), selected.len())?;
         let (nx, ny) = axes.dims();
-        check_area_budget(time_indices.len(), ny, nx, selected.len())?;
-        check_mask_budget(nx * ny, &polygon)?;
 
-        // Project each cell centre ONCE (the CRS forward transform is the
-        // expensive part — Critical Rule 5); parameters and timesteps then
-        // reuse the fractional grid pixel. `None` = masked.
+        // Each cell's fractional grid pixel ONCE; parameters and timesteps
+        // then reuse it. `None` = masked. A lat/lon grid's position is
+        // affine, so exact per cell, as is a projected grid's (LCC,
+        // stereographic, rotated lat-lon) up to `MAX_EXACT_AREA_CELLS`; past
+        // that its CRS forward transform per cell would dominate the answer
+        // (Critical Rule 5), so a larger grid's comes from the coarse
+        // output→source map the map path uses, as a map pixel's does
+        // (#1190, #1436).
         let mask = polygon.cell_mask(&axes);
         let gt = data.grid.geo_transform();
-        let cell_px: Vec<Option<(f64, f64)>> = axes
-            .y
-            .iter()
-            .enumerate()
-            .flat_map(|(iy, &y)| {
-                let (gt, axes, mask) = (gt, &axes, &mask);
-                axes.x.iter().enumerate().map(move |(ix, &x)| {
-                    mask[axes.index(ix, iy)].then(|| world_to_grid_px(gt, x, y))
+        let exact = matches!(gt.crs, ds_core::geo::Crs::Wgs84) || nx * ny <= MAX_EXACT_AREA_CELLS;
+        let cell_px: Vec<Option<(f64, f64)>> = if exact {
+            axes.y
+                .iter()
+                .enumerate()
+                .flat_map(|(iy, &y)| {
+                    let (gt, axes, mask) = (gt, &axes, &mask);
+                    axes.x.iter().enumerate().map(move |(ix, &x)| {
+                        mask[axes.index(ix, iy)].then(|| world_to_grid_px(gt, x, y))
+                    })
                 })
-            })
-            .collect();
+                .collect()
+        } else {
+            let b = &polygon.bbox;
+            let map = data.grid.source().output_map_quiet(
+                [b.west, b.south, b.east, b.north],
+                nx as u32,
+                ny as u32,
+                &OutputCrs::Wgs84,
+            );
+            if let Some(error_px) = map.capped_error() {
+                tracing::warn!(
+                    collection = %self.collection_id,
+                    bbox = ?[b.west, b.south, b.east, b.north],
+                    nx,
+                    ny,
+                    error_px,
+                    "Area query's projection grid hit its cell cap over the interpolation \
+                     budget; its cells may be slightly misregistered"
+                );
+            }
+            (0..ny)
+                .flat_map(|iy| {
+                    let (map, axes, mask) = (&map, &axes, &mask);
+                    (0..nx).map(move |ix| {
+                        mask[axes.index(ix, iy)]
+                            .then(|| map.position(ix as u32, iy as u32))
+                            .flatten()
+                    })
+                })
+                .collect()
+        };
 
         let times: Vec<DateTime<Utc>> = time_indices.iter().map(|(_, t)| *t).collect();
         let mut params_map = HashMap::new();
@@ -487,6 +529,7 @@ impl EdrEngine for QueryDataEngine {
                 y: axes.y,
                 t: Some(times),
                 z: None,
+                coarsened: axes.coarsened,
             },
             parameters: params_map,
             ranges,
@@ -1638,6 +1681,89 @@ mod tests {
         assert!(samples.len() > 20, "{}", samples.len());
         assert!(samples.iter().any(|(_, v)| v.is_some()));
         assert_matches_position(&engine, &qr, &param);
+    }
+
+    /// #1436: an area over the projected (LCC) MEPS crop samples each cell
+    /// centre exactly as a position query samples the point while the grid
+    /// has at most `MAX_EXACT_AREA_CELLS`, as every area did under the old
+    /// 256-cell cap. A larger grid, here a bbox far wider than the crop at
+    /// its native cell size, is placed through the map's coarse
+    /// output→source map instead: every cell within its 0.2-pixel budget.
+    #[test]
+    fn projected_area_cells_sample_as_positions_do() {
+        let engine = meps_engine();
+        let (first, _) = engine.get_temporal_extent().unwrap();
+        let param = engine.get_parameters()[0].clone();
+        let worst = |coords: &str| {
+            let CoverageResponse::Single(q) = engine
+                .query_area(
+                    coords,
+                    Some((first, first)),
+                    Some(std::slice::from_ref(&param)),
+                    None,
+                    None,
+                )
+                .unwrap()
+            else {
+                panic!("one grid");
+            };
+            let DomainDescription::Grid {
+                x, y, coarsened, ..
+            } = &q.domain
+            else {
+                panic!("a Grid");
+            };
+            assert_eq!(*coarsened, None, "{coords}: native");
+            let values = &q.ranges[&param].values;
+            // About 40 × 40 of the cells over the crop.
+            let over_crop = |&(_, &lon): &(usize, &f64)| (10.0..=20.0).contains(&lon);
+            let step = (x.iter().enumerate().filter(over_crop).count() / 40).max(1);
+            let (mut compared, mut differ, mut worst) = (0, 0, 0.0_f64);
+            for (iy, &lat) in y.iter().enumerate().step_by(step) {
+                if !(60.0..=65.0).contains(&lat) {
+                    continue;
+                }
+                for (ix, &lon) in x.iter().enumerate().filter(over_crop).step_by(step) {
+                    let CoverageResponse::Single(p) = engine
+                        .query_position(
+                            &format!("POINT({lon} {lat})"),
+                            Some((first, first)),
+                            Some(std::slice::from_ref(&param)),
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                    else {
+                        panic!("one series");
+                    };
+                    let exact = p.ranges[&param].values[0];
+                    match (values[iy * x.len() + ix], exact) {
+                        (Some(v), Some(e)) => {
+                            worst = worst.max((v - e).abs());
+                            compared += 1;
+                        }
+                        (None, None) => {}
+                        // A cell and the point disagree on having data.
+                        _ => differ += 1,
+                    }
+                }
+            }
+            (x.len() * y.len(), compared, differ, worst)
+        };
+        let (cells, compared, differ, exact) = worst("10,60,20,65");
+        assert!(
+            cells <= MAX_EXACT_AREA_CELLS && compared > 100,
+            "{cells} {compared}"
+        );
+        assert_eq!((differ, exact), (0, 0.0), "placed exactly");
+        let (cells, compared, differ, coarse) = worst("-20,40,60,80");
+        assert!(
+            cells > MAX_EXACT_AREA_CELLS && compared > 100,
+            "{cells} {compared}"
+        );
+        // Only a cell at the grid's very edge may fall either side of it.
+        assert!(differ * 20 < compared, "{differ} of {compared}");
+        assert!(coarse < 0.5, "within the coarse map's budget: {coarse}");
     }
 
     #[test]

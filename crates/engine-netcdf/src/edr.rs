@@ -52,9 +52,10 @@ use ds_core::cube::CubeResolution;
 use ds_core::edr_engine::{select_parameters, EdrEngine};
 use ds_core::error::DataServerError;
 use ds_core::feature::{
-    check_area_budget, check_mask_budget, parse_area_coords, parse_point_coords, Bbox, MAX_AREA_DIM,
+    check_area_budget, parse_area_coords, parse_point_coords, Bbox, MAX_EXACT_AREA_CELLS,
 };
 use ds_core::instances::RunInfo;
+use ds_core::map_engine::OutputCrs;
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
     QueryResult, VerticalCoord,
@@ -1142,22 +1143,28 @@ impl NetcdfEngine {
         }
         let (columns, rows) = reads.layout.source.size();
         let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(extent);
-        let axes = polygon.sample_grid(
+        // Native resolution while the answer fits the budget, evenly
+        // coarser past it (#1436).
+        let axes = polygon.fit_grid(
             lon_span / f64::from(columns.max(1)),
             lat_span / f64::from(rows.max(1)),
-            MAX_AREA_DIM,
-        );
-        let (nx, ny) = axes.dims();
-        check_area_budget(
             reads.steps.len() * reads.levels.len(),
-            ny,
-            nx,
             reads.params.len(),
         )?;
-        check_mask_budget(nx * ny, &polygon)?;
+        let (nx, ny) = axes.dims();
         let mask = polygon.cell_mask(&axes);
         let source = &reads.layout.source;
-        let positions: Positions = Arc::new(
+        // A lat/lon grid places each cell centre exactly, an affine step. A
+        // projected grid's place is a CRS forward transform and a
+        // curvilinear grid's an inverse lookup over its nodes: exact too up
+        // to `MAX_EXACT_AREA_CELLS`, as a position query places a point;
+        // past it they would dominate the answer (Critical Rule 5), and a
+        // larger grid's come from the shared coarse output→source map the
+        // map draws with (#1436).
+        let lat_lon = source
+            .transform()
+            .is_some_and(|t| matches!(t.crs, ds_core::geo::Crs::Wgs84));
+        let positions: Positions = Arc::new(if lat_lon || nx * ny <= MAX_EXACT_AREA_CELLS {
             axes.y
                 .iter()
                 .enumerate()
@@ -1169,8 +1176,36 @@ impl NetcdfEngine {
                             .flatten()
                     })
                 })
-                .collect(),
-        );
+                .collect()
+        } else {
+            let b = &polygon.bbox;
+            let map = source.output_map_quiet(
+                [b.west, b.south, b.east, b.north],
+                nx as u32,
+                ny as u32,
+                &OutputCrs::Wgs84,
+            );
+            if let Some(error_px) = map.capped_error() {
+                tracing::warn!(
+                    collection = %self.collection_id,
+                    nx,
+                    ny,
+                    error_px,
+                    "Area query's projection grid hit its cell cap over the interpolation \
+                     budget; its cells may be slightly misregistered"
+                );
+            }
+            (0..ny)
+                .flat_map(|iy| {
+                    let (map, axes, mask) = (&map, &axes, &mask);
+                    (0..nx).map(move |ix| {
+                        mask[axes.index(ix, iy)]
+                            .then(|| map.position(ix as u32, iy as u32))
+                            .flatten()
+                    })
+                })
+                .collect()
+        });
         let sampled = self.sample(&reads, &positions, limits)?;
         // The steps read are always on a `t` axis, one included (#1412), as
         // a cube's are.
@@ -1206,6 +1241,7 @@ impl NetcdfEngine {
                 y: axes.y,
                 t: Some(times),
                 z: vertical,
+                coarsened: axes.coarsened,
             },
             parameters: Self::descriptions(&catalog, reads.layout, &reads.params),
             ranges,
@@ -1214,6 +1250,11 @@ impl NetcdfEngine {
 }
 
 impl EdrEngine for NetcdfEngine {
+    /// Area and radius answers are fitted to the value budget (#1436).
+    fn coarsens_areas(&self) -> bool {
+        true
+    }
+
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
         Ok(LocationSnapshot::empty())
     }
@@ -1376,9 +1417,11 @@ impl EdrEngine for NetcdfEngine {
     }
 
     /// A CRS84 `Grid` over the polygon's bbox at the source's mean cell
-    /// size in degrees (≤ `MAX_AREA_DIM` cells per axis), each cell centre
-    /// projected onto the source grid once and sampled as the map is;
-    /// cells outside the polygon are null (#671). A polygon wholly outside
+    /// size in degrees while it fits the value budget, evenly coarser past
+    /// it (`QueryPolygon::fit_grid`, #1436), each cell centre placed on the
+    /// source grid once (a projected or curvilinear grid's through the
+    /// map's coarse output→source map) and sampled as the map is; cells
+    /// outside the polygon are null (#671). A polygon wholly outside
     /// the grid's extent is a 404. Without `datetime` the step a map without
     /// `TIME` draws (the newest run's last), an instant its exact step, an
     /// interval every step inside it: always on a `t` axis, even one step

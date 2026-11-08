@@ -218,6 +218,19 @@ pub trait EdrEngine: Send + Sync {
         false
     }
 
+    /// Whether this engine samples an `area` / `radius` answer onto a CRS84
+    /// grid fitted to the value budget
+    /// ([`crate::feature::QueryPolygon::fit_grid`], #1436): native
+    /// resolution while it fits, evenly coarser past it, the `Grid`
+    /// domain's `coarsened` saying so. The collection's `data_queries` tell
+    /// clients. **O(1)**: it is read per metadata request.
+    ///
+    /// Default `false`: station series, and grids answered at their native
+    /// cells and refused past the budget (GRIB, GeoTIFF).
+    fn coarsens_areas(&self) -> bool {
+        false
+    }
+
     /// The radius query that answers an EDR item which is not one of
     /// [`Self::get_locations`], such as a tracked storm cell (#970): its
     /// EDR GeoJSON `edrqueryendpoint` is this circle around the item's

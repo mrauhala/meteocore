@@ -194,6 +194,7 @@ impl EdrEngine for Mock {
                     y: vec![0.5],
                     t: Some(vec![hour(0)]),
                     z: Some(pressure(vec![850.0, 500.0])),
+                    coarsened: None,
                 },
                 vec![1, 2, 1, 2],
                 vec!["t", "z", "y", "x"],
