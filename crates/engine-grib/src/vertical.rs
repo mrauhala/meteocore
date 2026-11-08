@@ -1,7 +1,7 @@
 //! Vertical selection for the pressure and model-level collection views.
 
 use super::*;
-use ds_core::vertical::{VerticalDimension, VerticalKind};
+use ds_core::vertical::{in_axis_order, VerticalDimension, VerticalKind};
 
 impl GribEngine {
     pub(crate) fn vertical_kind(&self) -> Option<VerticalKind> {
@@ -22,10 +22,12 @@ impl GribEngine {
     /// different surface. Missing fields at a valid level remain missing.
     ///
     /// A requested list (`z=850,700`, or the levels `Rn/min/step` expands
-    /// to) keeps the run's levels it names, in request order and each once,
-    /// as an interval keeps those inside it (`/req/edr/z-response` B, D, E):
-    /// a level the run lacks is dropped, and only a request naming none of
-    /// them is a 400.
+    /// to) keeps the run's levels it names, as an interval keeps those
+    /// inside it (`/req/edr/z-response` B, D, E): a level the run lacks is
+    /// dropped, and only a request naming none of them is a 400. They come
+    /// in the run's order, bottom first as without `z`, each once, whatever
+    /// the list's order (`in_axis_order`, #1434: a CoverageJSON axis is
+    /// monotonic), and every query builds its values level by level in it.
     pub(crate) fn selected_levels(
         &self,
         catalog: &Catalog,
@@ -45,12 +47,14 @@ impl GribEngine {
             .get(&run)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let mut levels = Vec::new();
-        for &value in z.unwrap_or(available) {
-            if available.contains(&value) && !levels.contains(&Some(value)) {
-                levels.push(Some(value));
-            }
-        }
+        let levels: Vec<Option<f64>> = match z {
+            Some(z) => in_axis_order(z, available)
+                .into_iter()
+                .filter(|value| available.contains(value))
+                .map(Some)
+                .collect(),
+            None => available.iter().copied().map(Some).collect(),
+        };
         if levels.is_empty() {
             return Err(DataServerError::InvalidParameter(format!(
                 "The requested vertical levels select none of the levels available in this \
@@ -625,10 +629,10 @@ mod tests {
                 other => panic!("{other:?}"),
             },
         };
-        // Unavailable members drop out; request order holds, repeats once.
+        // Unavailable members drop out; the run's order holds, repeats once.
         assert_eq!(
             profile_levels(&[500.0, 200.0, 850.0, 500.0]),
-            [500.0, 850.0]
+            [850.0, 500.0]
         );
         // `R4/1000/-150` = 1000, 850, 700, 550: only 850 is in the run.
         assert_eq!(profile_levels(&[1000.0, 850.0, 700.0, 550.0]), [850.0]);
@@ -650,6 +654,76 @@ mod tests {
                 }
                 other => panic!("{z:?}: {other:?}"),
             }
+        }
+    }
+
+    /// #1434: CoverageJSON 1.0 §9.6.1.1 requires a monotonic axis. A `z`
+    /// list in any order answers bottom first, as the profile without `z`
+    /// does, and each level's values move with it, on position and area.
+    #[test]
+    fn z_lists_answer_in_the_axis_order_with_their_values() {
+        let source = TestSource::new();
+        source.write(
+            "f000",
+            &[
+                ("TMP", "1000 mb", message(0, 280.0, [0; 4], 100, 100000)),
+                ("TMP", "850 mb", message(0, 270.0, [0; 4], 100, 85000)),
+                ("TMP", "500 mb", message(0, 250.0, [0; 4], 100, 50000)),
+            ],
+            0,
+        );
+        let engine = GribEngine::new("forecast", &split_config(&source)).unwrap();
+        let views = engine.level_collections();
+        let pressure = &views[0];
+        let tmp = ["TMP".to_string()];
+        let request = [500.0, 1000.0, 850.0];
+        // 280 K, 270 K and 250 K in °C, bottom first.
+        let celsius = [6.85, -3.15, -23.15];
+        let close = |got: Option<f64>, want: f64| (got.unwrap() - want).abs() < 1e-9;
+
+        let profile = match pressure
+            .query_position("POINT(0.5 0.5)", None, Some(&tmp), Some(&request), None)
+            .unwrap()
+        {
+            CoverageResponse::Collection(mut profiles) => profiles.remove(0),
+            CoverageResponse::Single(profile) => profile,
+        };
+        let DomainDescription::VerticalProfile { z, .. } = &profile.domain else {
+            panic!("{:?}", profile.domain)
+        };
+        assert_eq!(z.values, [1000.0, 850.0, 500.0]);
+        let values = &profile.ranges["TMP"].values;
+        for (got, want) in values.iter().zip(celsius) {
+            assert!(close(*got, want), "{values:?}");
+        }
+        // Without `z` the same order: a listed subset reads like the whole.
+        let CoverageResponse::Collection(all) = pressure
+            .query_position("POINT(0.5 0.5)", None, Some(&tmp), None, None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let DomainDescription::VerticalProfile { z: every, .. } = &all[0].domain else {
+            panic!()
+        };
+        assert_eq!(every.values, z.values);
+
+        let CoverageResponse::Single(area) = pressure
+            .query_area("0,0,1,1", None, Some(&tmp), Some(&request), None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let DomainDescription::Grid { z: Some(z), .. } = &area.domain else {
+            panic!()
+        };
+        assert_eq!(z.values, [1000.0, 850.0, 500.0]);
+        let range = &area.ranges["TMP"];
+        assert_eq!(range.axis_names, ["t", "z", "y", "x"]);
+        assert_eq!(range.shape, [1, 3, 2, 2]);
+        for (level, want) in celsius.into_iter().enumerate() {
+            let cells = &range.values[level * 4..(level + 1) * 4];
+            assert!(cells.iter().all(|v| close(*v, want)), "{level}: {cells:?}");
         }
     }
 

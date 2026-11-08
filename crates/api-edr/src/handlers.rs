@@ -818,7 +818,8 @@ fn instance_path_segment(iid: &str) -> String {
 ///   follow their own standards.
 /// - An interval (`z=min/max`, `../max`, `min/..`) is expanded against the
 ///   collection's advertised levels; a list — including the levels a
-///   recurring `Rn/min/step` expands to — passes through for the engine.
+///   recurring `Rn/min/step` expands to — is put in their order, each level
+///   once (#1434), for the engine to match.
 fn resolve_request_z(
     engine: &Arc<dyn EdrEngine>,
     z: Option<&str>,
@@ -1727,7 +1728,7 @@ pub async fn api_definition(
                     "schema": {"type": "string"},
                     "style": "form",
                     "explode": false,
-                    "description": format!("Vertical level selector. Forms: z=850 (one level); z=10,80,200 (a list); z=100/550 (every advertised level between and including the two); z=../850 or z=500/.. (open intervals, reaching the lowest or highest advertised level); z=R20/100/50 (20 levels 50 apart starting at 100, treated as a list). A list or recurring interval names at most {} levels; more is a 400. A single level or list is matched against the collection's advertised vertical extent by the collection's engine, which keeps only the levels it has: an exact level, or on radar volumes a sweep within 0.05° of the requested elevation angle (the response domain reports the level served). An interval or list that matches no level is a 400. A collection with no vertical extent ignores z, but a malformed z is still a 400.", crate::params::MAX_Z_LEVELS)
+                    "description": format!("Vertical level selector. Forms: z=850 (one level); z=10,80,200 (a list); z=100/550 (every advertised level between and including the two); z=../850 or z=500/.. (open intervals, reaching the lowest or highest advertised level); z=R20/100/50 (20 levels 50 apart starting at 100, treated as a list). A list or recurring interval names at most {} levels; more is a 400. A single level or list is matched against the collection's advertised vertical extent by the collection's engine, which keeps only the levels it has: an exact level, or on radar volumes a sweep within 0.05° of the requested elevation angle (the response domain reports the level served). An interval or list that matches no level is a 400. The levels served come back in the order the collection's extent.vertical lists them, each once, whatever the order of a list or the direction of a recurring interval. A collection with no vertical extent ignores z, but a malformed z is still a 400.", crate::params::MAX_Z_LEVELS)
                 },
                 "coords-point": {
                     "name": "coords",

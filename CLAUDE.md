@@ -824,13 +824,18 @@ one never implies the other.
 - The GeoTIFF source cap only trips on a full-resolution read: over it,
   `get_raster_tile` switches to the finest overview under it, else the
   coarsest, so in practice only COGs without overviews hit it.
-- GeoTIFF EDR area answers at the native window, like GRIB (no
-  `MAX_AREA_DIM` coarsening): `query_bbox` checks `MAX_AREA_VALUES` over
-  `timesteps × ny × nx` before allocating the result or reading a file, so
-  an over-budget area is the 400. Only a file that cannot be read becomes a
-  logged timestep of nulls; client errors fail the query (#858). Its
-  polygon mask has the shared `check_mask_budget` (#889). Both run before
-  any data read; on a STAC source, after the window's metadata loads.
+- GeoTIFF EDR area answers at native resolution, like GRIB (no
+  `MAX_AREA_DIM` coarsening): a geographic source its native window, a
+  projected one a regular CRS84 grid no coarser than a native pixel
+  anywhere, each cell the nearest pixel (#1435). `AreaGrid::plan` holds the
+  answer's `timesteps × ny × nx` to `MAX_AREA_VALUES` before allocating the
+  result or reading a file, so an over-budget area is the 400, and a
+  projected source's native window, read whole per timestep, to
+  `MAX_AREA_VALUES` source pixels, a 400 naming them. Only a file that
+  cannot be read becomes a logged timestep of nulls; client errors fail the
+  query (#858). Its polygon mask has the shared `check_mask_budget` over
+  the answer's cells (#889). All run before any data read; on a STAC
+  source, after the window's metadata loads.
 - A new source cap must name the pixel space it counts and fail with
   `InvalidParameter`/`QueryTooLarge` (400 with its message in Maps/Tiles/EDR).
   `Engine(..)` is an opaque 500 there, and WMS GetMap turns every engine

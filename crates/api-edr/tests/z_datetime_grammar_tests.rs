@@ -356,9 +356,14 @@ async fn z_list_over_the_cap_is_a_400_before_the_engine() {
 async fn z_is_honoured_with_a_vertical_extent() {
     let (flat, levels) = (Recorder::new(false), Recorder::new(true));
     let app = router(&flat, &levels);
-    let cases: [(&str, Vec<f64>); 6] = [
+    let cases: [(&str, Vec<f64>); 9] = [
         ("850", vec![850.0]),
         ("850,500", vec![850.0, 500.0]),
+        // #1434: a list reaches the engine in the axis's order, each level
+        // once, so the CoverageJSON z axis is monotonic.
+        ("500,1000,850", vec![1000.0, 850.0, 500.0]),
+        ("850,850", vec![850.0]),
+        ("R3/700/150", vec![1000.0, 850.0, 700.0]),
         ("500/850", vec![850.0, 700.0, 500.0]),
         // Open ends reach the lowest / highest advertised level.
         ("../700", vec![700.0, 500.0, 250.0]),

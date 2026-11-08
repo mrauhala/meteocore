@@ -4593,22 +4593,21 @@ fn sweep_matches(level: f64, want: f64) -> bool {
 
 /// Match requested elevation angles to the catalog's canonical sweep-angle
 /// set: each keeps the nearest sweep within [`SWEEP_MATCH_TOLERANCE_DEG`],
-/// and one with no sweep that close drops out. Duplicates collapse while
-/// request order holds.
+/// and one with no sweep that close drops out. The sweeps kept come in the
+/// canonical order, lowest first as a profile without `z` reads, each once,
+/// whatever the request's order (`in_axis_order`, #1434).
 fn snap_levels(requested: &[f64], canonical: &[f64]) -> Vec<f64> {
-    let mut out: Vec<f64> = Vec::new();
-    for &want in requested {
-        if let Some(&lvl) = canonical
-            .iter()
-            .filter(|lvl| sweep_matches(**lvl, want))
-            .min_by(|a, b| (**a - want).abs().total_cmp(&(**b - want).abs()))
-        {
-            if !out.contains(&lvl) {
-                out.push(lvl);
-            }
-        }
-    }
-    out
+    let snapped: Vec<f64> = requested
+        .iter()
+        .filter_map(|&want| {
+            canonical
+                .iter()
+                .filter(|lvl| sweep_matches(**lvl, want))
+                .min_by(|a, b| (**a - want).abs().total_cmp(&(**b - want).abs()))
+                .copied()
+        })
+        .collect();
+    ds_core::vertical::in_axis_order(&snapped, canonical)
 }
 
 /// The sweep and moment a point query reads for `quantity` at the
@@ -7838,7 +7837,10 @@ mod tests {
             (&[0.3, 50.0], &[0.3]),
             // Both ends of the band are inclusive; one sweep is kept once.
             (&[8.95, 9.05], &[9.0]),
-            (&[1.55, 0.4], &[1.5, 0.4]),
+            // In the sweeps' order, lowest first, as the profile without
+            // `z` reads, whatever the list's order (#1434).
+            (&[1.55, 0.4], &[0.4, 1.5]),
+            (&[5.0, 0.3, 4.0, 0.30001, 0.7], &[0.3, 0.7, 4.0, 5.0]),
         ] {
             assert_eq!(resolve(z).unwrap().as_deref(), Some(kept), "{z:?}");
         }
