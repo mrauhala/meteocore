@@ -58,6 +58,16 @@ impl MapsError {
     }
 }
 
+/// A model run the request names that the collection cannot draw (#337).
+impl From<api_common::subset::RunError> for MapsError {
+    fn from(error: api_common::subset::RunError) -> Self {
+        match error {
+            api_common::subset::RunError::NoRunAxis(message) => MapsError::BadRequest(message),
+            api_common::subset::RunError::UnknownRun(message) => MapsError::NotFound(message),
+        }
+    }
+}
+
 impl IntoResponse for MapsError {
     fn into_response(self) -> axum::response::Response {
         let retry_after = match &self {

@@ -13,20 +13,26 @@
 //! ```
 //!
 //! `axisName` is a letter A–Z of either case followed by any number of
-//! letters and digits, `number` an integer or floating-point number, and
-//! `text` double-quoted ASCII such as an RFC 3339 time. One value may hold
+//! letters, digits and `_`, `number` an integer or floating-point number, and
+//! `text` double-quoted ASCII such as an RFC 3339 time. The ABNF's prose says
+//! alphanumeric, but General Subsetting takes "any name of the additional
+//! dimensions in the extent" as an axis name, and its own example is
+//! `atm_pressure_hpa(500)` (`/req/general-subsetting/subset-definition`):
+//! `reference_time` is one. One value may hold
 //! several comma-separated expressions, and `subset` may repeat:
 //! `subset=Lat(-90:90)&subset=Lon(0:10)` is `subset=Lat(-90:90),Lon(0:10)`.
 //!
 //! The axes a route accepts are the caller's ([`by_axis`]): Maps takes
 //! `Lon`/`Lat` or `E`/`N` and `time`, while OGC API - Tiles names its time
 //! axis `datetime`. An axis outside that list is an error, never ignored.
+//! Map and map tile routes also take [`REFERENCE_TIME_AXIS`], the model run
+//! (#337), on a collection that retains runs ([`named_run`]).
 //!
-//! [`render_time`] turns a [`RequestedTime`] into the instant a map or map
-//! tile renders, so both select the same time step; each API maps a
-//! selection with none ([`NoTimeStep`]) to its own status. [`is_exact_time`]
-//! and [`is_fixed_run`] are the rule for whether the response may be
-//! `immutable`, WMS's included.
+//! [`resolve_frame`] turns a [`RequestedTime`] and a named run into the time
+//! step and run a map or map tile draws, so both select the same frame; each
+//! API maps a selection with none ([`NoTimeStep`]) to its own status.
+//! [`is_exact_time`] and [`is_fixed_run`] are the rule for whether the
+//! response may be `immutable`, WMS's included.
 
 use std::collections::BTreeMap;
 
@@ -145,10 +151,10 @@ fn parse_expression(expression: &str) -> Result<Subset, String> {
     let axis = axis.trim();
     let mut chars = axis.chars();
     let valid_axis = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric());
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
     if !valid_axis {
         return Err(invalid(
-            "the axis name must start with a letter followed by letters and digits",
+            "the axis name must start with a letter followed by letters, digits and '_'",
         ));
     }
     let inner = rest
@@ -228,6 +234,166 @@ impl Axis<'_> {
                 .iter()
                 .any(|a| a.eq_ignore_ascii_case(requested))
     }
+}
+
+/// The `subset` axis naming a model run, its forecast reference time
+/// (#337): `reference_time("2026-10-01T06:00:00Z")`, or `reference_time(*)`
+/// for the latest run, as omitting it is. The value is the run's EDR
+/// instance id. The map and map tile routes take it on a collection that
+/// retains runs ([`named_run`]), whose `extent` advertises the dimension
+/// under the same name (`ds_core::ogc_extent::ReferenceTimeExtent`).
+pub const REFERENCE_TIME_AXIS: Axis<'static> = Axis {
+    name: "reference_time",
+    aliases: &[],
+};
+
+/// A `reference_time` subset: the run it names, `None` for `*`, the latest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestedRun(pub Option<DateTime<Utc>>);
+
+impl RequestedRun {
+    /// The run of a `reference_time` subset: one double-quoted EDR instance
+    /// id, RFC 3339 or the compact `20261001T0600Z` instance ids had before
+    /// #947 (`ds_core::instances::parse_instance_id`), or `*`.
+    ///
+    /// An interval is an error. General Subsetting's grammar takes one on
+    /// any axis, and a 2D map flattens it, but no standard says which run a
+    /// map of an interval of runs draws; the MetOcean Maps profile
+    /// discussion names a run with a slice only. Accepting one later, say
+    /// as the latest run inside it, would break no client.
+    pub fn from_subset(range: &SubsetRange) -> Result<Self, String> {
+        match range {
+            SubsetRange::Single(SubsetValue::Star) => Ok(Self(None)),
+            SubsetRange::Single(SubsetValue::Text(text)) => {
+                ds_core::instances::parse_instance_id(text.trim())
+                    .map(|run| Self(Some(run)))
+                    .ok_or_else(|| {
+                        format!(
+                            "reference_time subset value \"{text}\" is not a model run: use an \
+                             RFC 3339 time, e.g. reference_time(\"2026-10-01T06:00:00Z\")"
+                        )
+                    })
+            }
+            SubsetRange::Single(SubsetValue::Number(_)) => Err(
+                "reference_time subset values are double-quoted RFC 3339 times or '*', \
+                 e.g. reference_time(\"2026-10-01T06:00:00Z\")"
+                    .to_string(),
+            ),
+            SubsetRange::Interval(..) => Err(
+                "reference_time takes one model run, reference_time(\"<run>\"), or '*' for \
+                 the latest; an interval is not supported"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Why a named run cannot be drawn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunError {
+    /// The collection retains no runs, a 400. The routes parse `subset`
+    /// with the collection's axes, so its `by_axis` 400 names them first.
+    NoRunAxis(String),
+    /// The collection has no such run, a 404 as an unknown EDR instance is
+    /// (`/req/general-subsetting/subset-definition`: a value entirely
+    /// outside the axis' valid values is a 204 or a 404).
+    UnknownRun(String),
+}
+
+/// The model run a map or map tile request names, checked against the
+/// collection's `runs` (`RasterInfo::reference_times`, ascending): `None`
+/// for none or `*`, the latest.
+pub fn named_run(
+    requested: Option<RequestedRun>,
+    runs: &[DateTime<Utc>],
+    collection_id: &str,
+) -> Result<Option<DateTime<Utc>>, RunError> {
+    let Some(RequestedRun(run)) = requested else {
+        return Ok(None);
+    };
+    if runs.is_empty() {
+        return Err(RunError::NoRunAxis(format!(
+            "subset axis '{}' is not supported: collection '{collection_id}' has no model runs",
+            REFERENCE_TIME_AXIS.name,
+        )));
+    }
+    match run {
+        // Ascending by the `RasterInfo` contract; an archive keeps thousands
+        // of runs (#1006).
+        Some(rt) if runs.binary_search(&rt).is_err() => Err(RunError::UnknownRun(format!(
+            "reference_time '{}' is not a model run of collection '{collection_id}'",
+            ds_core::instances::format_instance_id(rt)
+        ))),
+        run => Ok(run),
+    }
+}
+
+/// The frame a map or map tile draws: the time step and model run the
+/// engine renders, which key the rendered caches, and whether the response
+/// may be pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawnFrame {
+    pub time: Option<DateTime<Utc>>,
+    pub reference_time: Option<DateTime<Utc>>,
+    /// An instant drawn exactly ([`is_exact_time`]) from a fixed run
+    /// ([`is_fixed_run`]).
+    pub pinned: bool,
+}
+
+/// The frame a map or map tile request draws, shared by Maps and map tiles
+/// so both select the same one. `run` is the run the request named
+/// ([`named_run`]).
+///
+/// 1. The time: [`render_time`]. With an older run named and no time, the
+///    engine is asked for `None`, which it resolves to that run's own latest
+///    step: the collection's latest time may lie past the run.
+/// 2. The run: [`MapEngine::resolve_parameter_reference_time`] of
+///    [`engine_run`], the CONCRETE run the engine renders (#521). Keyed as
+///    `None`, the no-TTL rendered caches would keep serving the
+///    first-rendered run's pixels after a newer run re-covers the same valid
+///    times: every few minutes for a nowcast generation, every few hours for
+///    a forecast. Asking the engine keeps its cross-run fallback, and the run
+///    is the parameter's: GRIB renders an aggregate the newest run lacks at
+///    that time from an older run (#1005). Engines without runs keep `None`.
+/// 3. The time step: [`MapEngine::resolve_parameter_time`] in that run
+///    (#507). A not-yet-ingested time then keys the step drawn, never its
+///    own; a parameter with its own time axis snaps on that axis.
+pub fn resolve_frame(
+    requested: Option<&RequestedTime>,
+    run: Option<DateTime<Utc>>,
+    engine: &dyn MapEngine,
+    info: &RasterInfo,
+    parameter: Option<&str>,
+) -> Result<DrawnFrame, NoTimeStep> {
+    let asked = engine_run(&info.reference_times, run);
+    let time = match (asked, requested) {
+        (Some(_), None) => None,
+        _ => render_time(requested, engine, info, parameter)?,
+    };
+    let reference_time = engine.resolve_parameter_reference_time(parameter, time, asked);
+    let time = engine.resolve_parameter_time(parameter, time, reference_time);
+    // Only an instant can pin the image: `*` and intervals follow new data.
+    let instant = requested.and_then(|t| t.selection.instant());
+    Ok(DrawnFrame {
+        time,
+        reference_time,
+        pinned: is_exact_time(instant, time)
+            && is_fixed_run(&info.reference_times, run, reference_time),
+    })
+}
+
+/// The run to ask the engine for when a request names `named`: the latest
+/// of `runs` is asked for as `None`, an older one as itself. The common
+/// client echoes the latest run on every request, frames older than that
+/// run's reference time included, and an exact pin of it would refuse them;
+/// as `None` it gets the engine's run selection for the time, an older run's
+/// fallback included. An older run named stays exact: that is the request's
+/// intent. WMS `DIM_REFERENCE_TIME`, Maps and Tiles alike.
+///
+/// [`is_fixed_run`] still takes the run as named, so a frame the engine drew
+/// from another run is not pinned.
+pub fn engine_run(runs: &[DateTime<Utc>], named: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+    named.filter(|&rt| runs.last().copied() != Some(rt))
 }
 
 /// Assign each subset to one of `axes`, keyed by the axis' reported name.
@@ -476,8 +642,9 @@ pub fn is_exact_time(requested: Option<DateTime<Utc>>, drawn: Option<DateTime<Ut
 /// retains runs draws a valid time from the run it selects, and a newer run
 /// re-covers valid times an older one drew: a nowcast generation every few
 /// minutes, a forecast run every few hours. So only a run the request named,
-/// and the engine drew, is fixed. WMS names one with `DIM_REFERENCE_TIME`;
-/// Maps and Tiles name none, and pass `None`.
+/// and the engine drew, is fixed. WMS names one with `DIM_REFERENCE_TIME`,
+/// Maps and map tiles with `subset=reference_time(…)` ([`named_run`]); `*`
+/// names none.
 ///
 /// Like [`is_exact_time`], the request's own answer, never stored with a
 /// cached image: the rendered caches key on the run drawn (#521).
@@ -733,6 +900,13 @@ mod tests {
             )
         );
         assert_eq!(one("h2(*)").range, SubsetRange::Single(SubsetValue::Star));
+        // An additional dimension's name, as General Subsetting's own
+        // `atm_pressure_hpa(500)`.
+        assert_eq!(one("reference_time(*)").axis, "reference_time");
+        assert_eq!(
+            one("atm_pressure_hpa(500)").range,
+            SubsetRange::Single(SubsetValue::Number(500.0))
+        );
     }
 
     /// Comma-separated expressions and repeated parameters are one list
@@ -768,6 +942,7 @@ mod tests {
             "Lat1:2)",
             "1Lat(1:2)",
             "La-t(1:2)",
+            "_Lat(1:2)",
             "Lat(1:2:3)",
             "Lat(a:2)",
             "Lat(NaN:2)",
@@ -1057,6 +1232,162 @@ mod tests {
 
     fn hour(h: u32) -> DateTime<Utc> {
         at(&format!("2024-01-01T{h:02}:00:00Z"))
+    }
+
+    /// #337: a run is one double-quoted instance id, either form, or `*`.
+    #[test]
+    fn a_reference_time_subset_names_one_run_or_the_latest() {
+        let run = |value: &str| RequestedRun::from_subset(&one(value).range);
+        let six = Some(at("2026-10-01T06:00:00Z"));
+        assert_eq!(
+            run(r#"reference_time("2026-10-01T06:00:00Z")"#),
+            Ok(RequestedRun(six))
+        );
+        assert_eq!(
+            run(r#"reference_time("2026-10-01T09:00:00+03:00")"#),
+            Ok(RequestedRun(six))
+        );
+        // The compact instance id served before #947.
+        assert_eq!(
+            run(r#"reference_time("20261001T0600Z")"#),
+            Ok(RequestedRun(six))
+        );
+        assert_eq!(run("reference_time(*)"), Ok(RequestedRun(None)));
+        for bad in [
+            r#"reference_time("2026-10-01T00:00:00Z":"2026-10-02T00:00:00Z")"#,
+            "reference_time(*:*)",
+            "reference_time(20261001)",
+            r#"reference_time("2026-10-01")"#,
+            r#"reference_time("latest")"#,
+        ] {
+            assert!(run(bad).is_err(), "{bad}");
+        }
+        let err = run(r#"reference_time("2026-10-01T00:00:00Z":*)"#).unwrap_err();
+        assert!(err.contains("an interval is not supported"), "{err}");
+    }
+
+    /// A named run must be one of the collection's; a collection without
+    /// runs has no such axis.
+    #[test]
+    fn a_named_run_is_checked_against_the_collection() {
+        let runs = [hour(0), hour(6)];
+        let named = |requested, runs: &[DateTime<Utc>]| named_run(requested, runs, "nwp");
+        assert_eq!(named(None, &runs), Ok(None));
+        assert_eq!(named(None, &[]), Ok(None));
+        assert_eq!(named(Some(RequestedRun(None)), &runs), Ok(None));
+        assert_eq!(
+            named(Some(RequestedRun(Some(hour(0)))), &runs),
+            Ok(Some(hour(0)))
+        );
+        let Err(RunError::UnknownRun(message)) = named(Some(RequestedRun(Some(hour(3)))), &runs)
+        else {
+            panic!("an unknown run is not a 404");
+        };
+        assert!(message.contains("2024-01-01T03:00:00Z"), "{message}");
+        for requested in [RequestedRun(None), RequestedRun(Some(hour(0)))] {
+            assert_eq!(
+                named(Some(requested), &[]),
+                Err(RunError::NoRunAxis(
+                    "subset axis 'reference_time' is not supported: collection 'nwp' has no \
+                     model runs"
+                        .into()
+                ))
+            );
+        }
+    }
+
+    /// The latest run named is asked for as none; an older one as itself.
+    #[test]
+    fn the_latest_run_named_is_asked_for_as_none() {
+        let runs = [hour(0), hour(6)];
+        assert_eq!(engine_run(&runs, None), None);
+        assert_eq!(engine_run(&runs, Some(hour(6))), None);
+        assert_eq!(engine_run(&runs, Some(hour(0))), Some(hour(0)));
+    }
+
+    /// Runs at 00Z, valid 00Z–09Z, and 06Z, valid 06Z–12Z, hourly. Unpinned,
+    /// a time before 06Z falls back to the 00Z run.
+    struct TwoRuns;
+
+    impl MapEngine for TwoRuns {
+        fn get_raster_tile(
+            &self,
+            _: [f64; 4],
+            _: u32,
+            _: u32,
+            _: Option<DateTime<Utc>>,
+            _: &ds_core::map_engine::OutputCrs,
+            _: Option<&str>,
+            _: Option<f64>,
+            _: Option<DateTime<Utc>>,
+        ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError> {
+            unreachable!("frame resolution never renders")
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                reference_times: vec![hour(0), hour(6)],
+                times: (0..=12).map(hour).collect(),
+                ..Axis3.raster_info()
+            }
+        }
+
+        fn resolve_reference_time(
+            &self,
+            time: Option<DateTime<Utc>>,
+            reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            reference_time.or(Some(if time.is_some_and(|t| t < hour(6)) {
+                hour(0)
+            } else {
+                hour(6)
+            }))
+        }
+
+        fn resolve_time(
+            &self,
+            time: Option<DateTime<Utc>>,
+            reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            let last = if reference_time == Some(hour(0)) {
+                hour(9)
+            } else {
+                hour(12)
+            };
+            Some(time.unwrap_or(last))
+        }
+    }
+
+    /// The frame Maps and map tiles draw: a named older run's own latest
+    /// step by default, its steps otherwise; only a named run drawn pins.
+    #[test]
+    fn resolve_frame_draws_from_the_named_run() {
+        let engine = TwoRuns;
+        let info = engine.raster_info();
+        let instant = |h| RequestedTime {
+            selection: TimeSelection::Instant(hour(h)),
+            from_subset: false,
+        };
+        let frame = |time: Option<RequestedTime>, run: Option<u32>| {
+            resolve_frame(time.as_ref(), run.map(hour), &engine, &info, None).unwrap()
+        };
+        let drawn = |time: u32, run: u32, pinned: bool| DrawnFrame {
+            time: Some(hour(time)),
+            reference_time: Some(hour(run)),
+            pinned,
+        };
+        // None named: the collection's latest time, from the latest run.
+        assert_eq!(frame(None, None), drawn(12, 6, false));
+        assert_eq!(frame(Some(instant(9)), None), drawn(9, 6, false));
+        // An older run: its own latest step, not the collection's 12Z, which
+        // it does not have; an exact step of it pins.
+        assert_eq!(frame(None, Some(0)), drawn(9, 0, false));
+        assert_eq!(frame(Some(instant(6)), Some(0)), drawn(6, 0, true));
+        // The latest run named is the engine's pick: drawn, it pins; fallen
+        // back from for a time it lacks, it does not.
+        assert_eq!(frame(None, Some(6)), drawn(12, 6, false));
+        assert_eq!(frame(Some(instant(9)), Some(6)), drawn(9, 6, true));
+        assert_eq!(frame(Some(instant(3)), Some(6)), drawn(3, 0, false));
     }
 
     /// The selection rules Maps and map tiles share.

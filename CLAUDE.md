@@ -978,8 +978,11 @@ one never implies the other.
     it, engines and `build_instances` stay ascending), `/instances/{id}`,
     `/instances/{id}/{position,area}` — gated on `get_instances()` being
     non-empty; no-instance routes default to the latest run. WMS exposes
-    `DIM_REFERENCE_TIME` (see `crates/api-wms/CLAUDE.md`). Maps/Tiles still
-    pass `reference_time: None` (follow-up).
+    `DIM_REFERENCE_TIME` (see `crates/api-wms/CLAUDE.md`). Maps maps and map
+    tiles take `subset=reference_time("<instance id>")` and advertise the
+    runs as the extent's `reference_time` dimension (#337): one resolution
+    for both, `api_common::subset::resolve_frame`, and one latest-run rule
+    with WMS, `subset::engine_run`.
 - **`ds_core::time_axis`** — the one rule for long time axes (#1006): up to
   `MAX_LISTED_VALUES` (500) values a list, WMS byte-identical to before; past it,
   ranges of equally spaced values, lossless. WMS writes them as Annex C

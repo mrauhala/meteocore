@@ -974,9 +974,11 @@ pub trait MapEngine: Send + Sync {
     ///
     /// The API layers also decide `Cache-Control` from it: on an engine with
     /// runs, an explicit-`TIME` response is `immutable` only when the request
-    /// named the run this returns (WMS `DIM_REFERENCE_TIME`; Maps and Tiles
-    /// name none), since a newer run re-covers the valid times an older one
-    /// drew (#1421). An engine whose content for a named run can still
+    /// named the run this returns (WMS `DIM_REFERENCE_TIME`, Maps and map
+    /// tiles `subset=reference_time(…)`, #337), since a newer run re-covers
+    /// the valid times an older one drew (#1421). A request naming an older
+    /// run and no time asks this and [`Self::resolve_time`] with `time`
+    /// `None`: they return the run and its own latest step. An engine whose content for a named run can still
     /// change also needs a non-zero [`Self::content_version`].
     ///
     /// Default: identity — correct only for engines without model runs
