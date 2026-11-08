@@ -468,6 +468,12 @@ fn gfi(layer: &str, i: u32, j: u32, extra: &str) -> String {
     )
 }
 
+/// `DIM_REFERENCE_TIME` naming the latest run, which [`Nwp`] draws: an
+/// exact `TIME` is pinned only with a run named (#1421).
+fn named_run() -> String {
+    format!("&DIM_REFERENCE_TIME={}", RUNS[1])
+}
+
 /// [`gfi`] on a map of `layers`, reading `query_layers`.
 fn gfi_layers(layers: &str, query_layers: &str, extra: &str) -> String {
     gfi(layers, 0, 0, extra).replacen(
@@ -1108,20 +1114,29 @@ fn get_feature_info_has_a_deadline_of_its_own() {
     });
 }
 
-/// As GetMap: `immutable` only for an explicit TIME over content the
-/// engine never revises in place. A null value is never pinned: an engine
-/// may answer a transient read failure with one.
+/// As GetMap: `immutable` only for an explicit TIME from a fixed run, over
+/// content the engine never revises in place. The engine retains runs, so
+/// the run must be named and drawn (#1421): without `DIM_REFERENCE_TIME` a
+/// newer run re-covers the valid time. A null value is never pinned: an
+/// engine may answer a transient read failure with one.
 #[tokio::test]
 async fn cache_control_is_get_maps() {
     const IMMUTABLE: &str = "public, max-age=86400, immutable";
     const SHORT: &str = "public, max-age=60, must-revalidate";
     let app = router(Nwp::new(Answer::Value(1.0)));
-    let pinned = gfi("nwp/t2m", 0, 0, "&TIME=2026-10-01T01:00:00Z");
+    let pinned = gfi(
+        "nwp/t2m",
+        0,
+        0,
+        &format!("&TIME={}{}", TIMES[1], named_run()),
+    );
     assert_eq!(get(&app, &pinned).await.cache_control, IMMUTABLE);
     assert_eq!(
         get(&app, &gfi("nwp/t2m", 0, 0, "")).await.cache_control,
         SHORT
     );
+    let any_run = gfi("nwp/t2m", 0, 0, &format!("&TIME={}", TIMES[1]));
+    assert_eq!(get(&app, &any_run).await.cache_control, SHORT);
     assert_eq!(
         get(&router(Nwp::new(Answer::Nodata)), &pinned)
             .await
@@ -1144,6 +1159,7 @@ async fn cache_control_is_get_maps() {
 /// once the next lands, before the oldest as the window slides, between two
 /// once one lands in the gap. `TIME` is compared as an instant, so every form
 /// that names the step stays pinned. The read itself is of the step drawn.
+/// The run is named, so only the time decides.
 #[tokio::test]
 async fn only_a_time_drawn_exactly_is_pinned() {
     const IMMUTABLE: &str = "public, max-age=86400, immutable";
@@ -1164,7 +1180,7 @@ async fn only_a_time_drawn_exactly_is_pinned() {
         let engine = Nwp::new(Answer::Value(1.0));
         let reply = get(
             &router(engine.clone()),
-            &gfi("nwp/t2m", 0, 0, &format!("&TIME={time}")),
+            &gfi("nwp/t2m", 0, 0, &format!("&TIME={time}{}", named_run())),
         )
         .await;
         assert_eq!(reply.status, StatusCode::OK, "{time}: {}", reply.body);
@@ -1517,7 +1533,10 @@ async fn a_failing_query_layer_fails_the_request() {
     assert_eq!(reply.status, StatusCode::SERVICE_UNAVAILABLE);
 
     let app = router_with(Nwp::new(Answer::Value(1.0)), Nwp::new(Answer::NotFound));
-    let pinned = both("&INFO_FORMAT=application/json&TIME=2026-10-01T01:00:00Z");
+    let pinned = both(&format!(
+        "&INFO_FORMAT=application/json&TIME=2026-10-01T01:00:00Z{}",
+        named_run()
+    ));
     let reply = get(&app, &pinned).await;
     assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
     let values: Vec<_> = json(&reply)["features"]

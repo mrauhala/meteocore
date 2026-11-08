@@ -696,6 +696,36 @@ async fn immutable_needs_every_layer_to_draw_the_time_exactly() {
     }
 }
 
+/// A list is `immutable` only when every layer's run is fixed too (#1421):
+/// a layer with runs and no `DIM_REFERENCE_TIME` draws whichever run the
+/// engine picks, and a newer one re-covers the valid time. A named older
+/// run is fixed; the layer without runs is fixed either way.
+#[tokio::test]
+async fn immutable_needs_every_layer_to_draw_a_fixed_run() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    let fixture = Fixture::new();
+    let older = format!("&TIME={T0}&DIM_REFERENCE_TIME={R0}");
+    for (layers, dimensions, expected) in [
+        ("timed", format!("&TIME={T0}"), IMMUTABLE),
+        ("runs", format!("&TIME={T0}"), SHORT),
+        ("timed,runs", format!("&TIME={T0}"), SHORT),
+        ("runs,timed", format!("&TIME={T0}"), SHORT),
+        ("runs", older.clone(), IMMUTABLE),
+        ("timed,runs", older.clone(), IMMUTABLE),
+        ("runs,timed", older, IMMUTABLE),
+    ] {
+        let reply = fixture.get_map(layers, "", &dimensions).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "{layers} {dimensions}: {}",
+            reply.text()
+        );
+        assert_eq!(reply.cache_control, expected, "{layers} {dimensions}");
+    }
+}
+
 /// Without `TIME`, each layer draws its own default, a parameter with its
 /// own time axis its own latest (#819), and keys its caches on it.
 #[tokio::test]

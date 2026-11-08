@@ -312,20 +312,25 @@ fn render_job(
 
 /// Cache-Control header value for a WMS response.
 ///
-/// - A TIME the engine draws exactly (`ResolvedLayer::exact_time`), over
-///   immutable content (`content_version == 0`): the pixels for that instant
-///   never change — cache for 24 hours, `immutable` (no revalidation at all).
+/// - A `pinned` frame (`ResolvedLayer::pinned`): a TIME the engine draws
+///   exactly, from a fixed run (an engine without runs, or the
+///   `DIM_REFERENCE_TIME` named and drawn), over immutable content
+///   (`content_version == 0`): the pixels for that instant never change —
+///   cache for 24 hours, `immutable` (no revalidation at all).
 /// - Otherwise — no TIME ("latest" moves), a TIME snapped to another timestep
 ///   (the URL draws another frame once one lands, or as the window slides,
 ///   #1415), a TIME the engine has nothing to render for yet (resolved to
-///   `None`: its catalog is still empty after a start or reload), or content
+///   `None`: its catalog is still empty after a start or reload), a TIME of
+///   an engine that retains runs with no `DIM_REFERENCE_TIME` drawn (a newer
+///   run or nowcast generation re-covers the valid time, #1421), or content
 ///   the engine revises in place under a fixed instant
-///   (`content_version != 0`, e.g. a push-fed alert set): short cache (60 s)
-///   and revalidate, so a browser/CDN that holds a tile the URL no longer
-///   means asks again (the ETag is content-derived, so an unchanged tile is a
-///   cheap 304). The red error tile is always short too.
-pub(crate) fn cache_control_value(pinned_time: bool, content_version: u64) -> &'static str {
-    if pinned_time && content_version == 0 {
+///   (`content_version != 0`, e.g. a push-fed alert set, a lightning frame
+///   strikes can still land in): short cache (60 s) and revalidate, so a
+///   browser/CDN that holds a tile the URL no longer means asks again (the
+///   ETag is content-derived, so an unchanged tile is a cheap 304). The red
+///   error tile is always short too.
+pub(crate) fn cache_control_value(pinned: bool, content_version: u64) -> &'static str {
+    if pinned && content_version == 0 {
         "public, max-age=86400, immutable"
     } else {
         "public, max-age=60, must-revalidate"
@@ -485,12 +490,15 @@ pub(crate) struct ResolvedLayer {
     /// the style's, else on the root layer the default parameter whose style
     /// it draws with (#1133); for a composite, the composite's name.
     pub parameter: Option<String>,
-    /// Whether the layer draws exactly the request's `TIME`
-    /// ([`api_common::subset::is_exact_time`], #1415): it takes it (a `TIME`
-    /// was sent, and the layer has a time dimension or no listed layer has
-    /// one, #1181) and the engine did not snap it. Only such a layer can be
-    /// `immutable`. The request's, never a cached entry's.
-    pub exact_time: bool,
+    /// Whether the layer's frame is fixed at this URL: it draws exactly the
+    /// request's `TIME` ([`api_common::subset::is_exact_time`], #1415), so it
+    /// takes it (a `TIME` was sent, and the layer has a time dimension or no
+    /// listed layer has one, #1181) and the engine did not snap it; and from
+    /// a fixed run ([`api_common::subset::is_fixed_run`], #1421), so its
+    /// engine retains no runs, or it draws the `DIM_REFERENCE_TIME` it takes.
+    /// Only such a layer can be `immutable`. The request's, never a cached
+    /// entry's.
+    pub pinned: bool,
     /// The timestep drawn: `TIME`, or the layer's default, snapped by the
     /// engine (#507). `None` when the engine has nothing to draw.
     pub time: Option<DateTime<Utc>>,
@@ -696,6 +704,14 @@ fn resolve_layer(
     // (#1334).
     let content_version =
         engine.content_version_for(parameter.as_deref(), time, reference_time, elevation);
+    // The run as named, not normalised: a named latest run the engine draws
+    // is as fixed as an older one, and one it falls back from is not (#1421).
+    let pinned = api_common::subset::is_exact_time(requested_time, time)
+        && api_common::subset::is_fixed_run(
+            &info.reference_times,
+            requested_reference_time,
+            reference_time,
+        );
 
     ResolvedLayer {
         layer: layer.to_string(),
@@ -704,9 +720,9 @@ fn resolve_layer(
         paint,
         style_layer,
         style_name,
+        pinned,
         info,
         parameter,
-        exact_time: api_common::subset::is_exact_time(requested_time, time),
         time,
         reference_time,
         elevation,
@@ -770,15 +786,15 @@ pub async fn wms_handler(
                 .with_quality(params.quality, webp_quality(&state, &layers));
             let content_type = format.content_type();
 
-            // Immutable only when every layer draws exactly the TIME, over
-            // content no layer's engine revises in place.
-            let pinned_time = layers.iter().all(|layer| layer.exact_time);
+            // Immutable only when every layer draws exactly the TIME from a
+            // fixed run, over content no layer's engine revises in place.
+            let pinned = layers.iter().all(|layer| layer.pinned);
             let content_version = layers
                 .iter()
                 .map(|layer| layer.content_version)
                 .max()
                 .unwrap_or_default();
-            let cache_control = cache_control_value(pinned_time, content_version);
+            let cache_control = cache_control_value(pinned, content_version);
 
             // The rendered cache holds single-layer images only. A layer
             // list is drawn from each layer's cached meta-tiles but never

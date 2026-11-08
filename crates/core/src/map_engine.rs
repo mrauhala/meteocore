@@ -972,6 +972,13 @@ pub trait MapEngine: Send + Sync {
     /// engine no longer retains should also echo — the render will error
     /// and cache nothing, so the key value is moot.
     ///
+    /// The API layers also decide `Cache-Control` from it: on an engine with
+    /// runs, an explicit-`TIME` response is `immutable` only when the request
+    /// named the run this returns (WMS `DIM_REFERENCE_TIME`; Maps and Tiles
+    /// name none), since a newer run re-covers the valid times an older one
+    /// drew (#1421). An engine whose content for a named run can still
+    /// change also needs a non-zero [`Self::content_version`].
+    ///
     /// Default: identity — correct only for engines without model runs
     /// (`reference_times` empty), where `None` stays `None` and nothing
     /// regenerates under the same valid time. **Expected complexity:
@@ -1027,6 +1034,9 @@ pub trait MapEngine: Send + Sync {
     /// a change orphans only the frames it touches (#1334). GRIB hashes the
     /// identity of the message the render reads, selected through the SAME
     /// helpers `get_raster_tile` uses: share them so the two cannot drift.
+    /// Likewise one whose recent frames can still change while older ones
+    /// cannot: PostGIS lightning frames are `0` once settled and non-zero
+    /// while strikes can still land in them (#1421).
     /// A wrapper that derives a layer from other parameters combines their
     /// versions; every wrapper forwards it.
     ///

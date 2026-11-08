@@ -110,11 +110,16 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
 ## Responses
 
 - Map tiles carry `Content-Crs`, `ETag` and `x-cache` (`HIT`, `MISS`,
-  `EMPTY`). An instant the engine draws exactly, on an engine that never
-  revises content in place, is `public, max-age=86400, immutable`; everything
-  else is `public, max-age=60, must-revalidate`: no time, an interval even when
-  closed, or an instant snapped to another time step, whose URL draws another
-  frame once one lands or the window slides. Instants are compared, not their
+  `EMPTY`). An instant the engine draws exactly, on an engine without model
+  runs that never revises content in place, is
+  `public, max-age=86400, immutable`; everything else is
+  `public, max-age=60, must-revalidate`: no time, an interval even when
+  closed, an instant snapped to another time step, whose URL draws another
+  frame once one lands or the window slides, or an instant of an engine that
+  keeps model runs (GRIB, QueryData, Zarr and NetCDF forecasts, nowcast
+  generations): Tiles names no run, and a newer run re-covers the instant. A
+  PostGIS lightning frame is revised until an hour before the newest strike.
+  Instants are compared, not their
   text, so a step written with an offset is exact. The header is each request's
   own: a snapped and an exact request share the step's cached tile.
 - Vector tiles carry `ETag`, `x-cache` and `Cache-Control: public, max-age=300`.

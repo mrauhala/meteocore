@@ -254,6 +254,17 @@ the frame follows the newest step, updated on refresh. Each window is one
 read, cached (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32) and capped at the
 newest 200 000 events.
 
+Events can land late and out of order: the table's writer inserts what its
+source publishes, when it publishes it. So a frame is settled only once its
+window ends an hour or more before the newest event the last refresh read
+(the hour EDR and Features responses use for late observations). Until
+then, an explicit `TIME`, a future one included, revalidates
+(`max-age=60, must-revalidate`) rather than being `immutable`, and keeps the
+events its first read found. Once settled it is read again, and its
+responses are `immutable`. With no events yet no frame settles, and while
+ingest is stalled none within that hour of the newest event, or after it,
+does.
+
 WMS GetFeatureInfo answers the events of the frame's window whose drawn
 disc covers the clicked pixel, newest first, with their time, id, the
 configured parameters, `type` and `peak_current_ka`: one statement per

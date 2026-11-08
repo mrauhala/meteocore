@@ -2842,6 +2842,40 @@ async fn map_re_renders_when_a_new_run_lands() {
     );
 }
 
+/// #1421: Maps names no run, so on an engine that retains runs an exact
+/// valid time is drawn from whichever run is the latest now, and a newer run
+/// re-covers it later (a nowcast generation every few minutes, a forecast
+/// run every few hours). Its image is never `immutable`. Once the engine
+/// retains no runs, the same exact step is.
+#[tokio::test]
+async fn an_exact_step_without_a_fixed_run_is_not_immutable() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    let runs = Arc::new(std::sync::RwLock::new(vec!["2026-07-11T12:00:00Z"
+        .parse()
+        .unwrap()]));
+    let app = build_router_with_engine(Arc::new(RunSwapMockMapEngine {
+        runs: runs.clone(),
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    async fn cache_control(app: &axum::Router) -> String {
+        let uri = "/collections/radar/map?bbox=10,55,30,70&width=64&height=64\
+                   &datetime=2026-07-11T20:00:00Z";
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp.headers()[axum::http::header::CACHE_CONTROL]
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+    // A cold render and a cache hit alike.
+    assert_eq!(cache_control(&app).await, SHORT);
+    assert_eq!(cache_control(&app).await, SHORT);
+    runs.write().unwrap().clear();
+    assert_eq!(cache_control(&app).await, IMMUTABLE);
+}
+
 // ---------------------------------------------------------------------------
 // Per-parameter style layers
 // ---------------------------------------------------------------------------

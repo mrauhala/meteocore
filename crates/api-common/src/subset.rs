@@ -25,7 +25,8 @@
 //! [`render_time`] turns a [`RequestedTime`] into the instant a map or map
 //! tile renders, so both select the same time step; each API maps a
 //! selection with none ([`NoTimeStep`]) to its own status. [`is_exact_time`]
-//! is the rule for whether the response may be `immutable`, WMS's included.
+//! and [`is_fixed_run`] are the rule for whether the response may be
+//! `immutable`, WMS's included.
 
 use std::collections::BTreeMap;
 
@@ -465,6 +466,29 @@ pub fn is_exact_time(requested: Option<DateTime<Utc>>, drawn: Option<DateTime<Ut
     requested.is_some() && requested == drawn
 }
 
+/// Whether a map response drawn from model run `drawn` may be pinned: the
+/// frame's run is fixed, so the URL keeps meaning that frame (#1421). `runs`
+/// is the layer's `RasterInfo::reference_times`, `requested` the run the
+/// request named and `drawn` what `MapEngine::resolve_parameter_reference_time`
+/// returned for it.
+///
+/// An engine that retains no runs draws one frame per time step. One that
+/// retains runs draws a valid time from the run it selects, and a newer run
+/// re-covers valid times an older one drew: a nowcast generation every few
+/// minutes, a forecast run every few hours. So only a run the request named,
+/// and the engine drew, is fixed. WMS names one with `DIM_REFERENCE_TIME`;
+/// Maps and Tiles name none, and pass `None`.
+///
+/// Like [`is_exact_time`], the request's own answer, never stored with a
+/// cached image: the rendered caches key on the run drawn (#521).
+pub fn is_fixed_run(
+    runs: &[DateTime<Utc>],
+    requested: Option<DateTime<Utc>>,
+    drawn: Option<DateTime<Utc>>,
+) -> bool {
+    runs.is_empty() || (requested.is_some() && requested == drawn)
+}
+
 /// A time value of a subset: an instant, or a partial date or time naming a
 /// period `[start, end]` (end inclusive, one nanosecond before the next).
 enum TimeText {
@@ -643,6 +667,24 @@ mod tests {
         assert!(!is_exact_time(step, None));
         assert!(!is_exact_time(None, step));
         assert!(!is_exact_time(None, None));
+    }
+
+    /// #1421: without runs every frame's run is fixed; with them, only a run
+    /// the request named and the engine drew. The engine's pick for a request
+    /// naming none is the latest run now, and a newer one later.
+    #[test]
+    fn only_a_named_run_drawn_is_fixed() {
+        let (old, new) = (at("2026-01-01T00:00:00Z"), at("2026-01-01T06:00:00Z"));
+        let runs = [old, new];
+        assert!(is_fixed_run(&[], None, None));
+        assert!(is_fixed_run(&runs, Some(new), Some(new)));
+        assert!(is_fixed_run(&runs, Some(old), Some(old)));
+        // None named: whichever run the engine picks today.
+        assert!(!is_fixed_run(&runs, None, Some(new)));
+        assert!(!is_fixed_run(&runs, None, None));
+        // Named, but another drawn: a cross-run fallback for a valid time
+        // the named run does not cover yet.
+        assert!(!is_fixed_run(&runs, Some(new), Some(old)));
     }
 
     /// Only an instant names one: a range, closed or a single instant wide,
