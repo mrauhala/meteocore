@@ -641,10 +641,7 @@ impl QueryPolygon {
             cells = cells.min(MAX_MASK_EDGE_TESTS / self.vertex_count().max(1));
         }
         let (lon_span, lat_span) = self.spans();
-        let native = (
-            native_cells(lon_span, res_lon_deg),
-            native_cells(lat_span, res_lat_deg),
-        );
+        let native = self.native_dims(res_lon_deg, res_lat_deg);
         let (nx, ny) = fit_dims(native.0, native.1, cells);
         let mut axes = self.grid_axes(nx, ny);
         if (nx, ny) != native {
@@ -656,8 +653,25 @@ impl QueryPolygon {
         Ok(axes)
     }
 
-    /// The cell centres of an `nx` × `ny` grid over the bbox.
-    fn grid_axes(&self, nx: usize, ny: usize) -> AreaGridAxes {
+    /// `(nx, ny)`: the cells of a source `res_lon_deg` × `res_lat_deg`
+    /// degrees across the bbox, a partial cell counting whole (a
+    /// non-positive or non-finite size is one cell): the native grid
+    /// [`Self::fit_grid`] starts from. An engine answering its native cells
+    /// whatever their count (GeoTIFF) takes its grid from this and
+    /// [`Self::grid_axes`], so the shared formula cannot drift.
+    pub fn native_dims(&self, res_lon_deg: f64, res_lat_deg: f64) -> (usize, usize) {
+        let (lon_span, lat_span) = self.spans();
+        (
+            native_cells(lon_span, res_lon_deg),
+            native_cells(lat_span, res_lat_deg),
+        )
+    }
+
+    /// The cell-centre axes of exactly `nx` × `ny` cells (each at least
+    /// one) over the bbox, as [`AreaGridAxes`] lays them out, with no budget
+    /// and no `coarsened`: [`Self::fit_grid`]'s axes, and those of an
+    /// engine that chooses its own cell counts.
+    pub fn grid_axes(&self, nx: usize, ny: usize) -> AreaGridAxes {
         let (nx, ny) = (nx.max(1), ny.max(1));
         let (lon_span, lat_span) = self.spans();
         let (west, north) = (self.bbox.west, self.bbox.north);

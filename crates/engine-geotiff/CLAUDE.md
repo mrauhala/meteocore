@@ -182,8 +182,9 @@ apply here.
   (`stac::datetime_param`). EDR parses an open `..` end into
   `MIN_UTC`/`MAX_UTC`; written out, those were dates the host refused.
 - An area query checks its window's grid between that count and the loads
-  (`check_window`, #1075): the bbox must meet the grid, then the mask and
-  the response budgets, in `query_area`'s order. The answer uses the grid of
+  (`check_window`, #1075): the bbox must meet the grid, then the mask,
+  response and native-window budgets, `area::AreaGrid::plan` as
+  `query_grid` runs it (see EDR below). The answer uses the grid of
   the window's first entry, so that is the grid checked. Loaded, it is
   checked at once and a refused query loads nothing. A stub loads alone
   first, one round trip, so a refused query loads that one item, not the
@@ -477,16 +478,68 @@ depends on the kind:
 
 Position + area queries. Nearest-neighbour sampling of the source grid.
 
-Area (and radius) answers the native pixel window of the polygon's bbox, like
-GRIB: no `QueryPolygon::fit_grid` coarsening (#1436), which would need overview selection and a
-strided polygon mask. `query_bbox` checks the shared
-`ds_core::feature::check_area_budget` over `timesteps × ny × nx` before it
-allocates the result or reads a file, so an over-budget area is a 400 naming
-the limit (#858). The polygon mask tests each cell of the window against every
-ring vertex, so `query_area` first checks the shared
-`ds_core::feature::check_mask_budget`, before `query_bbox` reads a file
-(#889): over 20 M edge tests is a 400, as on GRIB and QueryData. A rectangle
-is exempt; a radius query's 65-vertex circle trips it past about 307 k cells.
+Area (and radius) answers the grid `area::AreaGrid` gives the polygon's bbox
+on the first matching entry's grid (#1435), at native resolution: no
+`QueryPolygon::fit_grid` coarsening (#1436), which would need overview
+selection.
+
+- **Geographic (CRS84) source:** the native pixel window of the bbox, like
+  GRIB. Its pixel centres are the axes; each cell is masked by its centre.
+- **Projected source:** a regular CRS84 grid, `QueryPolygon::grid_axes`'
+  cell centres over the bbox clipped to the raster's CRS84 envelope
+  (`footprint_envelope`: a bbox past the raster answers the raster's part,
+  one missing the envelope is the 400), masked by `cell_mask`. Each cell is
+  the native pixel holding its centre, through a coarse `ProjectionGrid` and
+  `resample_nearest`: never one CRS transform per cell (root Critical Rule
+  5), never interpolated (radar classes stay the file's values). Axes along
+  the window's middle row and column, as before, put corner cells up to
+  12 km from their data, so a client reading or drawing them by `x`/`y` was
+  wrong.
+- **Step:** a native pixel's ground size in degrees
+  (`area::pixel_ground_size` at the grid's centre: a column's for
+  longitude, a row's for latitude), its longitude step at the grid's
+  latitude nearest the equator, where a degree of longitude is longest. No
+  cell anywhere is wider than a pixel, so nearest sampling skips none;
+  poleward cells are finer, which costs cells (18 % more over 60–70°N).
+  Never the envelope's span over the window's pixels (7 % coarser per axis
+  where the grid is rotated, one pixel in seven skipped), never the
+  centre's latitude (85.6 % of the pixels reached at 60–61°N over a
+  60–70°N box), and no latitude step for a polar cap's longitude (a cap
+  1 / cos(edge) times the cells: -180,85,180,90 on 3 km polar LAEA was a
+  2.5 M cell 400, now 218 k). The 4° × 1.3° box at 68°N on 250 m TM35FIN
+  is 684 × 581 cells and reaches 99.6 % of the pixels in it.
+- **Read window:** `area::source_window`, the pixels the cells take, from
+  the projection grid's own positions: exact by construction. No cell on
+  the raster, a bbox in a corner of the envelope that a rotated raster
+  leaves empty, is the same 400 "Requested bbox does not intersect the
+  raster" from `plan`, before any read or STAC load, never a 200 grid of
+  nulls. Never `GeoTransform::bbox_to_pixels` of the bbox: its 21 samples
+  per edge miss a parallel's projected bulge at the central meridian on a
+  wide bbox, and the rows it missed answered as nulls.
+- **Frame:** `area::lon_arc` intersects the bbox's and the envelope's
+  longitude arcs and places the result within half a turn of the source's
+  central longitude: an antimeridian-crossing bbox is one arc, not the long
+  way round (which made the whole raster answer as nulls), and an LCC
+  forward, not periodic in longitude (#1114), gets the longitudes it is
+  meant for. A bbox nearly a whole turn wide whose gap lies inside the
+  envelope meets it in two pieces: the answer is the shorter arc joining
+  them, the envelope's side, its gap's cells masked, never the arc round the
+  bbox (-179,10,179,20 over a raster at 170–190°E: 220 cells wide, not
+  3925). A zero-width piece beside a real one is dropped.
+
+`AreaGrid::new` settles the answer's extent and cell count without
+allocating either; `AreaGrid::plan` runs every budget on them before the
+axes, the projection grid or the result are allocated or a file read:
+`ds_core::feature::check_mask_budget` for a polygon over the answer's cells
+(#889; over 20 M edge tests is a 400, as on GRIB and QueryData; a rectangle
+is exempt, a radius query's 65-vertex circle trips it past about 307 k
+cells), `check_area_budget` over `timesteps × ny × nx` (#858), and for a
+projected source its read window, which each timestep reads whole, against
+`MAX_AREA_VALUES` pixels, a 400 naming the source pixels. A projected
+answer can hold more cells than its window has pixels (the whole TM35FIN
+fixture: 882 × 372 cells from 480 × 360 pixels), so a polygon or a
+timestep count the native window passed can be a 400. The STAC pre-load
+check below is the same call.
 Per timestep, only a file that cannot be read (`Engine`, `Storage`, `Io`:
 `is_unreadable_file`), such as a local file that fails to open or decode or a
 remote file with an invalid tile layout, becomes logged nulls; any other read
