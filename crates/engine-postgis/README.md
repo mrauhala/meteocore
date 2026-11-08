@@ -54,7 +54,15 @@ CREATE INDEX ON public.observations (station_id, time DESC);
 Index every observation table on `(station, time)`, and an event table on
 time and (GiST) geometry. The two registry indexes serve the registry-only
 area (`geom`) and nearest-station (`geom::geography`) queries. A catalog
-check logs a warning for each missing index.
+check logs a warning for each missing index. Every statement orders by
+the table's own columns, so on a `timestamp without time zone` column the
+time index serves the order too.
+
+A statement the `statement_timeout` cancels is logged at WARN and answered
+503 with `Retry-After: 1` (EDR: 504), as a read past its time budget is in
+every engine. Until a metadata refresh has checked the tables, queries
+answer 503 with `Retry-After: 1` too. Any other database error is a 500
+whose body names nothing internal.
 
 Put the DSN in an environment variable
 (`export OBS_DSN='postgres://meteocore_ro:…@127.0.0.1:5432/weather'`); a
@@ -269,8 +277,9 @@ does.
 
 WMS GetFeatureInfo answers the events of the frame's window whose drawn
 disc covers the clicked pixel, newest first, with their time, id, the
-configured parameters, `type` and `peak_current_ka`: one statement per
-request, on the EDR bridge, with every such event counted.
+configured parameters, `type`, `peak_current_ka` and `feature_id`, the
+event's Features id (`<id>@<time>`, below): one statement per request, on
+the EDR bridge, with every such event counted.
 
 A nowcast `lightning_source` reads the same table. Optional
 `cloud_indicator_col` (0 cloud-to-ground, 1 intra-cloud), `peak_current_col`
@@ -278,8 +287,9 @@ A nowcast `lightning_source` reads the same table. Optional
 
 With `features` in `apis`, Features `/items` serves one feature per event
 (#503): its point (null for a NULL or empty geometry) and the properties
-GetFeatureInfo answers. Its id is the event's key, `<id>@<time>`, such as
-`4711@2026-06-08T12:00:00.123456Z`, and `/items/{featureId}` reads it back
+GetFeatureInfo answers, but for `feature_id`. Its id is the event's key,
+`<id>@<time>`, such as `4711@2026-06-08T12:00:00.123456Z`, the pick's
+`feature_id`, and `/items/{featureId}` reads it back
 with one lookup on the `(time, id)` primary key. An id is written one way
 only: an id that is not of that form, the same key written another way
 (`017@…`, a `+02:00` time), an id holding a NUL, or one the column cannot

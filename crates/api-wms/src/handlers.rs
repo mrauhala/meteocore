@@ -458,31 +458,76 @@ fn layer_hint(state: &WmsState, layer: &str) -> Option<String> {
     Some(format!("Layers of collection '{id}': {listed}."))
 }
 
-/// Resolve one GetMap layer and its style: `LayerNotDefined` for a layer
-/// this server does not serve (an unknown collection, or an unknown
-/// parameter of `collection/param`), `StyleNotDefined` for a style the
-/// layer does not offer (WMS 1.3.0 Table E.1).
-fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLayer, WmsError> {
-    // Parse layer name: "collection-id" or "collection-id/parameter"
-    let (collection_id, layer_parameter) = match layer.split_once('/') {
-        Some((cid, param)) => (cid.to_string(), Some(param.to_string())),
-        None => (layer.to_string(), None),
-    };
+/// A layer name GetMap, GetFeatureInfo and GetLegendGraphic serve
+/// ([`served_layer`]): its collection, engine and metadata snapshot, the
+/// `/param` segment, and the RGB composite it names, if one.
+struct ServedLayer<'a> {
+    collection_id: &'a str,
+    /// The `/param` of `collection/param`: a parameter or a composite.
+    parameter: Option<&'a str>,
+    engine: Arc<dyn MapEngine>,
+    /// The RGB composite the layer is (#819). It has no style map: its
+    /// colours come from its channels, and its one style is `default`.
+    composite: Option<Arc<CompositeSpec>>,
+    info: Arc<ds_core::map_engine::RasterInfo>,
+}
 
-    // Look up engine by collection ID
+/// The layer `layer` names, or `LayerNotDefined` with its hint
+/// ([`layer_not_defined`]): the one check of a layer name that GetMap,
+/// GetFeatureInfo and GetLegendGraphic share, so a name one of them refuses
+/// is never another's legend or value (#1440).
+///
+/// `{collection}` names a collection's layer: a single-parameter
+/// collection's, or a multi-parameter collection's root, which draws its
+/// default parameter (#1133). `{collection}/{name}` names one of the
+/// engine's parameters or RGB composites. An engine that lists no
+/// parameters takes any `{name}` and draws its one quantity, as Maps and
+/// Tiles take any `parameter-name` for it.
+fn served_layer<'a>(state: &WmsState, layer: &'a str) -> Result<ServedLayer<'a>, WmsError> {
+    let (collection_id, parameter) = match layer.split_once('/') {
+        Some((collection_id, parameter)) => (collection_id, Some(parameter)),
+        None => (layer, None),
+    };
     let engine = state
         .engines
-        .get(&collection_id)
+        .get(collection_id)
         .ok_or_else(|| layer_not_defined(state, layer))?
         .clone();
-
-    // An RGB composite layer (#819) has no style map: its colours
-    // come from its channels, and its one style is `default`.
     let composite = composite_layer(engine.as_ref(), layer);
-
-    // Share one metadata snapshot across style resolution and parameter,
-    // ELEVATION and reference_time validation.
+    // One metadata snapshot for this check and the caller's style
+    // resolution and dimension validation.
     let info = engine.raster_info_shared();
+    // Without this, an unknown parameter would silently render (or label a
+    // legend with) whatever the collection's style draws, and GetMap would
+    // cache that under the invalid name.
+    if let Some(name) = parameter {
+        if composite.is_none()
+            && !info.parameters.is_empty()
+            && !info.parameters.iter().any(|p| p.name == name)
+        {
+            return Err(layer_not_defined(state, layer));
+        }
+    }
+    Ok(ServedLayer {
+        collection_id,
+        parameter,
+        engine,
+        composite,
+        info,
+    })
+}
+
+/// Resolve one GetMap layer and its style: `LayerNotDefined` for a layer
+/// this server does not serve ([`served_layer`]), `StyleNotDefined` for a
+/// style the layer does not offer (WMS 1.3.0 Table E.1).
+fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLayer, WmsError> {
+    let ServedLayer {
+        collection_id,
+        parameter: layer_parameter,
+        engine,
+        composite,
+        info,
+    } = served_layer(state, layer)?;
 
     // Look up style, through the resolution Maps and Tiles share: a
     // "collection/param" layer (e.g. "ecmwf-kenya/2t") styles from that
@@ -502,14 +547,14 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
                 layer.to_string(),
                 Paint::Composite(spec.clone()),
                 ds_render::COMPOSITE_STYLE.to_string(),
-                layer_parameter.clone(),
+                layer_parameter.map(str::to_string),
             )
         }
         None => {
             let resolved = ds_render::resolve_layer_style(
                 &state.styles,
-                &collection_id,
-                layer_parameter.as_deref(),
+                collection_id,
+                layer_parameter,
                 Some(&info),
                 style,
             )
@@ -531,23 +576,8 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
         }
     };
 
-    // Validate `LAYERS=collection/parameter` against the engine's
-    // advertised list (mirroring Maps + Tiles). Without this, an
-    // unknown parameter would silently render whatever the engine
-    // defaults to and cache that result under the invalid name —
-    // ServiceException is the correct OGC response here. Its message
-    // lists the collection's layers, as GetCapabilities names them (#118).
-    if let Some(pname) = layer_parameter.as_deref() {
-        if composite.is_none()
-            && !info.parameters.is_empty()
-            && !info.parameters.iter().any(|p| p.name == pname)
-        {
-            return Err(layer_not_defined(state, layer));
-        }
-    }
-
     Ok(MapLayer {
-        collection_id,
+        collection_id: collection_id.to_string(),
         style_layer,
         engine,
         paint,
@@ -1235,40 +1265,36 @@ pub async fn wms_handler(
                 style_name
             };
 
+            // The layer GetMap would draw, through its own check (#1440): a
+            // name GetMap refuses is `LayerNotDefined` here too, never the
+            // legend of the collection's style.
+            let ServedLayer {
+                collection_id: legend_collection_id,
+                parameter: layer_parameter,
+                composite,
+                info,
+                ..
+            } = served_layer(&state, layer_name)?;
+
             // An RGB composite layer's legend is its channel list (#819).
-            let legend_engine = state
-                .engines
-                .get(layer_name.split('/').next().unwrap_or(layer_name));
-            if let Some((engine, spec)) = legend_engine.and_then(|engine| {
-                composite_layer(engine.as_ref(), layer_name).map(|s| (engine, s))
-            }) {
-                return composite_legend(&query, layer_name, style_name, engine.as_ref(), spec)
-                    .await;
+            if let Some(spec) = composite {
+                return composite_legend(&query, layer_name, style_name, &info, spec).await;
             }
 
-            // Support "collection/parameter" layer names for legend. Resolve
-            // the style exactly as GetMap does (`ds_render::resolve_layer_style`):
-            // a "{collection}/{param}" layer carries its own style map (the
-            // parameter's colormap from `[[wms.parameters]]`, a bundle
-            // parameter entry, or a built-in default), and a multi-parameter
-            // collection's root layer draws its default parameter from that
-            // parameter's map (#1133).
+            // Resolve the style exactly as GetMap does
+            // (`ds_render::resolve_layer_style`): a "{collection}/{param}"
+            // layer carries its own style map (the parameter's colormap from
+            // `[[wms.parameters]]`, a bundle parameter entry, or a built-in
+            // default), and a multi-parameter collection's root layer draws
+            // its default parameter from that parameter's map (#1133).
             // Falling straight through to the collection made the legend
             // describe a different palette than the GetMap of the same LAYER
             // rendered.
-            let (legend_collection_id, layer_parameter) = match layer_name.split_once('/') {
-                Some((collection_id, parameter)) => (collection_id, Some(parameter)),
-                None => (layer_name, None),
-            };
-            let info = state
-                .engines
-                .get(legend_collection_id)
-                .map(|e| e.raster_info_shared());
             let resolved = ds_render::resolve_layer_style(
                 &state.styles,
                 legend_collection_id,
                 layer_parameter,
-                info.as_deref(),
+                Some(&info),
                 style_name,
             )
             .map_err(|error| match error {
@@ -1288,15 +1314,11 @@ pub async fn wms_handler(
             // after selecting the parameter.
             // Both feed the rendered legend's title and the JSON legend, so the
             // two representations describe the same thing.
-            let param = resolved.parameter.map(str::to_string).or_else(|| {
-                info.as_ref()
-                    .map(|i| i.parameter.clone())
-                    .filter(|p| !p.is_empty())
-            });
-            let unit = info
-                .as_ref()
-                .and_then(|i| i.parameter_unit(param.as_deref()))
-                .map(str::to_string);
+            let param = resolved
+                .parameter
+                .map(str::to_string)
+                .or_else(|| Some(info.parameter.clone()).filter(|p| !p.is_empty()));
+            let unit = info.parameter_unit(param.as_deref()).map(str::to_string);
 
             // Machine-readable legend: palette stops + range, for clients that
             // draw their own legend.
@@ -1714,12 +1736,13 @@ fn legend_size(query: &WmsQuery) -> (u32, u32) {
 
 /// GetLegendGraphic for an RGB composite layer (#819): the channel list,
 /// each channel's bands, range, gamma and unit, with no colour bar. The
-/// units are the bands' own. Its one style is `default`.
+/// units are the bands' own, from `info`, the engine's metadata snapshot.
+/// Its one style is `default`.
 async fn composite_legend(
     query: &WmsQuery,
     layer_name: &str,
     style_name: &str,
-    engine: &dyn MapEngine,
+    info: &ds_core::map_engine::RasterInfo,
     spec: Arc<CompositeSpec>,
 ) -> Result<axum::response::Response, WmsError> {
     if style_name != ds_render::COMPOSITE_STYLE {
@@ -1728,8 +1751,7 @@ async fn composite_legend(
         )));
     }
     let format = crate::params::parse_legend_format(query.format.as_deref())?;
-    let info = engine.raster_info_shared();
-    let units: Vec<Option<String>> = ds_render::composite_units(&spec, &info)
+    let units: Vec<Option<String>> = ds_render::composite_units(&spec, info)
         .into_iter()
         .map(|unit| unit.map(str::to_string))
         .collect();
