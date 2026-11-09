@@ -8,7 +8,7 @@ license.workspace = true
 ds-core = { path = "../core" }
 ds-poll = { path = "../ds-poll" }
 ds-storage = { path = "../storage" }
-grib = { version = "0.15", default-features = false, features = ["ccsds-unpack-with-libaec"] }
+grib = { version = "0.20", default-features = false, features = ["ccsds-unpack-with-libaec"] }
 # The libaec that `grib` links: RSI offsets and single-RSI decodes for
 # point reads of CCSDS fields (#1300). Same version as `grib` resolves.
 libaec-sys = "0.1.3"
