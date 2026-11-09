@@ -43,7 +43,7 @@ use ds_core::geo::{outside_projection_domain, projected_output_crs, wgs84_envelo
 use ds_core::map_engine::{OutputCrs, RasterTile};
 
 use crate::colorize;
-use crate::{ColorMap, CompositeSpec, ImageFormat};
+use crate::{ColorMap, CompositeSpec, ContourPlan, ContourStyle, ImageFormat};
 
 /// Tile edge length in pixels (WebMercatorQuad standard).
 const TILE_PX: u32 = 256;
@@ -561,6 +561,54 @@ where
             times.engine += t_engine.elapsed();
             let t_colorize = Instant::now();
             let rgba = crate::compose_tiles(&tiles, spec)?;
+            times.colorize += t_colorize.elapsed();
+            Ok(rgba)
+        },
+    )
+}
+
+/// [`assemble_metatiled`] for a contour style (#1378): each uncached tile is
+/// read grown by its [`ContourPlan`] margin (`render_tile` gets the grown
+/// box, size and output CRS) and drawn by [`ContourPlan::draw`], the lines
+/// over `fill` when given. The cached tiles are the drawn RGBA, keyed on the
+/// contour style's name in `prefix`. Every tile of a ladder level traces its
+/// neighbours' edge cells too, and smooths alike (`source_deg`, as for
+/// [`ContourPlan::new`]), so lines meet across tile edges.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_metatiled_contours<F>(
+    bbox_deg: [f64; 4],
+    output_crs: &OutputCrs,
+    width: u32,
+    height: u32,
+    prefix: &TileKeyPrefix,
+    contour: &ContourStyle,
+    fill: Option<&dyn ColorMap>,
+    source_deg: Option<f64>,
+    cache: &TilePixelCache,
+    render_tile: F,
+) -> Result<MetaTilePixels, DataServerError>
+where
+    F: Fn([f64; 4], u32, u32, &OutputCrs) -> Result<RasterTile, DataServerError>,
+{
+    render_metatiled_with(
+        bbox_deg,
+        output_crs,
+        width,
+        height,
+        prefix,
+        cache,
+        |tbbox, tw, th, tile_output, times| {
+            let plan = ContourPlan::new(contour, tbbox, tw, th, tile_output, source_deg);
+            let t_engine = Instant::now();
+            let tile = render_tile(
+                plan.fetch_bbox(),
+                plan.fetch_width(),
+                plan.fetch_height(),
+                plan.fetch_crs(),
+            )?;
+            times.engine += t_engine.elapsed();
+            let t_colorize = Instant::now();
+            let rgba = plan.draw(&tile, contour, fill)?;
             times.colorize += t_colorize.elapsed();
             Ok(rgba)
         },

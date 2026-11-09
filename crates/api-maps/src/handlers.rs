@@ -103,6 +103,10 @@ fn layer_style<'a>(
 enum Paint {
     /// One parameter through its style's colormap.
     Colormap(Arc<dyn ColorMap>),
+    /// One parameter's contour lines (#1378), over the style's colormap
+    /// when it has a fill: read grown by the lines' margin, traced and
+    /// drawn by `ds_render::ContourPlan`.
+    Contour(ds_render::ContourPaint),
     /// An RGB composite (#819): its bands from `get_raster_tiles`, composed
     /// by its channels. It has one style, `default`.
     Composite(Arc<CompositeSpec>),
@@ -212,14 +216,51 @@ fn with_vary(mut resp: Response) -> Response {
 /// Relations are the registered OGC ones only (Maps Req 53 styled-map links,
 /// the legend recommendation): the short `map`/`legend` forms were dropped once
 /// no client depended on them (a bare unregistered relation type is not an
-/// RFC 8288 extension relation).
-fn style_links(collection_id: &str, style_name: &str, root: &str) -> serde_json::Value {
-    let map = format!("{root}/collections/{collection_id}/styles/{style_name}/map");
-    let legend = format!("{root}/collections/{collection_id}/styles/{style_name}/legend");
+/// RFC 8288 extension relation). A style only `parameter`'s layer offers
+/// names it as `parameter-name`, without which it is not drawn.
+fn style_links_for(
+    collection_id: &str,
+    style_name: &str,
+    parameter: Option<&str>,
+    root: &str,
+) -> serde_json::Value {
+    let query = parameter
+        .map(|p| format!("?parameter-name={}", api_common::workbench::path_segment(p)))
+        .unwrap_or_default();
+    let map = format!("{root}/collections/{collection_id}/styles/{style_name}/map{query}");
+    let legend = format!("{root}/collections/{collection_id}/styles/{style_name}/legend{query}");
     json!([
         {"href": map, "rel": rel::MAP, "type": "image/png"},
         {"href": legend, "rel": rel::LEGEND, "type": "application/json"}
     ])
+}
+
+/// The style list of a collection (`styles` of its description and of
+/// `…/styles`): every style its own layer offers, then those only some of
+/// its parameter layers offer, with a `parameters` member naming them and
+/// links naming the first ([`ds_render::collection_style_offers`]), such as
+/// a parameter's built-in `contours` (#1378).
+fn style_list(
+    collection_id: &str,
+    styles: &HashMap<String, HashMap<String, StyleInfo>>,
+    info: &ds_core::map_engine::RasterInfo,
+    root: &str,
+) -> Vec<serde_json::Value> {
+    ds_render::collection_style_offers(styles, collection_id, Some(info))
+        .into_iter()
+        .map(|offer| {
+            let name = &offer.style.name;
+            let mut entry = json!({
+                "id": name,
+                "title": offer.title,
+                "links": style_links_for(collection_id, name, offer.parameters.first().copied(), root),
+            });
+            if !offer.parameters.is_empty() {
+                entry["parameters"] = json!(offer.parameters);
+            }
+            entry
+        })
+        .collect()
 }
 
 /// Maps' description of a collection: its standard fields and data-access
@@ -229,7 +270,7 @@ pub(crate) fn collection_parts(
     config: &CollectionConfig,
     engine: &dyn MapEngine,
     info: &ds_core::map_engine::RasterInfo,
-    styles: Option<&HashMap<String, StyleInfo>>,
+    styles: &HashMap<String, HashMap<String, StyleInfo>>,
     root: &str,
 ) -> (
     serde_json::Map<String, serde_json::Value>,
@@ -239,28 +280,7 @@ pub(crate) fn collection_parts(
     // accept.
     let crs_uris = MapCrs::uris();
 
-    let mut style_list = Vec::new();
-    if let Some(styles) = styles {
-        let mut names: Vec<&String> = styles.keys().collect();
-        names.sort_by(|a, b| {
-            if a.as_str() == "default" {
-                std::cmp::Ordering::Less
-            } else if b.as_str() == "default" {
-                std::cmp::Ordering::Greater
-            } else {
-                a.cmp(b)
-            }
-        });
-        for name in names {
-            if let Some(s) = styles.get(name) {
-                style_list.push(json!({
-                    "id": s.name,
-                    "title": s.title,
-                    "links": style_links(&config.id, &s.name, root)
-                }));
-            }
-        }
-    }
+    let style_list = style_list(&config.id, styles, info, root);
 
     let links = vec![
         // The registered relation Maps Req 46 requires (and the Maps test
@@ -312,8 +332,7 @@ fn build_collection_metadata(
     base_url: &str,
     root: &str,
 ) -> serde_json::Value {
-    let styles = state.styles.get(&config.id);
-    let (fields, access) = collection_parts(config, engine, info, styles, root);
+    let (fields, access) = collection_parts(config, engine, info, &state.styles, root);
     let mut links = vec![json!({
         "href": format!("{root}/collections/{}", config.id),
         "rel": "self",
@@ -813,6 +832,11 @@ pub(crate) fn openapi_components() -> serde_json::Value {
                 "properties": {
                     "id": {"type": "string"},
                     "title": {"type": "string"},
+                    "parameters": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The parameter-name values the style is drawn with, for a style only those parameters offer (a parameter's built-in `contours`). Absent: every request may name it."
+                    },
                     "links": {"type": "array", "items": {"$ref": "#/components/schemas/link"}}
                 }
             },
@@ -1102,31 +1126,11 @@ pub async fn styles(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, MapsError> {
     let state = state.load_full();
-    let (_engine, config) = lookup_engine(&state, &id)?;
+    let (engine, config) = lookup_engine(&state, &id)?;
     let root = &mount.root(&request_base_url(&state, &headers));
 
-    let mut style_list = Vec::new();
-    if let Some(layer_styles) = state.styles.get(&id) {
-        let mut names: Vec<&String> = layer_styles.keys().collect();
-        names.sort_by(|a, b| {
-            if a.as_str() == "default" {
-                std::cmp::Ordering::Less
-            } else if b.as_str() == "default" {
-                std::cmp::Ordering::Greater
-            } else {
-                a.cmp(b)
-            }
-        });
-        for name in names {
-            if let Some(s) = layer_styles.get(name) {
-                style_list.push(json!({
-                    "id": s.name,
-                    "title": s.title,
-                    "links": style_links(&config.id, &s.name, root)
-                }));
-            }
-        }
-    }
+    let info = engine.raster_info_shared();
+    let style_list = style_list(&config.id, &state.styles, &info, root);
 
     Ok(Json(json!({
         "styles": style_list,
@@ -1207,14 +1211,13 @@ pub async fn style_legend(
             Ok(response)
         }
         LegendFormat::Png => {
-            let colormap = style_info.colormap.clone();
-            let (min, max) = (style_info.min, style_info.max);
             let title = ds_render::legend_title(style_info, parameter.as_deref(), unit.as_deref());
+            // A contour style's legend is its line swatch (#1378).
+            let style_info = style_info.clone();
             let bytes = tokio::task::spawn_blocking(move || {
-                ds_render::render_legend(
-                    colormap.as_ref(),
-                    min,
-                    max,
+                ds_render::render_style_legend(
+                    &style_info,
+                    unit.as_deref(),
                     ds_render::LEGEND_DEFAULT_WIDTH,
                     ds_render::LEGEND_DEFAULT_HEIGHT,
                     ds_render::ImageFormat::Png,
@@ -1440,9 +1443,13 @@ async fn render_map(
                 &raster_info,
                 style_name,
             )?;
+            let paint = match ds_render::ContourPaint::of(resolved.style, &raster_info) {
+                Some(contour) => Paint::Contour(contour),
+                None => Paint::Colormap(resolved.style.colormap.clone()),
+            };
             (
                 resolved.layer.to_string(),
-                Paint::Colormap(resolved.style.colormap.clone()),
+                paint,
                 resolved.parameter.map(str::to_string),
             )
         }
@@ -1632,7 +1639,7 @@ async fn render_map(
     // A composite holds one value plane per band.
     let queue_start = std::time::Instant::now();
     let planes = match &paint {
-        Paint::Colormap(_) => 1,
+        Paint::Colormap(_) | Paint::Contour(_) => 1,
         Paint::Composite(spec) => spec.parameters.len(),
     };
     let (job, memory_permit) = ds_executor::RenderJob::acquire_raster_planes(
@@ -1675,6 +1682,43 @@ async fn render_map(
 
             let colormap = match &paint {
                 Paint::Colormap(colormap) => colormap,
+                Paint::Contour(contour) => {
+                    // The view grown by the lines' margin, through the same
+                    // domain helper, so lines meet the next view's.
+                    let plan = contour.plan(bbox, width, height, &output_crs);
+                    let engine_start = std::time::Instant::now();
+                    let Some(tile) = ds_core::map_engine::get_raster_tile_in_domain(
+                        engine.as_ref(),
+                        plan.fetch_bbox(),
+                        plan.fetch_width(),
+                        plan.fetch_height(),
+                        time,
+                        plan.fetch_crs(),
+                        render_parameter.as_deref(),
+                        render_z,
+                        reference_time,
+                    )?
+                    else {
+                        return Ok((None, phases));
+                    };
+                    phases.add(RenderPhase::Engine, engine_start.elapsed());
+                    let encode_start = std::time::Instant::now();
+                    let Some(mut rgba) = contour.draw(&plan, &tile)? else {
+                        return Ok((None, phases));
+                    };
+                    drop(tile);
+                    let earth = background.earth_columns(&output_crs, bbox, width, height);
+                    let bytes = ds_render::encode_map(
+                        &mut rgba,
+                        width,
+                        height,
+                        format,
+                        background,
+                        earth.as_deref(),
+                    )?;
+                    phases.add(RenderPhase::Encode, encode_start.elapsed());
+                    return Ok((Some(bytes), phases));
+                }
                 Paint::Composite(spec) => {
                     // Bands that share no scan resolve no time: nothing to
                     // draw, and nothing to cache under a key naming none.

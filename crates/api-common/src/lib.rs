@@ -749,6 +749,21 @@ pub fn background_parameters() -> serde_json::Map<String, Value> {
 /// channel list (`ds_render::composite_legend_json`, #819). One definition
 /// so the blocks of the shared root declare one identical component.
 pub fn legend_schema() -> Value {
+    // A contour style's lines (#1378), as `ds_render::ContourStyle::legend_json`
+    // writes them.
+    let contour = json!({
+        "type": "object",
+        "description": "Contour lines the style draws",
+        "required": ["interval", "base", "color", "width", "fill", "description"],
+        "properties": {
+            "interval": {"type": "number", "description": "Spacing between lines, in the parameter's unit"},
+            "base": {"type": "number", "description": "A value a line passes through"},
+            "color": {"type": "string", "description": "#RRGGBB, or #RRGGBBAA when not fully opaque"},
+            "width": {"type": "number", "description": "Line width in output pixels"},
+            "fill": {"type": "boolean", "description": "Whether the lines are drawn over the style's colour fill, whose stops the legend then lists"},
+            "description": {"type": "string", "description": "What the lines mark, e.g. `every 4 hPa`"}
+        }
+    });
     json!({
         "oneOf": [
             {
@@ -765,6 +780,7 @@ pub fn legend_schema() -> Value {
                     "interpolation": {"type": "string", "enum": ["linear", "step"],
                                       "description": "How colours are produced between stops"},
                     "nodataColor": {"type": "string", "description": "Colour for no-data pixels, when the palette defines one."},
+                    "contour": contour,
                     "stops": {
                         "type": "array",
                         "description": "Palette colour stops, ascending by value",
@@ -807,6 +823,19 @@ pub fn legend_schema() -> Value {
                             }
                         }
                     }
+                }
+            },
+            {
+                "type": "object",
+                "description": "Contour lines alone, which have no colour bar",
+                "required": ["style", "title", "contour"],
+                "not": {"required": ["stops"]},
+                "properties": {
+                    "style": {"type": "string", "description": "Style identifier"},
+                    "title": {"type": "string", "description": "Human-readable style title"},
+                    "parameter": {"type": "string", "description": "Data parameter the style renders. Omitted when unknown."},
+                    "unit": {"type": "string", "description": "Unit of the interval. Omitted when unknown."},
+                    "contour": contour
                 }
             }
         ]

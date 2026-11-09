@@ -265,6 +265,7 @@ mod tests {
             min,
             max,
             parameter: None,
+            contour: None,
         }
     }
 

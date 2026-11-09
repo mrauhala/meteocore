@@ -92,6 +92,7 @@ fn style() -> HashMap<String, StyleInfo> {
             min: 0.0,
             max: 70.0,
             parameter: None,
+            contour: None,
         },
     )])
 }

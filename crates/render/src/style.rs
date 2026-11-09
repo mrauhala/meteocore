@@ -18,7 +18,7 @@ use ds_core::config::{CollectionConfig, StyleBundle, WmsParameterConfig};
 
 use crate::colormap::{ColorMap, IntegerLutColorMap, LinearColorMap, LutColorMap};
 use crate::palette::{Interpolation, Palette, PaletteRegistry};
-use crate::{parse_hex_color, ColorStop, StyleInfo};
+use crate::{parse_hex_color, ColorStop, ContourStyle, StyleInfo};
 
 /// The style-affecting fields of one config block — `[wms]` inline fields,
 /// one `[[wms.styles]]` entry, a bundle default/extra, or one
@@ -208,6 +208,7 @@ impl StyleContext {
                 min: default.min,
                 max: default.max,
                 parameter: None,
+                contour: None,
             },
         );
 
@@ -270,7 +271,51 @@ impl StyleContext {
             min: r.min,
             max: r.max,
             parameter: None,
+            contour: None,
         }))
+    }
+
+    /// The built-in contour style ([`crate::CONTOUR_STYLE`], #1378) of a
+    /// collection's own layer when it draws one parameter (`parameter`, in
+    /// `unit`), as a parameter layer gets it from
+    /// [`parameter_layer_styles`](Self::parameter_layer_styles). Offered
+    /// whatever palette is configured, since the lines draw no fill.
+    ///
+    /// `None` when `[wms] parameter_defaults = false`, the collection
+    /// already names a style `contours`, or no rule gives the parameter
+    /// contours in that unit.
+    pub fn base_layer_contours(
+        &self,
+        collection: &CollectionConfig,
+        bundle: Option<&StyleBundle>,
+        parameter: &str,
+        unit: Option<&str>,
+    ) -> Result<Option<StyleInfo>, String> {
+        let wms = collection.wms.as_ref();
+        if !wms.and_then(|w| w.parameter_defaults).unwrap_or(true) {
+            return Ok(None);
+        }
+        let mut named = wms
+            .into_iter()
+            .flat_map(|w| w.styles.iter().filter_map(|s| s.effective_name()))
+            .chain(
+                bundle
+                    .into_iter()
+                    .flat_map(|b| b.extras.iter().filter_map(|e| e.effective_name())),
+            );
+        if named.any(|name| name == crate::CONTOUR_STYLE) {
+            return Ok(None);
+        }
+        let unit = unit.filter(|u| !u.is_empty());
+        let Some(contour) = self
+            .defaults
+            .match_default(parameter, "", unit)
+            .and_then(|d| d.contour)
+        else {
+            return Ok(None);
+        };
+        let fill = self.collection_default(collection, bundle)?;
+        default_contour_style(&contour, &fill, None).map(Some)
     }
 
     /// Named styles: the union of bundle extras and inline `[[wms.styles]]`
@@ -290,16 +335,19 @@ impl StyleContext {
                 let Some(name) = extra.effective_name().map(str::to_string) else {
                     continue; // rejected by validation; defensive
                 };
+                let has_fill = extra.colormap.is_some() || !extra.color_stops.is_empty();
                 let r = self.build_colormap(&StyleSpec {
                     colormap: extra.colormap.as_deref(),
                     color_stops: &extra.color_stops,
                     min: extra.min,
                     max: extra.max,
                 })?;
+                let contour = contour_style(extra.contour.as_ref(), has_fill)?;
+                // Lines alone take no title from the palette they never draw.
                 let title = extra
                     .title
                     .clone()
-                    .or_else(|| r.palette.title.clone())
+                    .or_else(|| r.palette.title.clone().filter(|_| has_fill))
                     .unwrap_or_else(|| name.clone());
                 styles.insert(
                     name.clone(),
@@ -312,6 +360,7 @@ impl StyleContext {
                             min: r.min,
                             max: r.max,
                             parameter: extra.parameter.clone(),
+                            contour,
                         },
                         layers: extra.parameters.clone(),
                     },
@@ -323,16 +372,19 @@ impl StyleContext {
                 let Some(name) = style_config.effective_name().map(str::to_string) else {
                     continue; // no name and no colormap to derive one from
                 };
+                let has_fill =
+                    style_config.colormap.is_some() || !style_config.color_stops.is_empty();
                 let r = self.build_colormap(&StyleSpec {
                     colormap: style_config.colormap.as_deref(),
                     color_stops: &style_config.color_stops,
                     min: style_config.min,
                     max: style_config.max,
                 })?;
+                let contour = contour_style(style_config.contour.as_ref(), has_fill)?;
                 let title = style_config
                     .title
                     .clone()
-                    .or_else(|| r.palette.title.clone())
+                    .or_else(|| r.palette.title.clone().filter(|_| has_fill))
                     .unwrap_or_else(|| name.clone());
                 styles.insert(
                     name.clone(),
@@ -345,6 +397,7 @@ impl StyleContext {
                             min: r.min,
                             max: r.max,
                             parameter: style_config.parameter.clone(),
+                            contour,
                         },
                         layers: style_config.parameters.clone(),
                     },
@@ -452,6 +505,15 @@ impl StyleContext {
                 fallback.clone()
             };
 
+            // The built-in contour lines for this quantity (#1378), next to
+            // its default fill: a named style of the same name configured
+            // below replaces them.
+            if let Some(contour) = matched.as_ref().and_then(|d| d.contour.as_ref()) {
+                layer_styles.insert(
+                    crate::CONTOUR_STYLE.to_string(),
+                    default_contour_style(contour, &r, Some(short_name.clone()))?,
+                );
+            }
             layer_styles.insert(
                 "default".to_string(),
                 StyleInfo {
@@ -462,6 +524,7 @@ impl StyleContext {
                     min: r.min,
                     max: r.max,
                     parameter: Some(short_name.clone()),
+                    contour: None,
                 },
             );
 
@@ -496,6 +559,46 @@ impl StyleContext {
 
         Ok(out)
     }
+}
+
+/// The render-ready contour of a style's `contour` table, drawn over the
+/// style's colormap when it has a fill.
+fn contour_style(
+    config: Option<&ds_core::config::ContourConfig>,
+    has_fill: bool,
+) -> Result<Option<Arc<ContourStyle>>, String> {
+    config
+        .map(|c| {
+            ContourStyle::new(c.interval, c.base, c.color.as_deref(), c.width, has_fill)
+                .map(Arc::new)
+        })
+        .transpose()
+}
+
+/// The built-in contour style ([`crate::CONTOUR_STYLE`]) of a layer whose
+/// default fill is `fill`: lines alone, so the fill only stands in where a
+/// consumer of the style map reads a colormap (none draws it).
+fn default_contour_style(
+    contour: &crate::defaults::DefaultContour,
+    fill: &ResolvedColormap,
+    parameter: Option<String>,
+) -> Result<StyleInfo, String> {
+    Ok(StyleInfo {
+        name: crate::CONTOUR_STYLE.to_string(),
+        title: contour.title.clone(),
+        colormap: fill.colormap.clone(),
+        palette: fill.palette.clone(),
+        min: fill.min,
+        max: fill.max,
+        parameter,
+        contour: Some(Arc::new(ContourStyle::new(
+            contour.interval,
+            contour.base,
+            contour.color.as_deref(),
+            contour.width,
+            false,
+        )?)),
+    })
 }
 
 /// Slot-wise merge (bundles v2): `primary` wins every slot it defines. The
@@ -1822,5 +1925,182 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(radar.palette.name, "radar_dbz");
+    }
+
+    /// Contour styles from config (#1378): lines alone or over a fill, in
+    /// `[[wms.styles]]` and bundle extras, render-ready with the defaults
+    /// for an unset colour and width.
+    #[test]
+    fn configured_contour_styles_resolve() {
+        let ctx = StyleContext::with_builtins();
+        let b = bundle(
+            r##"
+            id = "b"
+            [default]
+            colormap = "pressure"
+            [[extras]]
+            name = "isobars_2"
+            contour = { interval = 2.0, color = "#0000ff" }
+            "##,
+        );
+        let c = coll(
+            r#"
+            colormap = "pressure"
+            [[wms.styles]]
+            name = "isobars"
+            contour = { interval = 4.0, width = 2.0 }
+            [[wms.styles]]
+            name = "filled"
+            colormap = "temperature"
+            contour = { interval = 2.0, base = 273.15 }
+            "#,
+        );
+        let styles = ctx.collection_styles(&c, Some(&b)).unwrap();
+        let lines = styles["isobars"].contour.as_deref().unwrap();
+        assert_eq!(
+            (
+                lines.interval,
+                lines.base,
+                lines.width,
+                lines.fill,
+                lines.color
+            ),
+            (4.0, 0.0, 2.0, false, [0, 0, 0, 255])
+        );
+        assert_eq!(
+            styles["isobars"].title, "isobars",
+            "lines take no palette title"
+        );
+        let filled = styles["filled"].contour.as_deref().unwrap();
+        assert!(filled.fill);
+        assert_eq!(styles["filled"].palette.name, "temperature");
+        let bundled = styles["isobars_2"].contour.as_deref().unwrap();
+        assert_eq!((bundled.interval, bundled.color), (2.0, [0, 0, 255, 255]));
+        assert!(styles["default"].contour.is_none());
+    }
+
+    /// The built-in contours (#1378): every parameter layer whose quantity
+    /// has them offers `contours` next to its unchanged default fill, in its
+    /// own unit; others offer none; `parameter_defaults = false` opts out;
+    /// a configured style named `contours` replaces them.
+    #[test]
+    fn parameter_layers_offer_default_contours() {
+        let ctx = StyleContext::with_builtins();
+        let params = [
+            ("msl", "Mean sea level pressure", "Pa"),
+            ("prmsl", "Pressure reduced to MSL", "hPa"),
+            ("2t", "2 metre temperature", "K"),
+            ("gh", "Geopotential height", "gpm"),
+            ("10si", "10 metre wind speed", "m/s"),
+        ]
+        .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
+            name: name.into(),
+            title: title.into(),
+            unit: unit.into(),
+        });
+        let maps = ctx
+            .parameter_layer_styles(&coll(""), None, &params, &|_, cm| cm)
+            .unwrap();
+        let lines = |name: &str| {
+            maps[&format!("c1/{name}")]
+                .get(crate::CONTOUR_STYLE)
+                .map(|s| {
+                    let c = s.contour.as_deref().unwrap();
+                    (s.title.as_str(), c.interval, c.base, c.fill)
+                })
+        };
+        assert_eq!(lines("msl"), Some(("Isobars", 400.0, 0.0, false)));
+        assert_eq!(lines("prmsl"), Some(("Isobars", 4.0, 0.0, false)));
+        assert_eq!(lines("2t"), Some(("Isotherms", 2.0, 273.15, false)));
+        assert_eq!(lines("gh"), Some(("Height contours", 60.0, 0.0, false)));
+        assert_eq!(lines("10si"), None);
+        // The default fill is unchanged.
+        let msl = &maps["c1/msl"];
+        assert!(msl["default"].contour.is_none());
+        assert_eq!(msl["default"].palette.name, "pressure");
+        assert_eq!(msl[crate::CONTOUR_STYLE].parameter.as_deref(), Some("msl"));
+
+        let opted_out = ctx
+            .parameter_layer_styles(
+                &coll(
+                    "parameter_defaults = false
+",
+                ),
+                None,
+                &params,
+                &|_, cm| cm,
+            )
+            .unwrap();
+        assert!(opted_out
+            .values()
+            .all(|layer| !layer.contains_key(crate::CONTOUR_STYLE)));
+
+        let own = coll(
+            "[[wms.styles]]
+name = \"contours\"
+parameter = \"msl\"
+             contour = { interval = 200.0 }
+",
+        );
+        let maps = ctx
+            .parameter_layer_styles(&own, None, &params, &|_, cm| cm)
+            .unwrap();
+        assert_eq!(
+            maps["c1/msl"][crate::CONTOUR_STYLE]
+                .contour
+                .as_deref()
+                .unwrap()
+                .interval,
+            200.0
+        );
+        // Another layer keeps its built-in lines.
+        assert_eq!(
+            maps["c1/prmsl"][crate::CONTOUR_STYLE]
+                .contour
+                .as_deref()
+                .unwrap()
+                .interval,
+            4.0
+        );
+    }
+
+    /// A collection's own layer drawing one parameter offers its built-in
+    /// contours too, whatever palette it configures, unless it opts out or
+    /// names a style `contours` itself.
+    #[test]
+    fn base_layer_contours_follow_the_drawn_parameter() {
+        let ctx = StyleContext::with_builtins();
+        let lines = |c: &CollectionConfig, parameter: &str, unit: &str| {
+            ctx.base_layer_contours(c, None, parameter, Some(unit))
+                .unwrap()
+                .map(|s| (s.name, s.contour.unwrap().interval))
+        };
+        let configured = coll(
+            "colormap = \"viridis\"
+",
+        );
+        assert_eq!(
+            lines(&configured, "msl", "hPa"),
+            Some(("contours".to_string(), 4.0))
+        );
+        assert_eq!(lines(&configured, "reflectivity", "dBZ"), None);
+        assert_eq!(
+            lines(
+                &coll(
+                    "parameter_defaults = false
+"
+                ),
+                "msl",
+                "hPa"
+            ),
+            None
+        );
+        let named = coll(
+            "[[wms.styles]]
+name = \"contours\"
+contour = { interval = 1.0 }
+",
+        );
+        assert_eq!(lines(&named, "msl", "hPa"), None);
     }
 }

@@ -483,6 +483,7 @@ fn solid_style(rgb: [u8; 3]) -> ds_render::StyleInfo {
         min: resolved.min,
         max: resolved.max,
         parameter: None,
+        contour: None,
     }
 }
 

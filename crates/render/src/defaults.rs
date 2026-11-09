@@ -38,7 +38,56 @@ struct DefaultRule {
     /// K vs °C); `None` with empty `unit_ranges` means the palette's own
     /// stop range applies (data-valued palettes like radar_dbz).
     fallback_range: Option<(f64, f64)>,
+    /// The contour lines offered as the `contours` style next to the fill
+    /// (#1378); `None` offers none.
+    contours: Option<&'static RuleContours>,
 }
+
+/// A built-in rule's contour lines (#1378): unit-gated like its ranges, so
+/// an interval is never guessed across units (4 hPa is 400 Pa).
+struct RuleContours {
+    /// The style's title.
+    title: &'static str,
+    /// Line colour, `#RRGGBB`.
+    color: &'static str,
+    /// Unit-key groups → `(interval, base)`.
+    units: &'static [(&'static [&'static str], f64, f64)],
+}
+
+/// Isobars every 4 hPa, the synoptic chart's spacing; 1000 hPa is one.
+static ISOBARS: RuleContours = RuleContours {
+    title: "Isobars",
+    color: "#000000",
+    units: &[(&["pa"], 400.0, 0.0), (&["hpa", "mbar", "mb"], 4.0, 0.0)],
+};
+
+/// Isotherms every 2 K, through 0 °C (273.15 K) so the freezing line is
+/// one; dark red, to stand apart from black isobars drawn over them.
+static ISOTHERMS: RuleContours = RuleContours {
+    title: "Isotherms",
+    color: "#b40000",
+    units: &[
+        (&["k", "kelvin"], 2.0, 273.15),
+        (&["c", "degc", "celsius", "cel"], 2.0, 0.0),
+    ],
+};
+
+/// Height contours every 6 dam, the upper-air chart's spacing (546, 552,
+/// … dam at 500 hPa); as geopotential, 60 gpm times g₀, so a level's `z`
+/// and the `gh` derived from it draw the same lines (#948).
+static HEIGHT_CONTOURS: RuleContours = RuleContours {
+    title: "Height contours",
+    color: "#000000",
+    units: &[
+        (&["gpm", "m"], 60.0, 0.0),
+        (&["dam"], 6.0, 0.0),
+        (
+            &["m2s2"],
+            60.0 * ds_core::geopotential::STANDARD_GRAVITY,
+            0.0,
+        ),
+    ],
+};
 
 /// Unit keys of a fraction (CF's dimensionless `1`, GRIB's `(0 - 1)`).
 const FRACTION: &[&str] = &["1", "01"];
@@ -73,6 +122,7 @@ static RULES: &[DefaultRule] = &[
         palette: "radar_dbz",
         unit_ranges: &[],
         fallback_range: None,
+        contours: None,
     },
     // The lightning strike-age layer (engine-postgis events shape, #504):
     // the value is the strike's age in minutes, on the data-valued
@@ -84,6 +134,7 @@ static RULES: &[DefaultRule] = &[
         palette: "lightning_age",
         unit_ranges: &[(&["min"], 0.0, 60.0)],
         fallback_range: None,
+        contours: None,
     },
     // Doppler radial velocity — diverging about zero.
     DefaultRule {
@@ -92,6 +143,7 @@ static RULES: &[DefaultRule] = &[
         palette: "radial_velocity",
         unit_ranges: &[],
         fallback_range: Some((-48.0, 48.0)),
+        contours: None,
     },
     // Satellite IR window brightness temperature and cloud top
     // temperature (#819): 180–330 K spans the coldest storm tops to the
@@ -104,6 +156,7 @@ static RULES: &[DefaultRule] = &[
         palette: "ir_bt_enhanced",
         unit_ranges: &[(&["k", "kelvin"], 180.0, 330.0)],
         fallback_range: None,
+        contours: None,
     },
     // Temperature / dew point — unit-gated: NEVER guess K vs °C. One range
     // for every level, −90…50 °C, so a colour means the same temperature
@@ -121,6 +174,7 @@ static RULES: &[DefaultRule] = &[
             (&["c", "degc", "celsius", "cel"], -90.0, 50.0),
         ],
         fallback_range: None,
+        contours: Some(&ISOTHERMS),
     },
     // Precipitation rate / intensity, in mm/h. A rate stored in
     // kg m-2 s-1 is served in mm/h by every engine that converts units
@@ -132,6 +186,7 @@ static RULES: &[DefaultRule] = &[
         palette: "precipitation_rate",
         unit_ranges: &[(&["mmh", "mmhr", "mmh1", "mmhr1"], 0.0, 30.0)],
         fallback_range: Some((0.0, 30.0)),
+        contours: None,
     },
     // Precipitation accumulated from the run's start (#1067): MET Norway's
     // MEPS `precipitation_amount_acc`, and the `…fall_amount_acc` names of
@@ -151,6 +206,7 @@ static RULES: &[DefaultRule] = &[
         palette: "precipitation_accumulation",
         unit_ranges: &[(&["kgm2", "mm"], 0.0, 200.0)],
         fallback_range: None,
+        contours: None,
     },
     // Precipitation amount / accumulation.
     DefaultRule {
@@ -159,6 +215,7 @@ static RULES: &[DefaultRule] = &[
         palette: "precipitation",
         unit_ranges: &[],
         fallback_range: Some((0.0, 50.0)),
+        contours: None,
     },
     // Snowfall water equivalent (ECMWF `sf`) — the precipitation scale, but
     // unit-gated: snowfall is also published in metres, which 0..50 would
@@ -169,6 +226,7 @@ static RULES: &[DefaultRule] = &[
         palette: "precipitation",
         unit_ranges: &[(&["mm", "kgm2"], 0.0, 50.0)],
         fallback_range: None,
+        contours: None,
     },
     // Wind components on pressure levels (#1067 PR 8): MET Norway's MEPS
     // `x_wind_pl`/`y_wind_pl`. The matcher never sees the level, so one
@@ -187,6 +245,7 @@ static RULES: &[DefaultRule] = &[
             (&["kt", "kn", "knots"], -160.0, 160.0),
         ],
         fallback_range: None,
+        contours: None,
     },
     // The speed derived from those components (`wind_speed_pl`), on the
     // same 0–80 m/s scale. The wind-speed palette's stops end at 50 m/s, so
@@ -202,6 +261,7 @@ static RULES: &[DefaultRule] = &[
             (&["kt", "kn", "knots"], 0.0, 160.0),
         ],
         fallback_range: Some((0.0, 80.0)),
+        contours: None,
     },
     // Signed wind components (u/v) — diverging about zero, on the wind-speed
     // rule's scale. Before it, so a "u-component of wind gust" title stays
@@ -226,6 +286,7 @@ static RULES: &[DefaultRule] = &[
             (&["kt", "kn", "knots"], -80.0, 80.0),
         ],
         fallback_range: None,
+        contours: None,
     },
     // Wind speed, native or derived from u/v (#897: `10si`, `100si`, `ws`,
     // wgrib2 `WIND`, FMI `WindSpeedMS`, CF stores' `…wind_speed…`; every
@@ -253,6 +314,7 @@ static RULES: &[DefaultRule] = &[
             (&["kt", "kn", "knots"], 0.0, 80.0),
         ],
         fallback_range: Some((0.0, 40.0)),
+        contours: None,
     },
     // Vertical velocity — diverging about zero. Pressure (omega, Pa s-1,
     // negative = ascent) and geometric (m s-1) velocities differ in unit and
@@ -264,6 +326,7 @@ static RULES: &[DefaultRule] = &[
         palette: "diverging",
         unit_ranges: &[(&["pas1", "pas"], -2.0, 2.0), (&["ms", "ms1"], -1.0, 1.0)],
         fallback_range: None,
+        contours: None,
     },
     // Vorticity (relative or absolute), s-1 — diverging about zero.
     // Potential vorticity carries another unit and does not match.
@@ -273,6 +336,7 @@ static RULES: &[DefaultRule] = &[
         palette: "diverging",
         unit_ranges: &[(&["s1", "1s"], -2e-4, 2e-4)],
         fallback_range: None,
+        contours: None,
     },
     // Divergence, s-1 — diverging about zero; convergence is negative.
     DefaultRule {
@@ -281,6 +345,7 @@ static RULES: &[DefaultRule] = &[
         palette: "diverging",
         unit_ranges: &[(&["s1", "1s"], -1e-4, 1e-4)],
         fallback_range: None,
+        contours: None,
     },
     // Geopotential / geopotential height. The matcher never sees the level,
     // so one range serves every pressure level: 0–21 000 gpm spans 1000 hPa
@@ -307,9 +372,11 @@ static RULES: &[DefaultRule] = &[
         palette: "viridis",
         unit_ranges: &[
             (&["gpm", "m"], 0.0, GEOPOTENTIAL_HEIGHT_MAX),
+            (&["dam"], 0.0, GEOPOTENTIAL_HEIGHT_MAX / 10.0),
             (&["m2s2"], 0.0, GEOPOTENTIAL_MAX),
         ],
         fallback_range: None,
+        contours: Some(&HEIGHT_CONTOURS),
     },
     // Surface pressure: elevated terrain reaches ~500 hPa, so it needs a far
     // wider range than MSLP, and a normalized palette — the MSLP palette's
@@ -324,6 +391,7 @@ static RULES: &[DefaultRule] = &[
             (&["hpa", "mbar", "mb"], 500.0, 1050.0),
         ],
         fallback_range: None,
+        contours: None,
     },
     // Pressure / MSLP — unit-gated: Pa vs hPa ranges differ 100×.
     DefaultRule {
@@ -335,6 +403,7 @@ static RULES: &[DefaultRule] = &[
             (&["hpa", "mbar", "mb"], 950.0, 1050.0),
         ],
         fallback_range: None,
+        contours: Some(&ISOBARS),
     },
     // Specific humidity / humidity mixing ratio, a mass fraction — never the
     // relative-humidity percent range. Unit-gated, and the RH rule below
@@ -348,6 +417,7 @@ static RULES: &[DefaultRule] = &[
             (&["gkg1", "gkg"], 0.0, 20.0),
         ],
         fallback_range: None,
+        contours: None,
     },
     // Total column water (vapour), mm = kg m-2.
     DefaultRule {
@@ -356,6 +426,7 @@ static RULES: &[DefaultRule] = &[
         palette: "viridis",
         unit_ranges: &[(&["mm", "kgm2"], 0.0, 70.0)],
         fallback_range: None,
+        contours: None,
     },
     // Relative humidity as a fraction, in unit 1 as a source serves it
     // unconverted (engine-netcdf and engine-zarr serve CF's
@@ -372,6 +443,7 @@ static RULES: &[DefaultRule] = &[
         palette: "humidity_fraction",
         unit_ranges: &[(FRACTION, 0.0, 1.0)],
         fallback_range: None,
+        contours: None,
     },
     // Relative humidity in percent. A bare `Humidity` short name with no
     // known unit still matches.
@@ -381,6 +453,7 @@ static RULES: &[DefaultRule] = &[
         palette: "humidity",
         unit_ranges: &[(PERCENT, 0.0, 100.0)],
         fallback_range: Some((0.0, 100.0)),
+        contours: None,
     },
     // Cloud and fog cover as a fraction, on the fraction-valued twin of the
     // percent palette (as for relative humidity above), including a CF area
@@ -397,6 +470,7 @@ static RULES: &[DefaultRule] = &[
         palette: "cloud_cover_fraction",
         unit_ranges: &[(FRACTION, 0.0, 1.0)],
         fallback_range: None,
+        contours: None,
     },
     // The CF area fractions in percent, as engine-netcdf and engine-zarr
     // serve them from their standard name (MEPS `cloud_area_fraction`).
@@ -410,6 +484,7 @@ static RULES: &[DefaultRule] = &[
         palette: "cloud_cover",
         unit_ranges: &[(PERCENT, 0.0, 100.0)],
         fallback_range: None,
+        contours: None,
     },
     // Cloud cover in percent.
     DefaultRule {
@@ -418,6 +493,7 @@ static RULES: &[DefaultRule] = &[
         palette: "cloud_cover",
         unit_ranges: &[(PERCENT, 0.0, 100.0)],
         fallback_range: Some((0.0, 100.0)),
+        contours: None,
     },
     // CAPE.
     DefaultRule {
@@ -426,15 +502,31 @@ static RULES: &[DefaultRule] = &[
         palette: "viridis",
         unit_ranges: &[],
         fallback_range: Some((0.0, 4000.0)),
+        contours: None,
     },
 ];
 
 /// A matched default: the palette name plus an explicit range when the rule
-/// defines one (`None` ⇒ the palette's own stop range applies).
+/// defines one (`None` ⇒ the palette's own stop range applies), and the
+/// contour lines offered next to it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedDefault {
     pub palette: String,
     pub range: Option<(f64, f64)>,
+    /// The `contours` style for the parameter's unit (#1378), `None` when
+    /// the matching rule offers none in that unit.
+    pub contour: Option<DefaultContour>,
+}
+
+/// A default contour style (#1378): its title and the lines' values, in the
+/// parameter's unit. `color` and `width` unset take the contour defaults.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DefaultContour {
+    pub title: String,
+    pub interval: f64,
+    pub base: f64,
+    pub color: Option<String>,
+    pub width: Option<f64>,
 }
 
 /// One user-configured override rule (`[[parameter_defaults]]`), checked
@@ -447,6 +539,22 @@ pub struct DefaultOverride {
     pub palette: String,
     pub unit_ranges: Vec<(Vec<String>, f64, f64)>,
     pub fallback_range: Option<(f64, f64)>,
+    /// `[[parameter_defaults.contours]]`: per unit, the lines' values.
+    /// `None` keeps the embedded table's contours for the parameters this
+    /// rule claims; `Some(empty)` offers none.
+    pub contours: Option<Vec<OverrideContour>>,
+    /// The contour style's title (default "Contours").
+    pub contour_title: Option<String>,
+}
+
+/// One `[[parameter_defaults.contours]]` entry.
+#[derive(Clone, Debug)]
+pub struct OverrideContour {
+    pub unit: String,
+    pub interval: f64,
+    pub base: f64,
+    pub color: Option<String>,
+    pub width: Option<f64>,
 }
 
 /// The defaults matcher: config overrides first, then the embedded table.
@@ -489,32 +597,93 @@ impl ParameterDefaults {
                 Ok(r) => r,
                 Err(()) => continue, // unit-gated rule, no unit match
             };
+            let contour = match &rule.contours {
+                Some(contours) => {
+                    override_contour(rule, contours, unit_n.as_deref(), unit_plain.as_deref())
+                }
+                // The rule restyles the fill only: the parameter keeps the
+                // embedded table's lines.
+                None => builtin_rule(&name_n, &title_n, unit_n.as_deref())
+                    .and_then(|(rule, _)| rule_contour(rule, unit_n.as_deref())),
+            };
             return Some(ResolvedDefault {
                 palette: rule.palette.clone(),
                 range,
+                contour,
             });
         }
 
-        for rule in RULES {
-            let name_hit = rule.names.contains(&name_n.as_str())
-                || rule
-                    .contains
-                    .iter()
-                    .any(|c| name_n.contains(c) || title_n.contains(c));
-            if !name_hit {
-                continue;
-            }
-            let range = match resolve_range(rule, unit_n.as_deref()) {
-                Ok(r) => r,
-                Err(()) => continue, // unit-gated rule, no unit match
-            };
-            return Some(ResolvedDefault {
-                palette: rule.palette.to_string(),
-                range,
-            });
-        }
-        None
+        let (rule, range) = builtin_rule(&name_n, &title_n, unit_n.as_deref())?;
+        Some(ResolvedDefault {
+            palette: rule.palette.to_string(),
+            range,
+            contour: rule_contour(rule, unit_n.as_deref()),
+        })
     }
+}
+
+/// The first embedded rule matching a normalized name and title whose unit
+/// gate passes, with its range.
+fn builtin_rule(
+    name_n: &str,
+    title_n: &str,
+    unit: Option<&str>,
+) -> Option<(&'static DefaultRule, Option<(f64, f64)>)> {
+    RULES.iter().find_map(|rule| {
+        let name_hit = rule.names.contains(&name_n)
+            || rule
+                .contains
+                .iter()
+                .any(|c| name_n.contains(c) || title_n.contains(c));
+        if !name_hit {
+            return None;
+        }
+        // `Err`: a unit-gated rule with no unit match does not apply.
+        resolve_range(rule, unit).ok().map(|range| (rule, range))
+    })
+}
+
+/// An embedded rule's contour lines for the unit key `unit`.
+fn rule_contour(rule: &DefaultRule, unit: Option<&str>) -> Option<DefaultContour> {
+    let contours = rule.contours?;
+    let unit = unit?;
+    let &(_, interval, base) = contours
+        .units
+        .iter()
+        .find(|(aliases, _, _)| aliases.contains(&unit))?;
+    Some(DefaultContour {
+        title: contours.title.to_string(),
+        interval,
+        base,
+        color: Some(contours.color.to_string()),
+        width: None,
+    })
+}
+
+/// A config rule's contour lines for a parameter in `unit` (its
+/// [`unit_key`]) or `plain` (its [`normalize`]d spelling), matched as
+/// [`resolve_range_owned`] matches ranges.
+fn override_contour(
+    rule: &DefaultOverride,
+    contours: &[OverrideContour],
+    unit: Option<&str>,
+    plain: Option<&str>,
+) -> Option<DefaultContour> {
+    let unit = unit?;
+    let plain = plain.filter(|p| !p.is_empty());
+    let entry = contours
+        .iter()
+        .find(|c| unit_key(&c.unit) == unit || plain.is_some_and(|p| normalize(&c.unit) == p))?;
+    Some(DefaultContour {
+        title: rule
+            .contour_title
+            .clone()
+            .unwrap_or_else(|| "Contours".to_string()),
+        interval: entry.interval,
+        base: entry.base,
+        color: entry.color.clone(),
+        width: entry.width,
+    })
 }
 
 /// `Ok(Some(range))` — explicit range; `Ok(None)` — palette stop range;
@@ -1052,6 +1221,7 @@ mod tests {
                 Some(ResolvedDefault {
                     palette: "humidity".into(),
                     range: Some((0.0, 100.0)),
+                    contour: None,
                 }),
                 "{name}"
             );
@@ -1064,12 +1234,20 @@ mod tests {
             ("dew_point_temperature_2m", "Dew point temperature (2 m)"),
             ("dew_point_temperature_pl", "Dew point temperature"),
         ] {
-            for (unit, range) in [("°C", (-90.0, 50.0)), ("K", (183.15, 323.15))] {
+            for (unit, range, base) in [("°C", (-90.0, 50.0), 0.0), ("K", (183.15, 323.15), 273.15)]
+            {
                 assert_eq!(
                     d.match_default(name, title, Some(unit)),
                     Some(ResolvedDefault {
                         palette: "temperature".into(),
                         range: Some(range),
+                        contour: Some(DefaultContour {
+                            title: "Isotherms".into(),
+                            interval: 2.0,
+                            base,
+                            color: Some("#b40000".into()),
+                            width: None,
+                        }),
                     }),
                     "{name} in {unit}"
                 );
@@ -1135,6 +1313,8 @@ mod tests {
             palette: "grayscale".into(),
             unit_ranges: vec![],
             fallback_range: Some((0.0, 60.0)),
+            contours: None,
+            contour_title: None,
         }]);
         let m = d.match_default("dbzh", "", None).unwrap();
         assert_eq!(m.palette, "grayscale");
@@ -1270,6 +1450,8 @@ mod tests {
             palette: "viridis".into(),
             unit_ranges: vec![(vec!["m/s".into()], 0.0, 30.0)],
             fallback_range: None,
+            contours: None,
+            contour_title: None,
         }]);
         for unit in ["m/s", "m s-1", "m s**-1"] {
             assert_eq!(
@@ -1277,6 +1459,7 @@ mod tests {
                 ResolvedDefault {
                     palette: "viridis".into(),
                     range: Some((0.0, 30.0)),
+                    contour: None,
                 },
                 "{unit}"
             );
@@ -1312,6 +1495,8 @@ mod tests {
                 palette: "viridis".into(),
                 unit_ranges: vec![(vec![alias.into()], 1.0, 2.0)],
                 fallback_range: None,
+                contours: None,
+                contour_title: None,
             }]);
             for unit in units {
                 assert_eq!(
@@ -1993,5 +2178,106 @@ mod tests {
         assert_eq!(normalize("°C"), "c");
         assert_eq!(normalize("m s**-1"), "ms1");
         assert_eq!(normalize("kg m-2 s-1"), "kgm2s1");
+    }
+
+    /// The built-in contour lines (#1378), unit-aware: isobars every 4 hPa
+    /// (400 Pa), height contours every 6 dam (60 gpm, 60 g₀ m² s⁻²),
+    /// isotherms every 2 K through 0 °C. Other quantities, surface pressure
+    /// and a unit the rule has no interval for get none.
+    #[test]
+    fn contour_defaults_follow_the_unit() {
+        let d = builtin();
+        let lines = |name: &str, title: &str, unit: &str| {
+            d.match_default(name, title, Some(unit))
+                .and_then(|m| m.contour)
+                .map(|c| (c.title, c.interval, c.base))
+        };
+        let isobars = |interval| Some(("Isobars".to_string(), interval, 0.0));
+        assert_eq!(lines("msl", "", "Pa"), isobars(400.0));
+        assert_eq!(lines("prmsl", "", "hPa"), isobars(4.0));
+        assert_eq!(
+            lines(
+                "air_pressure_at_sea_level",
+                "Mean Sea Level Pressure",
+                "hPa"
+            ),
+            isobars(4.0)
+        );
+        let heights = |interval| Some(("Height contours".to_string(), interval, 0.0));
+        assert_eq!(lines("gh", "", "gpm"), heights(60.0));
+        assert_eq!(lines("HGT", "", "m"), heights(60.0));
+        assert_eq!(lines("gh", "", "dam"), heights(6.0));
+        assert_eq!(
+            lines("z", "", "m**2 s**-2"),
+            heights(60.0 * ds_core::geopotential::STANDARD_GRAVITY)
+        );
+        let isotherms = |base| Some(("Isotherms".to_string(), 2.0, base));
+        assert_eq!(lines("2t", "", "K"), isotherms(273.15));
+        assert_eq!(lines("t", "Temperature", "°C"), isotherms(0.0));
+        for (name, title, unit) in [
+            ("sp", "Surface pressure", "Pa"),
+            ("10si", "", "m/s"),
+            ("tp", "", "mm"),
+            // A brightness temperature is claimed by its own rule first.
+            ("CMI", "Brightness temperature", "K"),
+        ] {
+            assert_eq!(lines(name, title, unit), None, "{name}");
+        }
+        // No unit, no guess.
+        assert_eq!(d.match_default("msl", "", None), None);
+    }
+
+    /// `[[parameter_defaults]]` contours: a rule that restyles only the fill
+    /// keeps the built-in lines, one with `contours` gives its own (by unit,
+    /// in any spelling), and `contours = []` offers none.
+    #[test]
+    fn config_rules_give_or_keep_contours() {
+        let rule = |contours: Option<Vec<OverrideContour>>| {
+            ParameterDefaults::with_overrides(vec![DefaultOverride {
+                names: vec!["msl".into()],
+                contains: vec![],
+                palette: "viridis".into(),
+                unit_ranges: vec![],
+                fallback_range: Some((950.0, 1050.0)),
+                contours,
+                contour_title: Some("Isobars every 2".into()),
+            }])
+        };
+        let lines = |d: &ParameterDefaults, unit: &str| {
+            d.match_default("msl", "", Some(unit))
+                .and_then(|m| m.contour)
+        };
+        let kept = rule(None);
+        assert_eq!(
+            kept.match_default("msl", "", Some("hPa")).unwrap().palette,
+            "viridis"
+        );
+        assert_eq!(
+            lines(&kept, "hPa").map(|c| (c.title, c.interval)),
+            Some(("Isobars".into(), 4.0))
+        );
+        let own = rule(Some(vec![OverrideContour {
+            unit: "hPa".into(),
+            interval: 2.0,
+            base: 0.0,
+            color: Some("#0000ff".into()),
+            width: Some(2.0),
+        }]));
+        assert!(
+            lines(&own, "mbar").is_none(),
+            "mbar is another unit key than hPa"
+        );
+        assert_eq!(
+            lines(&own, "hPa"),
+            Some(DefaultContour {
+                title: "Isobars every 2".into(),
+                interval: 2.0,
+                base: 0.0,
+                color: Some("#0000ff".into()),
+                width: Some(2.0),
+            })
+        );
+        assert_eq!(lines(&own, "Pa"), None, "no interval for Pa: none");
+        assert_eq!(lines(&rule(Some(Vec::new())), "hPa"), None);
     }
 }

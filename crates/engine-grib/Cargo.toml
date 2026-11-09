@@ -25,5 +25,7 @@ thiserror = "2"
 
 [dev-dependencies]
 async-trait = "0.1"
+# Contour lines over a real field against an independent trace (#1378).
+ds-render = { path = "../render" }
 futures = "0.3"
 tracing-subscriber = { version = "0.3", features = ["json"] }

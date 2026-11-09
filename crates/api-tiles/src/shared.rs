@@ -29,12 +29,7 @@ impl TilesBlock {
 }
 
 fn contribution(state: &TilesState, sources: &TileSources<'_>, root: &str) -> Contribution {
-    let (fields, links) = handlers::collection_parts(
-        sources,
-        state.styles.get(&sources.config.id),
-        Layout::Shared,
-        root,
-    );
+    let (fields, links) = handlers::collection_parts(sources, &state.styles, Layout::Shared, root);
     Contribution {
         config: sources.config.clone(),
         fields,

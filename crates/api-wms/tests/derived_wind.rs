@@ -198,6 +198,7 @@ fn wind_speed_style() -> HashMap<String, StyleInfo> {
             min: 0.0,
             max: 40.0,
             parameter: None,
+            contour: None,
         },
     )])
 }

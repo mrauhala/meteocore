@@ -764,6 +764,7 @@ mod tests {
             min: r.min,
             max: r.max,
             parameter: None,
+            contour: None,
         }
     }
 

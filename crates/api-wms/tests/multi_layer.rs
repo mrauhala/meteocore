@@ -247,6 +247,7 @@ fn style(name: &str, colour: [u8; 4]) -> StyleInfo {
         min: 0.0,
         max: 2.0,
         parameter: None,
+        contour: None,
     }
 }
 

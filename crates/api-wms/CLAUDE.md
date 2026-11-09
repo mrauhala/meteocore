@@ -122,6 +122,16 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   partly outside, `project_node` gives those pixels NaN and they stay
   empty. A meta-tile wholly outside is an all-nodata tile with no engine
   call, so a zoomed-out view of the north stays meta-tiled.
+- Contour styles (#1378) are `Paint::Contour`: the direct path reads the
+  `ContourPaint::plan`'s grown view through `get_raster_tile_in_domain`
+  and draws it; the meta-tile path is `ds_render::assemble_metatiled_contours`,
+  which grows each 256×256 tile the same way, so tiles trace their
+  neighbours' edge cells and lines meet across meta-tile edges. Cached
+  tiles are the drawn RGBA under the contour style's name. A view on the
+  ladder draws what a direct render of it draws, within one level of
+  anti-aliasing (`tests/contours.rs`). GetFeatureInfo treats a contour
+  layer as a value layer. GetLegendGraphic draws through
+  `ds_render::render_style_legend`: a line swatch and `every 4 hPa`.
 - Several layers (#1181): each layer takes its own path (`render_layer`):
   meta-tiled pixels from `ds_render::assemble_metatiled[_composite]`, or
   the direct path's `render_tile_rgba` / `render_composite_tiles_rgba`,

@@ -69,9 +69,15 @@ plus:
   asks for HTML gets its errors as an HTML page.
 - The legend is JSON by default (palette stops, range, interpolation) or a
   180 × 300 PNG with `f=png`. `parameter-name` selects a parameter's style;
-  for an RGB composite the legend lists the channels.
+  for an RGB composite the legend lists the channels. A contour style's
+  legend is a line swatch and `every 4 hPa`, its JSON a `contour` member.
+- A contour style (#1378) draws its lines into the tile from a read one or
+  two pixels past the tile's edges, so a line leaving one tile meets itself
+  in the next: a 2 × 2 block of tiles is the tile above drawn at 512 × 512.
 
-Collection metadata adds `dataType`, `crs`, `storageCrs`, `styles`,
+Collection metadata adds `dataType`, `crs`, `storageCrs`, `styles` (the
+collection's own, then those only some parameter layers offer, such as the
+built-in `contours`, with their `parameters`),
 `parameter_names` and `tilesets-map`/`tilesets-vector` links. Its extent
 describes the native grid as Maps does
 ([api-common](../api-common/README.md#native-grid)). Tilesets give

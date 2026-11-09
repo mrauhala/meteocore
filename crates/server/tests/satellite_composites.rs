@@ -146,6 +146,7 @@ fn styles() -> HashMap<String, HashMap<String, StyleInfo>> {
         min: 180.0,
         max: 330.0,
         parameter: None,
+        contour: None,
     };
     HashMap::from([(
         ID.to_string(),

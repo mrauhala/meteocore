@@ -128,6 +128,7 @@ fn build_empty_router() -> axum::Router {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     // A second, named style so legend tests can assert the selected STYLE flows
@@ -147,6 +148,7 @@ fn build_empty_router() -> axum::Router {
             min: -32.0,
             max: 95.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("empty".to_string(), layer_styles);
@@ -356,6 +358,7 @@ fn build_failing_router() -> axum::Router {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("broken".to_string(), layer_styles);
@@ -617,6 +620,7 @@ fn build_populated_state_with_wms(
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);
@@ -1018,6 +1022,7 @@ fn build_counting_router_versioned(
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("data".to_string(), layer_styles);
@@ -1298,6 +1303,7 @@ fn build_snapping_router_with(
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("data".to_string(), layer_styles);
@@ -2564,6 +2570,7 @@ fn build_forecast_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("ecmwf-fc".to_string(), layer_styles);
@@ -3068,6 +3075,7 @@ fn build_run_swap_router(initial_runs: &[&str]) -> RunSwapRouter {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("data".to_string(), layer_styles);
@@ -3265,6 +3273,7 @@ fn build_advancing_router() -> AdvancingFixture {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("radar-live".to_string(), layer_styles);
@@ -3780,6 +3789,7 @@ fn param_palette_style(name: &str, palette: &str, parameter: Option<&str>) -> St
         min: resolved.min,
         max: resolved.max,
         parameter: parameter.map(str::to_string),
+        contour: None,
     }
 }
 
@@ -4822,6 +4832,7 @@ mod per_parameter_times {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         };
         let state = Arc::new(ArcSwap::from_pointee(WmsState {
             engines: HashMap::from([("sat".to_string(), engine)]),
@@ -5767,6 +5778,7 @@ mod composites {
             min: 0.0,
             max: 100.0,
             parameter: None,
+            contour: None,
         };
         let mut viridis = style.clone();
         viridis.name = "viridis".into();
