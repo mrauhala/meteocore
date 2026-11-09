@@ -25,6 +25,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
 
+use crate::geo::Convergence;
 use crate::geopotential::{HeightOutcome, HeightPlan};
 use crate::moisture::{MoistureOutcome, MoisturePlan, Recipe};
 use crate::wind::{DerivedKind, PairOutcome, WindFacts, WindPlan};
@@ -70,13 +71,18 @@ impl Derivations {
 
 /// How a derived parameter's value follows from its inputs' samples, in
 /// [`DerivedParameter::inputs`] order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Formula {
     /// `hypot(u, v)` ([`crate::wind::speed`]); inputs u, v.
     WindSpeed,
     /// Where the wind blows from ([`crate::wind::from_direction`]); inputs
-    /// u, v.
+    /// u, v, earth-relative or along a north-aligned grid.
     WindDirection,
+    /// Where the wind blows from, of u, v along the axes of a grid turned
+    /// from north ([`crate::wind::from_grid_direction`]): inputs u, v, then
+    /// the grid's convergence at the value's position, in degrees, which
+    /// the wrapper appends ([`Formula::convergence`]).
+    GridWindDirection(Convergence),
     /// Φ / g₀ ([`crate::geopotential::height`]); input geopotential.
     GeopotentialHeight,
     /// Relative humidity or dew point ([`Recipe::value`]); inputs
@@ -93,6 +99,9 @@ impl Formula {
         match (self, inputs) {
             (Formula::WindSpeed, &[u, v]) => crate::wind::speed(u, v),
             (Formula::WindDirection, &[u, v]) => crate::wind::from_direction(u, v),
+            (Formula::GridWindDirection(_), &[u, v, gamma]) => {
+                crate::wind::from_grid_direction(u, v, gamma)
+            }
             (Formula::GeopotentialHeight, &[z]) => crate::geopotential::height(z),
             (Formula::Moisture(recipe), samples) => recipe.value(samples),
             _ => None,
@@ -104,7 +113,9 @@ impl Formula {
     pub fn standard_name(self) -> &'static str {
         match self {
             Formula::WindSpeed => crate::wind::WIND_SPEED,
-            Formula::WindDirection => crate::wind::WIND_FROM_DIRECTION,
+            Formula::WindDirection | Formula::GridWindDirection(_) => {
+                crate::wind::WIND_FROM_DIRECTION
+            }
             Formula::GeopotentialHeight => crate::geopotential::GEOPOTENTIAL_HEIGHT,
             Formula::Moisture(recipe) => recipe.quantity().standard_name(),
         }
@@ -117,16 +128,26 @@ impl Formula {
         matches!(self, Formula::Moisture(recipe) if recipe.reads_level_pressure())
     }
 
+    /// The convergence its last sample is taken from, at each value's own
+    /// position, which the wrapper appends: EDR only, from the coverage's
+    /// domain.
+    pub fn convergence(self) -> Option<Convergence> {
+        match self {
+            Formula::GridWindDirection(convergence) => Some(convergence),
+            _ => None,
+        }
+    }
+
     /// Whether the map APIs serve it: a scalar a palette can draw. A
     /// direction needs a cyclic palette and is EDR only.
     pub fn on_map(self) -> bool {
-        !matches!(self, Formula::WindDirection)
+        !matches!(self, Formula::WindDirection | Formula::GridWindDirection(_))
     }
 
     /// The derivation it belongs to, for messages: `"wind"`.
     pub fn quantity(self) -> &'static str {
         match self {
-            Formula::WindSpeed | Formula::WindDirection => "wind",
+            Formula::WindSpeed | Formula::WindDirection | Formula::GridWindDirection(_) => "wind",
             Formula::GeopotentialHeight => "geopotential height",
             Formula::Moisture(recipe) => recipe.quantity().noun(),
         }
@@ -135,18 +156,23 @@ impl Formula {
     /// What one input is called in messages: `"wind component"`.
     fn input_noun(self) -> &'static str {
         match self {
-            Formula::WindSpeed | Formula::WindDirection => "wind component",
+            Formula::WindSpeed | Formula::WindDirection | Formula::GridWindDirection(_) => {
+                "wind component"
+            }
             Formula::GeopotentialHeight => "geopotential",
             Formula::Moisture(_) => "humidity input",
         }
     }
 }
 
-impl From<DerivedKind> for Formula {
-    fn from(kind: DerivedKind) -> Self {
-        match kind {
-            DerivedKind::Speed => Formula::WindSpeed,
-            DerivedKind::Direction => Formula::WindDirection,
+impl Formula {
+    /// The formula of a planned wind parameter: a direction from
+    /// components along a turned grid's axes turns them by its convergence.
+    fn wind(kind: DerivedKind, convergence: Option<Convergence>) -> Self {
+        match (kind, convergence) {
+            (DerivedKind::Speed, _) => Formula::WindSpeed,
+            (DerivedKind::Direction, None) => Formula::WindDirection,
+            (DerivedKind::Direction, Some(convergence)) => Formula::GridWindDirection(convergence),
         }
     }
 }
@@ -245,7 +271,7 @@ impl Plan {
             plan.derived
                 .extend(wind.derived.into_iter().map(|d| DerivedParameter {
                     name: d.name,
-                    formula: d.kind.into(),
+                    formula: Formula::wind(d.kind, d.convergence),
                     inputs: vec![d.u, d.v],
                     edr_inputs: vec![d.edr_u, d.edr_v],
                     title: d.title,

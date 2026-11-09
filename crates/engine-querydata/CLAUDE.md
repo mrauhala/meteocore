@@ -133,8 +133,11 @@ runtime).
   (`GridValues`/`PressureValues`/`HeightValues` with `relative_uv`).
   `gribtoqd` copies GRIB components without reading their flag. On a
   lat/lon area grid-relative is earth-relative: speed and direction. On
-  LCC, stereographic and rotated lat/lon areas (`GridAxes::Rotated`) speed
-  only, until `ds_core::wind` can turn components to true north.
+  LCC, stereographic and rotated lat/lon areas (`GridAxes::Rotated`, built
+  by `GridAxes::of(&area.crs)` with the area's convergence) the direction
+  is each value's components turned to true north by the convergence at
+  its position, as `DoWindComponentFix` turns them by `TrueNorthAzimuth`
+  (`wind_tests::fmi_components_on_lcc_are_turned_to_true_north`).
 - **Humidity (#898):** `wind_facts` also sets `fmi_param` for 4
   (Temperature, °C), 10 (DewPoint, °C) and 13 (Humidity, %), and only
   for those and the wind numbers, so a vocabulary name still pairs a

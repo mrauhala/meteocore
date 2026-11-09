@@ -1792,10 +1792,14 @@ Direction needs to know whether u and v are earth- or grid-relative, and
 that comes from the source: the GRIB2 resolution-and-component flag, the CF
 standard name (`eastward_wind` vs `x_wind`). QueryData carries no flag and
 follows FMI newbase's convention, components relative to the data's own
-grid: direction on lat/lon areas, speed only on projected ones (LCC,
-stereographic, rotated lat/lon) until grid-relative components can be turned
-to true north. MEPS NetCDF's `x_wind`/`y_wind` are grid-relative on its
-Lambert grid likewise: speed only. The server logs, per u/v pair, what was derived or why not.
+grid. Grid-relative components on a projected or rotated grid (LCC, polar
+and oblique stereographic, Transverse Mercator, rotated lat/lon) are turned
+to true north by the grid's convergence angle at each value's own position
+before the direction is taken; the speed needs no turn. MEPS NetCDF's
+`x_wind`/`y_wind`, grid-relative on its Lambert grid, get a direction that
+way, at the surface and per pressure level. Components whose frame is
+unknown, or grid-relative ones on a grid that is not conformal, get no
+direction. The server logs, per u/v pair, what was derived or why not.
 `derive_wind = false` turns it off for a collection.
 
 ### Derived geopotential height
@@ -2063,7 +2067,7 @@ variables = ["air_temperature_2m"]
 
 **Pressure levels.** A collection has one vertical axis, so a family on pressure levels, such as MEPS's per-lead `pl` files (13 levels, 1000 to 50 hPa), is a collection of its own, apart from the surface family. Its levels are `VerticalKind::Pressure` in hPa, listed bottom first (the largest pressure first): the WMS `ELEVATION` dimension (`units="hPa"`), Maps/Tiles `elevation` and EDR `z`, matched exactly, so a level the collection lacks is a 400 (on WMS GetMap, the error image). A map without one draws the first, bottom level, and GetFeatureInfo reports and reads that level. EDR `z` takes a level, a list, an interval or `Rn/min/step`, and without `z` reads every level: one level is a `PointSeries` with a one-value `z` axis, several a `VerticalProfile` per step; an area puts the levels on a `z` axis (`[t, z, y, x]`). Each level is a field of its own, read, cached and counted by the query cap alone, so name the levels a query needs. With an allowlist every listed variable must be on the same levels; without one the largest group of the first file's fields on the same levels wins, single-level fields on a tie. Height above ground and hybrid model levels are not served. `collections.d/meps-netcdf-pl-local.toml` is a runnable example on a committed sample (`testdata/meps-netcdf-pl`: five MEPS pl files at 1000, 850, 500 and 300 hPa); `collections.d/meps-netcdf-pl-thredds.toml.disabled` reads the family from thredds.met.no, with its traffic stated: 1.23 MB of metadata per file measured serving one variable, about 1.5 MB serving the example's five, ~1.4 MB per field first drawn, and a field is one variable at one level, 13 per variable and lead. `prewarm_variables` fetches the bottom level only.
 
-**Derived wind.** u/v components that their CF `standard_name` identifies give a wind speed on every API: MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`, and on pressure levels `x_wind_pl`/`y_wind_pl` give `wind_speed_pl`, both components read at the one level asked for. MEPS's components are relative to its Lambert grid, so they give no direction until they are turned to true north (#897); `derive_wind = false` turns it off.
+**Derived wind.** u/v components that their CF `standard_name` identifies give a wind speed on every API: MEPS's `x_wind_10m`/`y_wind_10m` give `wind_speed_10m`, and on pressure levels `x_wind_pl`/`y_wind_pl` give `wind_speed_pl`, both components read at the one level asked for. MEPS's components are relative to its Lambert grid: EDR also serves their direction, `wind_direction_10m` and `wind_direction_pl`, each value's components turned to true north by the grid's convergence where it is (#897); `derive_wind = false` turns it off.
 
 **Derived geopotential height.** A variable whose `standard_name` is `geopotential` is served as stored, in m² s⁻², and gives its height in gpm on every API: MEPS's `geopotential_pl` gives `geopotential_height_pl`, read at the one level asked for (#948); `derive_geopotential_height = false` turns it off.
 

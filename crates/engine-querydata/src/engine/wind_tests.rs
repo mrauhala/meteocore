@@ -1,7 +1,8 @@
 //! QueryData u/v components (#897). The format states no u/v frame; FMI
 //! newbase's convention makes them relative to the data's own grid, so a
-//! pair gives speed and direction on a lat/lon area and speed only on a
-//! projected one. No committed fixture carries wind: these tests rename two
+//! pair gives speed and direction on a lat/lon area, and on a projected one
+//! a direction turned to true north by the grid's convergence where each
+//! value is. No committed fixture carries wind: these tests rename two
 //! descriptors of the Kenya (lat/lon) and MEPS (LCC) fixtures to FMI's u
 //! and v components (newbase `kFmiWindUMS = 23`, `kFmiWindVMS = 24`). The
 //! values are no wind, but the derivation only needs two fields.
@@ -179,27 +180,45 @@ fn fmi_components_on_lat_lon_give_speed_and_direction() {
 }
 
 /// A Lambert conformal conic area: the components are along the grid's
-/// axes, which turn away from north across the grid, so speed only.
+/// axes, which turn away from north across the grid. The direction is each
+/// value's turned by the grid's convergence where it is: on the fixture's
+/// cone, tangent at 63.3° about 15°E, `γ = sin 63.3° · (λ − 15°)`, worked
+/// out here apart from `ds_core`. On the central meridian there is no turn.
 #[test]
-fn fmi_components_on_lcc_give_speed_only() {
+fn fmi_components_on_lcc_are_turned_to_true_north() {
     let fixture = Fixture::new(MEPS, &[(MEPS_T, FMI_U), (MEPS_MSL, FMI_V)]);
     let (engine, wind, logged) = wrap(&fixture);
     assert_eq!(
         logged,
-        [
-            "qd: WindUMS/WindVMS: derived speed 'WindSpeedMS' only; no direction: u/v are \
-             grid-relative on a rotated grid and turning them to true north is not implemented"
-        ]
+        ["qd: WindUMS/WindVMS: derived speed 'WindSpeedMS' and direction 'WindDirection'"]
     );
-    assert_eq!(engine.wind_facts().grid, ds_core::wind::GridAxes::Rotated);
-    assert_eq!(wind.get_parameters(), ["WindUMS", "WindVMS", "WindSpeedMS"]);
+    assert!(matches!(
+        engine.wind_facts().grid,
+        ds_core::wind::GridAxes::Rotated(Some(_))
+    ));
+    assert_eq!(
+        wind.get_parameters(),
+        ["WindUMS", "WindVMS", "WindSpeedMS", "WindDirection"]
+    );
+    // Direction is EDR only.
     assert_eq!(map_names(&wind), ["WindUMS", "WindVMS", "WindSpeedMS"]);
-    let point = "POINT(15 62.5)";
-    let components = series(engine.as_ref(), point, &["WindUMS", "WindVMS"]);
-    let derived = series(&wind, point, &["WindSpeedMS"]);
-    let u = components.ranges["WindUMS"].values[0].unwrap();
-    let v = components.ranges["WindVMS"].values[0].unwrap();
-    assert_eq!(derived.ranges["WindSpeedMS"].values[0], Some(u.hypot(v)));
+    for (lon, lat) in [(15.0, 62.5), (11.0, 61.0), (19.0, 63.5)] {
+        let point = format!("POINT({lon} {lat})");
+        let components = series(engine.as_ref(), &point, &["WindUMS", "WindVMS"]);
+        let derived = series(&wind, &point, &["WindSpeedMS", "WindDirection"]);
+        let gamma = 63.3f64.to_radians().sin() * (lon - 15.0);
+        let u = &components.ranges["WindUMS"].values;
+        let v = &components.ranges["WindVMS"].values;
+        for (i, (u, v)) in u.iter().zip(v).enumerate() {
+            let (u, v) = (u.unwrap(), v.unwrap());
+            assert_eq!(derived.ranges["WindSpeedMS"].values[i], Some(u.hypot(v)));
+            let on_grid = (-u).atan2(-v).to_degrees();
+            let want = (on_grid + gamma).rem_euclid(360.0);
+            let got = derived.ranges["WindDirection"].values[i].unwrap();
+            let off = (got - want + 180.0).rem_euclid(360.0) - 180.0;
+            assert!(off.abs() < 1e-9, "({lon}, {lat}) step {i}: {got} ≠ {want}");
+        }
+    }
     assert_speed_tile(&engine, &wind, [12.0, 61.0, 18.0, 64.0], "WindSpeedMS");
 }
 

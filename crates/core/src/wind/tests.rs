@@ -1,6 +1,7 @@
 use super::*;
 
 mod derived;
+mod turned;
 
 const EPS: f64 = 1e-9;
 
@@ -84,12 +85,25 @@ fn frames_come_from_the_grib_flag_and_the_cf_standard_name() {
         false_n: 0.0,
         radius: Some(6_371_220.0),
     };
-    assert_eq!(GridAxes::of(&lcc), GridAxes::Rotated);
+    assert_eq!(GridAxes::of(&lcc), GridAxes::Rotated(Convergence::of(&lcc)));
+    assert!(matches!(GridAxes::of(&lcc), GridAxes::Rotated(Some(_))));
     let rotated = Crs::RotatedLatLon {
         south_pole_lat: -0.5,
         south_pole_lon: 0.3,
     };
-    assert_eq!(GridAxes::of(&rotated), GridAxes::Rotated);
+    assert!(matches!(GridAxes::of(&rotated), GridAxes::Rotated(Some(_))));
+    // Parallels symmetric about the equator make no cone: a conformal grid
+    // whose convergence is unknown.
+    let no_cone = Crs::LambertConformalConic {
+        lat1: 0.5,
+        lat2: -0.5,
+        lat0: 0.0,
+        lon0: 0.26,
+        false_e: 0.0,
+        false_n: 0.0,
+        radius: Some(6_371_220.0),
+    };
+    assert_eq!(GridAxes::of(&no_cone), GridAxes::Rotated(None));
     let laea = Crs::LambertAzimuthalEqualArea {
         lat0: 0.9,
         lon0: 0.17,
@@ -105,21 +119,133 @@ fn the_frame_rules() {
     use Derivable::*;
     use GridAxes::*;
     use VectorFrame::*;
-    for grid in [NorthAligned, Rotated, Skewed] {
+    let convergence = Convergence::of(&meps_lcc()).unwrap();
+    let turned = Rotated(Some(convergence));
+    for grid in [NorthAligned, turned, Rotated(None), Skewed] {
         // Earth-relative: always both. Mixed: never anything.
         assert_eq!(derivable(Earth, Earth, grid), SpeedAndDirection);
         assert!(matches!(derivable(Earth, Grid, grid), Nothing(_)));
         assert!(matches!(derivable(Grid, Earth, grid), Nothing(_)));
     }
-    // Grid-relative: the convergence is zero only on a north-aligned grid.
+    // Grid-relative: no turn on a north-aligned grid, the grid's own on a
+    // rotated one, and speed only when the grid's convergence is unknown.
     assert_eq!(derivable(Grid, Grid, NorthAligned), SpeedAndDirection);
-    assert!(matches!(derivable(Grid, Grid, Rotated), SpeedOnly(_)));
+    assert_eq!(
+        derivable(Grid, Grid, turned),
+        SpeedAndTurnedDirection(convergence)
+    );
+    assert!(matches!(derivable(Grid, Grid, Rotated(None)), SpeedOnly(_)));
     assert!(matches!(derivable(Grid, Grid, Skewed), Nothing(_)));
     // Unknown: never a direction; a speed only where the axes are orthogonal.
     for (u, v) in [(Unknown, Unknown), (Unknown, Earth), (Grid, Unknown)] {
         assert!(matches!(derivable(u, v, NorthAligned), SpeedOnly(_)));
-        assert!(matches!(derivable(u, v, Rotated), SpeedOnly(_)));
+        assert!(matches!(derivable(u, v, turned), SpeedOnly(_)));
+        assert!(matches!(derivable(u, v, Rotated(None)), SpeedOnly(_)));
         assert!(matches!(derivable(u, v, Skewed), Nothing(_)));
+    }
+}
+
+/// MEPS's grid mapping: a cone tangent at 63.3° about 15°E, on the
+/// 6 371 km sphere.
+fn meps_lcc() -> Crs {
+    Crs::LambertConformalConic {
+        lat1: 63.3f64.to_radians(),
+        lat2: 63.3f64.to_radians(),
+        lat0: 63.3f64.to_radians(),
+        lon0: 15f64.to_radians(),
+        false_e: 0.0,
+        false_n: 0.0,
+        radius: Some(6_371_000.0),
+    }
+}
+
+fn lambert() -> GridAxes {
+    GridAxes::of(&meps_lcc())
+}
+
+/// The sign convention, worked by hand. On MEPS's cone, at 25°E, 10° east
+/// of the central meridian, the meridians lean in toward the apex above
+/// 15°E: true north points up and to the left on the grid, so grid north
+/// lies γ = n (λ − λ₀) = 10° · sin 63.3° ≈ 8.934° east of true north. A
+/// wind from grid north there (u = 0, v < 0 along the grid) comes from
+/// 8.934°, east of true north; one from grid west (u > 0) from 278.934°.
+/// West of the meridian, at 5°E, grid north lies 8.934° west of true north.
+/// The speed is the same in either frame.
+#[test]
+fn a_wind_from_grid_north_east_of_the_meridian_comes_from_east_of_true_north() {
+    let gamma = 10.0 * 63.3f64.to_radians().sin();
+    assert!((gamma - 8.933_714).abs() < 1e-6);
+    let convergence = Convergence::of(&meps_lcc()).unwrap();
+    let east = convergence.degrees(25.0, 60.0);
+    let west = convergence.degrees(5.0, 60.0);
+    assert!((east.unwrap() - gamma).abs() < 1e-9);
+    assert!((west.unwrap() + gamma).abs() < 1e-9);
+    for (u, v, at, want) in [
+        (0.0, -10.0, east, gamma),
+        (10.0, 0.0, east, 270.0 + gamma),
+        (-10.0, 0.0, east, 90.0 + gamma),
+        (0.0, -10.0, west, 360.0 - gamma),
+        (0.0, 10.0, west, 180.0 - gamma),
+    ] {
+        let got = from_grid_direction(Some(u), Some(v), at).unwrap();
+        assert!((got - want).abs() < 1e-9, "({u}, {v}): {got} ≠ {want}");
+        let (ue, ve) = to_earth_relative(u, v, at.unwrap());
+        assert!(
+            (ue.hypot(ve) - 10.0).abs() < 1e-12,
+            "the turn keeps the speed"
+        );
+    }
+    // The wind from grid north east of the meridian blows toward the
+    // south-southwest: earth-relative u and v both negative.
+    let (ue, ve) = to_earth_relative(0.0, -10.0, gamma);
+    assert!((ue + 10.0 * gamma.to_radians().sin()).abs() < 1e-12);
+    assert!((ve + 10.0 * gamma.to_radians().cos()).abs() < 1e-12);
+    // Calm has no direction in any frame; a missing angle gives none.
+    assert_eq!(from_grid_direction(Some(0.0), Some(0.0), east), None);
+    assert_eq!(from_grid_direction(Some(0.0), Some(-1.0), None), None);
+    assert_eq!(
+        from_grid_direction(Some(0.0), Some(-1.0), Some(f64::NAN)),
+        None
+    );
+    assert_eq!(from_grid_direction(None, Some(-1.0), east), None);
+}
+
+/// A polar stereographic and a Transverse Mercator grid, by their PROJ
+/// convergences (`proj -V`, PROJ 9.8.1): `+proj=stere +lat_0=90 +lat_ts=60
+/// +lon_0=-45 +ellps=WGS84` at (10°E, 70°N) is 55°, and TM35FIN
+/// (`+proj=utm +zone=35 +ellps=GRS80`) at (30°E, 65°N) is 2.71936863°. A
+/// wind from grid north comes from γ, one from grid south from 180° + γ.
+#[test]
+fn turned_directions_on_polar_stereographic_and_transverse_mercator_grids() {
+    let wgs84 = crate::geo::Ellipsoid::WGS84;
+    let polar = Crs::Stereographic {
+        lat0: 90f64.to_radians(),
+        lon0: (-45f64).to_radians(),
+        k0: crate::geo::polar_stereographic_k0(60f64.to_radians(), &wgs84),
+        false_e: 0.0,
+        false_n: 0.0,
+        figure: wgs84,
+    };
+    let tm35fin = Crs::TransverseMercator {
+        lat0: 0.0,
+        lon0: 27f64.to_radians(),
+        k0: 0.9996,
+        false_e: 500_000.0,
+        false_n: 0.0,
+        figure: crate::geo::Ellipsoid::GRS80,
+    };
+    for (crs, lon, lat, gamma) in [
+        (polar, 10.0, 70.0, 55.0),
+        (tm35fin, 30.0, 65.0, 2.719_368_63),
+    ] {
+        let GridAxes::Rotated(Some(convergence)) = GridAxes::of(&crs) else {
+            panic!("{crs:?} is conformal");
+        };
+        let at = convergence.degrees(lon, lat);
+        let north = from_grid_direction(Some(0.0), Some(-5.0), at).unwrap();
+        let south = from_grid_direction(Some(0.0), Some(5.0), at).unwrap();
+        assert!((north - gamma).abs() < 1e-6, "{crs:?}: {north}");
+        assert!((south - 180.0 - gamma).abs() < 1e-6, "{crs:?}: {south}");
     }
 }
 
@@ -276,9 +402,30 @@ fn unknown_and_grid_relative_frames_follow_the_rules() {
         "10u/10v: derived speed '10si' only; no direction: whether u/v are earth- or grid-relative is unknown"
     ));
     // Grid-relative on a regular lat/lon grid: both (zero convergence).
-    assert_eq!(names(&pair(Grid, Grid, NorthAligned)), ["10si", "10wdir"]);
-    // Grid-relative on a rotated grid: speed only until rotation exists.
-    assert_eq!(names(&pair(Grid, Grid, Rotated)), ["10si"]);
+    let plan = pair(Grid, Grid, NorthAligned);
+    assert_eq!(names(&plan), ["10si", "10wdir"]);
+    assert_eq!(plan.get("10wdir").unwrap().convergence, None);
+    // Grid-relative on a rotated grid: both, the direction turned by the
+    // grid's convergence; speed only when the grid's is unknown.
+    let plan = pair(Grid, Grid, lambert());
+    assert_eq!(names(&plan), ["10si", "10wdir"]);
+    assert_eq!(
+        plan.get("10wdir").unwrap().convergence,
+        Convergence::of(&meps_lcc())
+    );
+    assert_eq!(plan.get("10si").unwrap().convergence, None);
+    let plan = pair(Grid, Grid, Rotated(None));
+    assert_eq!(names(&plan), ["10si"]);
+    assert_eq!(
+        plan.outcomes[0].to_string(),
+        "10u/10v: derived speed '10si' only; no direction: u/v are grid-relative on a \
+         rotated grid whose convergence angle is unknown (its projection parameters give none)"
+    );
+    // Earth-relative components are never turned, whatever the grid.
+    let plan = pair(Earth, Earth, lambert());
+    assert_eq!(plan.get("10wdir").unwrap().convergence, None);
+    // An unknown frame on a rotated grid: speed only.
+    assert_eq!(names(&pair(Unknown, Unknown, lambert())), ["10si"]);
     // Non-conformal grid, or mixed frames: nothing.
     for plan in [pair(Grid, Grid, Skewed), pair(Earth, Grid, NorthAligned)] {
         assert!(plan.derived.is_empty());
@@ -390,15 +537,23 @@ fn cf_pairs_are_named_in_the_store_vocabulary() {
         ));
         assert_eq!(names(&plan), [speed, direction], "{u}");
     }
-    // x/y components on a rotated grid: speed only.
+    // x/y components on MEPS's Lambert grid: speed, and the direction
+    // turned to true north at each value's position.
     let plan = WindPlan::build(&facts(
-        GridAxes::Rotated,
+        lambert(),
         vec![
             cf("x_wind_10m", Some("x_wind")),
             cf("y_wind_10m", Some("y_wind")),
         ],
     ));
-    assert_eq!(names(&plan), ["wind_speed_10m"]);
+    assert_eq!(names(&plan), ["wind_speed_10m", "wind_direction_10m"]);
+    let direction = plan.get("wind_direction_10m").unwrap();
+    // From grid north at 25°E and 15°E: γ ≈ 8.934° and 0°.
+    let at = |lon| direction.value(Some(0.0), Some(-3.0), lon, 60.0).unwrap();
+    assert!((at(25.0) - 10.0 * 63.3f64.to_radians().sin()).abs() < 1e-9);
+    assert!(at(15.0).abs() < 1e-9);
+    let speed = plan.get("wind_speed_10m").unwrap();
+    assert_eq!(speed.value(Some(3.0), Some(-4.0), 25.0, 60.0), Some(5.0));
     // Without a standard name a store's own names pair nothing.
     let plan = WindPlan::build(&facts(
         GridAxes::NorthAligned,
@@ -425,9 +580,10 @@ fn fmi_components_keep_their_edr_names() {
         ..ParameterFacts::new(name)
     };
     let plan = WindPlan::build(&facts(
-        GridAxes::Rotated,
+        lambert(),
         vec![qd("WindUMS", 23), qd("WindVMS", 24)],
     ));
+    // No frame stated: speed only, on a rotated grid as on any.
     assert_eq!(names(&plan), ["WindSpeedMS"]);
     let speed = &plan.derived[0];
     assert_eq!(speed.u, "WindUMS");
@@ -442,8 +598,28 @@ fn fmi_components_keep_their_edr_names() {
     assert_eq!(plan.derived[0].edr_v, "V wind (full)");
     // A native WindSpeedMS (id 21) blocks the duplicate.
     let plan = WindPlan::build(&facts(
-        GridAxes::Rotated,
+        lambert(),
         vec![qd("WindUMS", 23), qd("WindVMS", 24), qd("WindSpeedMS", 21)],
     ));
     assert!(plan.derived.is_empty());
+    // Grid-relative, as the QueryData engine states them: the direction
+    // too, unless the collection has one (FMI 20).
+    let grid = |name: &str, id| ParameterFacts {
+        frame: VectorFrame::Grid,
+        ..qd(name, id)
+    };
+    let plan = WindPlan::build(&facts(
+        lambert(),
+        vec![grid("WindUMS", 23), grid("WindVMS", 24)],
+    ));
+    assert_eq!(names(&plan), ["WindSpeedMS", "WindDirection"]);
+    let plan = WindPlan::build(&facts(
+        lambert(),
+        vec![
+            grid("WindUMS", 23),
+            grid("WindVMS", 24),
+            qd("WindDirection", 20),
+        ],
+    ));
+    assert_eq!(names(&plan), ["WindSpeedMS"]);
 }

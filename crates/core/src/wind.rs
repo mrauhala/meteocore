@@ -7,6 +7,10 @@
 //! - the frame rules: which way a source's components point
 //!   ([`VectorFrame`]) and how its grid's axes lie on the ground
 //!   ([`GridAxes`]) decide what may be derived ([`derivable`]);
+//! - the turn to true north: grid-relative components on a grid turned
+//!   from north are rotated by the grid's convergence at each value's own
+//!   position ([`crate::geo::Convergence`], [`to_earth_relative`]) before
+//!   their direction is taken ([`from_grid_direction`]);
 //! - the pairing: which parameters form a u/v pair, and what the derived
 //!   parameters are called in the source's own vocabulary ([`WindPlan`]).
 //!
@@ -21,13 +25,15 @@
 //! **Derive after sampling.** The components are sampled with the engine's
 //! normal interpolation, at the output pixel or EDR point, and combined per
 //! sample. A derived field is never interpolated: 359° and 1° would average
-//! to 180°.
+//! to 180°. Nor is a turned component: grid-relative u and v are sampled
+//! as the grid holds them, then turned by the convergence where the value
+//! is.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, LazyLock};
 
-use crate::geo::Crs;
+use crate::geo::{Convergence, Crs};
 
 #[cfg(test)]
 mod tests;
@@ -60,9 +66,10 @@ pub fn speed(u: Option<f64>, v: Option<f64>) -> Option<f64> {
 
 /// The direction the wind blows **from**, in degrees clockwise from north
 /// in `[0, 360)`: `atan2(-u, -v)`. A northerly (`v < 0`) is 0°, an easterly
-/// (`u < 0`) 90°. Earth-relative components only: grid-relative ones must
-/// be turned to true north first. `None` when either component is missing
-/// or not finite, and for calm (`u = v = 0`), which has no direction.
+/// (`u < 0`) 90°. Earth-relative components only: grid-relative ones are
+/// turned to true north first ([`from_grid_direction`]). `None` when either
+/// component is missing or not finite, and for calm (`u = v = 0`), which
+/// has no direction.
 #[inline]
 pub fn from_direction(u: Option<f64>, v: Option<f64>) -> Option<f64> {
     let (u, v) = finite_pair(u, v)?;
@@ -72,6 +79,31 @@ pub fn from_direction(u: Option<f64>, v: Option<f64>) -> Option<f64> {
     let degrees = (-u).atan2(-v).to_degrees().rem_euclid(360.0);
     // `rem_euclid` rounds a tiny negative angle up to exactly 360.
     Some(if degrees >= 360.0 { 0.0 } else { degrees })
+}
+
+/// Components `(u, v)` along a grid's x and y axes, turned to east and
+/// north where the grid's convergence is `gamma` degrees: grid north lies
+/// `gamma` clockwise from true north ([`Convergence`]), so the grid's y axis
+/// points `(sin γ, cos γ)` east and north and its x axis `(cos γ, −sin γ)`.
+/// The turn keeps the vector's length.
+#[inline]
+pub fn to_earth_relative(u: f64, v: f64, gamma: f64) -> (f64, f64) {
+    let (sin, cos) = gamma.to_radians().sin_cos();
+    (u * cos + v * sin, v * cos - u * sin)
+}
+
+/// The direction the wind blows **from**, as [`from_direction`], of
+/// components along a grid's axes at a point where the grid's convergence
+/// is `gamma` degrees: the components turned to east and north first
+/// ([`to_earth_relative`]). A wind from grid north comes from γ. `None`
+/// when a component or the convergence is missing or not finite, and for
+/// calm.
+#[inline]
+pub fn from_grid_direction(u: Option<f64>, v: Option<f64>, gamma: Option<f64>) -> Option<f64> {
+    let (u, v) = finite_pair(u, v)?;
+    let gamma = gamma.filter(|gamma| gamma.is_finite())?;
+    let (u, v) = to_earth_relative(u, v, gamma);
+    from_direction(Some(u), Some(v))
 }
 
 fn finite_pair(u: Option<f64>, v: Option<f64>) -> Option<(f64, f64)> {
@@ -125,7 +157,7 @@ impl VectorFrame {
 
 /// How a source grid's x and y axes lie on the ground, which decides what
 /// grid-relative components can give.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GridAxes {
     /// x points east and y north everywhere: a regular, unrotated lat/lon
     /// grid, or Mercator. The convergence angle is zero, so grid- and
@@ -133,10 +165,13 @@ pub enum GridAxes {
     NorthAligned,
     /// The axes are orthogonal on the ground but turned from north by a
     /// convergence angle that varies across the grid: conformal projections
-    /// (Lambert conformal conic, polar stereographic, transverse Mercator)
-    /// and rotated lat/lon. Turning a vector keeps its length, so speed is
-    /// right in either frame; direction needs the rotation.
-    Rotated,
+    /// (Lambert conformal conic, polar and oblique stereographic, transverse
+    /// Mercator) and rotated lat/lon. Turning a vector keeps its length, so
+    /// speed is right in either frame; direction needs the turn, by the
+    /// grid's [`Convergence`]. `None` when the grid's parameters give no
+    /// convergence (a cone constant that is zero or not a number): speed
+    /// only.
+    Rotated(Option<Convergence>),
     /// Axes that are not orthogonal on the ground (equal-area and other
     /// non-conformal projections), or an unknown grid: the hypotenuse of
     /// grid-relative components is not the wind speed.
@@ -144,23 +179,26 @@ pub enum GridAxes {
 }
 
 impl GridAxes {
-    /// The axes of a grid laid out in `crs`.
+    /// The axes of a grid laid out in `crs`, with its convergence.
     pub fn of(crs: &Crs) -> Self {
         match crs {
             Crs::Wgs84 | Crs::WebMercator => GridAxes::NorthAligned,
             Crs::TransverseMercator { .. }
             | Crs::LambertConformalConic { .. }
             | Crs::Stereographic { .. }
-            | Crs::RotatedLatLon { .. } => GridAxes::Rotated,
+            | Crs::RotatedLatLon { .. } => GridAxes::Rotated(Convergence::of(crs)),
             Crs::LambertAzimuthalEqualArea { .. } | Crs::Geostationary { .. } => GridAxes::Skewed,
         }
     }
 }
 
 /// What a u/v pair can give ([`derivable`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Derivable {
     SpeedAndDirection,
+    /// Speed, and a direction once each value's components are turned to
+    /// true north by the grid's convergence where the value is.
+    SpeedAndTurnedDirection(Convergence),
     /// Speed only, with the reason there is no direction.
     SpeedOnly(&'static str),
     /// Nothing, with the reason.
@@ -174,19 +212,21 @@ pub enum Derivable {
 ///    its length.
 /// 2. Components in different frames give nothing.
 /// 3. Earth-relative components give speed and direction.
-/// 4. Grid-relative components must be turned to true north by the grid's
+/// 4. Grid-relative components are turned to true north by the grid's
 ///    convergence angle before a direction. On a north-aligned grid the
-///    angle is zero. Rotation on other grids is not implemented yet, so
-///    they give speed only, and a non-conformal grid gives nothing.
+///    angle is zero; on a rotated grid it is the grid's [`Convergence`] at
+///    each value's position, and without one there is speed only. A grid
+///    that is not conformal gives nothing.
 pub fn derivable(u: VectorFrame, v: VectorFrame, grid: GridAxes) -> Derivable {
     use VectorFrame::{Earth, Grid, Unknown};
     match (u, v) {
         (Earth, Earth) => Derivable::SpeedAndDirection,
         (Grid, Grid) => match grid {
             GridAxes::NorthAligned => Derivable::SpeedAndDirection,
-            GridAxes::Rotated => Derivable::SpeedOnly(
-                "u/v are grid-relative on a rotated grid and turning them to true north \
-                 is not implemented",
+            GridAxes::Rotated(Some(convergence)) => Derivable::SpeedAndTurnedDirection(convergence),
+            GridAxes::Rotated(None) => Derivable::SpeedOnly(
+                "u/v are grid-relative on a rotated grid whose convergence angle is unknown \
+                 (its projection parameters give none)",
             ),
             GridAxes::Skewed => {
                 Derivable::Nothing("u/v are grid-relative on a grid that is not conformal")
@@ -196,7 +236,7 @@ pub fn derivable(u: VectorFrame, v: VectorFrame, grid: GridAxes) -> Derivable {
             Derivable::Nothing("u and v are relative to different frames")
         }
         (Unknown, _) | (_, Unknown) => match grid {
-            GridAxes::NorthAligned | GridAxes::Rotated => Derivable::SpeedOnly(
+            GridAxes::NorthAligned | GridAxes::Rotated(_) => Derivable::SpeedOnly(
                 "whether u/v are earth- or grid-relative is unknown (not stated by the \
                  source, or not read yet)",
             ),
@@ -515,15 +555,24 @@ pub struct DerivedParameter {
     pub title: String,
     /// The components' unit for speed, [`DIRECTION_UNIT`] for direction.
     pub unit: String,
+    /// For a direction from grid-relative components on a rotated grid,
+    /// the grid's convergence, which turns each value's components to true
+    /// north where the value is. `None` for a speed, and for a direction
+    /// from earth-relative components or on a north-aligned grid.
+    pub convergence: Option<Convergence>,
 }
 
 impl DerivedParameter {
-    /// This parameter's value from the component samples.
+    /// This parameter's value from the component samples taken at
+    /// `(lon, lat)`, degrees: the position a turned direction is turned at.
     #[inline]
-    pub fn value(&self, u: Option<f64>, v: Option<f64>) -> Option<f64> {
-        match self.kind {
-            DerivedKind::Speed => speed(u, v),
-            DerivedKind::Direction => from_direction(u, v),
+    pub fn value(&self, u: Option<f64>, v: Option<f64>, lon: f64, lat: f64) -> Option<f64> {
+        match (self.kind, self.convergence) {
+            (DerivedKind::Speed, _) => speed(u, v),
+            (DerivedKind::Direction, None) => from_direction(u, v),
+            (DerivedKind::Direction, Some(convergence)) => {
+                from_grid_direction(u, v, convergence.degrees(lon, lat))
+            }
         }
     }
 }
@@ -626,10 +675,13 @@ impl WindPlan {
                 )));
                 continue;
             }
-            let (speed_ok, direction_ok) = match derivable(u.frame, v.frame, facts.grid) {
-                Derivable::SpeedAndDirection => (Ok(()), Ok(())),
-                Derivable::SpeedOnly(why) => (Ok(()), Err(why.to_string())),
-                Derivable::Nothing(why) => (Err(why.to_string()), Err(why.to_string())),
+            let (speed_ok, direction_ok, turn) = match derivable(u.frame, v.frame, facts.grid) {
+                Derivable::SpeedAndDirection => (Ok(()), Ok(()), None),
+                Derivable::SpeedAndTurnedDirection(convergence) => {
+                    (Ok(()), Ok(()), Some(convergence))
+                }
+                Derivable::SpeedOnly(why) => (Ok(()), Err(why.to_string()), None),
+                Derivable::Nothing(why) => (Err(why.to_string()), Err(why.to_string()), None),
             };
             let mut result = |kind: DerivedKind, name: String, allowed: Result<(), String>| {
                 allowed?;
@@ -667,6 +719,10 @@ impl WindPlan {
                     edr_v: v.edr_name().to_string(),
                     title,
                     unit,
+                    convergence: match kind {
+                        DerivedKind::Speed => None,
+                        DerivedKind::Direction => turn,
+                    },
                 });
                 Ok(name)
             };
