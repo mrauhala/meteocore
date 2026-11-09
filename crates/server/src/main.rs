@@ -510,6 +510,10 @@ async fn serve(cli: CliArgs) {
     for warning in &rendered_cache_warnings {
         tracing::warn!("{warning}");
     }
+    // Keys a style entry does not know load, but are reported (#1378).
+    for warning in config.style_key_warnings() {
+        tracing::warn!("{warning}");
+    }
 
     // The WCMP2 records WIS2-fed collections learn (#1356): one registry
     // for the process, which every load and engine shares.

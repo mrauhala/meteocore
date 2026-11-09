@@ -89,6 +89,7 @@ fn default_style() -> HashMap<String, StyleInfo> {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     )])
 }

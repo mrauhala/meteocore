@@ -213,6 +213,7 @@ fn build_state_with_wms(wms: Option<ds_core::config::WmsConfig>) -> api_tiles::A
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     layer_styles.insert(
@@ -229,6 +230,7 @@ fn build_state_with_wms(wms: Option<ds_core::config::WmsConfig>) -> api_tiles::A
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);
@@ -311,6 +313,7 @@ fn build_state_with_engine(engine: Arc<dyn MapEngine>) -> api_tiles::AppState {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);
@@ -1313,6 +1316,7 @@ fn build_empty_router() -> axum::Router {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("empty".to_string(), layer_styles);
@@ -1457,6 +1461,7 @@ fn build_multi_param_router() -> axum::Router {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("wx".to_string(), layer_styles);
@@ -3130,6 +3135,7 @@ fn palette_style(name: &str, palette: &str, parameter: Option<&str>) -> StyleInf
         min: resolved.min,
         max: resolved.max,
         parameter: parameter.map(str::to_string),
+        contour: None,
     }
 }
 

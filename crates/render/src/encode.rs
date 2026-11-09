@@ -280,33 +280,40 @@ pub fn draw_over(below: &mut [u8], above: &[u8]) -> Result<(), DataServerError> 
     let (below, _) = below.as_chunks_mut::<4>();
     let (above, _) = above.as_chunks::<4>();
     for (pixel, &top) in below.iter_mut().zip(above) {
-        let (a, b) = (top[3] as u32, pixel[3] as u32);
-        *pixel = match (a, b) {
-            (255, _) | (_, 0) => top,
-            (0, _) => *pixel,
-            (_, 255) => {
-                let [r, g, bl] = over(top, [pixel[0], pixel[1], pixel[2]]);
-                [r, g, bl, 255]
-            }
-            _ => {
-                // Both weights are scaled by 255: `a·255` for the pixel above,
-                // `b·(255 − a)` for the one below; their sum is the result's
-                // alpha scaled by 255, at most 255².
-                let (top_weight, below_weight) = (a * 255, b * (255 - a));
-                let sum = top_weight + below_weight;
-                let blend = |t: u8, u: u8| {
-                    ((t as u32 * top_weight + u as u32 * below_weight + sum / 2) / sum) as u8
-                };
-                [
-                    blend(top[0], pixel[0]),
-                    blend(top[1], pixel[1]),
-                    blend(top[2], pixel[2]),
-                    ((sum + 127) / 255) as u8,
-                ]
-            }
-        };
+        over_pixel(pixel, top);
     }
     Ok(())
+}
+
+/// [`draw_over`] for one pixel: `top` over `pixel`, in place. Contour lines
+/// are drawn over their fill with it (#1378).
+#[inline]
+pub(crate) fn over_pixel(pixel: &mut [u8; 4], top: [u8; 4]) {
+    let (a, b) = (top[3] as u32, pixel[3] as u32);
+    *pixel = match (a, b) {
+        (255, _) | (_, 0) => top,
+        (0, _) => *pixel,
+        (_, 255) => {
+            let [r, g, bl] = over(top, [pixel[0], pixel[1], pixel[2]]);
+            [r, g, bl, 255]
+        }
+        _ => {
+            // Both weights are scaled by 255: `a·255` for the pixel above,
+            // `b·(255 − a)` for the one below; their sum is the result's
+            // alpha scaled by 255, at most 255².
+            let (top_weight, below_weight) = (a * 255, b * (255 - a));
+            let sum = top_weight + below_weight;
+            let blend = |t: u8, u: u8| {
+                ((t as u32 * top_weight + u as u32 * below_weight + sum / 2) / sum) as u8
+            };
+            [
+                blend(top[0], pixel[0]),
+                blend(top[1], pixel[1]),
+                blend(top[2], pixel[2]),
+                ((sum + 127) / 255) as u8,
+            ]
+        }
+    };
 }
 
 /// Encode an RGBA buffer to JPEG bytes at `quality` (1–100).

@@ -133,6 +133,10 @@ impl MapRender {
 pub(crate) enum Paint {
     /// One parameter through its style's colormap.
     Colormap(Arc<dyn ColorMap>),
+    /// One parameter's contour lines (#1378), over the style's colormap
+    /// when it has a fill: read grown by the lines' margin, traced and
+    /// drawn by `ds_render::ContourPlan`.
+    Contour(ds_render::ContourPaint),
     /// An RGB composite layer (#819): its bands from `get_raster_tiles`,
     /// composed by its channels. It has one style, `default`.
     Composite(Arc<CompositeSpec>),
@@ -142,7 +146,7 @@ impl Paint {
     /// Value planes a render holds at once, for memory admission.
     fn planes(&self) -> usize {
         match self {
-            Paint::Colormap(_) => 1,
+            Paint::Colormap(_) | Paint::Contour(_) => 1,
             Paint::Composite(spec) => spec.parameters.len(),
         }
     }
@@ -567,9 +571,13 @@ fn resolve_map_layer(state: &WmsState, layer: &str, style: &str) -> Result<MapLa
                     ))
                 }
             })?;
+            let paint = match ds_render::ContourPaint::of(resolved.style, &info) {
+                Some(contour) => Paint::Contour(contour),
+                None => Paint::Colormap(resolved.style.colormap.clone()),
+            };
             (
                 resolved.layer.to_string(),
-                Paint::Colormap(resolved.style.colormap.clone()),
+                paint,
                 resolved.style.name.clone(),
                 resolved.parameter.map(str::to_string),
             )
@@ -1343,19 +1351,16 @@ pub async fn wms_handler(
 
             let (width, height) = legend_size(&query);
 
-            let colormap = style_info.colormap.clone();
-            let min = style_info.min;
-            let max = style_info.max;
-
             // Title shared with the Maps/Tiles legend endpoints so the three
             // services label the same style identically.
             let title = ds_render::legend_title(style_info, param.as_deref(), unit.as_deref());
+            // A contour style's legend is its line swatch (#1378).
+            let style_info = style_info.clone();
 
             let legend_bytes = tokio::task::spawn_blocking(move || {
-                ds_render::render_legend(
-                    colormap.as_ref(),
-                    min,
-                    max,
+                ds_render::render_style_legend(
+                    &style_info,
+                    unit.as_deref(),
                     width,
                     height,
                     format,
@@ -1494,7 +1499,7 @@ fn render_layer(
     // A composite's bands, in the plane order its spec reads.
     let bands: Vec<&str> = match &layer.paint {
         Paint::Composite(spec) => spec.parameters.iter().map(String::as_str).collect(),
-        Paint::Colormap(_) => Vec::new(),
+        Paint::Colormap(_) | Paint::Contour(_) => Vec::new(),
     };
     // Bands that share no scan resolve no time (#819): nothing to draw,
     // and nothing to cache under a key that names no timestep.
@@ -1534,6 +1539,32 @@ fn render_layer(
                 let colorize_start = Instant::now();
                 let rgba = ds_render::render_tile_rgba(&tile, colormap.as_ref())?;
                 phases.add(RenderPhase::Encode, colorize_start.elapsed());
+                rgba
+            }
+            Paint::Contour(contour) => {
+                // The view grown by the lines' margin, through the same
+                // domain helper: lines leaving the view meet the next one.
+                let plan = contour.plan(bbox, width, height, output_crs);
+                let Some(tile) = ds_core::map_engine::get_raster_tile_in_domain(
+                    engine,
+                    plan.fetch_bbox(),
+                    plan.fetch_width(),
+                    plan.fetch_height(),
+                    time,
+                    plan.fetch_crs(),
+                    parameter,
+                    elevation,
+                    reference_time,
+                )?
+                else {
+                    return Ok((None, phases));
+                };
+                phases.add(RenderPhase::Engine, engine_start.elapsed());
+                let draw_start = Instant::now();
+                let Some(rgba) = contour.draw(&plan, &tile)? else {
+                    return Ok((None, phases));
+                };
+                phases.add(RenderPhase::Encode, draw_start.elapsed());
                 rgba
             }
             Paint::Composite(spec) => {
@@ -1585,6 +1616,29 @@ fn render_layer(
             height,
             prefix,
             colormap.as_ref(),
+            tile_cache,
+            |tbbox, tw, th, tile_output| {
+                engine.get_raster_tile(
+                    tbbox,
+                    tw,
+                    th,
+                    time,
+                    tile_output,
+                    parameter,
+                    elevation,
+                    reference_time,
+                )
+            },
+        )?,
+        Paint::Contour(contour) => ds_render::assemble_metatiled_contours(
+            bbox,
+            output_crs,
+            width,
+            height,
+            prefix,
+            &contour.style,
+            contour.fill.as_deref(),
+            contour.source_deg,
             tile_cache,
             |tbbox, tw, th, tile_output| {
                 engine.get_raster_tile(

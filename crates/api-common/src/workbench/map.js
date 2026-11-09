@@ -318,6 +318,7 @@
         Object.assign(state, change);
         if (!changed.length) return;
         if (changed.includes('mode')) applyMode();
+        else if (changed.includes('parameter-name')) syncStyles();
         // Another layer: nothing buffered or failed for the old one counts.
         if (changed.some(key => LAYER_KEYS.includes(key))) resetFrames();
         if (changed.includes('parameter-name')) rebind();
@@ -1069,7 +1070,18 @@
       // theme: the palette stops over the style's range, linear or stepped,
       // titled with the parameter's label and unit, at the data's opacity.
       function drawLegend(legend, styleTitle) {
-        if (Array.isArray(legend.channels)) {
+        if (legend.contour && !Array.isArray(legend.stops)) {
+          // Contour lines alone (#1378): the line and what it marks.
+          const list = document.createElement('ul'); list.className = 'map-legend-channels';
+          const item = document.createElement('li');
+          const swatch = document.createElement('span'); swatch.className = 'contour-swatch';
+          const color = /^#[0-9a-f]{6}([0-9a-f]{2})?$/i.test(legend.contour.color || '') ? legend.contour.color : 'currentColor';
+          const width = Math.min(8, Math.max(1, Number(legend.contour.width) || 1));
+          swatch.style.borderTop = `${width}px solid ${color}`;
+          const text = document.createElement('span'); text.textContent = String(legend.contour.description || '');
+          item.append(swatch,text); list.append(item);
+          legendScale.replaceChildren(list);
+        } else if (Array.isArray(legend.channels)) {
           // An RGB composite: one line per channel, no colour bar.
           const list = document.createElement('ul'); list.className = 'map-legend-channels';
           legend.channels.forEach(channel => {
@@ -1110,6 +1122,12 @@
         const known = findParameter(name);
         defaultParameter = known?.name || name;
         if (parameter) parameter.options[0].textContent = `Default · ${known?.label || name}`;
+        // A style only other parameters offer is no choice for this one.
+        if (!state['parameter-name']) {
+          const before = state.style;
+          syncStyles();
+          if (state.style !== before) render();
+        }
         syncLayer();
         if (shown && statusShowsFrame) showing(shown);
         // The default parameter on its own axis: the time bar follows it.
@@ -1125,7 +1143,7 @@
       const legends = new Map();
       function legendDocument(href, choice) {
         const url = new URL(href, location.href);
-        if (choice) url.searchParams.set('parameter-name',choice); else url.searchParams.delete('parameter-name');
+        if (choice) url.searchParams.set('parameter-name',choice);
         url.searchParams.set('f','json');
         if (!legends.has(url.href)) {
           legends.set(url.href, (async () => {
@@ -1547,6 +1565,36 @@
         }
         return tilesets.get(key);
       }
+      // The parameters whose layers alone offer a style option (a
+      // parameter's built-in contours, #1378), or none for every parameter.
+      function styleParameters(option) {
+        const list = option?.dataset.parameters;
+        return list ? list.split(',').filter(Boolean) : undefined;
+      }
+      // The parameter drawn: the one chosen, else the server's default,
+      // once a legend has named it.
+      const drawnParameter = () => state['parameter-name'] || defaultParameter || (parameters.length === 1 ? parameters[0].name : '');
+      // Which styles the mode and the parameter drawn allow: WMS serves
+      // every style by name, Maps and map tiles where linked, and a style
+      // only some parameters offer while one of them is drawn (before the
+      // default is known it stays offered).
+      function syncStyles() {
+        const mode = state.mode, drawn = drawnParameter();
+        let usable = 0;
+        for (const option of style.options) {
+          const only = styleParameters(option);
+          option.disabled = (mode === 'maps' ? !option.value : mode === 'tiles' ? !option.dataset.tiles : false)
+            || Boolean(only && drawn && !only.includes(drawn));
+          if (!option.disabled) usable++;
+        }
+        if (style.selectedOptions[0]?.disabled) {
+          const first = [...style.options].findIndex(option => !option.disabled);
+          if (first >= 0) style.selectedIndex = first;
+        }
+        state.style = Math.max(0, style.selectedIndex);
+        // One style is no choice.
+        styleField.hidden = mode === 'vector' || usable < 2;
+      }
       function applyMode() {
         const mode = state.mode;
         const vector = mode === 'vector';
@@ -1558,26 +1606,24 @@
         if (bar) bar.hidden = vector || !axis.length;
         // A vector-only collection has nothing to choose: no controls at all.
         block.hidden = vector && modes.length === 1;
-        let usable = 0;
-        for (const option of style.options) {
-          // WMS serves every style by name; Maps and map tiles where linked.
-          option.disabled = mode === 'maps' ? !option.value : mode === 'tiles' ? !option.dataset.tiles : false;
-          if (!option.disabled) usable++;
-        }
-        if (style.selectedOptions[0]?.disabled) {
-          const first = [...style.options].findIndex(option => !option.disabled);
-          if (first >= 0) style.selectedIndex = first;
-        }
-        state.style = Math.max(0, style.selectedIndex);
-        // One style is no choice.
-        styleField.hidden = vector || usable < 2;
+        syncStyles();
         link.textContent = mode === 'maps' || mode === 'wms' ? 'Open ↗' : 'Open tileset ↗';
         if (ladder) ladder.hidden = vector;
         measureDock();
         if (help) help.textContent = vector ? 'Vector tiles load as you pan and zoom: feature geometry in one outline color.' : generalHelp;
       }
-      // The request a render makes, fixed when it starts.
-      const snapshot = () => ({ ...state });
+      // The request a render makes, fixed when it starts. A style only some
+      // parameters offer is drawn for one of them: the parameter drawn when
+      // it is one, else the first, which its links name.
+      function snapshot() {
+        const want = { ...state };
+        const only = styleParameters(style.options[want.style]);
+        if (only && !want['parameter-name']) {
+          const drawn = drawnParameter();
+          want['parameter-name'] = only.includes(drawn) ? drawn : only[0];
+        }
+        return want;
+      }
       const pixelRatio = () => typeof devicePixelRatio === 'number' && devicePixelRatio > 0 ? devicePixelRatio : 1;
       let timer;
       function render(attempt = 0, refill = false) {
@@ -1631,8 +1677,13 @@
         if (want.datetime) params.set('datetime',want.datetime);
         if (want.elevation) params.set('elevation',want.elevation);
         if (pixelRatio() >= 1.5) { params.set('width','512'); params.set('height','512'); }
-        const query = params.toString();
-        return query ? `${tileset.template}${tileset.template.includes('?') ? '&' : '?'}${query}` : tileset.template;
+        // The template's own query (a style only one parameter's layer
+        // offers names it) gives way to the request's.
+        const [path, own = ''] = tileset.template.split('?');
+        const merged = new URLSearchParams(own);
+        params.forEach((value, key) => merged.set(key, value));
+        const query = merged.toString();
+        return query ? `${path}?${query}` : path;
       }
       // Whether the view reaches the tileset at all: outside it no tile is
       // requested, which is no lack of data.
@@ -1716,7 +1767,9 @@
         url.searchParams.set('bbox-crs','CRS:84'); url.searchParams.set('crs','EPSG:3857');
         url.searchParams.set('width',view.width); url.searchParams.set('height',view.height);
         url.searchParams.set('f','image/png'); url.searchParams.set('transparent','true');
-        ['parameter-name','datetime','elevation'].forEach(key => { if (want[key]) url.searchParams.set(key,want[key]); else url.searchParams.delete(key); });
+        // A link's own `parameter-name` (a style only that parameter's layer
+        // offers) stays unless another is chosen.
+        ['parameter-name','datetime','elevation'].forEach(key => { if (want[key]) url.searchParams.set(key,want[key]); else if (key !== 'parameter-name') url.searchParams.delete(key); });
         return url;
       }
       // EPSG:3857 metres from MapLibre's own Web Mercator. Nothing is

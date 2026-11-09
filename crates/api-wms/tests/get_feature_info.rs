@@ -361,6 +361,7 @@ fn style() -> HashMap<String, StyleInfo> {
             min: 250.0,
             max: 300.0,
             parameter: None,
+            contour: None,
         },
     )])
 }

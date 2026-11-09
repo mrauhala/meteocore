@@ -1931,6 +1931,7 @@ mod tests {
                 min: 0.0,
                 max: 1.0,
                 parameter: None,
+                contour: None,
             },
         );
         wms.styles.insert("radar-wms".into(), styles);
@@ -3418,6 +3419,7 @@ mod tests {
                 min: 0.0,
                 max: 1.0,
                 parameter: None,
+                contour: None,
             },
         );
         let desc = raster_tile_descriptor("radar", "http://localhost:8000", Some(&styles));

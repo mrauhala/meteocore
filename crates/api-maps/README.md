@@ -164,6 +164,16 @@ that parameter's own layer when one is configured; without it, on a
 multi-parameter collection, from the default parameter's layer. An RGB
 composite has only the `default` style; any other style is a 404.
 
+The style lists (`…/styles` and the collection's `styles`) name the
+collection's own styles first, then those only some parameter layers offer,
+such as a parameter's built-in `contours` (#1378), with a `parameters` member
+naming those layers and map and legend links carrying `parameter-name` for
+the first. A contour style draws its lines (over its fill when it has one),
+read a pixel or two past the map's edges so they meet the next map's; its
+legend is a line swatch and `every 4 hPa`, and the JSON carries a `contour`
+member (`interval`, `base`, `color`, `width`, `fill`, `description`) and,
+for lines alone, no stops.
+
 The legend takes `f` (`json`, the default, or `png`; media types work too) and
 `parameter-name`. JSON gives the palette stops, value range and interpolation
 for a client to draw its own legend; PNG is a 180 × 300 image. A composite's

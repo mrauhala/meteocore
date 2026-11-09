@@ -6446,6 +6446,15 @@ pub fn load_collections(
         ],
         &mut edr_styles,
     );
+    default_root_contours(
+        style_ctx,
+        &bundle_index,
+        [
+            (&map_engines, &map_collections, &mut map_styles),
+            (&maps_engines, &maps_collections, &mut maps_styles),
+            (&tiles_engines, &tiles_collections, &mut tiles_styles),
+        ],
+    );
 
     // Both render cache sizes are server-wide settings, passed in as single
     // values: the meta-tile pixel cache (#202, `[server] metatile_cache_mb`,
@@ -6762,6 +6771,7 @@ fn fallback_default_styles(ctx: &ds_render::StyleContext) -> HashMap<String, ds_
             min: r.min,
             max: r.max,
             parameter: None,
+            contour: None,
         },
     );
     styles
@@ -6853,6 +6863,52 @@ fn default_generic_root_layers(
     for (id, default) in decided {
         if let (Some(default), Some(layer)) = (default, edr_styles.get_mut(&id)) {
             layer.insert("default".to_string(), default);
+        }
+    }
+}
+
+/// The built-in contour style (#1378) on the root layer of every map
+/// collection whose engine draws one parameter there, once per collection
+/// of a load: such a collection is one WMS layer, its own, so the
+/// `contours` style a parameter layer gets
+/// ([`ds_render::StyleContext::parameter_layer_styles`]) belongs on it too
+/// ([`ds_render::StyleContext::base_layer_contours`]). A multi-parameter
+/// collection's root layer offers only the collection's styles.
+fn default_root_contours(
+    ctx: &ds_render::StyleContext,
+    bundles: &HashMap<&str, &StyleBundle>,
+    registries: [MapRegistry<'_>; 3],
+) {
+    let mut decided: HashMap<String, Option<ds_render::StyleInfo>> = HashMap::new();
+    for (engines, collections, styles) in registries {
+        for (id, engine) in engines {
+            let Some(collection) = collections.get(id) else {
+                continue;
+            };
+            let contours = decided.entry(id.clone()).or_insert_with(|| {
+                let info = engine.raster_info_shared();
+                // Station symbols are no field to trace (#1204).
+                if info.parameters.len() > 1
+                    || info.parameter.is_empty()
+                    || is_station_symbol_collection(collection)
+                {
+                    return None;
+                }
+                let bundle = resolve_bundle(collection, bundles);
+                ctx.base_layer_contours(collection, bundle, &info.parameter, Some(&info.unit))
+                    .unwrap_or_else(|e| {
+                        tracing::error!(
+                            "Collection '{id}': built-in contour style for '{}' failed ({e})",
+                            info.parameter
+                        );
+                        None
+                    })
+            });
+            if let (Some(contours), Some(layer)) = (contours, styles.get_mut(id)) {
+                layer
+                    .entry(ds_render::CONTOUR_STYLE.to_string())
+                    .or_insert_with(|| contours.clone());
+            }
         }
     }
 }
@@ -6975,13 +7031,33 @@ fn collection_layer_styles(
     if is_station_symbol_collection(collection) {
         // Station symbol layers (#1063, #1204): every style of the
         // collection, so no path draws the transparent ground in an opaque
-        // nodata colour or a nodata marker as a value.
+        // nodata colour or a nodata marker as a value. Their pixels are
+        // symbols, not a field, so they get no built-in contour lines
+        // (#1378); a contour style the collection names stays.
         for styles in layers.values_mut() {
             styles.values_mut().for_each(wrap_station_symbols);
+            if !names_style(collection, bundle, ds_render::CONTOUR_STYLE) {
+                styles.remove(ds_render::CONTOUR_STYLE);
+            }
         }
     }
     cache.insert(collection.id.clone(), layers.clone());
     layers
+}
+
+/// Whether `collection` configures a style called `name`, inline or through
+/// its bundle.
+fn names_style(collection: &CollectionConfig, bundle: Option<&StyleBundle>, name: &str) -> bool {
+    let inline = collection
+        .wms
+        .iter()
+        .flat_map(|w| &w.styles)
+        .filter_map(|s| s.effective_name());
+    let bundled = bundle
+        .into_iter()
+        .flat_map(|b| &b.extras)
+        .filter_map(|e| e.effective_name());
+    inline.chain(bundled).any(|n| n == name)
 }
 
 /// A station symbol layer's colormap (#1063, #1204): the transparent ground
@@ -7397,6 +7473,10 @@ pub(crate) fn do_reload(state: &AdminState) -> Result<ReloadOutcome, ReloadError
     // `[wms]` fallback like `metatile_cache_mb` (#1028): `AcceptedLoad::new`
     // takes the size, its warnings are logged once here.
     for warning in config.rendered_cache_mb().1 {
+        tracing::warn!("{warning}");
+    }
+    // Keys a style entry does not know load, but are reported (#1378).
+    for warning in config.style_key_warnings() {
         tracing::warn!("{warning}");
     }
 
@@ -14914,6 +14994,122 @@ max = 30.0
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (_, metadata) = get("/collections/radar").await;
         assert!(metadata["data_queries"].get("items").is_none());
+    }
+
+    /// Built-in contour styles at load (#1378): a collection drawing one
+    /// parameter offers `contours` on its own layer in every map API, a
+    /// multi-parameter one only on its parameter layers, a configured style
+    /// of that name is kept, and station symbol layers get none.
+    #[test]
+    fn root_layers_of_one_parameter_offer_built_in_contours() {
+        use ds_core::map_engine::{MapEngine, ParameterInfo, RasterInfo};
+        struct Info(RasterInfo);
+        impl MapEngine for Info {
+            fn get_raster_tile(
+                &self,
+                _: [f64; 4],
+                _: u32,
+                _: u32,
+                _: Option<chrono::DateTime<chrono::Utc>>,
+                _: &ds_core::map_engine::OutputCrs,
+                _: Option<&str>,
+                _: Option<f64>,
+                _: Option<chrono::DateTime<chrono::Utc>>,
+            ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError>
+            {
+                unreachable!("styles never render")
+            }
+            fn raster_info(&self) -> RasterInfo {
+                self.0.clone()
+            }
+        }
+        let info = |parameters: &[(&str, &str)]| RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: None,
+            times: Vec::new(),
+            parameter: "msl".into(),
+            unit: "hPa".into(),
+            parameters: parameters
+                .iter()
+                .map(|(name, unit)| ParameterInfo {
+                    name: name.to_string(),
+                    title: name.to_string(),
+                    unit: unit.to_string(),
+                })
+                .collect(),
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+            native_grid: None,
+        };
+        let collection = |id: &str, engine_type: &str, extra: &str| -> CollectionConfig {
+            toml::from_str(&format!(
+                "id = \"{id}\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"{engine_type}\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        let named = "[wms]\ncolormap = \"pressure\"\n[[wms.styles]]\nname = \"contours\"\n\
+                     contour = { interval = 1.0 }\n";
+        let cases: [(&str, &str, &str, RasterInfo); 4] = [
+            ("one", "geotiff", "", info(&[])),
+            ("many", "grib", "", info(&[("msl", "hPa"), ("2t", "K")])),
+            ("named", "geotiff", named, info(&[])),
+            ("obs", "csv", "", info(&[])),
+        ];
+        let ctx = ds_render::StyleContext::with_builtins();
+        let bundles = HashMap::new();
+        let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+        let mut collections = HashMap::new();
+        let mut cache = HashMap::new();
+        let mut styles = HashMap::new();
+        for (id, engine_type, extra, info) in cases {
+            let config = collection(id, engine_type, extra);
+            styles.extend(collection_layer_styles(
+                &ctx,
+                &mut cache,
+                &config,
+                &info.parameters,
+                &bundles,
+            ));
+            engines.insert(id.to_string(), Arc::new(Info(info)));
+            collections.insert(id.to_string(), config);
+        }
+        let (mut maps, mut tiles) = (styles.clone(), styles.clone());
+        super::default_root_contours(
+            &ctx,
+            &bundles,
+            [
+                (&engines, &collections, &mut styles),
+                (&engines, &collections, &mut maps),
+                (&engines, &collections, &mut tiles),
+            ],
+        );
+        let interval = |styles: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+                        layer: &str| {
+            styles[layer]
+                .get(ds_render::CONTOUR_STYLE)
+                .map(|s| s.contour.as_ref().unwrap().interval)
+        };
+        for registry in [&styles, &maps, &tiles] {
+            assert_eq!(interval(registry, "one"), Some(4.0));
+            assert_eq!(interval(registry, "many"), None);
+            assert_eq!(interval(registry, "many/msl"), Some(4.0));
+            assert_eq!(interval(registry, "many/2t"), Some(2.0));
+            assert_eq!(interval(registry, "named"), Some(1.0));
+            assert_eq!(interval(registry, "obs"), None);
+        }
+        // A station collection's parameter layers get none either.
+        let obs = collection("obs-params", "csv", "");
+        let layers = collection_layer_styles(
+            &ctx,
+            &mut cache,
+            &obs,
+            &info(&[("msl", "hPa")]).parameters,
+            &bundles,
+        );
+        assert!(!layers["obs-params/msl"].contains_key(ds_render::CONTOUR_STYLE));
     }
 
     #[test]

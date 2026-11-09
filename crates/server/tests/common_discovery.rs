@@ -2547,6 +2547,7 @@ fn styled_app(surface: &str) -> (Router, String) {
         min: 0.0,
         max: 1.0,
         parameter: None,
+        contour: None,
     };
     let styles: HashMap<String, HashMap<String, ds_render::StyleInfo>> = configs
         .keys()

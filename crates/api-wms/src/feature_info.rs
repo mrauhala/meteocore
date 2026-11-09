@@ -357,14 +357,14 @@ impl Query {
                     .collect();
                 (Read::Bands(point_engine()?, spec.parameters.clone()), units)
             }
-            Paint::Colormap(_)
+            Paint::Colormap(_) | Paint::Contour(_)
                 if parameter
                     .as_deref()
                     .is_some_and(|parameter| resolved.engine.layer_picks_features(parameter)) =>
             {
                 (Read::Features(resolved.engine.clone()), Vec::new())
             }
-            Paint::Colormap(_) => {
+            Paint::Colormap(_) | Paint::Contour(_) => {
                 if !layer_is_queryable(
                     &state.point_engines,
                     &resolved.collection_id,

@@ -29,12 +29,7 @@ impl TilesBlock {
 }
 
 fn contribution(state: &TilesState, sources: &TileSources<'_>, root: &str) -> Contribution {
-    let (fields, links) = handlers::collection_parts(
-        sources,
-        state.styles.get(&sources.config.id),
-        Layout::Shared,
-        root,
-    );
+    let (fields, links) = handlers::collection_parts(sources, &state.styles, Layout::Shared, root);
     Contribution {
         config: sources.config.clone(),
         fields,
@@ -141,13 +136,23 @@ impl BuildingBlock for TilesBlock {
                 "/collections/{id}/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
                 get(handlers::map_tile),
             )
+            // A style only a parameter's layer offers (its built-in
+            // `contours`, #1378) is listed for that `parameter-name`.
             .route(
                 "/collections/{id}/styles/{styleId}/map/tiles",
-                api_common::errors::json_only_get(handlers::styled_map_tilesets, "a tileset list"),
+                api_common::errors::json_only_get_with(
+                    handlers::styled_map_tilesets,
+                    "a tileset list",
+                    STYLED_TILESET_PARAMETERS,
+                ),
             )
             .route(
                 "/collections/{id}/styles/{styleId}/map/tiles/{tileMatrixSetId}",
-                api_common::errors::json_only_get(handlers::styled_map_tileset, "a tileset"),
+                api_common::errors::json_only_get_with(
+                    handlers::styled_map_tileset,
+                    "a tileset",
+                    STYLED_TILESET_PARAMETERS,
+                ),
             )
             .route(
                 "/collections/{id}/styles/{styleId}/map/tiles/{tileMatrixSetId}/{tileMatrix}/{tileRow}/{tileCol}",
@@ -168,6 +173,9 @@ impl BuildingBlock for TilesBlock {
             .with_state(self.state.clone())
     }
 }
+
+/// The query parameters of a styled map tileset list and tileset.
+const STYLED_TILESET_PARAMETERS: &[&str] = &["f", "parameter-name"];
 
 fn path_parameter(name: &str, schema: Value, description: &str) -> Value {
     json!({"name": name, "in": "path", "required": true, "schema": schema,
@@ -315,6 +323,14 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
                 raster_query(),
                 binary(&raster_formats),
             );
+            // The styled list and tileset take the `parameter-name` whose
+            // layer offers a style the collection's own layer has not.
+            let styled = format!("{m}/collections/{id}/styles/{{styleId}}/map/tiles");
+            for path in [styled.clone(), format!("{styled}/{{tileMatrixSetId}}")] {
+                if let Some(parameters) = paths[&path]["get"]["parameters"].as_array_mut() {
+                    parameters.push(json!({"$ref": "#/components/parameters/parameter-name"}));
+                }
+            }
             // A time selection with no time step is an empty map tile.
             for list in [
                 format!("{m}/collections/{id}/map/tiles"),

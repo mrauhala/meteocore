@@ -1297,8 +1297,17 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
         escape(default_mode)
     ));
     for style in styles {
+        // The parameters whose layers alone offer the style (#1378): the
+        // script offers it only while one of them is drawn.
+        let parameters = style["parameters"]
+            .as_array()
+            .map(|names| {
+                let names: Vec<&str> = names.iter().filter_map(Value::as_str).collect();
+                format!(" data-parameters=\"{}\"", escape(&names.join(",")))
+            })
+            .unwrap_or_default();
         card.push_str(&format!(
-            "<option value=\"{}\" data-id=\"{}\" data-tiles=\"{}\" data-legend=\"{}\">{}</option>",
+            "<option value=\"{}\" data-id=\"{}\" data-tiles=\"{}\" data-legend=\"{}\"{parameters}>{}</option>",
             escape(maps_href(style).unwrap_or_default()),
             escape(style["id"].as_str().unwrap_or_default()),
             escape(style["tiles"].as_str().map(safe_href).unwrap_or_default()),
@@ -1371,6 +1380,12 @@ pub fn map_html(base: &str, features: &Value, quicklook: bool, fallback: &str) -
             let Some(href) = maps_href(style) else {
                 continue;
             };
+            // A GET form replaces the action's query with its fields, so the
+            // `parameter-name` a parameter-only style's link names (#1378)
+            // would be lost: those styles are the script's alone.
+            if style["parameters"].is_array() {
+                continue;
+            }
             if i == 0 {
                 card.push_str("<button class=\"btn primary\">Open map image</button>");
             } else {
@@ -1525,7 +1540,13 @@ pub fn collection_page(
             let href = map_link(style_links).filter(safe);
             let tiles = map_tilesets_link(style_links).filter(safe);
             if href.is_some() || tiles.is_some() {
-                styles.push(json!({"id":style["id"],"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"tiles":tiles,"legend":legend(style)}));
+                let mut entry = json!({"id":style["id"],"title":style["title"].as_str().or(style["id"].as_str()).unwrap_or("Style"),"href":href,"tiles":tiles,"legend":legend(style)});
+                // A style only some parameters' layers offer (a parameter's
+                // built-in `contours`, #1378): offered with those only.
+                if let Some(parameters) = style["parameters"].as_array().filter(|p| !p.is_empty()) {
+                    entry["parameters"] = Value::Array(parameters.clone());
+                }
+                styles.push(entry);
             }
         }
         // WMS draws a raster collection, as the layer named by its id.
@@ -5290,6 +5311,48 @@ mod tests {
         let start = html.find("<div class=\"map-panel map-raster\">").unwrap();
         let end = start + html[start..].find("<script").unwrap();
         format!("{}\n", &html[start..end])
+    }
+
+    /// A style only some parameters' layers offer (#1378): its option names
+    /// them for the script, which offers it only while one is drawn, and
+    /// it gets no no-script button, whose GET form would drop the
+    /// `parameter-name` its link carries.
+    #[test]
+    fn parameter_only_styles_name_their_parameters() {
+        let shared = Surface {
+            base: "https://x",
+            root: "https://x",
+            api: crate::shared::WORKSPACE,
+        };
+        let q = "?parameter-name=msl";
+        let doc = json!({"id":"nwp","title":"NWP",
+            "links":[{"rel":"self","href":"https://x/collections/nwp"},
+                {"rel":rel::MAP,"href":"https://x/collections/nwp/map"}],
+            "styles":[{"id":"default","title":"Default","links":[]},
+                {"id":"contours","title":"contours","parameters":["msl","2t"],"links":[
+                    {"rel":rel::MAP,"href":format!("https://x/collections/nwp/styles/contours/map{q}")},
+                    {"rel":rel::TILESETS_MAP,"href":format!("https://x/collections/nwp/styles/contours/map/tiles{q}")},
+                    {"rel":rel::LEGEND,"href":format!("https://x/collections/nwp/styles/contours/legend{q}")}]}]});
+        let html = collection_page(shared, &doc, None, None, &wms_at("https://x/wms"));
+        assert!(
+            html.contains(&format!(
+                "<option value=\"https://x/collections/nwp/styles/contours/map{}\" \
+                 data-id=\"contours\" data-tiles=\"https://x/collections/nwp/styles/contours/map/tiles{}\" \
+                 data-legend=\"https://x/collections/nwp/styles/contours/legend{}\" \
+                 data-parameters=\"msl,2t\">contours</option>",
+                escape(q),
+                escape(q),
+                escape(q)
+            )),
+            "{html}"
+        );
+        let noscript = html
+            .split("<noscript><p>Without JavaScript")
+            .nth(1)
+            .and_then(|rest| rest.split("</noscript>").next())
+            .unwrap();
+        assert!(noscript.contains("Open map image"), "{noscript}");
+        assert!(!noscript.contains("contours"), "{noscript}");
     }
 
     /// The fixture the node tests read is the markup this crate renders.

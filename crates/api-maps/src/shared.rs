@@ -29,13 +29,8 @@ fn contribution(
 ) -> Option<Contribution> {
     let engine = state.engines.get(&config.id)?;
     let info = engine.raster_info_shared();
-    let (fields, links) = handlers::collection_parts(
-        config,
-        engine.as_ref(),
-        &info,
-        state.styles.get(&config.id),
-        root,
-    );
+    let (fields, links) =
+        handlers::collection_parts(config, engine.as_ref(), &info, &state.styles, root);
     Some(Contribution {
         config: config.clone(),
         fields,

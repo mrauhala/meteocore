@@ -407,6 +407,64 @@ impl OutputCrs {
             }
         }
     }
+
+    /// The `width`×`height` view over `wgs84_bbox`, grown by `margin`
+    /// pixels on every side: the WGS84 box and output CRS of a
+    /// `(width + 2·margin)`×`(height + 2·margin)` render whose pixel
+    /// `(x + margin, y + margin)` has the centre of the view's pixel
+    /// `(x, y)`. A render that reads past its own edges (contour lines that
+    /// must meet the same line in the next tile, #1378) asks the engine for
+    /// this view instead of re-deriving the axes.
+    ///
+    /// Each axis grows linearly in the output CRS's own coordinates, as
+    /// [`Self::project_node`] lays the pixels out: degrees for `Wgs84`,
+    /// Mercator metres for `WebMercator` (through [`crate::web_mercator`]),
+    /// the carried metres for `Projected`, whose WGS84 read envelope is
+    /// recomputed ([`crate::geo::wgs84_envelope`], the view's own when the
+    /// grown box has none). Nothing is clamped (Critical Rule 4): a
+    /// geographic view may now reach past a pole, which
+    /// [`get_raster_tile_in_domain`] answers with nodata rows.
+    pub fn grown_by_pixels(
+        &self,
+        wgs84_bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        margin: u32,
+    ) -> ([f64; 4], OutputCrs) {
+        if margin == 0 || width == 0 || height == 0 {
+            return (wgs84_bbox, self.clone());
+        }
+        let m = f64::from(margin);
+        let grow = |[x0, y0, x1, y1]: [f64; 4]| {
+            let dx = (x1 - x0) / f64::from(width) * m;
+            let dy = (y1 - y0) / f64::from(height) * m;
+            [x0 - dx, y0 - dy, x1 + dx, y1 + dy]
+        };
+        let [west, south, east, north] = wgs84_bbox;
+        match self {
+            OutputCrs::Wgs84 => (grow(wgs84_bbox), OutputCrs::Wgs84),
+            OutputCrs::WebMercator => {
+                // Longitude is linear in Mercator x, so it grows as degrees.
+                let [w, _, e, _] = grow(wgs84_bbox);
+                let [_, s, _, n] = grow([west, lat_to_merc_y(south), east, lat_to_merc_y(north)]);
+                (
+                    [w, merc_y_to_lat(s), e, merc_y_to_lat(n)],
+                    OutputCrs::WebMercator,
+                )
+            }
+            OutputCrs::Projected { crs, bbox } => {
+                let grown = grow(*bbox);
+                let envelope = crate::geo::wgs84_envelope(crs, grown).unwrap_or(wgs84_bbox);
+                (
+                    envelope,
+                    OutputCrs::Projected {
+                        crs: crs.clone(),
+                        bbox: grown,
+                    },
+                )
+            }
+        }
+    }
 }
 
 /// The projected metres `(e, n)` of the output position `(fx, fy)` in the
@@ -1430,6 +1488,51 @@ pub fn get_raster_tiles_in_domain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A grown view's pixel `(x + m, y + m)` has the centre of the view's
+    /// pixel `(x, y)`, in every output CRS, and its margin pixels continue
+    /// the same axes outward (#1378).
+    #[test]
+    fn grown_view_keeps_the_pixel_centres_of_the_view() {
+        let tm35fin = crate::geo::projected_output_crs("EPSG:3067").unwrap();
+        let metres = [200_000.0, 6_700_000.0, 456_000.0, 6_956_000.0];
+        let envelope = crate::geo::wgs84_envelope(&tm35fin, metres).unwrap();
+        let views = [
+            (OutputCrs::Wgs84, [10.0, 50.0, 20.0, 60.0]),
+            (OutputCrs::WebMercator, [10.0, 50.0, 20.0, 60.0]),
+            (
+                OutputCrs::Projected {
+                    crs: tm35fin,
+                    bbox: metres,
+                },
+                envelope,
+            ),
+        ];
+        let (width, height, margin) = (64u32, 48u32, 2u32);
+        for (crs, bbox) in views {
+            let (grown_bbox, grown_crs) = crs.grown_by_pixels(bbox, width, height, margin);
+            let (gw, gh) = (width + 2 * margin, height + 2 * margin);
+            for (x, y) in [(0i64, 0i64), (13, 7), (63, 47), (-2, -2), (65, 49)] {
+                let view = crs.project_node(
+                    bbox,
+                    (x as f64 + 0.5) / f64::from(width),
+                    (y as f64 + 0.5) / f64::from(height),
+                );
+                let grown = grown_crs.project_node(
+                    grown_bbox,
+                    ((x + i64::from(margin)) as f64 + 0.5) / f64::from(gw),
+                    ((y + i64::from(margin)) as f64 + 0.5) / f64::from(gh),
+                );
+                assert!(
+                    (view.0 - grown.0).abs() < 1e-9 && (view.1 - grown.1).abs() < 1e-9,
+                    "{crs:?} pixel ({x}, {y}): {view:?} vs {grown:?}"
+                );
+            }
+        }
+        // No margin: the view itself.
+        let (bbox, crs) = OutputCrs::WebMercator.grown_by_pixels([1.0, 2.0, 3.0, 4.0], 8, 8, 0);
+        assert_eq!((bbox, crs), ([1.0, 2.0, 3.0, 4.0], OutputCrs::WebMercator));
+    }
 
     /// `default_request_time`: the engine's own default wins, then the
     /// parameter's latest time, then the collection's.

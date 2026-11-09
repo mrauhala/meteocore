@@ -136,6 +136,15 @@ pub struct ParameterDefault {
     /// `m s-1`, `kg/m^2` matches `kg m-2`).
     #[serde(default)]
     pub unit_ranges: Vec<UnitRange>,
+    /// The `contours` style this rule offers next to the default fill
+    /// (#1378), unit-gated like `unit_ranges`. Unset, a parameter this rule
+    /// claims keeps the built-in table's contours; `contours = []` offers
+    /// none.
+    #[serde(default)]
+    pub contours: Option<Vec<UnitContour>>,
+    /// The `contours` style's title (default "Contours").
+    #[serde(default)]
+    pub contour_title: Option<String>,
 }
 
 /// One unit → range entry inside `[[parameter_defaults]]`.
@@ -144,6 +153,23 @@ pub struct UnitRange {
     pub unit: String,
     pub min: f64,
     pub max: f64,
+}
+
+/// One unit → contour lines entry inside `[[parameter_defaults]]`
+/// (`[[parameter_defaults.contours]]`): the fields of a style's `contour`
+/// table for a parameter in `unit`.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct UnitContour {
+    /// Matched as `unit_ranges` units are, in any spelling.
+    pub unit: String,
+    pub interval: f64,
+    #[serde(default)]
+    pub base: f64,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub width: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -940,6 +966,10 @@ pub struct WmsConfig {
     /// Collection-level only: not part of style bundles, which carry styles.
     #[serde(default)]
     pub webp_quality: Option<u8>,
+    /// Keys `[wms]` does not know, warned about at load
+    /// ([`ServerConfig::style_key_warnings`]).
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// Per-parameter default colormap configuration for WMS.
@@ -956,9 +986,18 @@ pub struct WmsParameterConfig {
     pub min: Option<f64>,
     /// Maximum value for this parameter's colormap range.
     pub max: Option<f64>,
+    /// Keys this entry does not know, warned about at load
+    /// ([`ServerConfig::style_key_warnings`]).
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// A named WMS style with its own colormap configuration.
+///
+/// Unknown keys load but are kept in `unknown_keys` and warned about at load
+/// ([`ServerConfig::style_key_warnings`]), so a key meant for the `contour`
+/// table (`interval = 4` directly in the style) is reported, while a stray
+/// key in a deployed config cannot stop the server at its next restart.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct WmsStyle {
     /// Style name. Optional when `colormap` is set — defaults to the
@@ -988,6 +1027,116 @@ pub struct WmsStyle {
     /// to draw. Mutually exclusive with `parameter`.
     #[serde(default)]
     pub parameters: Vec<String>,
+    /// Draw contour lines (#1378): isobars, isotherms, height contours.
+    /// With `colormap` or `color_stops` the lines are drawn over that fill;
+    /// without, the style is the lines alone and needs a `name`.
+    #[serde(default)]
+    pub contour: Option<ContourConfig>,
+    /// Keys this style does not know, warned about at load.
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, serde::de::IgnoredAny>,
+}
+
+/// Default contour line colour: opaque black.
+pub const DEFAULT_CONTOUR_COLOR: &str = "#000000";
+/// Default contour line width, in output pixels.
+pub const DEFAULT_CONTOUR_WIDTH: f64 = 1.0;
+/// The widest contour line, in output pixels. A render reads
+/// `ceil(width / 2 + 0.5)` pixels past its edges, so the cap bounds that
+/// margin.
+pub const MAX_CONTOUR_WIDTH: f64 = 8.0;
+
+/// A style's `contour` table (#1378): lines at every value `base + k ×
+/// interval`, in the parameter's served unit. Unknown keys are a load
+/// error.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContourConfig {
+    /// Spacing between lines, in the parameter's unit (`4` for hPa, `400`
+    /// for Pa). Positive and finite.
+    pub interval: f64,
+    /// A value a line passes through (default 0): `273.15` puts the 0 °C
+    /// isotherm on a kelvin field.
+    #[serde(default)]
+    pub base: f64,
+    /// Line colour, `#RRGGBB` or `#RRGGBBAA` (default black).
+    #[serde(default)]
+    pub color: Option<String>,
+    /// Line width in output pixels, anti-aliased (default 1, at most
+    /// [`MAX_CONTOUR_WIDTH`]).
+    #[serde(default)]
+    pub width: Option<f64>,
+}
+
+impl ContourConfig {
+    /// Check the values, naming `owner` in the error.
+    pub fn validate(&self, owner: &str) -> Result<(), crate::error::DataServerError> {
+        validate_contour(
+            owner,
+            self.interval,
+            self.base,
+            self.color.as_deref(),
+            self.width,
+        )
+    }
+}
+
+/// The checks every contour definition shares: a style's `contour` table
+/// and a `[[parameter_defaults.contours]]` entry.
+fn validate_contour(
+    owner: &str,
+    interval: f64,
+    base: f64,
+    color: Option<&str>,
+    width: Option<f64>,
+) -> Result<(), crate::error::DataServerError> {
+    use crate::error::DataServerError::Config;
+    if !(interval.is_finite() && interval > 0.0) {
+        return Err(Config(format!(
+            "{owner}: contour interval must be a positive number, got {interval}"
+        )));
+    }
+    if !base.is_finite() {
+        return Err(Config(format!(
+            "{owner}: contour base must be a finite number, got {base}"
+        )));
+    }
+    if let Some(color) = color {
+        validate_hex_color(color).map_err(|e| Config(format!("{owner}: contour color: {e}")))?;
+    }
+    if let Some(width) = width {
+        if !(width.is_finite() && width > 0.0 && width <= MAX_CONTOUR_WIDTH) {
+            return Err(Config(format!(
+                "{owner}: contour width must be more than 0 and at most \
+                 {MAX_CONTOUR_WIDTH} pixels, got {width}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a style's `contour` table against the style's own fields: a
+/// lines-only style (no `colormap`, no `color_stops`) has no fill whose
+/// range `min`/`max` could set.
+fn validate_style_contour(
+    owner: &str,
+    name: &str,
+    contour: Option<&ContourConfig>,
+    has_fill: bool,
+    has_range: bool,
+) -> Result<(), crate::error::DataServerError> {
+    let Some(contour) = contour else {
+        return Ok(());
+    };
+    let owner = format!("{owner} style '{name}'");
+    contour.validate(&owner)?;
+    if !has_fill && has_range {
+        return Err(crate::error::DataServerError::Config(format!(
+            "{owner}: min/max set the range of a fill under the contour lines; \
+             give the style a colormap or color_stops, or remove them"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -1098,6 +1247,89 @@ fn quoted_collection_ids(ids: &[&str]) -> String {
 }
 
 impl ServerConfig {
+    /// One WARN line for the caller to log per style block with keys it
+    /// does not know: a collection's `[wms]`, `[[wms.styles]]` and
+    /// `[[wms.parameters]]` entries, and a style bundle's default, extras
+    /// and parameter entries, naming the collection or bundle, the block
+    /// and the keys. They load anyway: one invalid collection file rejects
+    /// the whole config, so a stray key in a deployed config must not stop
+    /// the server at its next restart. A `contour` table (#1378) outside a
+    /// style entry or extra, where it draws nothing, says where it belongs.
+    /// The `contour` table itself rejects unknown keys.
+    pub fn style_key_warnings(&self) -> Vec<String> {
+        type Unknown = BTreeMap<String, serde::de::IgnoredAny>;
+        // `owner: unknown key(s) 'a', 'b' ignored`, and where a `contour`
+        // table sits outside a style, where it draws nothing, where it
+        // belongs.
+        fn warning(owner: String, unknown: &Unknown, styled: bool) -> Option<String> {
+            if unknown.is_empty() {
+                return None;
+            }
+            let keys: Vec<String> = unknown.keys().map(|k| format!("'{k}'")).collect();
+            let hint = if !styled && unknown.contains_key("contour") {
+                " (a contour table draws lines only in a [[wms.styles]] entry or a \
+                 [[style_bundles.extras]] entry)"
+            } else {
+                ""
+            };
+            Some(format!(
+                "{owner}: unknown key(s) {} ignored{hint}",
+                keys.join(", ")
+            ))
+        }
+        let mut warnings = Vec::new();
+        for bundle in &self.style_bundles {
+            let id = &bundle.id;
+            warnings.extend(warning(
+                format!("Style bundle '{id}' default"),
+                &bundle.default.unknown_keys,
+                false,
+            ));
+            for extra in &bundle.extras {
+                let name = extra.effective_name().unwrap_or("<unnamed>");
+                warnings.extend(warning(
+                    format!("Style bundle '{id}' extra '{name}'"),
+                    &extra.unknown_keys,
+                    true,
+                ));
+            }
+            for parameter in &bundle.parameters {
+                warnings.extend(warning(
+                    format!("Style bundle '{id}' parameters entry '{}'", parameter.name),
+                    &parameter.unknown_keys,
+                    false,
+                ));
+            }
+        }
+        for collection in &self.collections {
+            let Some(wms) = &collection.wms else {
+                continue;
+            };
+            let id = &collection.id;
+            warnings.extend(warning(
+                format!("Collection '{id}' [wms]"),
+                &wms.unknown_keys,
+                false,
+            ));
+            for style in &wms.styles {
+                let name = style.effective_name().unwrap_or("<unnamed>");
+                warnings.extend(warning(
+                    format!("Collection '{id}' [[wms.styles]] '{name}'"),
+                    &style.unknown_keys,
+                    true,
+                ));
+            }
+            for parameter in &wms.parameters {
+                warnings.extend(warning(
+                    format!("Collection '{id}' [[wms.parameters]] '{}'", parameter.name),
+                    &parameter.unknown_keys,
+                    false,
+                ));
+            }
+        }
+        warnings
+    }
+
     /// [`select_rendered_cache_mb`] over this config: `[server]
     /// rendered_cache_mb` and the collections.
     pub fn rendered_cache_mb(&self) -> (u64, Vec<String>) {
@@ -1157,9 +1389,14 @@ pub struct StyleBundleDefault {
     pub color_stops: Vec<ColorStop>,
     pub min: Option<f64>,
     pub max: Option<f64>,
+    /// Keys the default does not know, warned about at load
+    /// ([`ServerConfig::style_key_warnings`]).
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
-/// Named extra style inside a `StyleBundle`.
+/// Named extra style inside a `StyleBundle`. Unknown keys are warned about
+/// at load, as in [`WmsStyle`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct StyleBundleExtra {
     /// Style name. Optional when `colormap` is set — it then defaults to
@@ -1179,6 +1416,12 @@ pub struct StyleBundleExtra {
     /// [`WmsStyle::parameters`]. Mutually exclusive with `parameter`.
     #[serde(default)]
     pub parameters: Vec<String>,
+    /// Contour lines; see [`WmsStyle::contour`].
+    #[serde(default)]
+    pub contour: Option<ContourConfig>,
+    /// Keys this extra does not know, warned about at load.
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// A named, reusable colormap (`[[colormaps]]` in the top-level config, or
@@ -4768,6 +5011,21 @@ impl ServerConfig {
                     "{owner}: at least one of 'names' or 'contains' must be non-empty"
                 )));
             }
+            for contour in rule.contours.iter().flatten() {
+                let owner = format!("{owner} contours unit '{}'", contour.unit);
+                if contour.unit.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "{owner}: 'unit' must not be empty"
+                    )));
+                }
+                validate_contour(
+                    &owner,
+                    contour.interval,
+                    contour.base,
+                    contour.color.as_deref(),
+                    contour.width,
+                )?;
+            }
         }
 
         // Validate [[colormaps]]: each definition well-formed, names present
@@ -4852,6 +5110,13 @@ impl ServerConfig {
                     name,
                     extra.parameter.as_deref(),
                     &extra.parameters,
+                )?;
+                validate_style_contour(
+                    &format!("Style bundle '{}'", bundle.id),
+                    name,
+                    extra.contour.as_ref(),
+                    extra.colormap.is_some() || !extra.color_stops.is_empty(),
+                    extra.min.is_some() || extra.max.is_some(),
                 )?;
             }
             // Bundle per-parameter defaults (bundles v2): non-empty, unique
@@ -5574,6 +5839,13 @@ impl ServerConfig {
                         name,
                         style.parameter.as_deref(),
                         &style.parameters,
+                    )?;
+                    validate_style_contour(
+                        &format!("Collection '{id}'"),
+                        name,
+                        style.contour.as_ref(),
+                        style.colormap.is_some() || !style.color_stops.is_empty(),
+                        style.min.is_some() || style.max.is_some(),
                     )?;
                 }
                 if let Some(bundle_ref) = &wms.style_bundle {
@@ -7541,6 +7813,237 @@ data_path = "/tmp"
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot be named"), "got: {err}");
+    }
+
+    /// Contour styles (#1378): `[[wms.styles]]`, bundle extras and
+    /// `[[parameter_defaults.contours]]` load when well formed; every bad
+    /// value, a range without a fill, a lines-only style without a name,
+    /// and an unknown key inside the contour table fail the load.
+    #[test]
+    fn contour_styles_are_validated_at_load() {
+        let base = r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[collections]]
+id = "c"
+title = "t"
+description = "d"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "x_%Y.tif"
+parameter = "p"
+unit = "hPa"
+data_path = "/tmp"
+"#;
+        let load = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("{base}\n{extra}"))
+                .map_err(|e| e.to_string())
+                .and_then(|c| c.validate().map(|()| c).map_err(|e| e.to_string()))
+        };
+
+        let ok = load(
+            "[[collections.wms.styles]]\nname = \"isobars\"\n\
+             contour = { interval = 4, base = 0, color = \"#000000cc\", width = 1.5 }\n\n\
+             [[collections.wms.styles]]\nname = \"isobars_filled\"\ncolormap = \"pressure\"\n\
+             min = 950\nmax = 1050\ncontour = { interval = 2 }\n",
+        )
+        .expect("well-formed contour styles load");
+        let styles = &ok.collections[0].wms.as_ref().unwrap().styles;
+        assert_eq!(
+            styles[0].contour,
+            Some(ContourConfig {
+                interval: 4.0,
+                base: 0.0,
+                color: Some("#000000cc".into()),
+                width: Some(1.5),
+            })
+        );
+        assert_eq!(styles[1].contour.as_ref().unwrap().base, 0.0);
+
+        for (bad, expected) in [
+            ("contour = { interval = 0 }", "interval must be a positive"),
+            ("contour = { interval = -4 }", "interval must be a positive"),
+            (
+                "contour = { interval = nan }",
+                "interval must be a positive",
+            ),
+            (
+                "contour = { interval = 4, base = inf }",
+                "base must be a finite",
+            ),
+            (
+                "contour = { interval = 4, color = \"black\" }",
+                "contour color",
+            ),
+            ("contour = { interval = 4, width = 0 }", "width must be"),
+            ("contour = { interval = 4, width = 9 }", "width must be"),
+            (
+                "contour = { interval = 4, step = 2 }",
+                "unknown field `step`",
+            ),
+            (
+                "contour = { interval = 4 }\nmin = 1",
+                "min/max set the range",
+            ),
+        ] {
+            let err = load(&format!(
+                "[[collections.wms.styles]]\nname = \"isobars\"\n{bad}\n"
+            ))
+            .expect_err(bad);
+            assert!(err.contains(expected), "{bad}: {err}");
+        }
+        let err = load("[[collections.wms.styles]]\ncontour = { interval = 4 }\n")
+            .expect_err("a lines-only style has no colormap to name it");
+        assert!(err.contains("needs a 'name'"), "{err}");
+
+        // Bundle extras take the same table, with the same checks.
+        let bundle = |extra: &str| {
+            format!(
+                "[[style_bundles]]\nid = \"b\"\n[style_bundles.default]\ncolormap = \"pressure\"\n\
+                 [[style_bundles.extras]]\nname = \"isobars\"\n{extra}\n"
+            )
+        };
+        let ok = load(&bundle("contour = { interval = 4 }")).expect("bundle contour loads");
+        assert_eq!(
+            ok.style_bundles[0].extras[0]
+                .contour
+                .as_ref()
+                .unwrap()
+                .interval,
+            4.0
+        );
+        let err = load(&bundle("contour = { interval = 4, width = 20 }")).expect_err("width");
+        assert!(err.contains("Style bundle 'b' style 'isobars'"), "{err}");
+
+        // `[[parameter_defaults.contours]]`.
+        let rule = |contours: &str| {
+            format!(
+                "[[parameter_defaults]]\nnames = [\"msl\"]\ncolormap = \"pressure\"\n{contours}\n"
+            )
+        };
+        let ok = load(&rule(
+            "contour_title = \"Isobars\"\n[[parameter_defaults.contours]]\nunit = \"hPa\"\n\
+             interval = 2\n",
+        ))
+        .expect("parameter default contours load");
+        assert_eq!(
+            ok.parameter_defaults[0].contours.as_deref().map(<[_]>::len),
+            Some(1)
+        );
+        assert_eq!(
+            load(&rule("contours = []")).unwrap().parameter_defaults[0].contours,
+            Some(Vec::new())
+        );
+        for (bad, expected) in [
+            (
+                "[[parameter_defaults.contours]]\nunit = \"hPa\"\ninterval = 0\n",
+                "interval must be a positive",
+            ),
+            (
+                "[[parameter_defaults.contours]]\nunit = \"\"\ninterval = 4\n",
+                "'unit' must not be empty",
+            ),
+            (
+                "[[parameter_defaults.contours]]\nunit = \"hPa\"\ninterval = 4\nlabel = \"x\"\n",
+                "unknown field `label`",
+            ),
+        ] {
+            let err = load(&rule(bad)).expect_err(bad);
+            assert!(err.contains(expected), "{bad}: {err}");
+        }
+    }
+
+    /// A key a `[[wms.styles]]` entry or bundle extra does not know loads,
+    /// with one warning naming the collection or bundle, the style and the
+    /// key: one invalid collection file rejects the whole config, so a stray
+    /// key in a deployed config must not stop the server at its restart.
+    #[test]
+    fn stray_style_keys_warn_and_load() {
+        let config: ServerConfig = toml::from_str(
+            r#"
+[server]
+host = "127.0.0.1"
+port = 8000
+
+[[style_bundles]]
+id = "b"
+[style_bundles.default]
+colormap = "pressure"
+contour = { interval = 4 }
+[[style_bundles.extras]]
+name = "isobars"
+contours = { interval = 4 }
+[[style_bundles.parameters]]
+name = "msl"
+contour = { interval = 4 }
+
+[[collections]]
+id = "c"
+title = "t"
+description = "d"
+engine_type = "geotiff"
+
+[collections.geotiff]
+filename_template = "x_%Y.tif"
+parameter = "p"
+unit = "hPa"
+data_path = "/tmp"
+
+[collections.wms]
+contour = { interval = 4 }
+webp_quality = 80
+
+[[collections.wms.parameters]]
+name = "msl"
+colormap = "pressure"
+contour = { interval = 4 }
+
+[[collections.wms.styles]]
+name = "isobars"
+interval = 4
+legacy_opacity = 0.5
+contour = { interval = 4 }
+
+[[collections.wms.styles]]
+colormap = "viridis"
+min = 950
+"#,
+        )
+        .expect("stray style keys load");
+        config.validate().expect("and validate");
+        let styles = &config.collections[0].wms.as_ref().unwrap().styles;
+        assert_eq!(styles[0].contour.as_ref().unwrap().interval, 4.0);
+        assert_eq!(styles[1].min, Some(950.0), "known keys still parse");
+        assert!(styles[1].unknown_keys.is_empty());
+        assert_eq!(
+            config.collections[0].wms.as_ref().unwrap().webp_quality,
+            Some(80)
+        );
+        // A contour table where it draws nothing says where it belongs.
+        let misplaced = " (a contour table draws lines only in a [[wms.styles]] entry or a \
+                         [[style_bundles.extras]] entry)";
+        assert_eq!(
+            config.style_key_warnings(),
+            vec![
+                format!("Style bundle 'b' default: unknown key(s) 'contour' ignored{misplaced}"),
+                "Style bundle 'b' extra 'isobars': unknown key(s) 'contours' ignored".to_string(),
+                format!(
+                    "Style bundle 'b' parameters entry 'msl': unknown key(s) 'contour' \
+                     ignored{misplaced}"
+                ),
+                format!("Collection 'c' [wms]: unknown key(s) 'contour' ignored{misplaced}"),
+                "Collection 'c' [[wms.styles]] 'isobars': unknown key(s) 'interval', \
+                 'legacy_opacity' ignored"
+                    .to_string(),
+                format!(
+                    "Collection 'c' [[wms.parameters]] 'msl': unknown key(s) 'contour' \
+                     ignored{misplaced}"
+                ),
+            ]
+        );
     }
 
     #[test]

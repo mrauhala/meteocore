@@ -338,6 +338,40 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   `transparent`, `void-color`, `void-transparent` with `parse_background`
   and encode with `encode_map`/`empty_map`. The void (pixels off the CRS)
   is `OutputCrs::earth_columns`, computed only when the void fill differs.
+  Contour lines live in `ds_render::contour` (#1378): a style whose
+  `StyleInfo.contour` is set is painted by a `ContourPaint`, never the plain
+  colormap path. Every render path (WMS direct, WMS meta-tiles through
+  `assemble_metatiled_contours`, Maps, Tiles) builds a `ContourPlan`, asks
+  the engine for the plan's grown view (`OutputCrs::grown_by_pixels`: the
+  line's reach, `ceil(width / 2 + 0.5)` pixels, plus one per smoothing
+  pass), and draws with `ContourPlan::draw`; never trace the bare view, or
+  lines break at tile edges. Tile edges meet because an edge crossing is
+  interpolated from its lower-index sample, a saddle is decided by its
+  cell's mean, a pixel keeps the largest coverage any segment gives it, and
+  smoothing is decided per zoom from `source_spacing_deg(RasterInfo)` (two
+  or more source cells per output pixel), never per tile. Pinned by
+  `a_block_of_tiles_matches_one_render_of_the_block` (ds-render),
+  `isobar_tiles_meet_across_tile_edges` (api-tiles) and
+  `meta_tiled_isobars_match_a_direct_render` (api-wms); the GRIB fixture's
+  isotherms against an independent trace in `engine-grib/tests/contours.rs`.
+  WMS meta-tiles a contour view only on a ladder step: between steps the
+  nearest-neighbour downsample (1–1.41×) drops line pixels, so
+  `assemble_metatiled_contours` declines and the view renders directly
+  (`contours_off_the_ladder_render_directly`). At most
+  `MAX_LEVELS_PER_CELL` (4) levels are traced per cell, the lowest, which
+  bounds an interval too small for its field.
+  Legends go through `render_style_legend` (line swatch + `every 4 hPa`) and
+  `legend_json`'s `contour` member. The Maps and Tiles style lists come from
+  `collection_style_offers`: a style only parameter layers offer (the
+  built-in `contours`) is listed with its `parameters`, and every link to it
+  carries `?parameter-name=` for the first: Maps map and legend, Tiles
+  legend, and the shared root's styled tileset list, whose route takes
+  `parameter-name`, resolves the style on that parameter's layer and names
+  it on its tilesets' links and tile templates. The workbench offers such a
+  style only while one of its parameters is drawn (`data-parameters`) and
+  keeps the parameter its links carry. A new link to a style must resolve
+  that way too: `server/tests/contour_links.rs` crawls every style link of
+  the shared root, the per-API Maps and Tiles, and WMS's LegendURLs.
   `ds-mvt` and `ds-3dtiles` are likewise framework-free byte encoders,
   mirroring `ds-render`.
 - **Byte-bounded LRU caches go through `ds-cache`** (#480):
@@ -1314,6 +1348,15 @@ unit = "K"                      # any spelling (ds_core::units::canonical_unit):
                                 # "kelvin" matches too, "m/s" matches "m s-1"
 min = 183.15
 max = 323.15
+# The rule's `contours` style (#1378), unit-gated like unit_ranges. Without
+# a `contours` key the parameter keeps the built-in lines (isobars every
+# 4 hPa / 400 Pa, height contours every 6 dam, isotherms every 2 K through
+# 273.15 K); `contours = []` offers none. Fields as a style's contour table.
+# contour_title = "Dew point every 2 K"
+# [[parameter_defaults.contours]]
+# unit = "K"
+# interval = 2.0
+# base = 273.15
 
 # Optional shared WMS style bundles. MUST live in top-level config.toml —
 # a [[style_bundles]] block inside a collections_dir file is silently
@@ -1370,6 +1413,17 @@ style_bundle = "radar_multi"
                          # QUALITY / quality wins. For continuous-tone layers
                          # (satellite IR, NWP fields); keep discrete radar
                          # classes lossless.
+# A contour style (#1378): lines at base + k × interval in the parameter's
+# served unit, over the style's colormap when it names one, else alone (then
+# `name` is required). Validated at load: an unknown key in the contour table
+# is a LOAD ERROR; one in a style entry or bundle extra loads with a WARN
+# (`ServerConfig::style_key_warnings`), so a stray key in a deployed config
+# cannot stop a restart. Bundle extras take the same table.
+# [[collections.wms.styles]]
+# name = "isobars"
+# parameter = "msl"
+# contour = { interval = 4.0, base = 0.0, color = "#000000", width = 1.0 }
+#                          # width in px, 0 < width <= 8; color #RRGGBB[AA]
 
 # Optional /preview SPA tuning: cap the time slider's `values[]` to the most
 # recent ISO 8601 duration before the latest timestep. Manifest-only; does

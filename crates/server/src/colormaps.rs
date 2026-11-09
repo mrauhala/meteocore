@@ -175,6 +175,19 @@ pub fn config_default_overrides(
                 (Some(min), Some(max)) => Some((min, max)),
                 _ => None,
             },
+            contours: r.contours.as_ref().map(|contours| {
+                contours
+                    .iter()
+                    .map(|c| ds_render::defaults::OverrideContour {
+                        unit: c.unit.clone(),
+                        interval: c.interval,
+                        base: c.base,
+                        color: c.color.clone(),
+                        width: c.width,
+                    })
+                    .collect()
+            }),
+            contour_title: r.contour_title.clone(),
         })
         .collect()
 }

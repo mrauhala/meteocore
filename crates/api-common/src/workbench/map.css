@@ -178,6 +178,7 @@ html:not(.js) .map-layer{padding:16px}
 .map-legend-channels{list-style:none;margin:6px 0 0;padding:0;display:grid;gap:6px}
 .map-legend-channels li{display:flex;align-items:center;gap:8px;color:var(--ink)}
 .channel-swatch{width:14px;height:14px;border-radius:3px;flex:none}
+.contour-swatch{width:24px;height:0;flex:none;align-self:center}
 .channel-swatch.red{background:#e0321e}.channel-swatch.green{background:#2a9d3a}.channel-swatch.blue{background:#2f63d6}
 
 /* The time bar, docked across the bottom: transport, the time drawn

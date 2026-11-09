@@ -1,6 +1,7 @@
 pub mod background;
 pub mod colormap;
 pub mod composite;
+pub mod contour;
 pub mod defaults;
 mod encode;
 /// 5×7 bitmap font for in-image text (legend labels). Crate-internal — an
@@ -27,11 +28,18 @@ pub use composite::{
     render_composite_legend, render_composite_tiles, render_composite_tiles_rgba, ChannelSource,
     ChannelSpec, CompositeSpec, COMPOSITE_STYLE,
 };
+pub use contour::{
+    render_contour_legend, source_spacing_deg, ContourPaint, ContourPlan, ContourStyle,
+    CONTOUR_STYLE,
+};
 pub use encode::{draw_over, encode_jpeg, encode_png, encode_webp, flatten_onto};
-pub use layer_style::{resolve_layer_style, LayerStyle, LayerStyleError};
+pub use layer_style::{
+    collection_style_offers, resolve_layer_style, LayerStyle, LayerStyleError, StyleOffer,
+};
 pub use metatile::{
-    assemble_metatiled, assemble_metatiled_composite, render_metatiled, render_metatiled_composite,
-    MetaTile, MetaTilePixels, MetaTileStats, TileKeyPrefix, TilePixelCache,
+    assemble_metatiled, assemble_metatiled_composite, assemble_metatiled_contours,
+    render_metatiled, render_metatiled_composite, MetaTile, MetaTilePixels, MetaTileStats,
+    TileKeyPrefix, TilePixelCache,
 };
 pub use palette::{
     builtin_palette, builtin_palette_arc, builtin_palettes, Interpolation, Palette, PaletteInsert,
@@ -195,6 +203,9 @@ pub struct StyleInfo {
     /// Data parameter to render. For multi-parameter engines, selects which
     /// parameter's data is returned by `get_raster_tile()`. None = engine default.
     pub parameter: Option<String>,
+    /// Contour lines this style draws (#1378), over `colormap` when the
+    /// contour style has a fill. `None` for a colour fill alone.
+    pub contour: Option<Arc<ContourStyle>>,
 }
 
 /// Cache key for rendered map images.
@@ -900,7 +911,7 @@ fn legend_ticks(min: f64, max: f64) -> Vec<f64> {
 /// A fixed decimal count can't do both — too few collapses tiny ticks to `0`,
 /// too many leaves trailing zeros on round ones. Values too small to show at
 /// 6 dp fall back to scientific notation (`2e-8`) so sub-µ ranges stay legible.
-fn format_tick(v: f64) -> String {
+pub(crate) fn format_tick(v: f64) -> String {
     if v == 0.0 {
         return "0".to_string(); // also catches -0.0
     }
@@ -955,11 +966,31 @@ pub const LEGEND_CACHE_CONTROL: &str = "public, max-age=86400";
 /// absent values are omitted from the payload rather than emitted as `""`.
 /// `nodataColor` appears only when the palette carries an explicit one.
 /// An RGB composite has no stops; [`composite_legend_json`] is its variant.
+///
+/// A contour style (#1378) adds a `contour` member: `interval`, `base`,
+/// `color`, `width`, `fill` and `description` (`"every 4 hPa"`). Lines
+/// alone have no colour scale, so that legend has no `min`, `max`,
+/// `interpolation` or `stops`; lines over a fill keep the fill's.
 pub fn legend_json(
     style: &StyleInfo,
     parameter: Option<&str>,
     unit: Option<&str>,
 ) -> serde_json::Value {
+    let unit = unit.map(str::trim).filter(|u| !u.is_empty());
+    if let Some(contour) = style.contour.as_deref().filter(|c| !c.fill) {
+        let mut legend = serde_json::json!({
+            "style": style.name,
+            "title": style.title,
+            "contour": contour.legend_json(unit),
+        });
+        if let Some(p) = parameter.map(str::trim).filter(|p| !p.is_empty()) {
+            legend["parameter"] = serde_json::json!(p);
+        }
+        if let Some(u) = unit {
+            legend["unit"] = serde_json::json!(u);
+        }
+        return legend;
+    }
     // domain_stops: a .pal display-threshold guard (one ULP below the
     // real minimum) is excluded so stops[0].value equals the reported
     // "min" — below-min values are simply absent from a legend client's
@@ -988,14 +1019,44 @@ pub fn legend_json(
     if let Some(p) = parameter.map(str::trim).filter(|p| !p.is_empty()) {
         legend["parameter"] = serde_json::json!(p);
     }
-    if let Some(u) = unit.map(str::trim).filter(|u| !u.is_empty()) {
+    if let Some(u) = unit {
         legend["unit"] = serde_json::json!(u);
     }
     if let Some(nodata) = style.palette.nodata_color {
         legend["nodataColor"] = serde_json::json!(Palette::color_hex(nodata));
     }
+    if let Some(contour) = &style.contour {
+        legend["contour"] = contour.legend_json(unit);
+    }
 
     legend
+}
+
+/// The legend image of `style`, the one entry point WMS GetLegendGraphic
+/// and the Maps and Tiles legend endpoints render with: a contour style's
+/// line swatch ([`render_contour_legend`], #1378), else the colour bar
+/// ([`render_legend`]). `title` comes from [`legend_title`]; `unit` labels
+/// the contour interval.
+pub fn render_style_legend(
+    style: &StyleInfo,
+    unit: Option<&str>,
+    width: u32,
+    height: u32,
+    format: ImageFormat,
+    title: Option<&str>,
+) -> Result<Vec<u8>, DataServerError> {
+    match style.contour.as_deref() {
+        Some(contour) => render_contour_legend(style, contour, unit, width, height, format, title),
+        None => render_legend(
+            style.colormap.as_ref(),
+            style.min,
+            style.max,
+            width,
+            height,
+            format,
+            title,
+        ),
+    }
 }
 
 /// Resolve the `(parameter, unit)` a legend describes from a style plus the
@@ -1075,6 +1136,22 @@ pub fn render_legend(
     format: ImageFormat,
     title: Option<&str>,
 ) -> Result<Vec<u8>, DataServerError> {
+    let mut rgba = legend_canvas(colormap, min, max, width, height, title, 0);
+    encode_rgba(&mut rgba, width, height, format, None)
+}
+
+/// [`render_legend`]'s pixels before encoding, the colour bar ending
+/// `reserve_bottom` pixels further up: a contour legend draws its line
+/// swatch below it (#1378). `0` is [`render_legend`]'s own layout.
+pub(crate) fn legend_canvas(
+    colormap: &dyn ColorMap,
+    min: f64,
+    max: f64,
+    width: u32,
+    height: u32,
+    title: Option<&str>,
+    reserve_bottom: u32,
+) -> Vec<u8> {
     // Normalise so the gradient always runs large-at-top → small-at-bottom even
     // if a caller passes the bounds reversed.
     let (min, max) = if min <= max { (min, max) } else { (max, min) };
@@ -1149,7 +1226,10 @@ pub fn render_legend(
     // PAD-margined swatch below the title. All pixel writes below are bounds-
     // checked (via `set_px`), so a 0-height swatch simply draws nothing rather
     // than spilling past the buffer at pathologically small heights.
-    let grad_h = height.saturating_sub(PAD).saturating_sub(grad_y0);
+    let grad_h = height
+        .saturating_sub(PAD)
+        .saturating_sub(reserve_bottom)
+        .saturating_sub(grad_y0);
 
     // Map a value to its pixel row in the gradient (top = max, bottom = min).
     let value_to_y = |value: f64| -> u32 {
@@ -1208,7 +1288,7 @@ pub fn render_legend(
         }
     }
 
-    encode_rgba(&mut rgba, width, height, format, None)
+    rgba
 }
 
 /// Write one RGBA pixel, clipped to the buffer bounds. The legend's geometry can
@@ -1314,6 +1394,66 @@ pub(crate) fn colorize(tile: &RasterTile, colormap: &dyn ColorMap) -> Vec<u8> {
     rgba
 }
 
+/// [`colorize`] of the `width × height` window of `tile` whose top-left
+/// pixel is `(x0, y0)`, without copying the tile: a contour render's fill
+/// is its grown read's interior (#1378). Each pixel takes exactly the
+/// colour [`colorize`] gives it, `U8` through the same 256-entry LUT. The
+/// window must lie inside the tile.
+pub(crate) fn colorize_window(
+    tile: &RasterTile,
+    colormap: &dyn ColorMap,
+    x0: u32,
+    y0: u32,
+    width: u32,
+    height: u32,
+) -> Vec<u8> {
+    use ds_core::map_engine::RasterValues;
+    debug_assert!(x0 + width <= tile.width && y0 + height <= tile.height);
+    let stride = tile.width as usize;
+    let rows = (y0 as usize..(y0 + height) as usize)
+        .map(|y| y * stride + x0 as usize..y * stride + (x0 + width) as usize);
+    let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+    match &tile.values {
+        RasterValues::F64(values) => {
+            for row in rows {
+                for value in &values[row] {
+                    rgba.extend_from_slice(&colormap.color(*value));
+                }
+            }
+        }
+        RasterValues::U8 {
+            data,
+            nodata,
+            gain,
+            offset,
+        } => {
+            let mut lut = [[0u8; 4]; 256];
+            for (raw, entry) in lut.iter_mut().enumerate() {
+                let value = if Some(raw as u8) == *nodata {
+                    None
+                } else {
+                    Some(raw as f64 * gain + offset)
+                };
+                *entry = colormap.color(value);
+            }
+            for row in rows {
+                for &raw in &data[row] {
+                    rgba.extend_from_slice(&lut[raw as usize]);
+                }
+            }
+        }
+        RasterValues::F32 { data, nodata } => {
+            for row in rows {
+                for &raw in &data[row] {
+                    let color = colormap.color(RasterValues::decode_f32(raw, *nodata));
+                    rgba.extend_from_slice(&color);
+                }
+            }
+        }
+    }
+    rgba
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1330,6 +1470,7 @@ mod tests {
             min,
             max,
             parameter: None,
+            contour: None,
         }
     }
 
@@ -1406,6 +1547,7 @@ mod tests {
             min: r.min,
             max: r.max,
             parameter: None,
+            contour: None,
         };
         let json = legend_json(&style, None, None);
         assert_eq!(json["min"], 10.0);
@@ -1474,6 +1616,7 @@ mod tests {
             min: 0.0,
             max: 1.0,
             parameter: Some("class".to_string()),
+            contour: None,
         };
         let legend = legend_json(&style, style.parameter.as_deref(), None);
         assert_eq!(legend["interpolation"], "step");

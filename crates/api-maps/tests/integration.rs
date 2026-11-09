@@ -225,6 +225,7 @@ fn build_state_with_engine_and_wms(
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);
@@ -306,6 +307,7 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     layer_styles.insert(
@@ -322,6 +324,7 @@ fn build_router_with_tilesets(apis: Vec<String>, map_tilesets: bool) -> axum::Ro
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);
@@ -1687,6 +1690,7 @@ fn build_empty_router() -> axum::Router {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("empty".to_string(), layer_styles);
@@ -1829,6 +1833,7 @@ fn build_multi_param_router() -> axum::Router {
             min: 0.0,
             max: 1.0,
             parameter: None,
+            contour: None,
         },
     );
     styles_map.insert("wx".to_string(), layer_styles);
@@ -3058,6 +3063,7 @@ fn palette_style(name: &str, palette: &str, parameter: Option<&str>) -> StyleInf
         min: resolved.min,
         max: resolved.max,
         parameter: parameter.map(str::to_string),
+        contour: None,
     }
 }
 
@@ -4534,7 +4540,8 @@ mod composites {
         assert_eq!(other.status, StatusCode::NOT_FOUND);
     }
 
-    /// The OpenAPI legend schema covers both legend shapes.
+    /// The OpenAPI legend schema covers every legend shape: a palette, a
+    /// composite's channels and contour lines alone (#1378).
     #[tokio::test]
     async fn openapi_legend_schema_covers_composites() {
         let app = router(Engine::new(&[T0, T1], &[T0, T1]));
@@ -4542,11 +4549,15 @@ mod composites {
         let variants = api["components"]["schemas"]["legend"]["oneOf"]
             .as_array()
             .unwrap();
-        assert_eq!(variants.len(), 2);
-        assert!(variants[1]["required"]
-            .as_array()
-            .unwrap()
-            .contains(&serde_json::json!("channels")));
+        assert_eq!(variants.len(), 3);
+        let requires = |i: usize, member: &str| {
+            variants[i]["required"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(member))
+        };
+        assert!(requires(1, "channels"));
+        assert!(requires(2, "contour"));
     }
 }
 

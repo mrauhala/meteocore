@@ -2640,6 +2640,89 @@ above require a known unit; unknown units (including a QueryData parameter
 number without a sourced unit) stay unlabelled and use the configured
 fallback style. Explicit parameter styles still take precedence.
 
+**Contour lines** (#1378) — a style with a `contour` table draws lines at
+every `base + k × interval` of the parameter, in its served unit:
+isobars, isotherms, height contours. They are drawn into the image, so WMS
+(meta-tiled or direct), Maps and Tiles draw the same lines, and a line
+leaving one tile meets itself in the next: every render reads its field a
+pixel or two past its edges. With a `colormap` (or `color_stops`) the lines
+are drawn over that fill; without one they are drawn alone on a transparent
+image, ready to lay over another layer (`LAYERS=gfs/2t,gfs/msl&STYLES=,contours`).
+No labels yet.
+
+```toml
+[[collections.wms.styles]]
+name = "isobars"              # required for lines alone
+parameter = "msl"             # or parameters = ["msl", "prmsl"]
+contour = { interval = 4.0, base = 0.0, color = "#000000", width = 1.0 }
+
+[[collections.wms.styles]]
+name = "isotherms_filled"
+parameters = ["2t"]
+colormap = "temperature"      # the fill under the lines; min/max set its range
+contour = { interval = 2.0, color = "#b40000cc", width = 1.5 }
+```
+
+`interval` must be positive; `base` (default 0) is a value a line passes
+through; `color` is `#RRGGBB` or `#RRGGBBAA` (default black); `width` is in
+output pixels, anti-aliased, more than 0 and at most 8 (default 1). Bundle
+extras (`[[style_bundles.extras]]`) take the same table. Every value is
+checked at load. An unknown key in the `contour` table fails the load; one
+in a style entry or bundle extra (`interval = 4` outside the table) loads
+with a warning naming the collection, the style and the key. Where the source is two or more cells per output pixel, the field
+is smoothed lightly before tracing so lines stay smooth; lines end where
+the data does.
+
+The built-in defaults also offer a style `contours` next to the default
+fill, lines alone, on every parameter layer whose quantity has them (and on
+the collection's own layer when it draws one parameter): `Isobars` every
+4 hPa (400 Pa) on mean sea-level pressure, `Height contours` every 6 dam
+(60 gpm, 6 dam, or 60 g₀ m² s⁻² on geopotential) and `Isotherms` every 2 K
+in dark red, through 0 °C (base 273.15 in K). The default style is
+unchanged. A configured style named `contours` replaces them; `[wms]
+parameter_defaults = false` turns them off; station symbol layers never get
+them. A `[[parameter_defaults]]` rule gives its own, unit-gated like its
+ranges; one that restyles only the fill keeps the built-in lines, and
+`contours = []` offers none:
+
+```toml
+[[parameter_defaults]]
+names = ["msl"]
+colormap = "pressure"
+contour_title = "Isobars every 2 hPa"
+[[parameter_defaults.contours]]
+unit = "hPa"                  # any spelling, as unit_ranges
+interval = 2.0
+# base = 0.0; color = "#000000"; width = 1.0
+```
+
+GetCapabilities lists the style on its layer, and the Maps and Tiles style
+lists name it after the collection's own styles with the `parameters` whose
+layers offer it (their links carry `parameter-name`). Its legend is a line
+swatch and the interval, `every 4 hPa` (`every 2 K through 273.15 K` when
+the base is not a multiple of the interval), and the JSON legend carries a
+`contour` member: `interval`, `base`, `color`, `width`, `fill` and that
+`description`; lines alone have no `stops`. A style only some parameters
+offer is listed with those `parameters`, and its links name the first
+(`?parameter-name=`), so they resolve: the styled map tileset list and
+tileset of the shared root take `parameter-name` for such a style.
+
+WMS meta-tiles a contour view only when its resolution is a step of the
+meta-tile ladder, as a client zooming in whole steps sends. Between steps
+the tiles would be downsampled by up to √2, nearest, dropping line pixels,
+so such a view renders directly: one engine read and one trace per view,
+with only exact repeats served from the rendered-image cache. A field
+whose interval puts more than four lines through one output cell draws
+the lowest four there, a solid band anyway.
+
+Measured on a 1024 × 1024 EPSG:3857 view of 16 uncached meta-tiles (`cargo
+run --release -p ds-render --example contour_cost`, a synthetic field),
+tracing and drawing the lines took 10 ms against 2 ms for colorizing the
+fill alone, 12 ms over a fill and 19 ms with two smoothing passes; each tile
+reads 258 × 258 pixels instead of 256 × 256. With every meta-tile cached the
+view assembles in 3 ms; rendered directly, as off the ladder, it costs its
+engine read every time (59 ms of the synthetic field) plus 8 ms to trace.
+
 **Named custom colormaps** — define once, reference anywhere a built-in
 name works (`[wms] colormap`, `[[wms.styles]]`, `[[wms.parameters]]`, style
 bundles). Only in top-level `config.toml` (like `[[style_bundles]]`), or as

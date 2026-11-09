@@ -129,6 +129,78 @@ pub fn resolve_layer_style<'a>(
     })
 }
 
+/// One style a collection offers, as the Maps and Tiles style lists name it.
+pub struct StyleOffer<'a> {
+    /// The style, on the collection's layer or its first parameter's.
+    pub style: &'a StyleInfo,
+    /// Its title, or its name when the layers offering it title it apart
+    /// (the built-in `contours` are "Isobars" on pressure, "Isotherms" on
+    /// temperature).
+    pub title: &'a str,
+    /// The parameters whose layers offer it, in `info.parameters` order;
+    /// empty when the collection's own layer offers it, which every request
+    /// may name.
+    pub parameters: Vec<&'a str>,
+}
+
+/// The styles of `collection_id` for a style list: its own layer's
+/// (`default` first, then by name), then those only some of its parameter
+/// layers offer (by name), each with those parameters, so a request naming
+/// one of them as `parameter-name` draws it. A parameter's built-in contour
+/// lines (#1378) and a style scoped by a `parameters` list are such styles:
+/// no other list names them.
+///
+/// Proportional to the collection's parameters, as the description listing
+/// them is; nothing is resolved twice.
+pub fn collection_style_offers<'a>(
+    styles: &'a HashMap<String, HashMap<String, StyleInfo>>,
+    collection_id: &str,
+    info: Option<&'a RasterInfo>,
+) -> Vec<StyleOffer<'a>> {
+    let own = styles.get(collection_id);
+    let mut offers: Vec<StyleOffer<'a>> = own
+        .map(|layer| {
+            let mut names: Vec<&String> = layer.keys().collect();
+            names.sort_by_key(|name| (name.as_str() != "default", name.as_str()));
+            names
+                .into_iter()
+                .map(|name| StyleOffer {
+                    style: &layer[name],
+                    title: &layer[name].title,
+                    parameters: Vec::new(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut scoped: Vec<StyleOffer<'a>> = Vec::new();
+    for parameter in info.into_iter().flat_map(|info| &info.parameters) {
+        let Some(layer) = styles.get(&format!("{collection_id}/{}", parameter.name)) else {
+            continue;
+        };
+        for (name, style) in layer {
+            if own.is_some_and(|own| own.contains_key(name)) {
+                continue;
+            }
+            match scoped.iter_mut().find(|offer| offer.style.name == *name) {
+                Some(offer) => {
+                    if offer.title != style.title {
+                        offer.title = &offer.style.name;
+                    }
+                    offer.parameters.push(&parameter.name);
+                }
+                None => scoped.push(StyleOffer {
+                    style,
+                    title: &style.title,
+                    parameters: vec![&parameter.name],
+                }),
+            }
+        }
+    }
+    scoped.sort_by(|a, b| a.style.name.cmp(&b.style.name));
+    offers.extend(scoped);
+    offers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -150,6 +222,7 @@ mod tests {
             min: resolved.min,
             max: resolved.max,
             parameter: parameter.map(str::to_string),
+            contour: None,
         }
     }
 
