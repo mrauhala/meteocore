@@ -16,6 +16,7 @@ members = [
     "crates/engine-satellite",
     "crates/engine-netcdf",
     "crates/engine-station-grid",
+    "crates/engine-period",
     "crates/storage",
     "crates/render",
     "crates/ds-cache",

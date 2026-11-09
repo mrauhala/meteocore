@@ -148,6 +148,7 @@ fn collection(dir: &Path, api: &str) -> CollectionConfig {
         postgis: None,
         nowcast: None,
         station_grid: None,
+        period: None,
         bufr: None,
         satellite: None,
         netcdf: None,

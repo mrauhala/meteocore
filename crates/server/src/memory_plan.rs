@@ -127,6 +127,7 @@ const STORE_FAMILIES: &[&str] = &[
     "wis2_dedup_bytes",
     "cap_alert_bytes",
     "nowcast_frame_bytes",
+    "period_grid_bytes",
     "pvol_catalog_bytes",
     "netcdf_open_file_bytes",
     "zarr_icechunk_staged_bytes",

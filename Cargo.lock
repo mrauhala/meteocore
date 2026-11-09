@@ -1585,6 +1585,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine-period"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "ds-core",
+ "ds-poll",
+ "engine-geotiff",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "engine-postgis"
 version = "0.1.0"
 dependencies = [
@@ -4795,6 +4808,7 @@ dependencies = [
  "engine-netcdf",
  "engine-nowcast",
  "engine-odim",
+ "engine-period",
  "engine-postgis",
  "engine-querydata",
  "engine-satellite",
