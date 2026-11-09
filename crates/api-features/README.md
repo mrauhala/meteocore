@@ -216,7 +216,9 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
   turns down (`QueryTooLarge`, such as a station grid's analysis cap) is a
   400 with its message; one it cannot answer yet or now
   (`ResourceExhausted`, `DeadlineExceeded`: a station grid whose residuals
-  are still being computed) is a 503 with `Retry-After: 1`; an object
+  are still being computed, a PostGIS collection no refresh has checked
+  yet, a PostGIS statement the database canceled for its
+  `statement_timeout`) is a 503 with `Retry-After: 1`; an object
   store that kept refusing the read (`Unavailable`) is a 503
   `SourceUnavailable` with `Retry-After: 10`; a missing feature, or any
   other resource the engine reports absent, is a 404; anything else is a
@@ -304,7 +306,8 @@ api-tiles vector-tile cache key.
   configured parameter, filtered by `valid_range` and `missing_values` as in
   EDR, `type` from `cloud_indicator_col` and `peak_current_ka` from
   `peak_current_col` when declared and no parameter reads it; the
-  properties GetFeatureInfo answers. Its id is its `(time, id)` key,
+  properties GetFeatureInfo answers, which adds this id as `feature_id`
+  (#1446). Its id is its `(time, id)` key,
   `<id_col value>@<time>`, written one way only, and `/items/{featureId}`
   reads that event back by its primary key. Any other string, the same key
   written another way (`017@…`, a `+02:00` time) or an id with a NUL, is a

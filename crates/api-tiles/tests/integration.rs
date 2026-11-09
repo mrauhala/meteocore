@@ -251,6 +251,12 @@ fn build_state_with_wms(wms: Option<ds_core::config::WmsConfig>) -> api_tiles::A
 /// A Tiles router backed by a caller-supplied engine, for exercising
 /// engine error paths.
 fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
+    api_tiles::router(build_state_with_engine(engine))
+}
+
+/// The state behind [`build_router_with_engine`], for mounting the same
+/// collection on the shared root ([`shared_router`]).
+fn build_state_with_engine(engine: Arc<dyn MapEngine>) -> api_tiles::AppState {
     let mut engines = HashMap::new();
     let mut collections = HashMap::new();
     let mut styles_map = HashMap::new();
@@ -308,7 +314,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
         },
     );
     styles_map.insert("radar".to_string(), layer_styles);
-    let state = Arc::new(ArcSwap::from_pointee(TilesState {
+    Arc::new(ArcSwap::from_pointee(TilesState {
         map_engines: engines,
         collections,
         styles: styles_map,
@@ -320,8 +326,7 @@ fn build_router_with_engine(engine: Arc<dyn MapEngine>) -> axum::Router {
         base_url: String::new(),
         trust_proxy_headers: false,
         discovery: Default::default(),
-    }));
-    api_tiles::router(state)
+    }))
 }
 
 async fn get(uri: &str) -> (StatusCode, Value) {
@@ -2820,9 +2825,9 @@ mod metadata_extras {
 // ---------------------------------------------------------------------------
 
 /// Mock forecast engine whose run list can be advanced mid-test — the Tiles
-/// twin of the WMS/Maps `RunSwapMockMapEngine`. Tiles never pins a run (the
-/// `reference_time` query parameter is a #337 Phase 4 follow-up), so every
-/// request exercises the `resolve_reference_time(time, None)` path.
+/// twin of the WMS/Maps `RunSwapMockMapEngine`. A tile naming no run
+/// (`subset=reference_time(…)`, #337) exercises the
+/// `resolve_reference_time(time, None)` path.
 struct RunSwapMockMapEngine {
     runs: Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -2926,8 +2931,8 @@ async fn tile_re_renders_when_a_new_run_lands() {
     );
 }
 
-/// #1421: Tiles names no run, so on an engine that retains runs an exact
-/// valid time is drawn from whichever run is the latest now, and a newer run
+/// #1421: a tile naming no run, on an engine that retains runs, draws an
+/// exact valid time from whichever run is the latest now, and a newer run
 /// re-covers it later (a nowcast generation every few minutes, a forecast
 /// run every few hours). Its tile is never `immutable`. Once the engine
 /// retains no runs, the same exact step is.
@@ -2957,6 +2962,96 @@ async fn an_exact_step_without_a_fixed_run_is_not_immutable() {
     assert_eq!(cache_control(&app).await, SHORT);
     runs.write().unwrap().clear();
     assert_eq!(cache_control(&app).await, IMMUTABLE);
+}
+
+/// #337: a map tile naming a run with `subset=reference_time(…)`, drawn at
+/// an exact valid time, is a fixed frame: `immutable`, on the per-API tile
+/// route and the shared root's map tile alike. `*` names none.
+#[tokio::test]
+async fn an_exact_step_of_a_named_run_is_immutable() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    let state = build_state_with_engine(Arc::new(RunSwapMockMapEngine {
+        runs: Arc::new(std::sync::RwLock::new(vec![
+            "2026-07-11T12:00:00Z".parse().unwrap(),
+            "2026-07-11T18:00:00Z".parse().unwrap(),
+        ])),
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    for (app, path) in [
+        (
+            api_tiles::router(state.clone()),
+            "/collections/radar/tiles/WebMercatorQuad/2/2/1",
+        ),
+        (
+            shared_router(state.clone()),
+            "/collections/radar/map/tiles/WebMercatorQuad/2/2/1",
+        ),
+    ] {
+        for (run, expected) in [
+            (
+                "&subset=reference_time(%222026-07-11T12:00:00Z%22)",
+                IMMUTABLE,
+            ),
+            (
+                "&subset=reference_time(%222026-07-11T18:00:00Z%22)",
+                IMMUTABLE,
+            ),
+            ("&subset=reference_time(*)", SHORT),
+            ("", SHORT),
+        ] {
+            let uri = format!("{path}?datetime=2026-07-11T20:00:00Z{run}");
+            let (status, headers, _) = get_raw_on(app.clone(), &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(
+                headers[axum::http::header::CACHE_CONTROL],
+                expected,
+                "{uri}"
+            );
+        }
+        let uri = format!("{path}?subset=reference_time(%222026-07-11T06:00:00Z%22)");
+        let (status, _, body) = get_raw_on(app.clone(), &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["description"]
+                .as_str()
+                .unwrap()
+                .contains("is not a model run"),
+            "{json}"
+        );
+    }
+}
+
+/// #337: the runs are the collection's `reference_time` dimension. A
+/// collection without runs has neither the dimension nor the axis: the 400
+/// names `datetime`, as a vector tile's does.
+#[tokio::test]
+async fn reference_time_is_a_dimension_and_axis_only_with_runs() {
+    let app = build_router_with_engine(Arc::new(RunSwapMockMapEngine {
+        runs: Arc::new(std::sync::RwLock::new(vec!["2026-07-11T12:00:00Z"
+            .parse()
+            .unwrap()])),
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    let (status, collection) = get_on(app, "/collections/radar").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        collection["extent"]["reference_time"]["grid"]["coordinates"],
+        serde_json::json!(["2026-07-11T12:00:00Z"])
+    );
+
+    let (status, collection) = get("/collections/radar").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(collection["extent"].is_object(), "{collection}");
+    assert!(collection["extent"].get("reference_time").is_none());
+    let (status, json) =
+        get("/collections/radar/tiles/WebMercatorQuad/0/0/0?subset=reference_time(*)").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        json["description"],
+        "subset axis 'reference_time' is not supported; valid axes: datetime"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -63,6 +63,16 @@ impl TilesError {
     }
 }
 
+/// A model run the map tile names that the collection cannot draw (#337).
+impl From<api_common::subset::RunError> for TilesError {
+    fn from(error: api_common::subset::RunError) -> Self {
+        match error {
+            api_common::subset::RunError::NoRunAxis(message) => TilesError::BadRequest(message),
+            api_common::subset::RunError::UnknownRun(message) => TilesError::NotFound(message),
+        }
+    }
+}
+
 impl IntoResponse for TilesError {
     fn into_response(self) -> axum::response::Response {
         let retry_after = match &self {

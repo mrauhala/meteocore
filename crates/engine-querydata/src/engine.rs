@@ -33,6 +33,16 @@ const VALUE_PRECISION: ValuePrecision = ValuePrecision::F32;
 struct RunEntry {
     data: Arc<QueryData>,
     path: PathBuf,
+    /// The run's valid times, `data.times` shared, for a map naming the run
+    /// (#337): a request clones the `Arc`.
+    times: Arc<[DateTime<Utc>]>,
+}
+
+impl RunEntry {
+    fn new(data: Arc<QueryData>, path: PathBuf) -> Self {
+        let times = data.times.as_slice().into();
+        Self { data, path, times }
+    }
 }
 
 /// The retained model runs, keyed by origin (analysis / forecast reference)
@@ -746,6 +756,20 @@ impl MapEngine for QueryDataEngine {
         find_time_idx(&data, time).map(|i| data.times[i]).or(time)
     }
 
+    /// A run's own valid times (#337): `RasterInfo::times` is the latest
+    /// run's. From the run set snapshot.
+    fn run_times(
+        &self,
+        _parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        self.runs
+            .load()
+            .runs
+            .get(&run)
+            .map(|entry| entry.times.clone())
+    }
+
     fn resolve_reference_time(
         &self,
         _time: Option<DateTime<Utc>>,
@@ -906,16 +930,14 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
             RunEntry {
                 data: existing.data.clone(),
                 path: path.clone(),
+                times: existing.times.clone(),
             }
         } else {
             match load_file(path, collection_id) {
                 Ok(data) => {
                     let data = Arc::new(data);
                     log_loaded(collection_id, path, &data);
-                    RunEntry {
-                        data,
-                        path: path.clone(),
-                    }
+                    RunEntry::new(data, path.clone())
                 }
                 Err(e) => {
                     // `e` already carries the `[collection_id]` prefix.
@@ -955,8 +977,10 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
 /// difference of the two areas' `NFmiArea::TrueNorthAzimuth`, which would be
 /// wrong for components already along east and north. So the components are
 /// grid-relative: on a lat/lon area that is east and north, giving speed and
-/// direction; on a rotated lat/lon, stereographic or LCC area `ds_core::wind`
-/// gives speed only until it can turn them to true north.
+/// direction; on a rotated lat/lon, stereographic or LCC area the grid's
+/// convergence (`GridAxes::of`, `ds_core::geo::Convergence`) turns them to
+/// true north for the direction, as `DoWindComponentFix` turns them by the
+/// areas' true-north azimuths.
 fn wind_facts(data: &QueryData) -> WindFacts {
     WindFacts {
         grid: GridAxes::of(&data.grid.area.crs),
@@ -2194,16 +2218,25 @@ mod tests {
         let (&origin, run) = set.runs.iter().next_back().unwrap();
         let runs = [0, 6, 18, 24]
             .map(|hours| {
-                let entry = RunEntry {
-                    data: run.data.clone(),
-                    path: run.path.clone(),
-                };
+                let entry = RunEntry::new(run.data.clone(), run.path.clone());
                 (origin + chrono::Duration::hours(hours), entry)
             })
             .into_iter()
             .collect();
         engine.runs.store(Arc::new(RunSet { runs, wind: None }));
         assert_eq!(engine.expected_interval(), Some(chrono::Duration::hours(6)));
+        // Each run's own valid times for a map naming it (#337); a run not
+        // retained has none.
+        let data = run.data.clone();
+        let older = origin + chrono::Duration::hours(6);
+        assert_eq!(
+            engine.run_times(None, older).as_deref(),
+            Some(data.times.as_slice())
+        );
+        assert_eq!(
+            engine.run_times(None, origin + chrono::Duration::hours(12)),
+            None
+        );
     }
 
     #[test]

@@ -295,20 +295,35 @@ way.
 
 - `subset` parses the OGC API - Maps `subset` grammar: repeatable,
   comma-separated `axis(low:high)` or `axis(value)`, where values are
-  numbers, quoted text or `*`. Each route supplies its own axes and aliases,
-  and an unknown or repeated axis is an error. `TimeSelection` reads
-  `datetime` values and time subsets, including partial dates; vector tiles
-  use it too. `unknown_parameter` finds a query parameter the route does
-  not accept, for a 400 that lists the accepted ones.
-- `render_time` picks the time to render:
-  - no time: the engine's default, else the latest time;
-  - an instant: passed on for the engine to snap to a time step;
-  - an interval: the latest time step inside it.
+  numbers, quoted text or `*`. An axis name is a letter, then letters,
+  digits and `_`, as General Subsetting's additional dimensions are
+  (`atm_pressure_hpa`, `reference_time`). Each route supplies its own axes
+  and aliases, and an unknown or repeated axis is an error. `TimeSelection`
+  reads `datetime` values and time subsets, including partial dates; vector
+  tiles use it too. `unknown_parameter` finds a query parameter the route
+  does not accept, for a 400 that lists the accepted ones.
+- `REFERENCE_TIME_AXIS` is the model run of a map or map tile (#337),
+  `reference_time("<EDR instance id>")` or `*` for the latest; an interval
+  is a 400. A route adds it to its axes only for a collection with runs, so
+  elsewhere it is the unknown-axis 400. `named_run` checks the run against
+  `RasterInfo.reference_times` (unknown: 404).
+- `resolve_frame` picks the frame to render, for Maps and map tiles alike:
+  - the time. With no run named, `render_time`: no time is the engine's
+    default, else the latest time; an instant is passed on for the engine
+    to snap to a time step; an interval is the latest time step inside it.
+    With one, `run_time`, on the run's own times (`MapEngine::run_times`):
+    no time is the run's latest step, an instant outside the run selects
+    nothing, an interval the run's latest step inside it;
+  - the run the engine renders, `resolve_parameter_reference_time`: a
+    named run exactly, the latest included, else the engine's pick with its
+    fallback. Then the step in it, `resolve_parameter_time`. Both key the
+    rendered cache.
 
-  When nothing matches, Maps returns 404 and map tiles return 204.
-- `is_exact_time` is the rule for `immutable` on Maps, Tiles and WMS: the
-  engine draws exactly the instant requested. A snapped instant, an interval
-  or no time revalidates.
+  When no time matches, Maps returns 404 and map tiles return 204.
+- `is_exact_time` and `is_fixed_run` are the rule for `immutable` on Maps,
+  Tiles and WMS: the engine draws exactly the instant requested, from a
+  collection without runs or the run the request named. A snapped instant,
+  an interval, no time, or a run left to the engine revalidates.
 - `map_frame` defines `MapCrs` (CRS84, EPSG:4326, EPSG:3857, EPSG:3067,
   EPSG:3035), each in its own axis order. It also handles `Content-Bbox`
   and converts scale denominator to resolution at 0.28 mm per pixel. The

@@ -12278,8 +12278,9 @@ prewarm_sweeps = 0
     /// A NetCDF collection serves EDR (#1067), its default `apis` included,
     /// and its WMS layers answer GetFeatureInfo whether or not it lists
     /// `edr`; every API serves the wind speed derived from its grid-relative
-    /// 10 m components, and no direction. A reload keeping its config keeps
-    /// its engine, open files and wrapper; a changed config builds anew.
+    /// 10 m components, and EDR alone their direction, turned to true north
+    /// (#897). A reload keeping its config keeps its engine, open files and
+    /// wrapper; a changed config builds anew.
     #[test]
     fn netcdf_serves_edr_and_derived_wind_and_is_reused_across_reloads() {
         let meps = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -12310,7 +12311,11 @@ prewarm_sweeps = 0
         assert!(edr.contains_key("meps-edr") && !edr.contains_key("meps-reload"));
         let parameters = edr["meps-edr"].get_parameters();
         assert!(parameters.contains(&"wind_speed_10m".to_string()));
-        assert!(!parameters.iter().any(|p| p.contains("direction")));
+        assert!(parameters.contains(&"wind_direction_10m".to_string()));
+        assert!(!first
+            .wms_state
+            .styles
+            .contains_key("meps-reload/wind_direction_10m"));
         assert!(first.wms_state.point_engines.contains_key("meps-reload"));
         assert!(!first.wms_state.point_engines.contains_key("meps-edr"));
         let speed = &first.wms_state.styles["meps-reload/wind_speed_10m"]["default"];

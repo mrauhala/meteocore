@@ -238,10 +238,12 @@ apart from its surface family (MEPS `sfc`).
 grid-relative, `eastward_wind`/`northward_wind` earth-relative), or, on a
 variable without one, by a known name such as `u`/`v` (frame unknown).
 `x_wind_10m` and `y_wind_10m` give `wind_speed_10m`; `x_wind_pl` and
-`y_wind_pl` give `wind_speed_pl` per level. Speed is served on every API.
-Direction is EDR-only and needs earth-relative components, or
-grid-relative ones on a latitude/longitude grid. `derive_wind = false`
-opts out.
+`y_wind_pl` give `wind_speed_pl` per level, with `wind_direction_10m` and
+`wind_direction_pl`. Speed is served on every API. Direction is EDR-only:
+earth-relative components as they are, grid-relative ones turned to true
+north by the grid's convergence at each value's position (Lambert
+conformal conic, polar and oblique stereographic, Transverse Mercator), or
+as they are on a latitude/longitude grid. `derive_wind = false` opts out.
 
 **Derived geopotential height.** A variable whose `standard_name` is
 `geopotential`, in m2 s-2, gives its height ÷ g₀ in gpm on every API,
@@ -358,8 +360,8 @@ Process-wide environment variables, shared by every NetCDF collection:
   than WGS84. A curvilinear grid has at most 16.8 million nodes (4096²),
   and its 2-D latitude/longitude are read whole each time a file is
   opened.
-- Grid-relative wind components on a projected grid give speed only, and
-  nothing on a geostationary or azimuthal equal-area grid, whose axes are
+- Grid-relative wind components give nothing on a geostationary or
+  azimuthal equal-area grid, whose axes are
   not orthogonal on the ground, nor on a curvilinear grid, whose axes'
   directions are unknown. `valid_range` is not applied; non-standard
   calendars are refused.

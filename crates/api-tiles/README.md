@@ -74,7 +74,9 @@ plus:
 Collection metadata adds `dataType`, `crs`, `storageCrs`, `styles`,
 `parameter_names` and `tilesets-map`/`tilesets-vector` links. Its extent
 describes the native grid as Maps does
-([api-common](../api-common/README.md#native-grid)). Tilesets give
+([api-common](../api-common/README.md#native-grid)), and a collection that
+keeps model runs lists them as its `reference_time` dimension, as Maps does
+([api-maps](../api-maps/README.md#endpoints)). Tilesets give
 `tileMatrixSetLimits` for zooms 0–18 from the extent. Catalog search and HTML
 pages come from [api-common](../api-common/README.md).
 
@@ -84,7 +86,7 @@ pages come from [api-common](../api-common/README.md).
 |---|---|---|
 | `f` | `image/png` (default), `image/jpeg`, `image/webp` | `mvt` or `application/vnd.mapbox-vector-tile` |
 | `datetime` | Instant or interval (`a/b`, `../b`, `a/..`) | Same; filters features |
-| `subset` | `datetime(…)` only: quoted RFC 3339 values, partial dates, `*` | Same |
+| `subset` | `datetime(…)`: quoted RFC 3339 values, partial dates, `*`; and `reference_time(…)` on a collection with model runs | `datetime(…)` only |
 | `width`, `height` | Image size over the tile's area, ≤ 8000 a side, ≤ 64 M px | 400 |
 | `scale-denominator` | Image size from the scale at the tile centre; not with `width`/`height` | 400 |
 | `parameter-name` | A parameter or RGB composite; unknown: 400 listing valid names (single-band: ignored) | 400 |
@@ -98,6 +100,13 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
   An instant snaps to one of the engine's time steps; an interval, a partial
   date or `*` renders the latest step inside it. No step selected: 204 No
   Content. `OGCAPI-datetime` names the instant rendered.
+- **Map tile model run.** `subset=reference_time("<run>")`, as on a Maps map
+  ([api-maps](../api-maps/README.md#map-parameters)): the run's EDR instance
+  id, or `*` for the latest. A named run is drawn exactly: the time is one
+  of its own valid times, by default its latest, and a time outside it is
+  an empty tile, 204. An unknown run is a 404, an interval of runs a 400,
+  and the axis a 400 naming `datetime` on a collection without runs or on a
+  vector tile.
 - **Vector tile time.** The tile keeps features whose temporal geometry
   intersects the selection, and features without time. A time subset entirely
   outside the temporal extent is a 204. A collection without a time dimension
@@ -111,13 +120,13 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
 
 - Map tiles carry `Content-Crs`, `ETag` and `x-cache` (`HIT`, `MISS`,
   `EMPTY`). An instant the engine draws exactly, on an engine without model
-  runs that never revises content in place, is
-  `public, max-age=86400, immutable`; everything else is
+  runs or from the run the tile names, that never revises content in place,
+  is `public, max-age=86400, immutable`; everything else is
   `public, max-age=60, must-revalidate`: no time, an interval even when
   closed, an instant snapped to another time step, whose URL draws another
   frame once one lands or the window slides, or an instant of an engine that
   keeps model runs (GRIB, QueryData, Zarr and NetCDF forecasts, nowcast
-  generations): Tiles names no run, and a newer run re-covers the instant. A
+  generations) with no run named, or `*`: a newer run re-covers the instant. A
   PostGIS lightning frame is revised until an hour before the newest strike.
   Instants are compared, not their
   text, so a step written with an offset is exact. The header is each request's
@@ -188,8 +197,8 @@ tiles) and `collections.d/zarr-era5-t2m-local.toml` (Zarr, map tiles).
 - Only WebMercatorQuad and WorldCRS84Quad; no projected tile matrix sets.
 - No per-collection zoom range: zooms 0–24 are served, 0–18 advertised.
 - Collection tilesets only; no dataset (multi-collection) tilesets.
-- Forecast collections render the engine's latest model run; there is no
-  `reference_time` parameter.
+- A run's own valid times are not in the Tiles description, as in Maps
+  ([api-maps](../api-maps/README.md#limits)).
 - Vector tiles carry every property in one layer: no property selection or
   styling. Their cache is 128 MB and not configurable.
 
@@ -198,6 +207,7 @@ tiles) and `collections.d/zarr-era5-t2m-local.toml` (Zarr, map tiles).
 ```bash
 cargo test -p api-tiles
 cargo test -p server --test common_discovery   # shared discovery, all APIs
+cargo test -p server --test grib_reference_time   # model runs over real GRIB
 ```
 
 Unit tests cover parameter validation, errors and tile matrix math.

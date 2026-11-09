@@ -50,6 +50,9 @@ struct Fixture {
     native_crs: &'static str,
     /// `RasterInfo.native_grid` (#1237).
     native_grid: Option<NativeGrid>,
+    /// `RasterInfo.reference_times`: model runs, the extent's
+    /// `reference_time` dimension (#337).
+    runs: Vec<DateTime<Utc>>,
 }
 
 impl EdrEngine for Fixture {
@@ -148,7 +151,7 @@ impl MapEngine for Fixture {
             vertical: self.vertical.clone(),
             grid_size: self.bbox.map(|_| [80, 80]),
             layer_subtitle: None,
-            reference_times: vec![],
+            reference_times: self.runs.clone(),
             native_grid: self.native_grid.clone(),
         }
     }
@@ -230,6 +233,15 @@ fn catalog() -> Catalog {
         } else {
             vec![]
         };
+        // The forecast also retains two model runs (#337).
+        let runs = if id == "c-match" {
+            vec![
+                instant("2023-12-31T18:00:00Z"),
+                instant("2024-01-01T00:00:00Z"),
+            ]
+        } else {
+            vec![]
+        };
         let fixture = Arc::new(Fixture {
             bbox,
             time,
@@ -238,6 +250,7 @@ fn catalog() -> Catalog {
             parameters,
             native_crs: "CRS:84",
             native_grid: None,
+            runs,
         });
         edr.insert(id.into(), fixture.clone());
         maps.insert(id.into(), fixture.clone());
@@ -278,6 +291,7 @@ fn numbered_catalog(n: usize) -> Catalog {
             parameters: vec![],
             native_crs: "CRS:84",
             native_grid: None,
+            runs: vec![],
         });
         edr.insert(id.clone(), fixture.clone());
         maps.insert(id.clone(), fixture.clone());
@@ -523,6 +537,40 @@ fn uad_dimension_check_rejects_the_previous_vertical_shape() {
         });
         assert!(rejected.is_err(), "accepted {broken}");
     }
+}
+
+/// #337: a raster's model runs are the `reference_time` dimension of its
+/// Maps, Tiles and shared root extent, a valid Uniform Additional Dimension
+/// by its `definition`. A collection without runs has none, nor has EDR's
+/// extent: EDR lists runs as instances. With a `trs` beside the `definition`
+/// the dimension matches two branches of the schema's `oneOf`, so it has
+/// none.
+#[tokio::test]
+async fn model_runs_are_a_uniform_additional_dimension() {
+    for surface in SURFACES {
+        let (app, prefix) = app(surface);
+        let doc = get_json(&app, &format!("{prefix}/collections/c-match")).await;
+        let dimension = &doc["extent"]["reference_time"];
+        if ["maps", "tiles", "shared"].contains(surface) {
+            assert_eq!(
+                dimension["grid"]["coordinates"],
+                json!(["2023-12-31T18:00:00Z", "2024-01-01T00:00:00Z"]),
+                "{surface}: {doc}"
+            );
+            assert!(dimension.get("trs").is_none(), "{surface}");
+        } else {
+            assert!(dimension.is_null(), "{surface}: {dimension}");
+        }
+        schema::assert_dimensions_valid(&doc, surface);
+        let other = get_json(&app, &format!("{prefix}/collections/d-match")).await;
+        assert!(other["extent"].get("reference_time").is_none(), "{surface}");
+    }
+    let mut both = get_json(&app("maps").0, "/base/maps/collections/c-match").await;
+    both["extent"]["reference_time"]["trs"] =
+        json!("http://www.opengis.net/def/uom/ISO-8601/0/Gregorian");
+    let rejected =
+        std::panic::catch_unwind(|| schema::assert_dimensions_valid(&both, "trs and definition"));
+    assert!(rejected.is_err(), "accepted {}", both["extent"]);
 }
 
 #[tokio::test]
@@ -1997,6 +2045,7 @@ async fn shared_root_extent_precedence_matches_discovery() {
             parameters: vec![],
             native_crs: "CRS:84",
             native_grid: None,
+            runs: vec![],
         }),
     );
     // `f-wind` is served by Features alone: no map, no tiles.
@@ -2136,6 +2185,7 @@ async fn native_grids_are_described_without_changing_storage_crs() {
                 parameters: vec![],
                 native_crs,
                 native_grid,
+                runs: vec![],
             }),
         );
     }

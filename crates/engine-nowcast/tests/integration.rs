@@ -899,6 +899,39 @@ fn new_source_frame_rolls_a_new_generation() {
     );
 }
 
+/// #337: a map naming an older generation selects its time on that
+/// generation's own frames, `run_times`: its analysis frame first, which the
+/// advertised axis, the latest generation's, no longer has. A generation the
+/// engine does not retain has none.
+#[test]
+fn an_older_generation_keeps_its_own_frames_for_a_map_naming_it() {
+    let anchor1 = t0() + Duration::minutes(5);
+    let (source, engine) = build("PT30M", &[t0(), anchor1]);
+    engine.poll_once();
+    let anchor2 = anchor1 + Duration::minutes(5);
+    source.times.write().unwrap().push(anchor2);
+    engine.poll_once();
+    let info = engine.raster_info();
+    assert_eq!(info.reference_times, vec![anchor1, anchor2]);
+    assert_eq!(info.times.first(), Some(&anchor2));
+
+    let older = engine.run_times(None, anchor1).expect("retained");
+    assert_eq!(older.first(), Some(&anchor1), "its analysis frame");
+    assert_eq!(older.last(), Some(&(anchor1 + Duration::minutes(30))));
+    assert!(older.windows(2).all(|w| w[0] < w[1]));
+    assert!(!info.times.contains(&anchor1));
+    // The analysis frame draws from the older generation itself.
+    assert_eq!(
+        engine.resolve_time(Some(anchor1), Some(anchor1)),
+        Some(anchor1)
+    );
+    assert_eq!(
+        engine.run_times(None, anchor2).as_deref(),
+        Some(info.times.as_slice())
+    );
+    assert_eq!(engine.run_times(None, anchor1 - Duration::hours(6)), None);
+}
+
 /// No silent caps: a horizon/step pair exceeding the per-generation lead cap
 /// is a config error at construction, not a silently shortened horizon.
 #[test]

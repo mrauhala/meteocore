@@ -299,9 +299,10 @@ impl Layout {
 /// `x_wind_pl`/`y_wind_pl` pair level by level (#1067 PR 8), and its
 /// `vertical` says the level is a pressure, which a humidity derived from
 /// specific humidity reads (#898). MEPS's
-/// Lambert grid is `GridAxes::Rotated`, so its grid-relative 10 m wind
-/// gives a speed and no direction until the components are turned by the
-/// convergence angle (a follow-up on #897); a curvilinear grid's are
+/// Lambert grid is `GridAxes::Rotated` with its convergence, so its
+/// grid-relative 10 m wind gives a speed, and a direction the components
+/// turned to true north at each value's position (#897); a curvilinear
+/// grid's are
 /// `GridAxes::Skewed` (#1174), so grid-relative components give nothing
 /// there, while earth-relative ones give both. Nothing is taken from a
 /// name.
@@ -541,6 +542,19 @@ impl Run {
     }
 }
 
+/// The valid times of each run of `runs` with a reference time, for
+/// [`Catalog::run_times`].
+pub(crate) fn run_times(
+    runs: &BTreeMap<RunKey, Run>,
+) -> BTreeMap<DateTime<Utc>, Arc<[DateTime<Utc>]>> {
+    runs.values()
+        .filter_map(|run| {
+            let times: Arc<[DateTime<Utc>]> = run.steps.keys().copied().collect();
+            run.reference_time.map(|rt| (rt, times))
+        })
+        .collect()
+}
+
 /// A step [`Catalog::select`] chose.
 pub(crate) struct Selected<'a> {
     pub reference_time: Option<DateTime<Utc>>,
@@ -557,6 +571,9 @@ pub(crate) struct Catalog {
     /// By reference time, ascending. Files without one form the single
     /// timeline under `None`; a catalog never holds both kinds.
     pub runs: BTreeMap<RunKey, Run>,
+    /// Each run's valid times, for a map naming it (#337): built with the
+    /// catalog ([`run_times`]), so a request clones an `Arc`.
+    pub run_times: BTreeMap<DateTime<Utc>, Arc<[DateTime<Utc>]>>,
     pub info: Arc<RasterInfo>,
     /// [`ds_core::map_engine::MapEngine::content_version`]: moves when a
     /// catalogued file is replaced on disk.
@@ -571,6 +588,7 @@ impl Catalog {
         Self {
             layout: None,
             runs: BTreeMap::new(),
+            run_times: BTreeMap::new(),
             info: Arc::new(raster_info(None, &BTreeMap::new(), &BTreeMap::new())),
             content_version,
             polled_at: None,

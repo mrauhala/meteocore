@@ -13,6 +13,7 @@ use crate::edr_engine::{EdrEngine, ItemRadius, LocationFilter, TrajectoryShape};
 use crate::error::DataServerError;
 use crate::feature::{AreaShare, Bbox, DatetimeInterval, Feature, MAX_AREA_VALUES};
 use crate::feature_pick::{FeaturePick, PickedFeatures};
+use crate::geo::Convergence;
 use crate::instances::RunInfo;
 use crate::map_engine::{
     CompositeDef, MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile, RasterValues,
@@ -560,7 +561,17 @@ impl EdrSelection {
                 None
             };
             let pressure_missing = d.formula.reads_level_pressure() && pressures.is_none();
-            let range = if ranges.iter().all(Option::is_some) && !pressure_missing {
+            // The convergence at each value's position, for components
+            // turned to true north there: none known gives missing values.
+            let convergences = d
+                .formula
+                .convergence()
+                .map(|convergence| Convergences::new(&convergence, &result.domain, first));
+            let convergence_missing = matches!(convergences, Some(None));
+            let range = if ranges.iter().all(Option::is_some)
+                && !pressure_missing
+                && !convergence_missing
+            {
                 let ranges: Vec<&NdArray> = ranges.into_iter().flatten().collect();
                 if ranges
                     .iter()
@@ -583,6 +594,9 @@ impl EdrSelection {
                             if let Some(pressures) = &pressures {
                                 samples.push(Some(pressures[i]));
                             }
+                            if let Some(Some(convergences)) = &convergences {
+                                samples.push(convergences.at(i));
+                            }
                             d.value(&samples)
                         })
                         .collect(),
@@ -591,8 +605,8 @@ impl EdrSelection {
                     precision: ranges.iter().map(|r| r.precision).min().unwrap_or_default(),
                 }
             } else {
-                // An input missing throughout, or no level pressure:
-                // missing values.
+                // An input missing throughout, or no level pressure or
+                // value positions: missing values.
                 NdArray {
                     shape: first.shape.clone(),
                     axis_names: first.axis_names.clone(),
@@ -652,6 +666,102 @@ fn level_pressures(domain: &DomainDescription, range: &NdArray) -> Option<Vec<f6
     hpa.iter()
         .all(|p| p.is_finite() && *p > 0.0)
         .then(|| hpa.into_iter().map(|p| p * 100.0).collect())
+}
+
+/// A grid's convergence at each value of a range over a domain, in degrees:
+/// computed once per distinct position (a point, a grid cell, a path node),
+/// from the domain's CRS84 longitude and latitude, and looked up per value.
+struct Convergences {
+    /// One per distinct position: the point, the grid's cells row by row
+    /// (`y` then `x`), or the path's nodes.
+    at: Vec<Option<f64>>,
+    layout: Layout,
+}
+
+/// Where value `i` of a range lies among a domain's distinct positions.
+enum Layout {
+    /// Every value at the one point.
+    One,
+    /// Along one axis of the range: position `(i / stride) % len`.
+    Axis { stride: usize, len: usize },
+    /// On a grid: cell `(i / y_stride) % ny` by `(i / x_stride) % nx`.
+    Grid {
+        x_stride: usize,
+        nx: usize,
+        y_stride: usize,
+        ny: usize,
+    },
+}
+
+impl Convergences {
+    /// `None` when the range's shape does not say where its values lie on
+    /// the domain.
+    fn new(convergence: &Convergence, domain: &DomainDescription, range: &NdArray) -> Option<Self> {
+        let n = range.values.len();
+        if range.shape.len() != range.axis_names.len() || range.shape.iter().product::<usize>() != n
+        {
+            return None;
+        }
+        // The stride and length of the range's axis `name`.
+        let axis = |name: &str| {
+            let at = range.axis_names.iter().position(|axis| axis == name)?;
+            Some((
+                range.shape[at + 1..].iter().product::<usize>(),
+                range.shape[at],
+            ))
+        };
+        let gamma = |lon: f64, lat: f64| convergence.degrees(lon, lat);
+        let (at, layout) = match domain {
+            DomainDescription::Point { x, y, .. }
+            | DomainDescription::PointSeries { x, y, .. }
+            | DomainDescription::VerticalProfile { x, y, .. } => (vec![gamma(*x, *y)], Layout::One),
+            DomainDescription::Grid { x, y, .. } => {
+                // A one-cell axis may be left out of the range.
+                let along = |name: &str, len: usize| match axis(name) {
+                    Some((stride, n)) if n == len => Some(stride),
+                    None if len == 1 => Some(1),
+                    _ => None,
+                };
+                let (x_stride, y_stride) = (along("x", x.len())?, along("y", y.len())?);
+                let at = y
+                    .iter()
+                    .flat_map(|&lat| x.iter().map(move |&lon| gamma(lon, lat)))
+                    .collect();
+                let layout = Layout::Grid {
+                    x_stride,
+                    nx: x.len(),
+                    y_stride,
+                    ny: y.len(),
+                };
+                (at, layout)
+            }
+            DomainDescription::Trajectory { nodes, .. }
+            | DomainDescription::Section { nodes, .. } => {
+                let (stride, len) = axis("composite")?;
+                if len != nodes.len() {
+                    return None;
+                }
+                let at = nodes.iter().map(|&(_, lon, lat)| gamma(lon, lat)).collect();
+                (at, Layout::Axis { stride, len })
+            }
+        };
+        Some(Self { at, layout })
+    }
+
+    /// The convergence where value `i` lies.
+    fn at(&self, i: usize) -> Option<f64> {
+        let position = match self.layout {
+            Layout::One => 0,
+            Layout::Axis { stride, len } => (i / stride) % len,
+            Layout::Grid {
+                x_stride,
+                nx,
+                y_stride,
+                ny,
+            } => (i / y_stride) % ny * nx + (i / x_stride) % nx,
+        };
+        self.at.get(position).copied().flatten()
+    }
 }
 
 /// The content version of a frame drawn from several frames: `0` while none
@@ -914,6 +1024,20 @@ impl MapEngine for Derived {
             // An input without an axis of its own has every time.
             1 => axes.pop(),
             _ => Some(self.common_axis(&d.name, axes)),
+        }
+    }
+
+    /// A derived parameter has its first input's times in the run: the
+    /// render then picks the step every input has, as
+    /// `resolve_parameter_time` does. Every other layer is the wrapped
+    /// engine's.
+    fn run_times(&self, parameter: Option<&str>, run: DateTime<Utc>) -> Option<Times> {
+        let plan = self.plan();
+        match parameter.and_then(|p| plan.get(p)) {
+            Some(d) => self
+                .map
+                .run_times(d.inputs.first().map(String::as_str), run),
+            None => self.map.run_times(parameter, run),
         }
     }
 

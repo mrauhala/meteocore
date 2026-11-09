@@ -211,8 +211,9 @@ type TrackReplay = (Vec<CellTrack>, Vec<CellTrack>, DateTime<Utc>, DateTime<Utc>
 struct Generation {
     lightning_epoch: u64,
     reference_time: DateTime<Utc>,
-    /// Valid times, ascending: `reference_time`, then the leads.
-    times: Vec<DateTime<Utc>>,
+    /// Valid times, ascending: `reference_time`, then the leads. Shared, so
+    /// a map naming the generation reads them without a copy (#337).
+    times: Arc<[DateTime<Utc>]>,
     frames: Vec<FrameData>,
     geom: GridGeom,
     /// The (blended) motion field this generation advected along — the
@@ -1379,7 +1380,7 @@ impl NowcastEngine {
         Ok(Generation {
             lightning_epoch: sources.lightning_epoch,
             reference_time: anchor,
-            times,
+            times: times.into(),
             frames,
             geom,
             field,
@@ -1585,7 +1586,7 @@ fn build_info(
     RasterInfo {
         native_crs: "CRS:84".into(),
         spatial_extent: source_info.spatial_extent,
-        times: latest.map(|g| g.times.clone()).unwrap_or_default(),
+        times: latest.map(|g| g.times.to_vec()).unwrap_or_default(),
         parameter: source_info.parameter.clone(),
         unit: source_info.unit.clone(),
         parameters: Vec::new(),
@@ -1773,6 +1774,17 @@ impl MapEngine for NowcastEngine {
         let state = self.state.load();
         let generation = Self::select_generation(&state, reference_time)?;
         Some(Self::select_time(&generation, time))
+    }
+
+    /// A generation's own valid times, its analysis frame first (#337):
+    /// `RasterInfo::times` is the latest generation's.
+    fn run_times(
+        &self,
+        _parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        let state = self.state.load();
+        Self::select_generation(&state, Some(run)).map(|g| g.times.clone())
     }
 
     fn resolve_reference_time(

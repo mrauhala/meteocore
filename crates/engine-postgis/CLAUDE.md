@@ -282,7 +282,7 @@ in step when changing this lifecycle.
     stops at the LIMIT: an ordered scan of the `(<fk>, <time> DESC)` index
     (`= ANY` on its leading column) under an incremental sort. Without that
     index, or with a bitmap scan and a full sort, it reads every row in the
-    window and can reach the role's `statement_timeout`, an opaque 500. The
+    window and can reach the role's `statement_timeout`, a 504 (below). The
     timing test prints each path's time to that 400 for a week over 20 000
     stations, and the statement's `EXPLAIN ANALYZE`.
   - Set-based (`build_area_set`, `run_area_set`): one statement per
@@ -333,6 +333,25 @@ in step when changing this lifecycle.
   `timestamp without time zone`. The WHERE clause wraps the BIND
   (`$N AT TIME ZONE '<tz>'`) so the column index stays usable; the SELECT
   list wraps the COLUMN to emit `timestamptz`.
+- **Every `ORDER BY` and `DISTINCT ON` names the table's column (#1446).**
+  The select lists emit `... AS time` (a naive column's converted
+  expression) and `<id>::text AS id`, and PostgreSQL resolves a bare
+  `ORDER BY "time"` or `"id"` to that output column: an order no index
+  provides, so the statement sorts its whole window before the `LIMIT`, and
+  in a zone's spring-forward gap not the order the WHERE bounds read.
+  Observation statements alias the table `mc_obs` (`OBS_ALIAS`), events
+  statements `mc_events` (`EVENTS_ALIAS`); the stations table is named in
+  full (`"schema"."table"."id"`), never aliased, because `where_clause` may
+  name it. `query::tests::ordered_statements_name_their_columns_through_the_table`
+  checks every ordered builder; keep a new one in it.
+- **Database errors (#1446):** `map_pg_error` logs the SQL template and the
+  database's error at WARN and answers SQLSTATE 57014 (`query_canceled`:
+  the role's `statement_timeout`) `DeadlineExceeded`, a 503 with
+  `Retry-After: 1` (EDR's 504); any other error is the opaque 500. Every
+  request-path statement goes through it. A request before a refresh
+  validated the tables (`require_validated`, pending) is
+  `ResourceExhausted`, a 503, logged at WARN; a confirmed schema mismatch
+  stays the 500. A pool checkout that fails is still the 500.
 - No data in window → `LocationNotFound` → 404 (an empty PointSeries fails
   CoverageJSON validation).
 - Supported `pg_type`s for `property_cols`: `bool`, `int2/4/8`, `float4/8`,
@@ -380,7 +399,11 @@ in step when changing this lifecycle.
   gives the total before `LIMIT`, attribute columns use `mc_` aliases, and
   value filters apply as in EDR. It runs through `run_single_query_sync`
   (`block_in_place` on the query runtime), never `maps.rs`'s
-  `spawn_blocking` bridge. Station layers do not pick.
+  `spawn_blocking` bridge. Station layers do not pick. A picked event's id
+  is the bare `id_col` value WMS clients read; its properties are the
+  Features ones plus `feature_id` last, its `<id>@<time>` key
+  (`EventRecord::into_picked`, #1446), so a client can read it back at
+  `/items/{featureId}`. Never change the pick's id itself.
 
 ## Features on the events shape (#503)
 
@@ -401,11 +424,9 @@ in step when changing this lifecycle.
   the index range, the `OR` only resolves ties. The key `(time, id)` must be
   unique and the id never NULL, as a hypertable's key is; a duplicate or
   NULL id at a page boundary is skipped. `offset > 0` is a 400.
-- **Name the order's time through the table alias** (`mc_events."time"`).
-  The select list emits `... AS time`; a bare `ORDER BY "time"` resolves to
-  that OUTPUT column, which for a naive column is the converted expression
-  no index provides, so every page would sort the whole window. Keep the
-  alias in any new ordered events statement.
+- **Name the order's time through the table alias** (`mc_events."time"`),
+  as every ordered statement does (Data-shape rules, #1446): a bare
+  `ORDER BY "time"` would sort every page's whole window.
 - The feature id and the cursor are the same string, `EventKey`:
   `<id>@<time>`, RFC 3339 UTC `AutoSi`, so a microsecond time round-trips
   exactly; parsed at the last `@`. **One event, one id:** `EventKey::parse`
@@ -482,6 +503,16 @@ in step when changing this lifecycle.
   fallback for an id type with no bind of its own.
   `events_features_default_window_chain` (`mc503_chain`): a chain on the
   named default window, events inserted between pages, each visited once.
+- `tests/support/order_and_timeouts.rs` (#1446, `mc1446_*`):
+  `naive_time_orders_by_the_table_column` stores rows in a
+  `Europe/Helsinki` spring-forward gap, the only ones whose converted times
+  order differently from the column, and checks that the events area, pick,
+  window and Features page keep the same newest strike, and that no plan of
+  those or the station statements sorts by a conversion while the bare-name
+  form of each does. `a_statement_timeout_is_the_deadline`: a DSN
+  `statement_timeout` and a view whose geometry sleeps, empty while the
+  refresh validates it, make the area and Features reads
+  `DeadlineExceeded`.
 - The timing test prints both paths by stations × steps on a TimescaleDB
   hypertable, each path's time to the value-budget 400 for a week over
   20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It
