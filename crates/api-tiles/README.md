@@ -74,6 +74,10 @@ plus:
 - A contour style (#1378) draws its lines into the tile from a read one or
   two pixels past the tile's edges, so a line leaving one tile meets itself
   in the next: a 2 × 2 block of tiles is the tile above drawn at 512 × 512.
+- The shared root's styled map tileset list and tileset take
+  `parameter-name` besides `f`: a style only that parameter's layer offers
+  (its built-in `contours`) is resolved there, and the list's links and
+  tile templates carry it.
 
 Collection metadata adds `dataType`, `crs`, `storageCrs`, `styles` (the
 collection's own, then those only some parameter layers offer, such as the

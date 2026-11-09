@@ -12,8 +12,8 @@ use ds_core::error::DataServerError;
 use ds_core::map_engine::{OutputCrs, RasterTile, RasterValues};
 use ds_core::web_mercator::EARTH_RADIUS;
 use ds_render::{
-    assemble_metatiled, assemble_metatiled_contours, ContourStyle, MetaTilePixels, MetaTileStats,
-    StyleContext, StyleSpec, TileKeyPrefix, TilePixelCache,
+    assemble_metatiled, assemble_metatiled_contours, ContourPlan, ContourStyle, MetaTilePixels,
+    MetaTileStats, StyleContext, StyleSpec, TileKeyPrefix, TilePixelCache,
 };
 
 /// Mean sea-level pressure in hPa over Europe's latitudes, ~25 isobars
@@ -166,6 +166,45 @@ fn main() -> Result<(), DataServerError> {
             |b, tw, th, c| Ok(field(b, tw, th, c)),
         )
         .map(stats)
+    })?;
+    // A warm view: every meta-tile cached, the assembly alone.
+    let warm = TilePixelCache::new(64);
+    let contours = |cache: &TilePixelCache| {
+        assemble_metatiled_contours(
+            bbox_deg,
+            &crs,
+            w,
+            h,
+            &prefix("contours"),
+            &lines,
+            None,
+            None,
+            cache,
+            |b, tw, th, c| Ok(field(b, tw, th, c)),
+        )
+        .map(stats)
+    };
+    contours(&warm)?;
+    report("contours, tiles cached", &|| contours(&warm))?;
+    // A view off the ladder renders directly: one read and one trace of
+    // the whole view, every time (no meta-tile to reuse).
+    report("contours, direct", &|| {
+        let plan = ContourPlan::new(&lines, bbox_deg, w, h, &crs, None);
+        let start = Instant::now();
+        let tile = field(
+            plan.fetch_bbox(),
+            plan.fetch_width(),
+            plan.fetch_height(),
+            plan.fetch_crs(),
+        );
+        let engine = start.elapsed();
+        let start = Instant::now();
+        plan.draw(&tile, &lines, None)?;
+        Ok(MetaTileStats {
+            engine,
+            colorize: start.elapsed(),
+            ..MetaTileStats::default()
+        })
     })?;
     Ok(())
 }

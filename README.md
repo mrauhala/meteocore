@@ -2645,11 +2645,26 @@ layers offer it (their links carry `parameter-name`). Its legend is a line
 swatch and the interval, `every 4 hPa` (`every 2 K through 273.15 K` when
 the base is not a multiple of the interval), and the JSON legend carries a
 `contour` member: `interval`, `base`, `color`, `width`, `fill` and that
-`description`; lines alone have no `stops`. Measured on a 1024 × 1024
-EPSG:3857 view of 16 uncached meta-tiles (`cargo run --release -p ds-render
---example contour_cost`), tracing and drawing the lines took 10 ms against
-2 ms for colorizing the fill alone, 12 ms over a fill and 19 ms with two
-smoothing passes; each tile reads 258 × 258 pixels instead of 256 × 256.
+`description`; lines alone have no `stops`. A style only some parameters
+offer is listed with those `parameters`, and its links name the first
+(`?parameter-name=`), so they resolve: the styled map tileset list and
+tileset of the shared root take `parameter-name` for such a style.
+
+WMS meta-tiles a contour view only when its resolution is a step of the
+meta-tile ladder, as a client zooming in whole steps sends. Between steps
+the tiles would be downsampled by up to √2, nearest, dropping line pixels,
+so such a view renders directly: one engine read and one trace per view,
+with only exact repeats served from the rendered-image cache. A field
+whose interval puts more than four lines through one output cell draws
+the lowest four there, a solid band anyway.
+
+Measured on a 1024 × 1024 EPSG:3857 view of 16 uncached meta-tiles (`cargo
+run --release -p ds-render --example contour_cost`, a synthetic field),
+tracing and drawing the lines took 10 ms against 2 ms for colorizing the
+fill alone, 12 ms over a fill and 19 ms with two smoothing passes; each tile
+reads 258 × 258 pixels instead of 256 × 256. With every meta-tile cached the
+view assembles in 3 ms; rendered directly, as off the ladder, it costs its
+engine read every time (59 ms of the synthetic field) plus 8 ms to trace.
 
 **Named custom colormaps** — define once, reference anywhere a built-in
 name works (`[wms] colormap`, `[[wms.styles]]`, `[[wms.parameters]]`, style

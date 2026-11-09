@@ -511,3 +511,63 @@ fn legends_describe_the_lines() {
         assert_eq!(coloured > 100, fill, "colour bar only under a fill");
     }
 }
+
+/// A cell crossed by far more levels than an output cell can show traces
+/// the lowest four only: an interval too small for the field costs a
+/// bounded amount of work per cell.
+#[test]
+fn levels_per_cell_are_capped() {
+    let grid = Grid {
+        width: 2,
+        height: 2,
+        values: vec![0.5, 100.5, 0.5, 100.5],
+    };
+    let mut levels = Vec::new();
+    trace(&grid, 0, 0.0, &lines(1.0), &mut |p, _| levels.push(p.0)).unwrap();
+    assert_eq!(levels.len(), 4, "{levels:?}");
+    // Levels 1..=4 cross the top edge at x = 0.5 + (level - 0.5) / 100.
+    for (k, x) in levels.iter().enumerate() {
+        assert!(
+            (x - (0.5 + (k as f64 + 0.5) / 100.0)).abs() < 1e-9,
+            "{levels:?}"
+        );
+    }
+}
+
+/// The source's cell size comes from its grid, else its extent and cell
+/// counts, an extent across the antimeridian included, and is never
+/// negative.
+#[test]
+fn source_spacing_is_positive() {
+    let info = |extent: [f64; 4], nx: u32| RasterInfo {
+        native_crs: "CRS:84".into(),
+        spatial_extent: Some(extent),
+        times: Vec::new(),
+        parameter: "msl".into(),
+        unit: "hPa".into(),
+        parameters: Vec::new(),
+        vertical: None,
+        grid_size: Some([nx, 10]),
+        layer_subtitle: None,
+        reference_times: Vec::new(),
+        native_grid: None,
+    };
+    assert_eq!(
+        source_spacing_deg(&info([0.0, 0.0, 40.0, 10.0], 160)),
+        Some(0.25)
+    );
+    assert_eq!(
+        source_spacing_deg(&info([170.0, 0.0, -170.0, 10.0], 80)),
+        Some(0.25)
+    );
+    let mut projected = info([0.0, 0.0, 1.0, 1.0], 1);
+    projected.native_grid = ds_core::native_grid::NativeGrid::new(
+        ds_core::geo::projected_output_crs("EPSG:3067").unwrap(),
+        Some(3067),
+        [100, 100],
+        [0.0, 0.0],
+        [2500.0, 2500.0],
+    );
+    let spacing = source_spacing_deg(&projected).unwrap();
+    assert!((spacing - 2500.0 / METRES_PER_DEGREE).abs() < 1e-12);
+}

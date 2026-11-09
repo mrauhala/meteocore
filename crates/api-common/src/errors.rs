@@ -436,9 +436,9 @@ const FORMAT_ONLY: &[&str] = &["f"];
 /// on every route that rejects unknown parameters (root CLAUDE.md "Adding a
 /// new API endpoint" rule 3), and its HTML page marks it; `f` given twice
 /// is the 400 [`crate::JsonQuery`] answers.
-fn format_only(uri: &Uri) -> Result<Option<String>, Box<Response>> {
-    if let Some(name) = crate::subset::unknown_parameter(uri.query(), FORMAT_ONLY) {
-        let message = crate::subset::unknown_parameter_message(&name, FORMAT_ONLY);
+fn format_only(uri: &Uri, allowed: &[&str]) -> Result<Option<String>, Box<Response>> {
+    if let Some(name) = crate::subset::unknown_parameter(uri.query(), allowed) {
+        let message = crate::subset::unknown_parameter_message(&name, allowed);
         let detail = ErrorDetail {
             parameter: Some(name),
             ..Default::default()
@@ -462,7 +462,24 @@ where
     T: 'static,
     S: Clone + Send + Sync + 'static,
 {
-    format_only_route(handler, Some(what))
+    format_only_route(handler, Some(what), FORMAT_ONLY)
+}
+
+/// [`json_only_get`] for a resource that also takes the query parameters
+/// `allowed` lists besides `f` (which it must list too): a styled map
+/// tileset names the `parameter-name` whose layer offers its style
+/// (#1378). Any parameter `allowed` does not list is the 400 naming them.
+pub fn json_only_get_with<H, T, S>(
+    handler: H,
+    what: &'static str,
+    allowed: &'static [&'static str],
+) -> axum::routing::MethodRouter<S>
+where
+    H: axum::handler::Handler<T, S>,
+    T: 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    format_only_route(handler, Some(what), allowed)
 }
 
 /// A GET route whose handler reads no query and serves one representation
@@ -475,7 +492,7 @@ where
     T: 'static,
     S: Clone + Send + Sync + 'static,
 {
-    format_only_route(handler, None)
+    format_only_route(handler, None, FORMAT_ONLY)
 }
 
 /// `handler` behind [`format_only`], and behind [`json_only_format`] for
@@ -483,6 +500,7 @@ where
 fn format_only_route<H, T, S>(
     handler: H,
     json_only: Option<&'static str>,
+    allowed: &'static [&'static str],
 ) -> axum::routing::MethodRouter<S>
 where
     H: axum::handler::Handler<T, S>,
@@ -491,7 +509,7 @@ where
 {
     axum::routing::get(handler).layer(axum::middleware::from_fn(
         move |request: Request, next: Next| async move {
-            let f = match format_only(request.uri()) {
+            let f = match format_only(request.uri(), allowed) {
                 Ok(f) => f,
                 Err(response) => return *response,
             };

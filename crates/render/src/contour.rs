@@ -33,8 +33,9 @@
 //! alias its small-scale structure and the lines come out jagged. With two
 //! or more source cells per output pixel the grid is smoothed lightly
 //! (binomial 1-2-1 passes) before tracing. A finer view than the source
-//! traces the samples as read: they are the engine's bilinear interpolation
-//! of the source.
+//! traces the samples as read, as the engine samples its source for the
+//! fill: bilinear for GRIB, NetCDF, QueryData and Zarr, nearest for GeoTIFF,
+//! whose lines then follow its cells' edges.
 
 use std::sync::Arc;
 
@@ -48,10 +49,11 @@ use crate::{font, ImageFormat, StyleInfo};
 /// a parameter layer next to its `default` fill (#1378).
 pub const CONTOUR_STYLE: &str = "contours";
 
-/// Levels traced in one grid cell at most. A field whose interval puts
-/// more lines than this through one output cell draws a solid band
-/// anyway; the cap bounds the work of a misconfigured interval.
-const MAX_LEVELS_PER_CELL: i64 = 64;
+/// Levels traced in one grid cell at most, the lowest of them. Past about
+/// two lines per output cell the band is solid anyway; the cap bounds the
+/// work of an interval too small for the field: at 64, a probe with 8-px
+/// lines took 1.6 s per 256-px tile.
+const MAX_LEVELS_PER_CELL: i64 = 4;
 
 /// Metres of the equator per degree of longitude, to compare a projected
 /// output pixel with a lat/lon source cell.
@@ -200,7 +202,7 @@ impl ContourPaint {
 pub fn source_spacing_deg(info: &RasterInfo) -> Option<f64> {
     let spacing = match &info.native_grid {
         Some(grid) => {
-            let dx = grid.spacing()[0];
+            let dx = grid.spacing()[0].abs();
             match grid.crs() {
                 ds_core::geo::Crs::Wgs84 | ds_core::geo::Crs::RotatedLatLon { .. } => dx,
                 _ => dx / METRES_PER_DEGREE,
@@ -209,7 +211,13 @@ pub fn source_spacing_deg(info: &RasterInfo) -> Option<f64> {
         None => {
             let [west, _, east, _] = info.spatial_extent?;
             let [nx, _] = info.grid_size?;
-            (east - west) / f64::from(nx.max(1))
+            // An extent across the antimeridian has its west east of its east.
+            let span = if east >= west {
+                east - west
+            } else {
+                east + 360.0 - west
+            };
+            (span / f64::from(nx.max(1))).abs()
         }
     };
     (spacing.is_finite() && spacing > 0.0).then_some(spacing)

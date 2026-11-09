@@ -352,10 +352,24 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   `isobar_tiles_meet_across_tile_edges` (api-tiles) and
   `meta_tiled_isobars_match_a_direct_render` (api-wms); the GRIB fixture's
   isotherms against an independent trace in `engine-grib/tests/contours.rs`.
+  WMS meta-tiles a contour view only on a ladder step: between steps the
+  nearest-neighbour downsample (1–1.41×) drops line pixels, so
+  `assemble_metatiled_contours` declines and the view renders directly
+  (`contours_off_the_ladder_render_directly`). At most
+  `MAX_LEVELS_PER_CELL` (4) levels are traced per cell, the lowest, which
+  bounds an interval too small for its field.
   Legends go through `render_style_legend` (line swatch + `every 4 hPa`) and
   `legend_json`'s `contour` member. The Maps and Tiles style lists come from
   `collection_style_offers`: a style only parameter layers offer (the
-  built-in `contours`) is listed with its `parameters`.
+  built-in `contours`) is listed with its `parameters`, and every link to it
+  carries `?parameter-name=` for the first: Maps map and legend, Tiles
+  legend, and the shared root's styled tileset list, whose route takes
+  `parameter-name`, resolves the style on that parameter's layer and names
+  it on its tilesets' links and tile templates. The workbench offers such a
+  style only while one of its parameters is drawn (`data-parameters`) and
+  keeps the parameter its links carry. A new link to a style must resolve
+  that way too: `server/tests/contour_links.rs` crawls every style link of
+  the shared root, the per-API Maps and Tiles, and WMS's LegendURLs.
   `ds-mvt` and `ds-3dtiles` are likewise framework-free byte encoders,
   mirroring `ds-render`.
 - **Byte-bounded LRU caches go through `ds-cache`** (#480):

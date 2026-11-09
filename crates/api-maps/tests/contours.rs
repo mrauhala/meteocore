@@ -228,3 +228,130 @@ async fn contour_maps_and_legends() {
     let (status, _) = get(&app, &map("contours").replace("msl", "10si")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+/// The `(time, reference_time)` a read asks for.
+type Frame = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// A model with two runs, each with its own steps, recording the frame
+/// every read asks for.
+struct Runs {
+    calls: std::sync::Mutex<Vec<Frame>>,
+}
+
+fn run(hour: i64) -> DateTime<Utc> {
+    time() + chrono::Duration::hours(hour)
+}
+
+impl MapEngine for Runs {
+    fn get_raster_tile(
+        &self,
+        bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        output_crs: &OutputCrs,
+        parameter: Option<&str>,
+        z: Option<f64>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        self.calls.lock().unwrap().push((time, reference_time));
+        Model.get_raster_tile(
+            bbox,
+            width,
+            height,
+            time,
+            output_crs,
+            parameter,
+            z,
+            reference_time,
+        )
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            times: vec![run(0), run(3), run(6), run(9)],
+            reference_times: vec![run(0), run(6)],
+            ..Model.raster_info()
+        }
+    }
+
+    fn run_times(
+        &self,
+        _: Option<&str>,
+        reference_time: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        Some(Arc::from(vec![
+            reference_time,
+            reference_time + chrono::Duration::hours(3),
+        ]))
+    }
+
+    fn resolve_reference_time(
+        &self,
+        _: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        reference_time.or(Some(run(6)))
+    }
+}
+
+/// A contour map of a named run reads the frame the fill reads: the run
+/// and that run's step, resolved before keying (#1450), never the latest.
+#[tokio::test]
+async fn contours_draw_the_named_run_as_the_fill_does() {
+    let collection: CollectionConfig = serde_json::from_value(serde_json::json!({
+        "id": ID, "title": "NWP", "description": "A model",
+        "apis": ["maps"], "engine_type": "grib",
+    }))
+    .unwrap();
+    let ctx = StyleContext::with_builtins();
+    let engine = Arc::new(Runs {
+        calls: Default::default(),
+    });
+    let info = engine.raster_info();
+    let mut styles = ctx
+        .parameter_layer_styles(&collection, None, &info.parameters, &|_, cmap| cmap)
+        .unwrap();
+    styles.insert(
+        ID.to_string(),
+        ctx.collection_styles(&collection, None).unwrap(),
+    );
+    let app = api_maps::router(Arc::new(ArcSwap::from_pointee(MapsState {
+        engines: HashMap::from([(ID.to_string(), engine.clone() as Arc<dyn MapEngine>)]),
+        collections: HashMap::from([(ID.to_string(), collection)]),
+        styles,
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(0)),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+        map_tileset_ids: HashSet::new(),
+        discovery: Default::default(),
+    })));
+    let named = r#"&subset=reference_time("2026-11-01T00:00:00Z")"#;
+    for (extra, run_drawn) in [
+        (named.to_string(), Some(run(0))),
+        (
+            format!("{named}&datetime=2026-11-01T03:00:00Z"),
+            Some(run(0)),
+        ),
+        (String::new(), Some(run(6))),
+    ] {
+        let mut frames = Vec::new();
+        for style in ["default", "contours"] {
+            let uri = format!(
+                "/collections/{ID}/styles/{style}/map?parameter-name=msl&bbox=0,40,40,70\
+                 &width=64&height=48{}",
+                extra.replace('"', "%22")
+            );
+            let (status, _) = get(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            frames.push(*engine.calls.lock().unwrap().last().unwrap());
+        }
+        assert_eq!(
+            frames[0], frames[1],
+            "contours and fill read one frame: {extra}"
+        );
+        assert_eq!(frames[1].1, run_drawn, "{extra}");
+    }
+    assert_eq!(engine.calls.lock().unwrap()[3].0, Some(run(3)));
+}

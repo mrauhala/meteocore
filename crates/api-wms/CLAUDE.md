@@ -135,7 +135,11 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   neighbours' edge cells and lines meet across meta-tile edges. Cached
   tiles are the drawn RGBA under the contour style's name. A view on the
   ladder draws what a direct render of it draws, within one level of
-  anti-aliasing (`tests/contours.rs`). GetFeatureInfo treats a contour
+  anti-aliasing (`tests/contours.rs`). A view off the ladder's steps is not
+  meta-tiled: the assembly would downsample the tiles by up to √2, nearest,
+  and drop line pixels, so it falls back to the direct path, which reads the
+  engine for every such view (smooth-zoom clients); only exact repeats hit
+  the rendered cache. GetFeatureInfo treats a contour
   layer as a value layer. GetLegendGraphic draws through
   `ds_render::render_style_legend`: a line swatch and `every 4 hPa`.
 - Several layers (#1181): each layer takes its own path (`render_layer`):

@@ -238,10 +238,13 @@ async function page({ hash = '', dpr = 1, mode, maps = url => image(url.searchPa
   const signals = [];
   const fetch = async (url, init) => {
     url = String(url); requests.push(url);
-    if (url.endsWith('/map/tiles')) {
-      const base = url.replace(/\/tiles$/, '');
+    if (url.split('?')[0].endsWith('/map/tiles')) {
+      // A list's query (a style only one parameter's layer offers names it)
+      // is on every link of the list, as the server writes them.
+      const [list, own] = url.split('?');
+      const base = list.replace(/\/tiles$/, ''), query = own ? `?${own}` : '';
       return respond(200, { json: { tilesets: [{ dataType: 'map', tileMatrixSetURI: 'http://www.opengis.net/def/tilematrixset/OGC/1.0/WebMercatorQuad',
-        links: [{ rel: 'self', href: `${base}/tiles/WebMercatorQuad` }, { rel: 'item', href: `${base}/tiles/WebMercatorQuad/{tileMatrix}/{tileRow}/{tileCol}` }] }] } });
+        links: [{ rel: 'self', href: `${base}/tiles/WebMercatorQuad${query}` }, { rel: 'item', href: `${base}/tiles/WebMercatorQuad/{tileMatrix}/{tileRow}/{tileCol}${query}` }] }] } });
     }
     if (url.includes('/legend')) return respond(200, { json: { stops: [{ value: 0, color: '#000000' }, { value: 1, color: '#ffffff' }], min: 0, max: 1, parameter: 't', unit: 'K' } });
     if (land && url.endsWith('/workbench-land.json')) return respond(200, { json: { type: 'FeatureCollection', features: [] } });
@@ -1557,4 +1560,56 @@ test('play and pause swap their icons; repeat is a radio group outside the form'
   await p.run(5000);
   assert.ok(!p.playing());
   assert.match(p.status.textContent, /^Played once to Mon 2024-01-01 02:00 UTC; paused\.$/);
+});
+
+// #1378: a style only some parameters' layers offer, such as a parameter's
+// built-in contours, its links naming the first of them.
+test('a style only some parameters offer is offered with them and drawn for them', async () => {
+  const edit = root => {
+    const select = [...root.walk()].find(e => e.id === 'map-style');
+    const option = new Element('option');
+    option.value = 'https://x/collections/nwp/styles/contours/map?parameter-name=t';
+    Object.assign(option.dataset, {
+      id: 'contours', parameters: 't',
+      tiles: 'https://x/collections/nwp/styles/contours/map/tiles?parameter-name=t',
+      legend: 'https://x/collections/nwp/styles/contours/legend?parameter-name=t',
+    });
+    option.textContent = 'Isotherms';
+    select.append(option);
+  };
+  const p = await page({ mode: 'maps', edit });
+  const select = p.byId('map-style');
+  const contours = select.options[2];
+  // The default parameter, which the legend names, is `t`: offered.
+  assert.equal(contours.disabled, false);
+  await p.change('map-style', contours.value);
+  let url = p.mapRequests().at(-1);
+  assert.equal(url.pathname, '/collections/nwp/styles/contours/map');
+  assert.equal(url.searchParams.get('parameter-name'), 't', 'the link\'s own parameter is kept');
+  const legend = p.requests.filter(u => u.includes('/styles/contours/legend')).map(u => new URL(u));
+  assert.equal(legend.at(-1).searchParams.get('parameter-name'), 't');
+  // Another parameter offers no contours: the style falls back.
+  await p.change('map-parameter', 'r');
+  assert.equal(contours.disabled, true);
+  assert.equal(select.selectedIndex, 0);
+  url = p.mapRequests().at(-1);
+  assert.equal(url.pathname, '/collections/nwp/map');
+  assert.equal(url.searchParams.get('parameter-name'), 'r');
+  // Back on `t`, as map tiles: one `parameter-name` in the template.
+  await p.change('map-parameter', 't');
+  assert.equal(contours.disabled, false);
+  await p.change('map-style', contours.value);
+  const radios = [...p.root.walk()].filter(e => e.name === 'map-mode');
+  radios.forEach(radio => { radio.checked = radio.value === 'tiles'; });
+  radios.find(radio => radio.checked).dispatch('change');
+  await settle();
+  const tile = p.tileFrames().at(-1);
+  assert.match(tile.pathname, /^\/collections\/nwp\/styles\/contours\/map\/tiles\/WebMercatorQuad\//);
+  assert.deepEqual(tile.searchParams.getAll('parameter-name'), ['t']);
+  // WMS names the parameter's layer, where the style is.
+  radios.forEach(radio => { radio.checked = radio.value === 'wms'; });
+  radios.find(radio => radio.checked).dispatch('change');
+  await settle();
+  const getMap = p.wmsRequests().at(-1);
+  assert.deepEqual([getMap.searchParams.get('LAYERS'), getMap.searchParams.get('STYLES')], ['nwp/t', 'contours']);
 });

@@ -255,3 +255,79 @@ async fn meta_tiled_isobars_match_a_direct_render() {
     let (_, _, fill) = get(&app(64), &query.replace("STYLES=contours", "STYLES=")).await;
     assert_ne!(decode(&fill).2, meta);
 }
+
+/// The render outcome of a GetMap: meta-tiled views whose tiles are all
+/// cached are `Assembled`, direct renders always `Cold`.
+async fn outcome(app: &axum::Router, query: &str) -> ds_executor::RenderOutcome {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/?SERVICE=WMS&VERSION=1.3.0&{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    response
+        .extensions()
+        .get::<ds_executor::RenderTiming>()
+        .expect("a render timing")
+        .outcome
+}
+
+/// Off the meta-tile ladder, a view would be assembled from tiles drawn at
+/// the finer step and downsampled by 1.1 to 1.41, nearest, losing line
+/// pixels. Such a contour view is rendered directly instead: every pixel a
+/// direct render covers fully stays covered. On a step, contours stay
+/// meta-tiled.
+#[tokio::test]
+async fn contours_off_the_ladder_render_directly() {
+    let level_6 = std::f64::consts::PI * ds_core::web_mercator::EARTH_RADIUS / 2.0 / 512.0;
+    let query = |factor: f64| {
+        let side = 512.0 * level_6 * factor;
+        format!(
+            "REQUEST=GetMap&LAYERS=nwp/msl&STYLES=contours&CRS=EPSG:3857\
+             &BBOX=0,0,{side},{side}&WIDTH=512&HEIGHT=512&FORMAT=image/png\
+             &TRANSPARENT=TRUE&TIME=2026-11-01T00:00:00Z"
+        )
+    };
+    for factor in [1.1, 1.2, 1.41] {
+        let (status, _, meta) = get(&app(64), &query(factor)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, _, direct) = get(&app(0), &query(factor)).await;
+        let ((_, _, meta), (_, _, direct)) = (decode(&meta), decode(&direct));
+        let faded = direct
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(meta.as_chunks::<4>().0)
+            .filter(|(d, m)| d[3] == 255 && m[3] < 255)
+            .count();
+        assert_eq!(faded, 0, "factor {factor}: {faded} core line pixels faded");
+        let worst = meta
+            .iter()
+            .zip(&direct)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        assert!(
+            worst <= 1,
+            "factor {factor}: differs from the direct render by {worst}"
+        );
+        // Nothing to reuse: every repeat reads the engine again.
+        let app = app(64);
+        get(&app, &query(factor)).await;
+        assert_eq!(
+            outcome(&app, &query(factor)).await,
+            ds_executor::RenderOutcome::Cold
+        );
+    }
+    // On the step the second view is assembled from cached meta-tiles.
+    let app = app(64);
+    get(&app, &query(1.0)).await;
+    assert_eq!(
+        outcome(&app, &query(1.0)).await,
+        ds_executor::RenderOutcome::Assembled
+    );
+}

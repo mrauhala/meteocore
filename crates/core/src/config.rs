@@ -960,6 +960,10 @@ pub struct WmsConfig {
     /// Collection-level only: not part of style bundles, which carry styles.
     #[serde(default)]
     pub webp_quality: Option<u8>,
+    /// Keys `[wms]` does not know, warned about at load
+    /// ([`ServerConfig::style_key_warnings`]).
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// Per-parameter default colormap configuration for WMS.
@@ -976,6 +980,10 @@ pub struct WmsParameterConfig {
     pub min: Option<f64>,
     /// Maximum value for this parameter's colormap range.
     pub max: Option<f64>,
+    /// Keys this entry does not know, warned about at load
+    /// ([`ServerConfig::style_key_warnings`]).
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// A named WMS style with its own colormap configuration.
@@ -1233,39 +1241,83 @@ fn quoted_collection_ids(ids: &[&str]) -> String {
 }
 
 impl ServerConfig {
-    /// One WARN line for the caller to log per `[[wms.styles]]` entry or
-    /// style bundle extra with keys it does not know, naming the collection
-    /// or bundle, the style and the keys. They load anyway: one invalid
-    /// collection file rejects the whole config, so a stray key in a
-    /// deployed config must not stop the server at its next restart. The
-    /// `contour` table itself (#1378) rejects unknown keys.
+    /// One WARN line for the caller to log per style block with keys it
+    /// does not know: a collection's `[wms]`, `[[wms.styles]]` and
+    /// `[[wms.parameters]]` entries, and a style bundle's default, extras
+    /// and parameter entries, naming the collection or bundle, the block
+    /// and the keys. They load anyway: one invalid collection file rejects
+    /// the whole config, so a stray key in a deployed config must not stop
+    /// the server at its next restart. A `contour` table (#1378) outside a
+    /// style entry or extra, where it draws nothing, says where it belongs.
+    /// The `contour` table itself rejects unknown keys.
     pub fn style_key_warnings(&self) -> Vec<String> {
-        fn keys(unknown: &BTreeMap<String, serde::de::IgnoredAny>) -> String {
-            unknown
-                .keys()
-                .map(|k| format!("'{k}'"))
-                .collect::<Vec<_>>()
-                .join(", ")
+        type Unknown = BTreeMap<String, serde::de::IgnoredAny>;
+        // `owner: unknown key(s) 'a', 'b' ignored`, and where a `contour`
+        // table sits outside a style, where it draws nothing, where it
+        // belongs.
+        fn warning(owner: String, unknown: &Unknown, styled: bool) -> Option<String> {
+            if unknown.is_empty() {
+                return None;
+            }
+            let keys: Vec<String> = unknown.keys().map(|k| format!("'{k}'")).collect();
+            let hint = if !styled && unknown.contains_key("contour") {
+                " (a contour table draws lines only in a [[wms.styles]] entry or a \
+                 [[style_bundles.extras]] entry)"
+            } else {
+                ""
+            };
+            Some(format!(
+                "{owner}: unknown key(s) {} ignored{hint}",
+                keys.join(", ")
+            ))
         }
         let mut warnings = Vec::new();
         for bundle in &self.style_bundles {
-            for extra in bundle.extras.iter().filter(|e| !e.unknown_keys.is_empty()) {
-                warnings.push(format!(
-                    "Style bundle '{}' extra '{}': unknown key(s) {} ignored",
-                    bundle.id,
-                    extra.effective_name().unwrap_or("<unnamed>"),
-                    keys(&extra.unknown_keys)
+            let id = &bundle.id;
+            warnings.extend(warning(
+                format!("Style bundle '{id}' default"),
+                &bundle.default.unknown_keys,
+                false,
+            ));
+            for extra in &bundle.extras {
+                let name = extra.effective_name().unwrap_or("<unnamed>");
+                warnings.extend(warning(
+                    format!("Style bundle '{id}' extra '{name}'"),
+                    &extra.unknown_keys,
+                    true,
+                ));
+            }
+            for parameter in &bundle.parameters {
+                warnings.extend(warning(
+                    format!("Style bundle '{id}' parameters entry '{}'", parameter.name),
+                    &parameter.unknown_keys,
+                    false,
                 ));
             }
         }
         for collection in &self.collections {
-            let styles = collection.wms.iter().flat_map(|w| &w.styles);
-            for style in styles.filter(|s| !s.unknown_keys.is_empty()) {
-                warnings.push(format!(
-                    "Collection '{}' [[wms.styles]] '{}': unknown key(s) {} ignored",
-                    collection.id,
-                    style.effective_name().unwrap_or("<unnamed>"),
-                    keys(&style.unknown_keys)
+            let Some(wms) = &collection.wms else {
+                continue;
+            };
+            let id = &collection.id;
+            warnings.extend(warning(
+                format!("Collection '{id}' [wms]"),
+                &wms.unknown_keys,
+                false,
+            ));
+            for style in &wms.styles {
+                let name = style.effective_name().unwrap_or("<unnamed>");
+                warnings.extend(warning(
+                    format!("Collection '{id}' [[wms.styles]] '{name}'"),
+                    &style.unknown_keys,
+                    true,
+                ));
+            }
+            for parameter in &wms.parameters {
+                warnings.extend(warning(
+                    format!("Collection '{id}' [[wms.parameters]] '{}'", parameter.name),
+                    &parameter.unknown_keys,
+                    false,
                 ));
             }
         }
@@ -1331,6 +1383,10 @@ pub struct StyleBundleDefault {
     pub color_stops: Vec<ColorStop>,
     pub min: Option<f64>,
     pub max: Option<f64>,
+    /// Keys the default does not know, warned about at load
+    /// ([`ServerConfig::style_key_warnings`]).
+    #[serde(flatten)]
+    pub unknown_keys: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 /// Named extra style inside a `StyleBundle`. Unknown keys are warned about
@@ -7840,9 +7896,13 @@ port = 8000
 id = "b"
 [style_bundles.default]
 colormap = "pressure"
+contour = { interval = 4 }
 [[style_bundles.extras]]
 name = "isobars"
 contours = { interval = 4 }
+[[style_bundles.parameters]]
+name = "msl"
+contour = { interval = 4 }
 
 [[collections]]
 id = "c"
@@ -7855,6 +7915,15 @@ filename_template = "x_%Y.tif"
 parameter = "p"
 unit = "hPa"
 data_path = "/tmp"
+
+[collections.wms]
+contour = { interval = 4 }
+webp_quality = 80
+
+[[collections.wms.parameters]]
+name = "msl"
+colormap = "pressure"
+contour = { interval = 4 }
 
 [[collections.wms.styles]]
 name = "isobars"
@@ -7874,12 +7943,29 @@ min = 950
         assert_eq!(styles[1].min, Some(950.0), "known keys still parse");
         assert!(styles[1].unknown_keys.is_empty());
         assert_eq!(
+            config.collections[0].wms.as_ref().unwrap().webp_quality,
+            Some(80)
+        );
+        // A contour table where it draws nothing says where it belongs.
+        let misplaced = " (a contour table draws lines only in a [[wms.styles]] entry or a \
+                         [[style_bundles.extras]] entry)";
+        assert_eq!(
             config.style_key_warnings(),
             vec![
+                format!("Style bundle 'b' default: unknown key(s) 'contour' ignored{misplaced}"),
                 "Style bundle 'b' extra 'isobars': unknown key(s) 'contours' ignored".to_string(),
+                format!(
+                    "Style bundle 'b' parameters entry 'msl': unknown key(s) 'contour' \
+                     ignored{misplaced}"
+                ),
+                format!("Collection 'c' [wms]: unknown key(s) 'contour' ignored{misplaced}"),
                 "Collection 'c' [[wms.styles]] 'isobars': unknown key(s) 'interval', \
                  'legacy_opacity' ignored"
                     .to_string(),
+                format!(
+                    "Collection 'c' [[wms.parameters]] 'msl': unknown key(s) 'contour' \
+                     ignored{misplaced}"
+                ),
             ]
         );
     }

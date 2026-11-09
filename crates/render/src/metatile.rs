@@ -482,6 +482,7 @@ where
         height,
         prefix,
         cache,
+        false,
         |tbbox, tw, th, tile_output, times| {
             let t_engine = Instant::now();
             let tile = render_tile(tbbox, tw, th, tile_output)?;
@@ -555,6 +556,7 @@ where
         height,
         prefix,
         cache,
+        false,
         |tbbox, tw, th, tile_output, times| {
             let t_engine = Instant::now();
             let tiles = render_bands(tbbox, tw, th, tile_output)?;
@@ -574,6 +576,14 @@ where
 /// contour style's name in `prefix`. Every tile of a ladder level traces its
 /// neighbours' edge cells too, and smooths alike (`source_deg`, as for
 /// [`ContourPlan::new`]), so lines meet across tile edges.
+///
+/// Only a view on a ladder step is meta-tiled: anywhere else this declines
+/// ([`MetaTilePixels::Fallback`]) and the caller renders directly. Between
+/// steps the assembly downsamples the tiles by up to √2, nearest, and a
+/// 1-px line loses up to a fifth of its core pixels and looks up to 29 %
+/// thinner. A colour fill survives that; a line does not. Off-ladder
+/// contour views therefore read the engine per view, as Maps and Tiles do,
+/// and only the rendered-image cache serves their repeats.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_metatiled_contours<F>(
     bbox_deg: [f64; 4],
@@ -597,6 +607,7 @@ where
         height,
         prefix,
         cache,
+        true,
         |tbbox, tw, th, tile_output, times| {
             let plan = ContourPlan::new(contour, tbbox, tw, th, tile_output, source_deg);
             let t_engine = Instant::now();
@@ -623,10 +634,13 @@ struct TileTimes {
     colorize: Duration,
 }
 
-/// The meta-tiling behind [`assemble_metatiled`] and
-/// [`assemble_metatiled_composite`]. `tile_pixels` renders one uncached tile
-/// to its `TILE_PX × TILE_PX` RGBA pixels, or `None` when all of them are
-/// nodata, adding its engine and colorize time to the [`TileTimes`].
+/// The meta-tiling behind [`assemble_metatiled`],
+/// [`assemble_metatiled_composite`] and [`assemble_metatiled_contours`].
+/// `tile_pixels` renders one uncached tile to its `TILE_PX × TILE_PX` RGBA
+/// pixels, or `None` when all of them are nodata, adding its engine and
+/// colorize time to the [`TileTimes`]. `on_steps_only` declines a view off
+/// the ladder's steps.
+#[allow(clippy::too_many_arguments)]
 fn render_metatiled_with<F>(
     bbox_deg: [f64; 4],
     output_crs: &OutputCrs,
@@ -634,6 +648,7 @@ fn render_metatiled_with<F>(
     height: u32,
     prefix: &TileKeyPrefix,
     cache: &TilePixelCache,
+    on_steps_only: bool,
     tile_pixels: F,
 ) -> Result<MetaTilePixels, DataServerError>
 where
@@ -685,6 +700,17 @@ where
         return Ok(MetaTilePixels::Fallback);
     }
     let span = TILE_PX as f64 * grid.level_res(level); // tile edge length in metres
+                                                       // `on_steps_only` (contour lines): both axes exactly at the step, so
+                                                       // the assembly is a crop, never a downsample.
+    if on_steps_only {
+        let step = grid.level_res(level);
+        let on_step = |res: f64| ((res - step) / step).abs() < 1e-6;
+        if !(on_step((east_m - west_m) / width as f64)
+            && on_step((north_m - south_m) / height as f64))
+        {
+            return Ok(MetaTilePixels::Fallback);
+        }
+    }
 
     // A tiny epsilon trims a spurious tile when an edge is on a grid line.
     let eps = span * 1e-9;

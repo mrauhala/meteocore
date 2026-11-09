@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Extension;
@@ -279,11 +279,7 @@ pub(crate) fn collection_parts(
         let s = offer.style;
         let links = match layout {
             Layout::PerApi => {
-                let query = offer
-                    .parameters
-                    .first()
-                    .map(|p| format!("?parameter-name={}", api_common::workbench::path_segment(p)))
-                    .unwrap_or_default();
+                let query = parameter_query(offer.parameters.first().copied());
                 let legend = format!("{root}/collections/{id}/styles/{}/legend{query}", s.name);
                 json!([
                     {"href": legend, "rel": rel::LEGEND, "type": "application/json"}
@@ -292,7 +288,11 @@ pub(crate) fn collection_parts(
             // The shared root's legend belongs to Maps; Tiles adds each
             // style's map tilesets (merged into the Maps style entry).
             Layout::Shared => json!([{
-                "href": format!("{root}/collections/{id}/styles/{}/map/tiles", s.name),
+                "href": format!(
+                    "{root}/collections/{id}/styles/{}/map/tiles{}",
+                    s.name,
+                    parameter_query(offer.parameters.first().copied())
+                ),
                 "rel": rel::TILESETS_MAP,
                 "type": "application/json",
                 "title": "Map tilesets in this style"
@@ -1472,6 +1472,11 @@ pub(crate) struct TilesetList<'a> {
     vector_query: &'static str,
     /// The style (id, definition) a styled map tileset renders.
     style: Option<(&'a str, &'a StyleInfo)>,
+    /// `?parameter-name=…` on every link of a styled list whose style only
+    /// that parameter's layer offers (a parameter's built-in `contours`,
+    /// #1378): the list, its tilesets and their tile templates name it, or
+    /// they would draw a style the collection's own layer has not.
+    query: String,
 }
 
 impl<'a> TilesetList<'a> {
@@ -1480,6 +1485,7 @@ impl<'a> TilesetList<'a> {
             url: format!("{root}/collections/{id}/tiles"),
             vector_query: "?f=mvt",
             style: None,
+            query: String::new(),
         }
     }
 
@@ -1492,23 +1498,40 @@ impl<'a> TilesetList<'a> {
             url: format!("{root}/collections/{id}/{path}"),
             vector_query: "",
             style: None,
+            query: String::new(),
         }
     }
 
-    fn styled(root: &str, id: &str, style_id: &'a str, style: &'a StyleInfo) -> Self {
+    /// The styled map tilesets of `style_id`, for `parameter` when the
+    /// request named one.
+    fn styled(
+        root: &str,
+        id: &str,
+        style_id: &'a str,
+        style: &'a StyleInfo,
+        parameter: Option<&str>,
+    ) -> Self {
         Self {
             url: format!("{root}/collections/{id}/styles/{style_id}/map/tiles"),
             vector_query: "",
             style: Some((style_id, style)),
+            query: parameter_query(parameter),
         }
     }
 
     fn json(&self, tilesets: Vec<serde_json::Value>) -> serde_json::Value {
         json!({
             "tilesets": tilesets,
-            "links": [{"href": self.url, "rel": "self", "type": "application/json"}]
+            "links": [{"href": format!("{}{}", self.url, self.query), "rel": "self", "type": "application/json"}]
         })
     }
+}
+
+/// `?parameter-name=<parameter>`, percent-encoded, or nothing.
+fn parameter_query(parameter: Option<&str>) -> String {
+    parameter
+        .map(|p| format!("?parameter-name={}", api_common::workbench::path_segment(p)))
+        .unwrap_or_default()
 }
 
 /// Tileset metadata for one tiling scheme and kind of tiles (Tiles Req 8):
@@ -1529,7 +1552,7 @@ fn tileset_json(
     let mut links = Vec::new();
     if with_self {
         links.push(json!({
-            "href": tileset,
+            "href": format!("{tileset}{}", list.query),
             "rel": "self",
             "type": "application/json",
             "title": "This tileset"
@@ -1547,7 +1570,7 @@ fn tileset_json(
         "title": sources.config.title
     }));
     let (data_type, query, media_type) = match kind {
-        TileKind::Map => ("map", "", "image/png"),
+        TileKind::Map => ("map", list.query.as_str(), "image/png"),
         TileKind::Vector => ("vector", list.vector_query, MVT_CONTENT_TYPE),
     };
     links.push(json!({
@@ -1668,23 +1691,39 @@ fn sources_of_kind<'a>(
     }
 }
 
-/// The collection-level style `style_id` of a map-tiles collection, or 404.
+/// The style `style_id` of a map-tiles collection, resolved as its tiles
+/// resolve it: on `parameter`'s layer when one is named (a parameter's
+/// built-in `contours` lives only there, #1378), else on the collection's.
+/// 404 for a style neither offers, 400 for a parameter it does not have.
 fn map_style<'a>(
     state: &'a TilesState,
-    id: &str,
+    sources: &'a TileSources<'a>,
     style_id: &str,
+    parameter: Option<&'a str>,
 ) -> Result<&'a StyleInfo, TilesError> {
-    state
-        .styles
-        .get(id)
-        .and_then(|styles| styles.get(style_id))
-        .ok_or_else(|| {
-            TilesError::NotFound(format!(
-                "Style '{style_id}' not found for collection '{id}'"
-            ))
-        })
+    let id = sources.config.id.as_str();
+    let not_found = || {
+        TilesError::NotFound(format!(
+            "Style '{style_id}' not found for collection '{id}'"
+        ))
+    };
+    let (Some(engine), Some(info)) = (sources.map_engine, sources.raster_info.as_deref()) else {
+        return Err(not_found());
+    };
+    check_parameter_name(engine, info, id, parameter)?;
+    layer_style(&state.styles, id, parameter, info, style_id).map(|resolved| resolved.style)
 }
 
+/// The query of a styled map tileset request: `f`, which the route's
+/// middleware checks, and the `parameter-name` whose layer offers the
+/// style.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct StyledTilesetQuery {
+    #[serde(rename = "parameter-name")]
+    pub parameter_name: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn shared_tilesets(
     state: AppState,
     mount: Mount,
@@ -1692,13 +1731,20 @@ async fn shared_tilesets(
     id: &str,
     kind: TileKind,
     style_id: Option<&str>,
+    parameter: Option<&str>,
     tms_id: Option<&str>,
 ) -> Result<Response, TilesError> {
     let state = state.load_full();
     let sources = sources_of_kind(&state, id, kind)?;
     let root = &mount.root(&request_base_url(&state, headers));
     let list = match style_id {
-        Some(style_id) => TilesetList::styled(root, id, style_id, map_style(&state, id, style_id)?),
+        Some(style_id) => TilesetList::styled(
+            root,
+            id,
+            style_id,
+            map_style(&state, &sources, style_id, parameter)?,
+            parameter,
+        ),
         None => TilesetList::shared(root, id, kind),
     };
     Ok(Json(match tms_id {
@@ -1726,7 +1772,7 @@ pub async fn map_tilesets(
     Extension(mount): Extension<Mount>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
-    shared_tilesets(state, mount, &headers, &id, TileKind::Map, None, None).await
+    shared_tilesets(state, mount, &headers, &id, TileKind::Map, None, None, None).await
 }
 
 /// GET /collections/{id}/map/tiles/{tileMatrixSetId} — map tileset
@@ -1743,16 +1789,19 @@ pub async fn map_tileset(
         &id,
         TileKind::Map,
         None,
+        None,
         Some(&tms_id),
     )
     .await
 }
 
-/// GET /collections/{id}/styles/{styleId}/map/tiles — styled map tilesets
+/// GET /collections/{id}/styles/{styleId}/map/tiles — styled map tilesets.
+/// `?parameter-name=` names the parameter whose layer offers the style.
 pub async fn styled_map_tilesets(
     Path((id, style_id)): Path<(String, String)>,
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
+    Query(query): Query<StyledTilesetQuery>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
     shared_tilesets(
@@ -1762,6 +1811,7 @@ pub async fn styled_map_tilesets(
         &id,
         TileKind::Map,
         Some(&style_id),
+        query.parameter_name.as_deref(),
         None,
     )
     .await
@@ -1772,6 +1822,7 @@ pub async fn styled_map_tileset(
     Path((id, style_id, tms_id)): Path<(String, String, String)>,
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
+    Query(query): Query<StyledTilesetQuery>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
     shared_tilesets(
@@ -1781,6 +1832,7 @@ pub async fn styled_map_tileset(
         &id,
         TileKind::Map,
         Some(&style_id),
+        query.parameter_name.as_deref(),
         Some(&tms_id),
     )
     .await
@@ -1793,7 +1845,17 @@ pub async fn vector_tilesets(
     Extension(mount): Extension<Mount>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
-    shared_tilesets(state, mount, &headers, &id, TileKind::Vector, None, None).await
+    shared_tilesets(
+        state,
+        mount,
+        &headers,
+        &id,
+        TileKind::Vector,
+        None,
+        None,
+        None,
+    )
+    .await
 }
 
 /// GET /collections/{id}/tiles/{tileMatrixSetId} — vector tileset
@@ -1809,6 +1871,7 @@ pub async fn vector_tileset(
         &headers,
         &id,
         TileKind::Vector,
+        None,
         None,
         Some(&tms_id),
     )
