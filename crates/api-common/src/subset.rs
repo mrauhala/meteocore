@@ -26,7 +26,8 @@
 //! `Lon`/`Lat` or `E`/`N` and `time`, while OGC API - Tiles names its time
 //! axis `datetime`. An axis outside that list is an error, never ignored.
 //! Map and map tile routes also take [`REFERENCE_TIME_AXIS`], the model run
-//! (#337), on a collection that retains runs ([`named_run`]).
+//! (#337), on a collection that retains runs ([`named_run`]); a named run's
+//! own times are then the time axis ([`run_time`]).
 //!
 //! [`resolve_frame`] turns a [`RequestedTime`] and a named run into the time
 //! step and run a map or map tile draws, so both select the same frame; each
@@ -342,22 +343,27 @@ pub struct DrawnFrame {
 
 /// The frame a map or map tile request draws, shared by Maps and map tiles
 /// so both select the same one. `run` is the run the request named
-/// ([`named_run`]).
+/// ([`named_run`]); `*` and none are `None`.
 ///
-/// 1. The time: [`render_time`]. With an older run named and no time, the
-///    engine is asked for `None`, which it resolves to that run's own latest
-///    step: the collection's latest time may lie past the run.
-/// 2. The run: [`MapEngine::resolve_parameter_reference_time`] of
-///    [`engine_run`], the CONCRETE run the engine renders (#521). Keyed as
-///    `None`, the no-TTL rendered caches would keep serving the
-///    first-rendered run's pixels after a newer run re-covers the same valid
-///    times: every few minutes for a nowcast generation, every few hours for
-///    a forecast. Asking the engine keeps its cross-run fallback, and the run
-///    is the parameter's: GRIB renders an aggregate the newest run lacks at
+/// 1. The time: with no run named, [`render_time`] on the parameter's or
+///    the collection's axis; with one, [`run_time`] on the run's own times.
+/// 2. The run: [`MapEngine::resolve_parameter_reference_time`], the
+///    CONCRETE run the engine renders (#521). Keyed as `None`, the no-TTL
+///    rendered caches would keep serving the first-rendered run's pixels
+///    after a newer run re-covers the same valid times: every few minutes
+///    for a nowcast generation, every few hours for a forecast. A named run
+///    is asked for as itself and drawn exactly, the latest included: no
+///    cross-run fallback, so the URL keeps meaning that run's frame. With
+///    none named the engine picks, its fallback included, and the run is
+///    the parameter's: GRIB renders an aggregate the newest run lacks at
 ///    that time from an older run (#1005). Engines without runs keep `None`.
 /// 3. The time step: [`MapEngine::resolve_parameter_time`] in that run
 ///    (#507). A not-yet-ingested time then keys the step drawn, never its
 ///    own; a parameter with its own time axis snaps on that axis.
+///
+/// WMS `DIM_REFERENCE_TIME` differs for the latest run named: it asks for
+/// `None`, since WMS clients echo the advertised default run on every
+/// frame.
 pub fn resolve_frame(
     requested: Option<&RequestedTime>,
     run: Option<DateTime<Utc>>,
@@ -365,12 +371,11 @@ pub fn resolve_frame(
     info: &RasterInfo,
     parameter: Option<&str>,
 ) -> Result<DrawnFrame, NoTimeStep> {
-    let asked = engine_run(&info.reference_times, run);
-    let time = match (asked, requested) {
-        (Some(_), None) => None,
-        _ => render_time(requested, engine, info, parameter)?,
+    let time = match run {
+        None => render_time(requested, engine, info, parameter)?,
+        Some(run) => run_time(requested, run, engine, info, parameter)?,
     };
-    let reference_time = engine.resolve_parameter_reference_time(parameter, time, asked);
+    let reference_time = engine.resolve_parameter_reference_time(parameter, time, run);
     let time = engine.resolve_parameter_time(parameter, time, reference_time);
     // Only an instant can pin the image: `*` and intervals follow new data.
     let instant = requested.and_then(|t| t.selection.instant());
@@ -382,18 +387,54 @@ pub fn resolve_frame(
     })
 }
 
-/// The run to ask the engine for when a request names `named`: the latest
-/// of `runs` is asked for as `None`, an older one as itself. The common
-/// client echoes the latest run on every request, frames older than that
-/// run's reference time included, and an exact pin of it would refuse them;
-/// as `None` it gets the engine's run selection for the time, an older run's
-/// fallback included. An older run named stays exact: that is the request's
-/// intent. WMS `DIM_REFERENCE_TIME`, Maps and Tiles alike.
+/// The instant a map naming model run `run` renders for, before the engine
+/// snaps it. The axis is the run's own times ([`MapEngine::run_times`]),
+/// else the parameter's or the collection's. A named run is drawn exactly,
+/// so the time is one of its own (#337), on every engine alike:
 ///
-/// [`is_fixed_run`] still takes the run as named, so a frame the engine drew
-/// from another run is not pinned.
-pub fn engine_run(runs: &[DateTime<Utc>], named: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
-    named.filter(|&rt| runs.last().copied() != Some(rt))
+/// - No time: `None`, which the engine resolves to the run's own latest
+///   step. The collection's latest time may lie past the run.
+/// - An instant, from `datetime` or a time `subset`: as given when it lies
+///   between the run's first and last time, for the engine to snap within
+///   the run; outside them, nothing. Never a time of another run.
+/// - An interval, a partial date or `*`: the latest of the run's times
+///   inside it; none inside selects nothing.
+///
+/// Nothing is the API's "no time step": a Maps 404, an empty map tile.
+pub fn run_time(
+    requested: Option<&RequestedTime>,
+    run: DateTime<Utc>,
+    engine: &dyn MapEngine,
+    info: &RasterInfo,
+    parameter: Option<&str>,
+) -> Result<Option<DateTime<Utc>>, NoTimeStep> {
+    let own = engine
+        .run_times(parameter, run)
+        .or_else(|| parameter.and_then(|p| engine.parameter_times(p)));
+    let axis: &[DateTime<Utc>] = own.as_deref().unwrap_or(&info.times);
+    let outside = |what: String| {
+        NoTimeStep(format!(
+            "No data for {what} in model run {}: the run's time axis has none",
+            rfc3339(run)
+        ))
+    };
+    match requested {
+        None => Ok(None),
+        Some(RequestedTime {
+            selection: TimeSelection::Instant(t),
+            ..
+        }) => match (axis.first(), axis.last()) {
+            (Some(first), Some(last)) if t < first || t > last => {
+                Err(outside(format!("time {}", rfc3339(*t))))
+            }
+            _ => Ok(Some(*t)),
+        },
+        Some(_) if axis.is_empty() => Ok(None),
+        Some(RequestedTime { selection, .. }) => selection
+            .latest_in(axis)
+            .map(Some)
+            .ok_or_else(|| outside("the requested time interval".to_string())),
+    }
 }
 
 /// Assign each subset to one of `axes`, keyed by the axis' reported name.
@@ -1296,18 +1337,21 @@ mod tests {
         }
     }
 
-    /// The latest run named is asked for as none; an older one as itself.
-    #[test]
-    fn the_latest_run_named_is_asked_for_as_none() {
-        let runs = [hour(0), hour(6)];
-        assert_eq!(engine_run(&runs, None), None);
-        assert_eq!(engine_run(&runs, Some(hour(6))), None);
-        assert_eq!(engine_run(&runs, Some(hour(0))), Some(hour(0)));
+    /// Runs at 00Z, valid 00Z–09Z, and 06Z, valid 06Z–12Z, hourly. Unpinned,
+    /// a time before 06Z falls back to the 00Z run. `union` is the time axis
+    /// GRIB and NetCDF advertise, every run's; without it the latest run's,
+    /// as QueryData, Zarr and the nowcast advertise.
+    struct TwoRuns {
+        union: bool,
     }
 
-    /// Runs at 00Z, valid 00Z–09Z, and 06Z, valid 06Z–12Z, hourly. Unpinned,
-    /// a time before 06Z falls back to the 00Z run.
-    struct TwoRuns;
+    fn run_hours(run: DateTime<Utc>) -> std::ops::RangeInclusive<u32> {
+        if run == hour(0) {
+            0..=9
+        } else {
+            6..=12
+        }
+    }
 
     impl MapEngine for TwoRuns {
         fn get_raster_tile(
@@ -1325,11 +1369,22 @@ mod tests {
         }
 
         fn raster_info(&self) -> RasterInfo {
+            let first = if self.union { 0 } else { 6 };
             RasterInfo {
                 reference_times: vec![hour(0), hour(6)],
-                times: (0..=12).map(hour).collect(),
+                times: (first..=12).map(hour).collect(),
                 ..Axis3.raster_info()
             }
+        }
+
+        fn run_times(
+            &self,
+            _: Option<&str>,
+            run: DateTime<Utc>,
+        ) -> Option<std::sync::Arc<[DateTime<Utc>]>> {
+            [hour(0), hour(6)]
+                .contains(&run)
+                .then(|| run_hours(run).map(hour).collect())
         }
 
         fn resolve_reference_time(
@@ -1344,50 +1399,111 @@ mod tests {
             }))
         }
 
+        /// Latest-not-after within the run, clamped to its first step, as
+        /// the nowcast snaps.
         fn resolve_time(
             &self,
             time: Option<DateTime<Utc>>,
             reference_time: Option<DateTime<Utc>>,
         ) -> Option<DateTime<Utc>> {
-            let last = if reference_time == Some(hour(0)) {
-                hour(9)
-            } else {
-                hour(12)
-            };
-            Some(time.unwrap_or(last))
+            let hours = run_hours(reference_time.unwrap_or(hour(6)));
+            Some(time.map_or(hour(*hours.end()), |t| {
+                t.clamp(hour(*hours.start()), hour(*hours.end()))
+            }))
         }
     }
 
-    /// The frame Maps and map tiles draw: a named older run's own latest
-    /// step by default, its steps otherwise; only a named run drawn pins.
+    /// The frame Maps and map tiles draw. A named run is drawn exactly, the
+    /// latest included: its own latest step by default, a time inside it
+    /// snapped within it, a time outside it nothing, never another run's
+    /// frame. Only a named run drawn pins.
     #[test]
     fn resolve_frame_draws_from_the_named_run() {
-        let engine = TwoRuns;
+        for union in [true, false] {
+            let engine = TwoRuns { union };
+            let info = engine.raster_info();
+            let selected = |selection, from_subset| RequestedTime {
+                selection,
+                from_subset,
+            };
+            let instant = |h| selected(TimeSelection::Instant(hour(h)), false);
+            let frame = |time: Option<RequestedTime>, run: Option<u32>| {
+                resolve_frame(time.as_ref(), run.map(hour), &engine, &info, None)
+            };
+            let drawn = |time: u32, run: u32, pinned: bool| {
+                Ok(DrawnFrame {
+                    time: Some(hour(time)),
+                    reference_time: Some(hour(run)),
+                    pinned,
+                })
+            };
+            let range = |start: Option<u32>, end: Option<u32>| TimeSelection::Range {
+                start: start.map(hour),
+                end: end.map(hour),
+            };
+            // None named: the collection's latest time, from the latest run.
+            assert_eq!(frame(None, None), drawn(12, 6, false), "{union}");
+            assert_eq!(frame(Some(instant(9)), None), drawn(9, 6, false));
+            // An older run: its own latest step, not the collection's 12Z,
+            // which it does not have; an exact step of it pins.
+            assert_eq!(frame(None, Some(0)), drawn(9, 0, false));
+            assert_eq!(frame(Some(instant(6)), Some(0)), drawn(6, 0, true));
+            // Intervals, `*` and partial dates select on the run's own times,
+            // on either axis: the latest inside, 09Z, never the axis' 12Z.
+            for (selection, from_subset) in [
+                (range(None, None), true),
+                (range(Some(0), None), false),
+                (range(Some(2), Some(20)), true),
+            ] {
+                let requested = Some(selected(selection, from_subset));
+                assert_eq!(frame(requested, Some(0)), drawn(9, 0, false), "{union}");
+            }
+            // A time subset instant of the run that the latest run's axis
+            // lacks is still the run's.
+            let early = selected(TimeSelection::Instant(hour(3)), true);
+            assert_eq!(frame(Some(early), Some(0)), drawn(3, 0, true), "{union}");
+            // Outside the run, from `datetime` or a subset, nothing: no
+            // snapping into it, no other run's frame.
+            for (h, run) in [(10, 0), (3, 6), (13, 6)] {
+                for from_subset in [false, true] {
+                    let outside = selected(TimeSelection::Instant(hour(h)), from_subset);
+                    let err = frame(Some(outside), Some(run)).unwrap_err();
+                    assert!(err.0.contains("in model run"), "{}", err.0);
+                }
+            }
+            let late = selected(range(Some(10), None), false);
+            assert!(frame(Some(late), Some(0)).is_err());
+            // The latest run named is drawn exactly too: it pins, and a time
+            // it lacks is nothing, where naming none falls back to 00Z.
+            assert_eq!(frame(None, Some(6)), drawn(12, 6, false));
+            assert_eq!(frame(Some(instant(9)), Some(6)), drawn(9, 6, true));
+            assert_eq!(frame(Some(instant(3)), None), drawn(3, 0, false));
+        }
+    }
+
+    /// Without its own times for the run, an engine's run selects on the
+    /// axis it advertises.
+    #[test]
+    fn run_time_falls_back_to_the_advertised_axis() {
+        let engine = Axis3;
         let info = engine.raster_info();
-        let instant = |h| RequestedTime {
-            selection: TimeSelection::Instant(hour(h)),
+        let instant = RequestedTime {
+            selection: TimeSelection::Instant(hour(5)),
             from_subset: false,
         };
-        let frame = |time: Option<RequestedTime>, run: Option<u32>| {
-            resolve_frame(time.as_ref(), run.map(hour), &engine, &info, None).unwrap()
+        assert!(run_time(Some(&instant), hour(0), &engine, &info, None).is_err());
+        let star = RequestedTime {
+            selection: TimeSelection::Range {
+                start: None,
+                end: None,
+            },
+            from_subset: true,
         };
-        let drawn = |time: u32, run: u32, pinned: bool| DrawnFrame {
-            time: Some(hour(time)),
-            reference_time: Some(hour(run)),
-            pinned,
-        };
-        // None named: the collection's latest time, from the latest run.
-        assert_eq!(frame(None, None), drawn(12, 6, false));
-        assert_eq!(frame(Some(instant(9)), None), drawn(9, 6, false));
-        // An older run: its own latest step, not the collection's 12Z, which
-        // it does not have; an exact step of it pins.
-        assert_eq!(frame(None, Some(0)), drawn(9, 0, false));
-        assert_eq!(frame(Some(instant(6)), Some(0)), drawn(6, 0, true));
-        // The latest run named is the engine's pick: drawn, it pins; fallen
-        // back from for a time it lacks, it does not.
-        assert_eq!(frame(None, Some(6)), drawn(12, 6, false));
-        assert_eq!(frame(Some(instant(9)), Some(6)), drawn(9, 6, true));
-        assert_eq!(frame(Some(instant(3)), Some(6)), drawn(3, 0, false));
+        assert_eq!(
+            run_time(Some(&star), hour(0), &engine, &info, Some("p")),
+            Ok(Some(hour(1)))
+        );
+        assert_eq!(run_time(None, hour(0), &engine, &info, None), Ok(None));
     }
 
     /// The selection rules Maps and map tiles share.

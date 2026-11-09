@@ -306,16 +306,18 @@ way.
   `reference_time("<EDR instance id>")` or `*` for the latest; an interval
   is a 400. A route adds it to its axes only for a collection with runs, so
   elsewhere it is the unknown-axis 400. `named_run` checks the run against
-  `RasterInfo.reference_times` (unknown: 404), and `engine_run` asks the
-  engine for the latest run named as `None`, the rule WMS
-  `DIM_REFERENCE_TIME` uses too.
+  `RasterInfo.reference_times` (unknown: 404).
 - `resolve_frame` picks the frame to render, for Maps and map tiles alike:
-  - the time, `render_time`: no time is the engine's default, else the
-    latest time, or a named older run's own latest step; an instant is
-    passed on for the engine to snap to a time step; an interval is the
-    latest time step inside it;
-  - the run the engine renders, `resolve_parameter_reference_time`, and
-    the step in it, `resolve_parameter_time`. Both key the rendered cache.
+  - the time. With no run named, `render_time`: no time is the engine's
+    default, else the latest time; an instant is passed on for the engine
+    to snap to a time step; an interval is the latest time step inside it.
+    With one, `run_time`, on the run's own times (`MapEngine::run_times`):
+    no time is the run's latest step, an instant outside the run selects
+    nothing, an interval the run's latest step inside it;
+  - the run the engine renders, `resolve_parameter_reference_time`: a
+    named run exactly, the latest included, else the engine's pick with its
+    fallback. Then the step in it, `resolve_parameter_time`. Both key the
+    rendered cache.
 
   When no time matches, Maps returns 404 and map tiles return 204.
 - `is_exact_time` and `is_fixed_run` are the rule for `immutable` on Maps,

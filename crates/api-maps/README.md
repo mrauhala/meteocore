@@ -115,13 +115,19 @@ tiles, with the Scaling and Background parameters.
 - **Model run.** `subset=reference_time("2026-10-01T06:00:00Z")` on a
   collection whose extent has a `reference_time` dimension. The value is the
   run's EDR instance id; the compact `20261001T0600Z` ids from before #947
-  also work. `reference_time(*)` or no run is the latest run. The time is
-  then a valid time of that run, by default its latest. An older run named
-  is drawn exactly. The latest run named is the engine's pick, as with no
-  run: a time it does not cover yet comes from an older run, as with WMS
-  `DIM_REFERENCE_TIME`. A run the collection does not have is a 404. An
-  interval is a 400: a map draws one run. On a collection without runs the
-  axis is a 400 naming the valid axes. The run drawn keys the rendered cache.
+  also work. `reference_time(*)` or no run is the latest run, where the
+  engine picks the run for the time: a time the newest run does not cover
+  yet comes from an older one. A named run, the latest included, is drawn
+  exactly, on every engine alike. The time is one of the run's own valid
+  times (`MapEngine::run_times`), by default its latest: an instant inside
+  the run snaps to one of its steps, an interval, a partial date or `*`
+  draws the latest step inside it, and an instant outside the run, or an
+  interval holding none of its steps, is a 404. WMS `DIM_REFERENCE_TIME`
+  differs for the latest run: there it falls back like no run, since WMS
+  clients echo the advertised default. A run the collection does not have
+  is a 404. An interval of runs is a 400: a map draws one run. On a
+  collection without runs the axis is a 400 naming the valid axes. The run
+  drawn keys the rendered cache.
 - **Background.** Transparent, the map keeps its alpha: areas with no data
   have opacity 0, in the `bgcolor`'s colour when one is given. Opaque, the
   map is composited onto `bgcolor`: areas with no data take it, and
@@ -214,10 +220,9 @@ runs offline on a fixture in `testdata/`. Server-wide settings for Maps:
 
 ## Limits
 
-- A run's own valid times are not in the Maps description: the time axis
-  spans every run's. A `datetime` interval selects on that axis, so with an
-  older run named it can pick a time only a newer run has. EDR
-  `/instances/{id}` lists each run's valid times.
+- A run's own valid times are not in the Maps description, whose time
+  axis is the engine's: every run's (GRIB, NetCDF) or the latest run's
+  (QueryData, Zarr, nowcast). EDR `/instances/{id}` lists each run's.
 - Maps are two-dimensional: a six-value `bbox` or a spatial slice such as
   `Lat(60)` is a 400, and `elevation` selects one level.
 - At the default `MC_RENDER_MEMORY_MB`, a map over 33 554 432 pixels (about

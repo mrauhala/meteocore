@@ -1,9 +1,12 @@
 //! Model-run selection on OGC API - Maps maps and map tiles (#337), end to
 //! end over a GRIB engine wrapped for derived wind, as the server registers
 //! it: `subset=reference_time("<run>")` draws that run's pixels and keys its
-//! own cache entry, `reference_time(*)` is the latest run as omitting it is,
-//! an unknown run is a 404, and the collection's `extent` lists the runs as
-//! the `reference_time` dimension, by their EDR instance ids.
+//! own cache entry, and selects the time on the run's own valid times: an
+//! interval, `*` or a partial date draws the run's latest step inside it, a
+//! time outside the run is no data, the latest run named included.
+//! `reference_time(*)` is the latest run as omitting it is, an unknown run
+//! is a 404, and the collection's `extent` lists the runs as the
+//! `reference_time` dimension, by their EDR instance ids.
 //!
 //! The fields are the real ARPEGE 10 m wind messages of
 //! `testdata/grib-arpege-wind`, written into two GFS-style runs with wgrib2
@@ -256,9 +259,15 @@ fn run(value: &str) -> String {
 }
 
 /// One route's run selection: `uri` builds the request from its extra
-/// query, and `time` is the route's time `subset` axis. Both routes behave
-/// the same.
-async fn assert_run_selection(app: &axum::Router, time: &str, uri: impl Fn(&str) -> String) {
+/// query, `time` is the route's time `subset` axis and `no_data` its answer
+/// for a time that selects no step, a Maps 404 or an empty map tile. Both
+/// routes behave the same.
+async fn assert_run_selection(
+    app: &axum::Router,
+    time: &str,
+    no_data: StatusCode,
+    uri: impl Fn(&str) -> String,
+) {
     let datetime = format!("datetime={BOTH}");
     // No run named: the latest run, 06Z.
     let latest = get(app, &uri(&datetime)).await;
@@ -284,6 +293,14 @@ async fn assert_run_selection(app: &axum::Router, time: &str, uri: impl Fn(&str)
         // No time: the run's own latest step, f009, not the collection's
         // 12Z, which the 00Z run does not have.
         run(OLD_RUN),
+        // An interval, `*` and a partial date select on the run's own
+        // times: their latest is f009, where the collection's axis would
+        // pick 12Z, which only the 06Z run has.
+        format!("datetime={OLD_RUN}/..&{}", run(OLD_RUN)),
+        format!("datetime=../2026-05-11T23:00:00Z&{}", run(OLD_RUN)),
+        format!("subset={time}(*),reference_time(%22{OLD_RUN}%22)"),
+        format!("subset={time}(%222026-05-11%22),reference_time(%22{OLD_RUN}%22)"),
+        format!("subset={time}(%22{OLD_RUN}%22:*),reference_time(%22{OLD_RUN}%22)"),
     ] {
         let reply = get(app, &uri(&query)).await;
         assert_eq!(
@@ -295,6 +312,16 @@ async fn assert_run_selection(app: &axum::Router, time: &str, uri: impl Fn(&str)
         assert_eq!(reply.body, old.body, "{query}");
         assert_eq!(reply.datetime, BOTH, "{query}");
     }
+    // A step only the 00Z run has: drawn from it when it is named.
+    let early = get(
+        app,
+        &uri(&format!(
+            "subset={time}(%222026-05-11T03:00:00Z%22),reference_time(%22{OLD_RUN}%22)"
+        )),
+    )
+    .await;
+    assert_eq!(early.status, StatusCode::OK);
+    assert_eq!(early.datetime, "2026-05-11T03:00:00Z");
     // `*` and the latest run named are the latest run, as omitting it is.
     for query in [
         format!("{datetime}&subset=reference_time(*)"),
@@ -308,6 +335,21 @@ async fn assert_run_selection(app: &axum::Router, time: &str, uri: impl Fn(&str)
         );
         assert_eq!(reply.body, latest.body, "{query}");
     }
+    // A named run is drawn exactly: a time outside it is no data, the
+    // latest run named included, never another run's frame or a 400. With
+    // no run named, 03Z falls back to the 00Z run.
+    for query in [
+        format!("datetime=2026-05-11T12:00:00Z&{}", run(OLD_RUN)),
+        format!("datetime=2026-05-11T03:00:00Z&{}", run(NEW_RUN)),
+        format!("subset={time}(%222026-05-11T12:00:00Z%22),reference_time(%22{OLD_RUN}%22)"),
+        format!("datetime=2026-05-11T10:00:00Z/..&{}", run(OLD_RUN)),
+    ] {
+        let reply = get(app, &uri(&query)).await;
+        assert_eq!(reply.status, no_data, "{query}");
+    }
+    let fallback = get(app, &uri("datetime=2026-05-11T03:00:00Z")).await;
+    assert_eq!(fallback.status, StatusCode::OK);
+    assert_eq!(fallback.datetime, "2026-05-11T03:00:00Z");
     // A run the collection does not have; an interval of runs.
     let unknown = get(
         app,
@@ -344,12 +386,12 @@ async fn a_named_run_draws_and_keys_that_runs_frame_on_maps_and_map_tiles() {
     );
 
     let app = maps(engine.clone(), dir.path());
-    assert_run_selection(&app, "time", |query| {
+    assert_run_selection(&app, "time", StatusCode::NOT_FOUND, |query| {
         format!("/collections/{ID}/map?bbox={BBOX}&width=64&height=64&parameter-name=UGRD&{query}")
     })
     .await;
     let app = tiles(engine, dir.path());
-    assert_run_selection(&app, "datetime", |query| {
+    assert_run_selection(&app, "datetime", StatusCode::NO_CONTENT, |query| {
         format!("/collections/{ID}/tiles/WebMercatorQuad/2/1/2?parameter-name=UGRD&{query}")
     })
     .await;
@@ -364,7 +406,7 @@ async fn the_extent_lists_the_runs_by_their_instance_ids() {
     let engine = engine(dir.path());
     let expected = json!({
         "interval": [[OLD_RUN, NEW_RUN]],
-        "description": "Model run (forecast reference time); values are EDR instance ids",
+        "description": "Model run (forecast reference time), as RFC 3339; the collection's EDR instance ids where it serves EDR",
         "definition": "https://vocab.nerc.ac.uk/standard_name/forecast_reference_time/",
         "grid": {"cellsCount": 2, "coordinates": [OLD_RUN, NEW_RUN]}
     });

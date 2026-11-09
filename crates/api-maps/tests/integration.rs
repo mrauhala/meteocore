@@ -2938,7 +2938,7 @@ async fn reference_time_is_a_dimension_and_axis_only_with_runs() {
         collection["extent"]["reference_time"],
         serde_json::json!({
             "interval": [["2026-07-11T12:00:00Z", "2026-07-11T18:00:00Z"]],
-            "description": "Model run (forecast reference time); values are EDR instance ids",
+            "description": "Model run (forecast reference time), as RFC 3339; the collection's EDR instance ids where it serves EDR",
             "definition": "https://vocab.nerc.ac.uk/standard_name/forecast_reference_time/",
             "grid": {
                 "cellsCount": 2,

@@ -783,10 +783,9 @@ fn resolve_layer(
     // every request — including animation frames OLDER than that
     // run's reference time, which an exact pin would refuse (GRIB's
     // cross-run fallback applies only to `None`). A pin of an
-    // *older* run stays explicit/exact — that is user intent. The one
-    // rule Maps and map tiles also apply (#337).
+    // *older* run stays explicit/exact — that is user intent.
     let requested_run =
-        api_common::subset::engine_run(&info.reference_times, requested_reference_time);
+        requested_reference_time.filter(|&rt| info.reference_times.last().copied() != Some(rt));
 
     // #521: resolve the run axis to the CONCRETE run the engine will
     // render — the run-axis mirror of what #508 does for TIME below.

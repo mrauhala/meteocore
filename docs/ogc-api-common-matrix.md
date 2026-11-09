@@ -358,7 +358,8 @@ collection.
     `trs`; Maps General Subsetting describes a dimension by its
     `definition`. Maps maps and map tiles take
     `subset=reference_time("<run>")` and `reference_time(*)`; an interval is
-    a 400, an unknown run a 404. General Subsetting is not declared: the
+    a 400, an unknown run a 404, and a named run is drawn exactly: a time
+    outside it selects nothing, a Maps 404 or an empty map tile. General Subsetting is not declared: the
     run is the only additional dimension a subset can select.
 
 **Advertised conformance versus assessed behavior**

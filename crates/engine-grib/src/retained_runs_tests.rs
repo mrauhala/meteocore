@@ -224,6 +224,19 @@ fn an_analysis_only_run_keeps_older_runs_parameters_advertised_and_described() {
     assert_eq!(times("TMAX"), Some(vec![at(3), at(6)]));
     // Every valid time has an `RH`: the older run's.
     assert_eq!(times("RH"), None);
+    // Each run's own times, for a map naming it (#337): every step's, or
+    // the steps carrying a parameter some of the run's steps lack. A
+    // parameter the run lacks keeps the run's steps; a run not retained has
+    // none.
+    let run =
+        |parameter: Option<&str>, rt: i64| engine.run_times(parameter, at(rt)).map(|t| t.to_vec());
+    assert_eq!(run(None, 0), Some(vec![at(0), at(3), at(6)]));
+    assert_eq!(run(Some("TMP"), 0), Some(vec![at(0), at(3), at(6)]));
+    assert_eq!(run(Some("TCDC_avg_3h"), 0), Some(vec![at(3)]));
+    assert_eq!(run(Some("TMAX"), 0), Some(vec![at(3), at(6)]));
+    assert_eq!(run(None, 6), Some(vec![at(6)]));
+    assert_eq!(run(Some("TMAX"), 6), Some(vec![at(6)]));
+    assert_eq!(run(None, 3), None);
 
     // The order holds once the new run has them all.
     complete(&source, NEW, "b", 10.0);

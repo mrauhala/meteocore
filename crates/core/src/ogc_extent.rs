@@ -75,7 +75,7 @@ pub const FORECAST_REFERENCE_TIME: &str =
 
 /// `extent.reference_time.description`.
 pub const REFERENCE_TIME_DESCRIPTION: &str =
-    "Model run (forecast reference time); values are EDR instance ids";
+    "Model run (forecast reference time), as RFC 3339; the collection's EDR instance ids where it serves EDR";
 
 impl ReferenceTimeExtent {
     /// The dimension of `runs` (`RasterInfo::reference_times`, ascending);
@@ -711,7 +711,7 @@ mod tests {
             extent.reference_time,
             Some(ReferenceTimeExtent {
                 interval: vec![[id("2026-06-02T00:00:00Z"), id("2026-06-02T06:00:00Z")]],
-                description: "Model run (forecast reference time); values are EDR instance ids",
+                description: "Model run (forecast reference time), as RFC 3339; the collection's EDR instance ids where it serves EDR",
                 definition: "https://vocab.nerc.ac.uk/standard_name/forecast_reference_time/",
                 grid: Some(TemporalGrid::Irregular {
                     cells_count: 2,

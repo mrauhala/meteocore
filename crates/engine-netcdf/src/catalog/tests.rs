@@ -378,3 +378,21 @@ fn a_lead_inside_a_run_changes_the_step_before() {
     assert!(changed(&[(Some(6), &[7, 8])], &[(Some(6), &[6, 7, 8])]));
     assert!(!changed(&[], &[(Some(6), &[6, 7, 8])]));
 }
+
+/// #337: each run's own valid times, which a map naming it selects on; the
+/// run-less timeline has none.
+#[test]
+fn run_times_are_each_runs_own_steps() {
+    let meps = meps();
+    let times = run_times(&meps.runs);
+    let hours = |rt: i64| {
+        times[&t(rt)]
+            .iter()
+            .map(|&v| (v - t(0)).num_hours())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(times.len(), 2);
+    assert_eq!(hours(6), [6, 7, 8, 9]);
+    assert_eq!(hours(9), [9, 10, 11]);
+    assert!(run_times(&catalog(&[(None, &[0, 1])]).runs).is_empty());
+}

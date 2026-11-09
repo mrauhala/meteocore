@@ -429,6 +429,16 @@ pub struct Catalog {
     /// Each advertised parameter's valid times over every retained run,
     /// kept only where they differ from `valid_times` (#1005).
     parameter_times: HashMap<String, Arc<[DateTime<Utc>]>>,
+    /// Per run, its own valid times, for a map naming it (#337).
+    run_times: BTreeMap<DateTime<Utc>, RunTimes>,
+}
+
+/// One run's valid times: every step's, and the steps carrying each
+/// parameter some of its steps lack (`partial_steps`).
+#[derive(Debug, Clone, Default)]
+struct RunTimes {
+    every: Arc<[DateTime<Utc>]>,
+    partial: HashMap<String, Arc<[DateTime<Utc>]>>,
 }
 
 impl Catalog {
@@ -514,6 +524,19 @@ impl Catalog {
         self.parameter_times.get(parameter).cloned()
     }
 
+    /// The valid times of run `run` for `parameter` (`None`: every step's),
+    /// the steps carrying it where some of the run's steps lack it: an `Arc`
+    /// clone from the publication snapshot. `None` for a run not retained.
+    pub fn run_times(
+        &self,
+        parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        let times = self.run_times.get(&run)?;
+        let partial = parameter.and_then(|p| times.partial.get(p));
+        Some(partial.unwrap_or(&times.every).clone())
+    }
+
     /// Whether any retained run has `parameter`.
     pub fn has_parameter(&self, parameter: &str) -> bool {
         self.advertised_keys.contains_key(parameter)
@@ -581,6 +604,28 @@ impl Catalog {
                     .map(|(name, steps)| (name.to_owned(), steps))
                     .collect();
                 (*reference_time, partial)
+            })
+            .collect()
+    }
+
+    /// Each run's own valid times, and its partial parameters' (#337).
+    fn build_run_times(&self) -> BTreeMap<DateTime<Utc>, RunTimes> {
+        self.runs
+            .iter()
+            .map(|(&reference_time, run)| {
+                let valid = |step: &u32| reference_time + chrono::Duration::hours(i64::from(*step));
+                let partial = self
+                    .partial_steps
+                    .get(&reference_time)
+                    .into_iter()
+                    .flatten()
+                    .map(|(name, steps)| (name.clone(), steps.iter().map(valid).collect()))
+                    .collect();
+                let times = RunTimes {
+                    every: run.valid_times().into(),
+                    partial,
+                };
+                (reference_time, times)
             })
             .collect()
     }
@@ -654,6 +699,7 @@ impl Catalog {
             })
             .collect();
         self.partial_steps = self.build_partial_steps();
+        self.run_times = self.build_run_times();
         // Every retained run's parameters, newest first (#1026): while a new
         // run has only its analysis, its windows and maxima, and anything
         // else only older runs still have, stay advertised, and in the same

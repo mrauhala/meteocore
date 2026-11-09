@@ -265,10 +265,8 @@ error images never are. Measured on a day of a live deployment's GetMaps
   once one lands or the window slides. So does a `TIME` on a layer with runs
   and no `DIM_REFERENCE_TIME`: a newer run or nowcast generation re-covers
   the valid time. The run is compared as named, before the latest is
-  normalised to `None` (`api_common::subset::engine_run`, the rule Maps and
-  map tiles share for `subset=reference_time`, #337), so a named latest run
-  the engine draws stays pinned and one it falls back from (GRIB's
-  cross-run fallback) does not.
+  normalised to `None`, so a named latest run the engine draws stays pinned
+  and one it falls back from (GRIB's cross-run fallback) does not.
   `resolve_layer` computes it per request and nothing stores it: the caches
   key on the resolved time and run, so a snapped and an exact request share
   one entry and each sends its own header, on a hit and a 304 too.

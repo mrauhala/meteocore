@@ -102,10 +102,11 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
   Content. `OGCAPI-datetime` names the instant rendered.
 - **Map tile model run.** `subset=reference_time("<run>")`, as on a Maps map
   ([api-maps](../api-maps/README.md#map-parameters)): the run's EDR instance
-  id, or `*` for the latest; the time is then a valid time of that run, by
-  default its latest. An unknown run is a 404, an interval a 400, and the
-  axis a 400 naming `datetime` on a collection without runs or on a vector
-  tile.
+  id, or `*` for the latest. A named run is drawn exactly: the time is one
+  of its own valid times, by default its latest, and a time outside it is
+  an empty tile, 204. An unknown run is a 404, an interval of runs a 400,
+  and the axis a 400 naming `datetime` on a collection without runs or on a
+  vector tile.
 - **Vector tile time.** The tile keeps features whose temporal geometry
   intersects the selection, and features without time. A time subset entirely
   outside the temporal extent is a 204. A collection without a time dimension
