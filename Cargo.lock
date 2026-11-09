@@ -1269,7 +1269,7 @@ dependencies = [
 name = "ds-cache"
 version = "0.1.0"
 dependencies = [
- "quick_cache 0.6.24",
+ "quick_cache 0.7.0",
 ]
 
 [[package]]
@@ -1575,7 +1575,7 @@ dependencies = [
  "futures",
  "hdf5-reader",
  "ndarray",
- "quick_cache 0.6.24",
+ "quick_cache 0.7.0",
  "serde",
  "tempfile",
  "thiserror",
