@@ -26,9 +26,11 @@
 //! - **Time.** `datetime` (an instant or interval) or `subset=time(…)`, not
 //!   both. An instant snaps as it always has; an interval renders the latest
 //!   time inside it.
+//! - **Model run.** `subset=reference_time("<run>")` on a collection that
+//!   retains runs (#337); `reference_time(*)` or none is the latest run.
 
 use api_common::map_frame::{self, Frame, MapCrs};
-use api_common::subset::{self, Axis, SubsetRange, SubsetValue, TimeSelection};
+use api_common::subset::{self, Axis, RequestedRun, SubsetRange, SubsetValue, TimeSelection};
 use ds_core::map_engine::{OutputCrs, RasterInfo};
 use ds_core::web_mercator;
 use serde::Deserialize;
@@ -73,7 +75,19 @@ const TIME: Axis<'static> = Axis {
     name: "time",
     aliases: &["t"],
 };
+/// The axes of every collection.
 const SUBSET_AXES: [Axis<'static>; 5] = [LON, LAT, EASTING, NORTHING, TIME];
+/// The axes of a collection that retains model runs: `reference_time` too
+/// ([`subset::REFERENCE_TIME_AXIS`], #337). A collection without runs
+/// rejects it as any other axis it lacks, naming [`SUBSET_AXES`].
+const RUN_SUBSET_AXES: [Axis<'static>; 6] = [
+    LON,
+    LAT,
+    EASTING,
+    NORTHING,
+    TIME,
+    subset::REFERENCE_TIME_AXIS,
+];
 
 /// Query parameters for OGC API Maps get_map / get_styled_map endpoints.
 /// `subset` may repeat, so the handler collects it from the raw query.
@@ -237,6 +251,9 @@ pub struct MapRequest {
     pub height: Option<u32>,
     pub scale_denominator: Option<f64>,
     pub time: Option<MapTime>,
+    /// `subset=reference_time(…)`, the model run; checked against the
+    /// collection's runs by [`subset::named_run`].
+    pub reference_time: Option<RequestedRun>,
     /// Output format at its default quality (JPEG 85, lossless WebP); the
     /// handler applies [`Self::quality`] and the collection's `webp_quality`.
     pub format: ds_render::ImageFormat,
@@ -302,8 +319,20 @@ fn numbers(name: &str, value: &str) -> Result<Vec<f64>, MapsError> {
 
 impl MapQueryParams {
     /// Validate the request on its own. `subsets` are the `subset` values in
-    /// request order.
+    /// request order. The `reference_time` axis is accepted, as on a
+    /// collection that retains runs ([`Self::validate_for`]).
     pub fn validate<S: AsRef<str>>(&self, subsets: &[S]) -> Result<MapRequest, MapsError> {
+        self.validate_for(subsets, true)
+    }
+
+    /// [`Self::validate`] for a collection that retains model runs or not
+    /// (`runs`): without them, `reference_time` is an axis the collection
+    /// lacks, a 400 naming those it has.
+    pub fn validate_for<S: AsRef<str>>(
+        &self,
+        subsets: &[S],
+        runs: bool,
+    ) -> Result<MapRequest, MapsError> {
         // FORMAT — default image/png
         let format_str = self.format.as_deref().unwrap_or("image/png");
         if !SUPPORTED_FORMATS.contains(&format_str) {
@@ -340,12 +369,11 @@ impl MapQueryParams {
         let scale_denominator =
             map_frame::parse_scale_denominator(present(&self.scale_denominator)).map_err(bad)?;
 
-        // SUBSET — spatial axes and `time`; any other axis is a 400.
-        let ranges = subset::by_axis(
-            subset::parse(subsets).map_err(MapsError::BadRequest)?,
-            &SUBSET_AXES,
-        )
-        .map_err(MapsError::BadRequest)?;
+        // SUBSET — spatial axes, `time` and, with runs, `reference_time`;
+        // any other axis is a 400.
+        let axes: &[Axis] = if runs { &RUN_SUBSET_AXES } else { &SUBSET_AXES };
+        let ranges = subset::by_axis(subset::parse(subsets).map_err(MapsError::BadRequest)?, axes)
+            .map_err(MapsError::BadRequest)?;
         let spatial_subset = parse_spatial_subset(&ranges, present(&self.subset_crs))?;
 
         // The area: at most one of bbox, a spatial subset and center
@@ -429,6 +457,11 @@ impl MapQueryParams {
             }),
             (None, None) => None,
         };
+        // RUN — `subset=reference_time(…)`, one run or `*`.
+        let reference_time = ranges
+            .get(subset::REFERENCE_TIME_AXIS.name)
+            .map(|range| RequestedRun::from_subset(range).map_err(MapsError::BadRequest))
+            .transpose()?;
 
         // parameter-name — validation that the name is in the engine's list
         // happens in the handler (we don't have the engine here). Just trim and
@@ -454,6 +487,7 @@ impl MapQueryParams {
             height,
             scale_denominator,
             time,
+            reference_time,
             format,
             quality,
             parameter_name,
@@ -954,6 +988,44 @@ mod tests {
             "{fields:?}"
         );
         assert_eq!(fields.len(), LEGEND_PARAMETERS.len());
+    }
+
+    /// #337: `subset=reference_time(…)` names one run, or `*` the latest, on
+    /// a collection with model runs; on one without, it is an axis the
+    /// collection lacks, the 400 naming those it has.
+    #[test]
+    fn a_reference_time_subset_names_a_run_where_the_collection_has_runs() {
+        let run = |subsets: &[&str], runs: bool| {
+            MapQueryParams::default()
+                .validate_for(subsets, runs)
+                .map(|request| request.reference_time)
+        };
+        let message = |result: Result<_, MapsError>| match result {
+            Err(MapsError::BadRequest(message)) => message,
+            other => panic!("expected BadRequest, got {other:?}"),
+        };
+        let six: chrono::DateTime<chrono::Utc> = "2026-10-01T06:00:00Z".parse().unwrap();
+        assert_eq!(
+            run(&[r#"reference_time("2026-10-01T06:00:00Z")"#], true).unwrap(),
+            Some(RequestedRun(Some(six)))
+        );
+        assert_eq!(
+            run(&[r#"time("2026-10-01T09:00:00Z"),reference_time(*)"#], true).unwrap(),
+            Some(RequestedRun(None))
+        );
+        assert_eq!(run(&["Lat(60:65)"], true).unwrap(), None);
+        assert!(
+            message(run(&[r#"reference_time("2026-10-01T00:00:00Z":*)"#], true))
+                .contains("an interval is not supported")
+        );
+        assert_eq!(
+            message(run(&["foo(1)"], true)),
+            "subset axis 'foo' is not supported; valid axes: Lon, Lat, E, N, time, reference_time"
+        );
+        assert_eq!(
+            message(run(&["reference_time(*)"], false)),
+            "subset axis 'reference_time' is not supported; valid axes: Lon, Lat, E, N, time"
+        );
     }
 
     #[test]

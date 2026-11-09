@@ -191,7 +191,7 @@ collection.
 | Regular spatial grid description (§8.2) | No Common grid descriptor | Partial — geographic grids, and grids in a source-stated `storageCrs` [6] | Partial — same, raster only [6] | N/A — feature data |
 | Native grid of any CRS (`meteocore:nativeGrid`, extension) | No — EDR's extent has no place for it [6] | Yes — every grid that is not lat/lon [6] | Yes — same, raster only [6] | N/A — feature data |
 | Regular/irregular temporal grid description (§8.2) | No — EDR `temporal.values` instead | Yes — available raster time series | Partial — raster only | No — intervals only [5] |
-| Additional axes such as ensemble/reference-time using the uniform extent model | No | No | No | No |
+| Additional axes such as ensemble/reference-time using the uniform extent model | No — runs are EDR instances | Yes — model runs as `reference_time` [14] | Yes — same, map tiles [14] | No |
 | Collection JSON and HTML encodings (§9) | Yes | Yes | Yes | Yes |
 | Complete current Part 2 abstract-test-suite result | Unverified | Unverified; native-bounds gap remains where the source states no code [6] | Unverified; same [6] | Unverified |
 | **Part 3 — Schemas** | | | | |
@@ -347,6 +347,20 @@ collection.
     theme is not a queryable. WCMP2 records themselves encode a topic as one
     theme per level; which form serves client filtering and record matching
     is the open question this experiment reports back on.
+14. Model runs (#337, following the MetOcean Maps profile discussion in
+    #944): a collection with runs adds the additional dimension
+    `reference_time`, with `interval`, a `description`, `definition`
+    `https://vocab.nerc.ac.uk/standard_name/forecast_reference_time/` and an
+    irregular `grid` of the runs, each written as its EDR instance id; past
+    500 runs a regular grid when they are equally spaced, else no grid.
+    `/req/uad-collections/extent-uad-definition` takes one of `definition`,
+    `trs` or `vrs`, and the schema's `oneOf` rejects two, so there is no
+    `trs`; Maps General Subsetting describes a dimension by its
+    `definition`. Maps maps and map tiles take
+    `subset=reference_time("<run>")` and `reference_time(*)`; an interval is
+    a 400, an unknown run a 404, and a named run is drawn exactly: a time
+    outside it selects nothing, a Maps 404 or an empty map tile. General Subsetting is not declared: the
+    run is the only additional dimension a subset can select.
 
 **Advertised conformance versus assessed behavior**
 

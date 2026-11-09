@@ -1032,10 +1032,13 @@ pub trait MapEngine: Send + Sync {
     ///
     /// The API layers also decide `Cache-Control` from it: on an engine with
     /// runs, an explicit-`TIME` response is `immutable` only when the request
-    /// named the run this returns (WMS `DIM_REFERENCE_TIME`; Maps and Tiles
-    /// name none), since a newer run re-covers the valid times an older one
-    /// drew (#1421). An engine whose content for a named run can still
-    /// change also needs a non-zero [`Self::content_version`].
+    /// named the run this returns (WMS `DIM_REFERENCE_TIME`, Maps and map
+    /// tiles `subset=reference_time(…)`, #337), since a newer run re-covers
+    /// the valid times an older one drew (#1421). A map naming a run and no
+    /// time asks this and [`Self::resolve_time`] with `time` `None`: they
+    /// return the run and its own latest step. A time it names lies within
+    /// the run's [`Self::run_times`]. An engine whose content for a named
+    /// run can still change also needs a non-zero [`Self::content_version`].
     ///
     /// Default: identity — correct only for engines without model runs
     /// (`reference_times` empty), where `None` stays `None` and nothing
@@ -1129,6 +1132,32 @@ pub trait MapEngine: Send + Sync {
     /// calls this for every parameter layer.
     fn parameter_times(&self, parameter: &str) -> Option<Arc<[DateTime<Utc>]>> {
         let _ = parameter;
+        None
+    }
+
+    /// The valid times model run `run` has for `parameter` (`None`: the one
+    /// `get_raster_tile` renders by default), ascending: the axis a map or
+    /// map tile naming that run selects its time on (#337). A named run is
+    /// drawn exactly, so a time outside these is no data, and an interval
+    /// draws the latest of them inside it.
+    ///
+    /// An engine that retains runs MUST override this when its time axis is
+    /// not each run's own: GRIB and NetCDF advertise the union over runs,
+    /// QueryData, Zarr and the nowcast the latest run's. It answers from
+    /// what its snapshot already holds; a run it does not retain is `None`.
+    /// Wrappers forward it. A parameter's own steps within the run may be
+    /// fewer; the engine then snaps to one of them, as
+    /// [`Self::resolve_parameter_time`] says.
+    ///
+    /// Default `None`: the run's times are the axis [`Self::parameter_times`]
+    /// or `RasterInfo::times` give. **O(1) from a snapshot** (Critical Rule
+    /// 10): it runs on the render path before the cache lookup.
+    fn run_times(
+        &self,
+        parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        let _ = (parameter, run);
         None
     }
 

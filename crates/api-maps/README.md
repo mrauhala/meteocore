@@ -62,7 +62,16 @@ collection. The extent describes the native grid
 ([api-common](../api-common/README.md#native-grid)):
 - `storageCrsBbox` and a `grid` in the `storageCrs` when the source states
   that code;
-- the `meteocore:nativeGrid` member for any grid that is not lat/lon. The per-API service adds a `tilesets-map` link to
+- the `meteocore:nativeGrid` member for any grid that is not lat/lon.
+
+A collection that keeps model runs adds the `reference_time` dimension to its
+extent, a Common Part 2 additional dimension: `interval` (first and last
+run), `description`, `definition`
+`https://vocab.nerc.ac.uk/standard_name/forecast_reference_time/` and
+`grid.coordinates` listing every run as its EDR instance id. The schema
+allows one of `definition`, `trs` and `vrs`, so there is no `trs`. Past 500
+runs (an archive) the runs are not listed: equally spaced ones are a regular
+`grid`, others have none, and EDR `/instances` pages them. The per-API service adds a `tilesets-map` link to
 `/tiles/collections/{id}/tiles` when the Tiles service renders the collection.
 
 `/conformance` lists the OGC API - Common classes and these OGC API - Maps
@@ -76,7 +85,7 @@ tiles, with the Scaling and Background parameters.
 | Parameter | Meaning |
 |---|---|
 | `bbox`, `bbox-crs` | Area: four values in the CRS's axis order. West greater than east crosses the antimeridian. |
-| `subset`, `subset-crs` | Area by axis, e.g. `Lon(19:32),Lat(59:70)`, or `E`/`N` in a projected CRS. `*` or a left-out axis keeps the extent. Also `time(…)`. |
+| `subset`, `subset-crs` | Area by axis, e.g. `Lon(19:32),Lat(59:70)`, or `E`/`N` in a projected CRS. `*` or a left-out axis keeps the extent. Also `time(…)`, and `reference_time(…)` on a collection with model runs. |
 | `center`, `center-crs` | Area around a point, at the native resolution or `scale-denominator`. |
 | `width`, `height` | Output size in pixels (see below). |
 | `scale-denominator` | One pixel spans scale × 0.28 mm on the ground at the map centre. |
@@ -103,6 +112,22 @@ tiles, with the Scaling and Background parameters.
   instant to one of its time steps (a parameter's own axis when it has one).
   An interval renders the latest step inside it, and is a 404 when it holds
   none. Without a time, the engine's default time is used, else the latest.
+- **Model run.** `subset=reference_time("2026-10-01T06:00:00Z")` on a
+  collection whose extent has a `reference_time` dimension. The value is the
+  run's EDR instance id; the compact `20261001T0600Z` ids from before #947
+  also work. `reference_time(*)` or no run is the latest run, where the
+  engine picks the run for the time: a time the newest run does not cover
+  yet comes from an older one. A named run, the latest included, is drawn
+  exactly, on every engine alike. The time is one of the run's own valid
+  times (`MapEngine::run_times`), by default its latest: an instant inside
+  the run snaps to one of its steps, an interval, a partial date or `*`
+  draws the latest step inside it, and an instant outside the run, or an
+  interval holding none of its steps, is a 404. WMS `DIM_REFERENCE_TIME`
+  differs for the latest run: there it falls back like no run, since WMS
+  clients echo the advertised default. A run the collection does not have
+  is a 404. An interval of runs is a 400: a map draws one run. On a
+  collection without runs the axis is a 400 naming the valid axes. The run
+  drawn keys the rendered cache.
 - **Background.** Transparent, the map keeps its alpha: areas with no data
   have opacity 0, in the `bgcolor`'s colour when one is given. Opaque, the
   map is composited onto `bgcolor`: areas with no data take it, and
@@ -117,13 +142,15 @@ tiles, with the Scaling and Background parameters.
   CRS's axis order), `Content-Datetime` (the instant rendered, on collections
   with a time axis), `ETag` and `x-cache` (`HIT`, `MISS` or `EMPTY`).
   `Cache-Control` is `public, max-age=86400, immutable` for an instant the
-  engine draws exactly, from an engine without model runs, on content it
-  never revises in place, and `public, max-age=60, must-revalidate`
-  otherwise: no time, an interval even when closed, an instant snapped to
-  another time step, whose URL draws another frame once one lands or the
-  window slides, or an instant of an engine that keeps model runs (GRIB,
-  QueryData, Zarr and NetCDF forecasts, nowcast generations): Maps names no
-  run, and a newer run re-covers the instant. A PostGIS lightning frame is
+  engine draws exactly, from an engine without model runs or from the run
+  the request names, on content it never revises in place, and
+  `public, max-age=60, must-revalidate` otherwise: no time, an interval even
+  when closed, an instant snapped to another time step, whose URL draws
+  another frame once one lands or the window slides, or an instant of an
+  engine that keeps model runs (GRIB, QueryData, Zarr and NetCDF forecasts,
+  nowcast generations) with no run named, or `*`: a newer run re-covers the
+  instant. GRIB frames always revalidate, since a late file can change the
+  message a frame draws. A PostGIS lightning frame is
   revised until an hour before the newest strike. Instants are compared,
   not their text, so a step written with an offset is exact. The header is
   each request's own: a snapped and an exact request share the step's cached
@@ -160,7 +187,7 @@ Errors are JSON `{"code": …, "description": …}`, or a page if HTML was asked
 | Status | Code | When |
 |---|---|---|
 | 400 | `BadRequest` | Bad or unknown parameter; engine `InvalidParameter`, `InvalidBbox`, `InvalidDatetime` or `QueryTooLarge` (with its message) |
-| 404 | `NotFound` | Unknown collection or style; no time step for the requested time; a model run gone before rendering, or anything else the engine reports absent |
+| 404 | `NotFound` | Unknown collection or style; no time step for the requested time; a `reference_time` the collection does not have; a model run gone before rendering, or anything else the engine reports absent |
 | 503 | `ServerBusy` | Render queue full, deadline passed, or an engine budget exhausted; with `Retry-After: 1` |
 | 503 | `SourceUnavailable` | The data's object store kept answering 429, 502, 503 or 504 through all of its retries; with `Retry-After: 10`. The description names no upstream; the server logs the error at WARN |
 | 500 | `ServerError` | Anything else, with a generic message |
@@ -203,8 +230,9 @@ runs offline on a fixture in `testdata/`. Server-wide settings for Maps:
 
 ## Limits
 
-- No `reference_time` parameter: a forecast collection renders the model run
-  the engine picks by default.
+- A run's own valid times are not in the Maps description, whose time
+  axis is the engine's: every run's (GRIB, NetCDF) or the latest run's
+  (QueryData, Zarr, nowcast). EDR `/instances/{id}` lists each run's.
 - Maps are two-dimensional: a six-value `bbox` or a spatial slice such as
   `Lat(60)` is a 400, and `elevation` selects one level.
 - At the default `MC_RENDER_MEMORY_MB`, a map over 33 554 432 pixels (about
@@ -216,10 +244,11 @@ runs offline on a fixture in `testdata/`. Server-wide settings for Maps:
 cargo test -p api-maps
 cargo test -p server --test common_discovery
 cargo test -p server --test satellite_composites --test grib_parameter_times
+cargo test -p server --test grib_reference_time
 ```
 
 The crate's tests drive the router with mock `MapEngine`s (no data files) and
 validate `/api` against `schemas/openapi-3.0.json`. `common_discovery` checks
 the Common behaviour of `/maps` and the shared root; `satellite_composites`
-(`testdata/goes19-abi`) and `grib_parameter_times` (`testdata/grib-arpege-wind`)
-render real data through Maps.
+(`testdata/goes19-abi`), `grib_parameter_times` and `grib_reference_time`
+(`testdata/grib-arpege-wind`) render real data through Maps.

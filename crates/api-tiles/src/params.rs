@@ -1,5 +1,7 @@
+use std::collections::BTreeMap;
+
 use api_common::map_frame::{self, Frame};
-use api_common::subset::{self, Axis, RequestedTime, TimeSelection};
+use api_common::subset::{self, Axis, RequestedRun, RequestedTime, SubsetRange, TimeSelection};
 use serde::Deserialize;
 
 use crate::error::TilesError;
@@ -103,7 +105,7 @@ pub const VECTOR_TILE_PARAMETERS: &[&str] = &["f", "datetime", "subset"];
 
 /// The `subset` axis tiles accept, map and vector alike: OGC API - Tiles
 /// names its time axis `datetime` (`/req/datetime/axis`). There is no
-/// other. The tile matrix
+/// other but a map tile's model run ([`MAP_TILE_AXES`]). The tile matrix
 /// set partitions the plane, and the vertical `h`/`z` axis that Maps
 /// Spatial Subsetting adds to map tiles needs a three-dimensional spatial
 /// extent, which no collection here has; levels are selected by `elevation`.
@@ -111,6 +113,11 @@ pub const DATETIME_AXIS: Axis<'static> = Axis {
     name: "datetime",
     aliases: &[],
 };
+
+/// The `subset` axes of a map tile: [`DATETIME_AXIS`] and the model run,
+/// `reference_time` (#337), which only a collection that retains runs takes
+/// (`api_common::subset::named_run`). Vector tiles take `datetime` only.
+pub const MAP_TILE_AXES: [Axis<'static>; 2] = [DATETIME_AXIS, subset::REFERENCE_TIME_AXIS];
 
 /// A 400 naming the accepted parameters when `raw_query` holds another one.
 pub fn reject_unknown_parameters(
@@ -229,6 +236,8 @@ pub enum TileScaling {
 pub struct ValidatedTileParams {
     /// `datetime` or `subset=datetime(…)`, not both.
     pub time: Option<RequestedTime>,
+    /// `subset=reference_time(…)`, the model run (#337).
+    pub reference_time: Option<RequestedRun>,
     /// Output format at its default quality (JPEG 85, lossless WebP); the
     /// handler applies [`Self::quality`] and the collection's `webp_quality`.
     pub format: ds_render::ImageFormat,
@@ -255,10 +264,22 @@ fn present(value: &Option<String>) -> Option<&str> {
 
 impl TileQueryParams {
     /// Validate the request on its own. `subsets` are the `subset` values in
-    /// request order.
+    /// request order. The `reference_time` axis is accepted, as on a
+    /// collection that retains runs ([`Self::validate_for`]).
     pub fn validate<S: AsRef<str>>(
         &self,
         subsets: &[S],
+    ) -> Result<ValidatedTileParams, TilesError> {
+        self.validate_for(subsets, true)
+    }
+
+    /// [`Self::validate`] for a collection that retains model runs or not
+    /// (`runs`): without them, `reference_time` is an axis the collection
+    /// lacks, a 400 naming `datetime`.
+    pub fn validate_for<S: AsRef<str>>(
+        &self,
+        subsets: &[S],
+        runs: bool,
     ) -> Result<ValidatedTileParams, TilesError> {
         let format_str = self.format.as_deref().unwrap_or("image/png");
         if !SUPPORTED_FORMATS.contains(&format_str) {
@@ -287,7 +308,19 @@ impl TileQueryParams {
         )
         .map_err(TilesError::BadRequest)?;
 
-        let time = self.time(subsets)?;
+        let axes: &[Axis] = if runs {
+            &MAP_TILE_AXES
+        } else {
+            &[DATETIME_AXIS]
+        };
+        let ranges = subset::by_axis(subset::parse(subsets).map_err(bad)?, axes).map_err(bad)?;
+        let time = self.time(&ranges)?;
+        // `subset=reference_time(…)`, the model run; checked against the
+        // collection's runs by `subset::named_run`.
+        let reference_time = ranges
+            .get(subset::REFERENCE_TIME_AXIS.name)
+            .map(|range| RequestedRun::from_subset(range).map_err(bad))
+            .transpose()?;
 
         // SCALING — the tile matrix sets the tile's area, as `bbox` does a
         // map's, so `scale-denominator` with `width` or `height` is a 400
@@ -322,6 +355,7 @@ impl TileQueryParams {
 
         Ok(ValidatedTileParams {
             time,
+            reference_time,
             format,
             quality,
             parameter_name,
@@ -335,15 +369,17 @@ impl TileQueryParams {
 impl TileQueryParams {
     /// The time a tile request selects: `datetime`
     /// (`/req/collections/rc-datetime-definition`) or `subset=datetime(…)`
-    /// (`/req/datetime/axis`), not both; any other subset axis is a 400
-    /// (`/req/collections/rc-subset-definition` B). Map and vector tiles
-    /// alike (OGC API - Tiles DateTime).
-    fn time<S: AsRef<str>>(&self, subsets: &[S]) -> Result<Option<RequestedTime>, TilesError> {
+    /// (`/req/datetime/axis`), not both. Map and vector tiles alike (OGC
+    /// API - Tiles DateTime). `ranges` are the request's subsets by axis,
+    /// an axis the tile does not take already a 400
+    /// (`/req/collections/rc-subset-definition` B).
+    fn time(
+        &self,
+        ranges: &BTreeMap<&str, SubsetRange>,
+    ) -> Result<Option<RequestedTime>, TilesError> {
         let datetime = present(&self.datetime)
             .map(|v| TimeSelection::from_datetime(v).map_err(bad))
             .transpose()?;
-        let ranges =
-            subset::by_axis(subset::parse(subsets).map_err(bad)?, &[DATETIME_AXIS]).map_err(bad)?;
         let time_subset = ranges
             .get(DATETIME_AXIS.name)
             .map(|range| TimeSelection::from_subset(range).map_err(bad))
@@ -383,7 +419,9 @@ impl TileQueryParams {
                 ))
             });
         }
-        self.time(subsets)
+        let ranges =
+            subset::by_axis(subset::parse(subsets).map_err(bad)?, &[DATETIME_AXIS]).map_err(bad)?;
+        self.time(&ranges)
     }
 }
 
@@ -431,7 +469,7 @@ mod tests {
         params.validate(&NO_SUBSET)
     }
 
-    fn message(result: Result<ValidatedTileParams, TilesError>) -> String {
+    fn message<T>(result: Result<T, TilesError>) -> String {
         match result {
             Err(TilesError::BadRequest(message)) => message,
             Err(other) => panic!("expected BadRequest, got {other:?}"),
@@ -506,6 +544,7 @@ mod tests {
         s.parse().unwrap()
     }
 
+    /// The time of a map tile of a collection without model runs.
     fn time_of(
         datetime: Option<&str>,
         subsets: &[&str],
@@ -514,8 +553,46 @@ mod tests {
             datetime: datetime.map(str::to_string),
             ..Default::default()
         }
-        .validate(subsets)
+        .validate_for(subsets, false)
         .map(|v| v.time)
+    }
+
+    /// #337: a map tile of a collection with model runs also takes the
+    /// `reference_time` axis, one run or `*`; one without runs, and a
+    /// vector tile, name only `datetime`.
+    #[test]
+    fn a_map_tile_takes_a_run_where_the_collection_has_runs() {
+        let run = |subsets: &[&str], runs: bool| {
+            TileQueryParams::default()
+                .validate_for(subsets, runs)
+                .map(|v| v.reference_time)
+        };
+        let six = at("2026-10-01T06:00:00Z");
+        assert_eq!(
+            run(&[r#"reference_time("2026-10-01T06:00:00Z")"#], true).unwrap(),
+            Some(RequestedRun(Some(six)))
+        );
+        assert_eq!(
+            run(&[r#"datetime(*),reference_time(*)"#], true).unwrap(),
+            Some(RequestedRun(None))
+        );
+        assert_eq!(run(&[], true).unwrap(), None);
+        let interval = run(&[r#"reference_time("2026-10-01T00:00:00Z":*)"#], true);
+        assert!(message(interval).contains("an interval is not supported"));
+        assert_eq!(
+            message(run(&["foo(1)"], true)),
+            "subset axis 'foo' is not supported; valid axes: datetime, reference_time"
+        );
+        assert_eq!(
+            message(run(&["reference_time(*)"], false)),
+            "subset axis 'reference_time' is not supported; valid axes: datetime"
+        );
+        let vector = TileQueryParams::default()
+            .validate_vector(Some("subset=reference_time(*)"), &["reference_time(*)"]);
+        assert_eq!(
+            message(vector),
+            "subset axis 'reference_time' is not supported; valid axes: datetime"
+        );
     }
 
     /// `/req/collections/rc-datetime-definition` B–D: an instant or an

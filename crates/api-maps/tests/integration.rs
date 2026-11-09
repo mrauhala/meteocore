@@ -2741,9 +2741,9 @@ mod content_negotiation {
 // ---------------------------------------------------------------------------
 
 /// Mock forecast engine whose run list can be advanced mid-test — the Maps
-/// twin of the WMS `RunSwapMockMapEngine`. Maps never pins a run (the
-/// `reference_time` query parameter is a #337 Phase 4 follow-up), so every
-/// request exercises the `resolve_reference_time(time, None)` path.
+/// twin of the WMS `RunSwapMockMapEngine`. A request naming no run
+/// (`subset=reference_time(…)`, #337) exercises the
+/// `resolve_reference_time(time, None)` path.
 struct RunSwapMockMapEngine {
     runs: Arc<std::sync::RwLock<Vec<chrono::DateTime<chrono::Utc>>>>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -2847,8 +2847,8 @@ async fn map_re_renders_when_a_new_run_lands() {
     );
 }
 
-/// #1421: Maps names no run, so on an engine that retains runs an exact
-/// valid time is drawn from whichever run is the latest now, and a newer run
+/// #1421: a map naming no run, on an engine that retains runs, draws an exact
+/// valid time from whichever run is the latest now, and a newer run
 /// re-covers it later (a nowcast generation every few minutes, a forecast
 /// run every few hours). Its image is never `immutable`. Once the engine
 /// retains no runs, the same exact step is.
@@ -2879,6 +2879,105 @@ async fn an_exact_step_without_a_fixed_run_is_not_immutable() {
     assert_eq!(cache_control(&app).await, SHORT);
     runs.write().unwrap().clear();
     assert_eq!(cache_control(&app).await, IMMUTABLE);
+}
+
+/// #337: a run named with `subset=reference_time(…)` and drawn, at an exact
+/// valid time, is a fixed frame: `immutable`, the latest run named too.
+/// `*` names none, as omitting the axis does.
+#[tokio::test]
+async fn an_exact_step_of_a_named_run_is_immutable() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    let runs = Arc::new(std::sync::RwLock::new(vec![
+        "2026-07-11T12:00:00Z".parse().unwrap(),
+        "2026-07-11T18:00:00Z".parse().unwrap(),
+    ]));
+    let app = build_router_with_engine(Arc::new(RunSwapMockMapEngine {
+        runs,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    let cache_control = |run: &'static str| {
+        let app = app.clone();
+        async move {
+            let uri = format!(
+                "/collections/radar/map?bbox=10,55,30,70&width=64&height=64\
+                 &datetime=2026-07-11T20:00:00Z{run}"
+            );
+            let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{run}");
+            resp.headers()[axum::http::header::CACHE_CONTROL]
+                .to_str()
+                .unwrap()
+                .to_string()
+        }
+    };
+    assert_eq!(
+        cache_control("&subset=reference_time(%222026-07-11T12:00:00Z%22)").await,
+        IMMUTABLE
+    );
+    assert_eq!(
+        cache_control("&subset=reference_time(%222026-07-11T18:00:00Z%22)").await,
+        IMMUTABLE
+    );
+    assert_eq!(cache_control("&subset=reference_time(*)").await, SHORT);
+    assert_eq!(cache_control("").await, SHORT);
+}
+
+/// #337: the runs are the collection's `reference_time` dimension, and a
+/// run it does not have is a 404. A collection without runs has neither the
+/// dimension nor the axis: the 400 names the axes it has.
+#[tokio::test]
+async fn reference_time_is_a_dimension_and_axis_only_with_runs() {
+    let runs = Arc::new(std::sync::RwLock::new(vec![
+        "2026-07-11T12:00:00Z".parse().unwrap(),
+        "2026-07-11T18:00:00Z".parse().unwrap(),
+    ]));
+    let app = build_router_with_engine(Arc::new(RunSwapMockMapEngine {
+        runs,
+        calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    }));
+    let (status, collection) = get_on(app.clone(), "/collections/radar").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        collection["extent"]["reference_time"],
+        serde_json::json!({
+            "interval": [["2026-07-11T12:00:00Z", "2026-07-11T18:00:00Z"]],
+            "description": "Model run (forecast reference time), as RFC 3339; the collection's EDR instance ids where it serves EDR",
+            "definition": "https://vocab.nerc.ac.uk/standard_name/forecast_reference_time/",
+            "grid": {
+                "cellsCount": 2,
+                "coordinates": ["2026-07-11T12:00:00Z", "2026-07-11T18:00:00Z"]
+            }
+        })
+    );
+    let (status, json) = get_on(
+        app,
+        "/collections/radar/map?bbox=10,55,30,70&width=64&height=64\
+         &subset=reference_time(%222026-07-11T06:00:00Z%22)",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+    assert_eq!(
+        json["description"],
+        "reference_time '2026-07-11T06:00:00Z' is not a model run of collection 'radar'"
+    );
+
+    let (status, collection) = get("/collections/radar").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(collection["extent"].is_object(), "{collection}");
+    assert!(collection["extent"].get("reference_time").is_none());
+    for run in ["*", "%222026-07-11T12:00:00Z%22"] {
+        let (status, json) = get(&format!(
+            "/collections/radar/map?bbox=10,55,30,70&subset=reference_time({run})"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{run}");
+        assert_eq!(
+            json["description"],
+            "subset axis 'reference_time' is not supported; valid axes: Lon, Lat, E, N, time"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

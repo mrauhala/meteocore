@@ -1027,6 +1027,20 @@ impl MapEngine for Derived {
         }
     }
 
+    /// A derived parameter has its first input's times in the run: the
+    /// render then picks the step every input has, as
+    /// `resolve_parameter_time` does. Every other layer is the wrapped
+    /// engine's.
+    fn run_times(&self, parameter: Option<&str>, run: DateTime<Utc>) -> Option<Times> {
+        let plan = self.plan();
+        match parameter.and_then(|p| plan.get(p)) {
+            Some(d) => self
+                .map
+                .run_times(d.inputs.first().map(String::as_str), run),
+            None => self.map.run_times(parameter, run),
+        }
+    }
+
     fn resolve_parameter_time(
         &self,
         parameter: Option<&str>,

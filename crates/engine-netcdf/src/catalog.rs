@@ -542,6 +542,19 @@ impl Run {
     }
 }
 
+/// The valid times of each run of `runs` with a reference time, for
+/// [`Catalog::run_times`].
+pub(crate) fn run_times(
+    runs: &BTreeMap<RunKey, Run>,
+) -> BTreeMap<DateTime<Utc>, Arc<[DateTime<Utc>]>> {
+    runs.values()
+        .filter_map(|run| {
+            let times: Arc<[DateTime<Utc>]> = run.steps.keys().copied().collect();
+            run.reference_time.map(|rt| (rt, times))
+        })
+        .collect()
+}
+
 /// A step [`Catalog::select`] chose.
 pub(crate) struct Selected<'a> {
     pub reference_time: Option<DateTime<Utc>>,
@@ -558,6 +571,9 @@ pub(crate) struct Catalog {
     /// By reference time, ascending. Files without one form the single
     /// timeline under `None`; a catalog never holds both kinds.
     pub runs: BTreeMap<RunKey, Run>,
+    /// Each run's valid times, for a map naming it (#337): built with the
+    /// catalog ([`run_times`]), so a request clones an `Arc`.
+    pub run_times: BTreeMap<DateTime<Utc>, Arc<[DateTime<Utc>]>>,
     pub info: Arc<RasterInfo>,
     /// [`ds_core::map_engine::MapEngine::content_version`]: moves when a
     /// catalogued file is replaced on disk.
@@ -572,6 +588,7 @@ impl Catalog {
         Self {
             layout: None,
             runs: BTreeMap::new(),
+            run_times: BTreeMap::new(),
             info: Arc::new(raster_info(None, &BTreeMap::new(), &BTreeMap::new())),
             content_version,
             polled_at: None,
