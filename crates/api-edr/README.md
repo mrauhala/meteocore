@@ -101,8 +101,8 @@ axes), `VerticalProfile`, `Section` and `Trajectory`, alone or in a
 An `area` or `radius` grid from a collection with time always has a `t`
 axis listing the steps it served: every step of an interval, the step at
 an instant, or the step or steps it serves without `datetime`, even when
-that is one step. Without `datetime`, GRIB, NetCDF, the station grid and
-the nowcast serve one step, the latest; GeoTIFF, ODIM composites,
+that is one step. Without `datetime`, GRIB, NetCDF, the station grid, the
+nowcast and period products serve one step, the latest; GeoTIFF, ODIM composites,
 QueryData, Zarr and Satellite serve every step they hold, of the newest
 run where they hold runs. Its ranges are therefore always `[t, y, x]`, or
 `[t, z, y, x]` with levels, and one step is `[1, ny, nx]`: the layout of
@@ -306,7 +306,8 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   not a rectangle is also capped at 20 million cell × vertex tests. Over a
   cap is a 400 that says how to narrow the query.
 - **Area resolution.** An `area` or `radius` answer of QueryData, Zarr,
-  ODIM composites, Satellite, NetCDF and station grids is a CRS84 grid at
+  ODIM composites, Satellite, NetCDF, station grids and period products is
+  a CRS84 grid at
   the source's resolution (a projected grid's mean cell size in degrees)
   while it fits both budgets above, at any size: a whole 0.0625° model
   domain is 1360 × 640 cells. Past them the grid is coarsened by one
@@ -354,7 +355,7 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   | Engine | Precision |
   |---|---|
   | GRIB | `f32`: every packing the engine reads decodes to `f32`; template 5.4 IEEE fields are not readable |
-  | QueryData, NetCDF, ODIM composite and PVOL, Station grid | `f32`: QueryData stores `f32`, NetCDF decodes every stored type to `f32`, ODIM's raws are 8- or 16-bit or `f32`, the analysis grids are `f32` |
+  | QueryData, NetCDF, ODIM composite and PVOL, Station grid, Period | `f32`: QueryData stores `f32`, NetCDF decodes every stored type to `f32`, ODIM's raws are 8- or 16-bit or `f32`, the analysis and window grids are `f32` |
   | Zarr, GeoTIFF | the array's or file's data type: `float32` is `f32`; `float64`, and integers, whose unpacked type is not stated, are `f64` |
   | CSV, BUFR, PostGIS, Satellite, Nowcast | `f64` |
 
@@ -474,6 +475,7 @@ steps before included, and the `MC_NETCDF_EDR_QUERY_MB` and
 | Nowcast | – | – | ✓ | ✓ | – | – | ✓ | ✓ |
 | Satellite | – | ✓ | ✓ | ✓ | – | – | n/a | – |
 | Station grid | – | ✓ | ✓ | ✓ | ✓ no `z` | – | n/a | – |
+| Period | – | ✓ | ✓ | ✓ | – | – | n/a | – |
 
 CAP and GeoJSON collections have no `EdrEngine`. Radius and location lists
 need no engine code of their own; items serve the engine's own
@@ -501,6 +503,7 @@ need no engine code of their own; items serve the engine's own
 | Nowcast | the motion field (`motion_u`, `motion_v` in m/s, `motion_quality`) over the polygon's bbox; generations are instances; items are tracked cells |
 | Station grid | the analysis grid the map draws (each station's latest valid value within `[station_grid] max_age`, interpolated onto a CRS84 grid), read at the cell under each point; without `datetime` the latest analysis; an instant must be an analysis time; at most 96 analyses (times × parameters) per query; an analysis still computing at the deadline is a 503, and its computation goes on for a retry. With a terrain, lapse-rate corrected values; with a land/sea mask, null outside it; no analysis time (404) until both are sampled |
 
+| Period | the window grids the map draws (rolling statistics over a gridded observation collection's frames, such as radar rain accumulation in mm; see [engine-period](../engine-period/README.md)), read at the cell under each point; area at the working grid's resolution, coarsened evenly past the value budget; each window serves its end, the source's latest frame, alone: without `datetime` that end, and a `datetime` that does not contain it is a 404; a window below `min_coverage` serves nothing, and `coverage_<window>` serves the share its frames cover |
 Each engine crate documents its own query details.
 
 ## HTML
@@ -529,8 +532,8 @@ Each engine crate documents its own query details.
 This crate has no config section of its own. A collection is served when its
 `apis` contains `"edr"` (the default when `apis` is omitted) and its engine
 type supports EDR: `csv`, `geotiff`, `grib`, `querydata`, `zarr`, `netcdf`,
-`odim`, `odim-volume`, `postgis`, `bufr`, `nowcast`, `satellite` or
-`station-grid`. The runnable `collections.d/weather.toml` is a CSV station
+`odim`, `odim-volume`, `postgis`, `bufr`, `nowcast`, `satellite`,
+`station-grid` or `period`. The runnable `collections.d/weather.toml` is a CSV station
 collection (`engine_type` defaults to `csv`; `id`, `title` and
 `description` are required):
 

@@ -2368,6 +2368,45 @@
                     {
                       "kind": "TabsLayoutTab",
                       "spec": {
+                        "title": "Period products",
+                        "layout": {
+                          "kind": "GridLayout",
+                          "spec": {
+                            "items": [
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 0,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-224"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 0,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-225"
+                                  }
+                                }
+                              }
+                            ]
+                          }
+                        }
+                      }
+                    },
+                    {
+                      "kind": "TabsLayoutTab",
+                      "spec": {
                         "title": "PostGIS",
                         "layout": {
                           "kind": "GridLayout",
@@ -18780,7 +18819,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)",
+                        "expr": "sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)",
                         "legendFormat": "stores",
                         "range": true,
                         "instant": false,
@@ -18802,7 +18841,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)), 0)",
+                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)), 0)",
                         "legendFormat": "heap without a gauge",
                         "range": true,
                         "instant": false,
@@ -19320,7 +19359,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)), 0)",
+                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)), 0)",
                         "legendFormat": "heap without a gauge",
                         "range": true,
                         "instant": false,
@@ -24834,6 +24873,242 @@
                   "links": [],
                   "min": 0,
                   "decimals": 1
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-224": {
+        "kind": "Panel",
+        "spec": {
+          "id": 224,
+          "title": "Period products — frame reads & polls",
+          "description": "Source frames the period collections' polls read and the polls they ran, in the trailing hour. Steady state is one frame per window and source step plus the frame that just got its successor, and a re-sum's quarter frame per window per step; a poll never reads more than max_reads_per_cycle. Far more means windows are breaking and rebuilding: check /health for the reason (a source dropping frames still inside a window, unreadable frames).",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (increase(period_frame_reads_total{job=~\"$job\", collection=~\"$collection\"}[1h]))",
+                        "legendFormat": "{{collection}} frame reads",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (collection) (increase(period_polls_total{job=~\"$job\", collection=~\"$collection\"}[1h]))",
+                        "legendFormat": "{{collection}} polls",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-225": {
+        "kind": "Panel",
+        "spec": {
+          "id": 225,
+          "title": "Period products — window grid bytes",
+          "description": "Bytes of each period collection's window grids: 6 per working-grid cell and window, one window more while a re-sum runs. No frame is kept between polls.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "max by (collection) (period_grid_bytes{job=~\"$job\", collection=~\"$collection\"})",
+                        "legendFormat": "{{collection}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 0
                 },
                 "overrides": []
               }

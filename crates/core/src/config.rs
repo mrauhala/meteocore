@@ -2,7 +2,9 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+mod period;
 mod station_grid;
+pub use period::{PeriodConfig, RainRateConfig};
 pub use station_grid::{
     StationExclusionRule, StationExclusions, StationGridParameter, StationGridParameterOptions,
     StationPropertyValue,
@@ -396,6 +398,10 @@ pub struct CollectionConfig {
     /// Station-grid derived-collection configuration. Required when
     /// engine_type = "station-grid".
     pub station_grid: Option<StationGridConfig>,
+    /// Period-product derived-collection configuration (#1379). Required
+    /// when engine_type = "period".
+    #[serde(default)]
+    pub period: Option<PeriodConfig>,
     /// BUFR surface-observation engine (`engine_type = "bufr"`).
     pub bufr: Option<BufrConfig>,
     /// CSV engine options (`engine_type = "csv"`, #1204): its station-symbol
@@ -5116,6 +5122,32 @@ impl ServerConfig {
                 }
             }
 
+            // Period engine requires its config section (and vice versa).
+            if collection.engine_type == "period" && collection.period.is_none() {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': engine_type 'period' requires a [collections.period] \
+                     config section"
+                )));
+            }
+            if collection.period.is_some() && collection.engine_type != "period" {
+                return Err(crate::error::DataServerError::Config(format!(
+                    "Collection '{id}': [collections.period] is set but engine_type is '{}'",
+                    collection.engine_type
+                )));
+            }
+            if let Some(period) = &collection.period {
+                if period.source.trim().is_empty() {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': [collections.period].source must be a collection id"
+                    )));
+                }
+                if period.source == collection.id {
+                    return Err(crate::error::DataServerError::Config(format!(
+                        "Collection '{id}': period source cannot be the collection itself"
+                    )));
+                }
+            }
+
             // Station-grid engine requires its config section (and vice versa).
             if collection.engine_type == "station-grid" && collection.station_grid.is_none() {
                 return Err(crate::error::DataServerError::Config(format!(
@@ -6479,6 +6511,50 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             "engine_type = \"nowcast\"\n[collections.nowcast]\nsource = \"radar\"\n",
         );
         assert!(ok.validate().is_ok());
+    }
+
+    /// #1379: `engine_type = "period"` and `[collections.period]` come
+    /// together, the source names another collection, the Marshall–Palmer
+    /// defaults fill an empty `rain_rate`, and an unknown key is an error.
+    #[test]
+    fn validate_period_config_pairing() {
+        let section = |source: &str| {
+            format!(
+                "[collections.period]\nsource = \"{source}\"\nwindows = [\"PT1H\"]\n\
+                 rain_rate = {{}}\n"
+            )
+        };
+        assert!(collection_with("engine_type = \"period\"\n")
+            .validate()
+            .is_err());
+        assert!(collection_with(&format!(
+            "engine_type = \"csv\"\ndata_path = \"x.csv\"\n{}",
+            section("radar")
+        ))
+        .validate()
+        .is_err());
+        for source in ["c", " "] {
+            let bad = collection_with(&format!("engine_type = \"period\"\n{}", section(source)));
+            assert!(bad.validate().is_err(), "source {source:?}");
+        }
+        let ok = collection_with(&format!("engine_type = \"period\"\n{}", section("radar")));
+        assert!(ok.validate().is_ok());
+        let period = ok.collections[0].period.as_ref().unwrap();
+        assert_eq!(period.statistic, "sum");
+        assert_eq!(period.min_coverage, 0.9);
+        // A 36 M-cell composite (4963 × 7316) stays native by default.
+        assert_eq!(period.max_pixels, 40_000_000);
+        // Frames read in strips of at most 4 Mi cells: 64 MiB boxed.
+        assert_eq!(period.read_strip_cells, 4 * 1024 * 1024);
+        let zr = period.rain_rate.as_ref().unwrap();
+        assert_eq!((zr.a, zr.b, zr.min_dbz), (200.0, 1.6, 7.0));
+
+        let typo = format!(
+            "[server]\nhost=\"127.0.0.1\"\nport=8000\n\n[[collections]]\nid=\"c\"\n\
+             title=\"t\"\ndescription=\"d\"\nengine_type = \"period\"\n{}windos = [\"PT3H\"]\n",
+            section("radar")
+        );
+        assert!(toml::from_str::<ServerConfig>(&typo).is_err());
     }
 
     #[test]

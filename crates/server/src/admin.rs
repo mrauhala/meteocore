@@ -2193,6 +2193,8 @@ struct CacheCounterState {
     bufr: HashMap<String, [u64; engine_bufr::health::COUNTERS]>,
     /// Station-grid per-collection `[analyses, failures]` (#1082).
     station_grid: HashMap<String, [u64; 2]>,
+    /// Period per-collection `[polls, frame reads]` (#1379).
+    period: HashMap<String, [u64; 2]>,
     /// PVOL scan `[ok, failed, cached, parsed, read failures, parse
     /// failures]` per source (#193).
     pvol_scans: HashMap<String, [u64; 6]>,
@@ -2231,6 +2233,7 @@ impl CacheCounterState {
             cap,
             bufr,
             station_grid,
+            period,
             pvol_scans,
             storage_host_throttled: _,
         } = self;
@@ -2255,9 +2258,45 @@ impl CacheCounterState {
         drop_keys(cap, removed);
         drop_keys(bufr, removed);
         drop_keys(station_grid, removed);
+        drop_keys(period, removed);
         drop_keys(pvol_scans, removed);
     }
 }
+
+// Period products (#1379): the windows' grids, 6 bytes a cell each (a
+// re-sum adds one window's while it runs), and the source frames the polls
+// read: one per window and step, plus the frame that got its successor,
+// plus a re-sum's share.
+static PERIOD_GRID_BYTES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    collection_gauge(
+        "period_grid_bytes",
+        "Bytes of a period collection's window grids, a re-sum in progress included",
+    )
+});
+
+static PERIOD_FRAME_READS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "period_frame_reads_total",
+            "Source frames a period collection's polls read",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
+
+static PERIOD_POLLS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    let counter = IntCounterVec::new(
+        Opts::new(
+            "period_polls_total",
+            "Polls a period collection ran against its source",
+        ),
+        &["collection"],
+    )
+    .unwrap();
+    per_collection(counter)
+});
 
 // Station grids (#1082): the stations behind the latest analysis is the
 // first thing to check when one looks wrong.
@@ -2906,6 +2945,7 @@ pub struct ServerState {
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
     pub nowcast_engines: RwLock<Vec<Arc<engine_nowcast::NowcastEngine>>>,
     pub station_grid_engines: RwLock<Vec<Arc<engine_station_grid::StationGridEngine>>>,
+    pub period_engines: RwLock<Vec<Arc<engine_period::PeriodEngine>>>,
     /// Serializes reloads so they never race: whoever runs one holds this
     /// until it ends. An `Arc` so the HTTP handler can move an owned guard
     /// into the task running its reload, which outlives the request (#1402).
@@ -2985,6 +3025,7 @@ pub struct LoadResult {
     /// accepted ([`Self::apply_cache_resizes`], #1311).
     cache_resizes: Vec<CacheResize>,
     pub station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>>,
+    pub period_engines: Vec<Arc<engine_period::PeriodEngine>>,
     /// Every successfully built (or reused) poll-loop engine, keyed by
     /// collection id — the reuse pool for the NEXT incremental reload (#574).
     pub engines_by_id: HashMap<String, EngineHandle>,
@@ -3102,6 +3143,7 @@ pub enum EngineHandle {
     Postgis(Arc<engine_postgis::PostgisEngine>),
     Nowcast(Arc<engine_nowcast::NowcastEngine>),
     StationGrid(Arc<engine_station_grid::StationGridEngine>),
+    Period(Arc<engine_period::PeriodEngine>),
 }
 
 impl EngineHandle {
@@ -3161,7 +3203,21 @@ impl EngineHandle {
             | Self::Satellite(_)
             | Self::Netcdf(_)
             | Self::Odim(_)
-            | Self::StationGrid(_) => None,
+            | Self::StationGrid(_)
+            | Self::Period(_) => None,
+        }
+    }
+
+    /// The gridded observations a period collection may summarise (#1379):
+    /// a non-derived raster collection's `MapEngine`, or a station grid's,
+    /// whichever APIs it lists. `None` for station, vector, polar-volume,
+    /// nowcast and period engines; a forecast raster is refused by the
+    /// period engine itself, and an ODIM composite by the fourth load pass
+    /// (it serves undetect as nodata).
+    fn period_source(&self) -> Option<Arc<dyn ds_core::map_engine::MapEngine>> {
+        match self {
+            Self::StationGrid(e) => Some(e.clone()),
+            other => other.raster_source(),
         }
     }
 }
@@ -3260,6 +3316,7 @@ impl EngineReuse {
         StationGrid,
         engine_station_grid::StationGridEngine
     );
+    reuse_take!(take_period, Period, engine_period::PeriodEngine);
 }
 
 /// Decide which collections of the NEW config may reuse their live engine
@@ -3299,7 +3356,7 @@ pub(crate) fn reusable_collections(
         .filter(|c| {
             !matches!(
                 c.engine_type.as_str(),
-                "nowcast" | "csv" | "geojson" | "station-grid"
+                "nowcast" | "csv" | "geojson" | "station-grid" | "period"
             )
         })
         .filter(|c| unchanged(c))
@@ -3332,6 +3389,14 @@ pub(crate) fn reusable_collections(
                         .all(|id| base.contains(id))
             })
         {
+            out.insert(c.id.clone());
+        }
+    }
+    // A period collection holds its source's `Arc` and the windows summed
+    // from it (#1379): it keeps them only with its source's engine, a base
+    // raster or a reused station grid.
+    for c in new.iter().filter(|c| c.engine_type == "period") {
+        if unchanged(c) && c.period.as_ref().is_some_and(|p| out.contains(&p.source)) {
             out.insert(c.id.clone());
         }
     }
@@ -3608,6 +3673,8 @@ pub fn load_collections(
     let mut nowcast_pending: Vec<&CollectionConfig> = Vec::new();
     let mut station_grid_pending: Vec<&CollectionConfig> = Vec::new();
     let mut station_grid_engines: Vec<Arc<engine_station_grid::StationGridEngine>> = Vec::new();
+    let mut period_pending: Vec<&CollectionConfig> = Vec::new();
+    let mut period_engines: Vec<Arc<engine_period::PeriodEngine>> = Vec::new();
     // Pool registry is local to this load: collections sharing a DSN share a
     // pool via Arc<Pool>. Seed it with the pools of every REUSED postgis
     // engine (#574) so a rebuilt collection on a shared DSN joins the live
@@ -3710,6 +3777,7 @@ pub fn load_collections(
             "postgis" => &["edr", "features", "tiles", "wms", "maps"],
             "nowcast" => &["wms", "maps", "tiles", "features", "edr"],
             "station-grid" => &["wms", "maps", "tiles", "edr", "features"],
+            "period" => &["wms", "maps", "tiles", "edr"],
             _ => &[],
         };
         let unsupported: Vec<&str> = collection
@@ -5774,6 +5842,9 @@ pub fn load_collections(
             "station-grid" => {
                 station_grid_pending.push(collection);
             }
+            "period" => {
+                period_pending.push(collection);
+            }
             other => {
                 tracing::error!(
                     "Collection '{}': unknown engine type '{}', skipping",
@@ -6212,6 +6283,159 @@ pub fn load_collections(
         );
     }
 
+    // ------------------------------------------------------------------
+    // Fourth pass: period products (#1379), rolling-window statistics over
+    // a gridded observation collection the passes above built: a base
+    // raster, or a station grid. Never over a nowcast (forecast frames) or
+    // another period collection.
+    // ------------------------------------------------------------------
+    for collection in period_pending {
+        let mut fail = |error: String| {
+            tracing::error!("Collection '{}': {error}, skipping", collection.id);
+            health.push(CollectionHealth {
+                id: collection.id.clone(),
+                engine_type: "period".into(),
+                status: CollectionStatus::Failed,
+                error: Some(error),
+            });
+        };
+        let Some(period_config) = collection.period.as_ref() else {
+            fail("missing [collections.period] config".into());
+            continue;
+        };
+        // An ODIM composite reads undetect (scanned, no echo) and masked
+        // cells as nodata, the same as unscanned ones: a cell dry all window
+        // would be null instead of 0 mm, `mean` would average rainy frames
+        // only, and coverage would count dry frames as gaps. Refused until
+        // the source API tells undetect from nodata.
+        if collections
+            .iter()
+            .any(|c| c.id == period_config.source && c.engine_type == "odim")
+        {
+            fail(format!(
+                "period source '{}' is an ODIM composite, which serves undetect (no echo) as \
+                 nodata: dry cells would be null instead of 0 mm, and means and coverage wrong; \
+                 period products over ODIM composites are not supported yet",
+                period_config.source
+            ));
+            continue;
+        }
+        let source = match engines_by_id
+            .get(&period_config.source)
+            .and_then(EngineHandle::period_source)
+        {
+            Some(source) => source,
+            None => {
+                fail(
+                    match collections.iter().find(|c| c.id == period_config.source) {
+                        None => format!(
+                            "period source '{}' not found (it must be defined in the same config)",
+                            period_config.source
+                        ),
+                        Some(c) if engines_by_id.contains_key(&c.id) => format!(
+                            "period source '{}' is a {} collection, not gridded observations \
+                         (geotiff, satellite, zarr, netcdf or station-grid)",
+                            c.id, c.engine_type
+                        ),
+                        Some(c) => format!("period source '{}' failed to load", c.id),
+                    },
+                );
+                continue;
+            }
+        };
+        let engine = match engine_reuse.take_period(&collection.id) {
+            Some(live) => live,
+            None => match engine_period::PeriodEngine::new(
+                &collection.id,
+                &period_config.source,
+                source,
+                period_config,
+            ) {
+                Ok(engine) => Arc::new(engine),
+                Err(e) => {
+                    fail(format!("failed to initialize period engine: {e}"));
+                    continue;
+                }
+            },
+        };
+        engines_by_id.insert(collection.id.clone(), EngineHandle::Period(engine.clone()));
+        period_engines.push(engine.clone());
+
+        let parameters = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).parameters;
+        let mut styles = || {
+            collection_layer_styles(
+                style_ctx,
+                &mut styles_cache,
+                collection,
+                &parameters,
+                &bundle_index,
+            )
+        };
+        if collection.apis.contains(&"edr".to_string()) {
+            edr_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            edr_collections.insert(collection.id.clone(), collection.clone());
+            edr_styles.extend(styles());
+            info!("Collection '{}': wired to EDR API", collection.id);
+        }
+        if collection.apis.contains(&"wms".to_string()) {
+            map_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            register_point_engine(
+                &mut wms_point_engines,
+                &collection.id,
+                engine.clone() as Arc<dyn ds_core::edr_engine::EdrEngine>,
+            );
+            map_collections.insert(collection.id.clone(), collection.clone());
+            map_styles.extend(styles());
+            info!("Collection '{}': wired to WMS API", collection.id);
+        }
+        if collection.apis.contains(&"maps".to_string()) {
+            maps_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            maps_collections.insert(collection.id.clone(), collection.clone());
+            maps_styles.extend(styles());
+            info!("Collection '{}': wired to Maps API", collection.id);
+        }
+        if collection.apis.contains(&"tiles".to_string()) {
+            tiles_engines.insert(
+                collection.id.clone(),
+                engine.clone() as Arc<dyn ds_core::map_engine::MapEngine>,
+            );
+            tiles_collections.insert(collection.id.clone(), collection.clone());
+            tiles_styles.extend(styles());
+            info!("Collection '{}': wired to Tiles API", collection.id);
+        }
+
+        // Nothing is served until a window is built from the source's
+        // frames, which the poll reads: degraded until then.
+        let has_data = engine.has_data();
+        health.push(CollectionHealth {
+            id: collection.id.clone(),
+            engine_type: "period".into(),
+            status: if has_data {
+                CollectionStatus::Ready
+            } else {
+                CollectionStatus::Degraded
+            },
+            error: (!has_data).then(|| {
+                engine
+                    .waiting_for()
+                    .unwrap_or_else(|| "waiting for the first poll".into())
+            }),
+        });
+        info!(
+            "Collection '{}': period products over '{}'",
+            collection.id, period_config.source
+        );
+    }
+
     default_generic_root_layers(
         style_ctx,
         &bundle_index,
@@ -6387,6 +6611,7 @@ pub fn load_collections(
         nowcast_dependency_updates,
         cache_resizes,
         station_grid_engines,
+        period_engines,
         engines_by_id,
         wind_by_id,
     }
@@ -7728,6 +7953,7 @@ fn apply_load(
     rotate_poll_loops!(postgis_engines);
     rotate_poll_loops!(nowcast_engines);
     rotate_poll_loops!(station_grid_engines);
+    rotate_poll_loops!(period_engines);
     info!(
         "Incremental reload: {shut_down} old poll engine(s) shut down, {spawned} new spawned, \
          {} reused",
@@ -7913,6 +8139,10 @@ fn apply_load(
         .station_grid_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.station_grid_engines;
+    *state
+        .period_engines
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = result.period_engines;
 
     // Recount from the final `result.health` — the vanished-site block above
     // appends `Degraded` entries after the guard's `ready` was computed, so
@@ -8108,6 +8338,29 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
                 h.error = None;
             } else if let Some(reason) = waiting.get(h.id.as_str()) {
                 h.error = Some(reason.clone());
+            }
+        }
+    }
+
+    // Period products (#1379): degraded until a window is served; the
+    // reason names the windows not served and why.
+    {
+        let engines = state
+            .period_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        let live: HashMap<&str, (bool, Option<String>)> = engines
+            .iter()
+            .map(|e| (e.collection_id(), (e.has_data(), e.waiting_for())))
+            .collect();
+        for h in health.iter_mut().filter(|h| h.engine_type == "period") {
+            if let Some((has_data, waiting)) = live.get(h.id.as_str()) {
+                h.status = if *has_data {
+                    CollectionStatus::Ready
+                } else {
+                    CollectionStatus::Degraded
+                };
+                h.error = if *has_data { None } else { waiting.clone() };
             }
         }
     }
@@ -8640,6 +8893,21 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         // Nowcast engines (the Ready flip is in `effective_health`).
         let engines = state
             .nowcast_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        for engine in engines.iter() {
+            let id = engine.collection_id().to_string();
+            let times = ds_core::map_engine::MapEngine::raster_info(engine.as_ref()).times;
+            if let Some(temporal) = temporal_from_times(&times) {
+                temporal_info.insert(id, temporal);
+            }
+        }
+    }
+
+    {
+        // Period products (#1379): the windows' served end.
+        let engines = state
+            .period_engines
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for engine in engines.iter() {
@@ -9430,6 +9698,24 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
         }
     }
 
+    // Period products (#1379): grid bytes, polls and frame reads.
+    if let Ok(engines) = state.period_engines.read() {
+        for engine in engines.iter() {
+            let collection = engine.collection_id();
+            let (polls, reads, _) = engine.metrics();
+            let d = delta_counts(&mut counter_state.period, collection, [polls, reads]);
+            PERIOD_POLLS_TOTAL
+                .with_label_values(&[collection])
+                .inc_by(d[0]);
+            PERIOD_FRAME_READS_TOTAL
+                .with_label_values(&[collection])
+                .inc_by(d[1]);
+            PERIOD_GRID_BYTES
+                .with_label_values(&[collection])
+                .set(engine.grid_bytes().min(i64::MAX as u64) as i64);
+        }
+    }
+
     // CAP engines: catalog gauges + supersede counter for every mode, and the
     // WIS2 pipeline / accumulator series for WIS2-mode collections.
     if let Ok(engines) = state.cap_engines.read() {
@@ -9994,6 +10280,7 @@ mod tests {
                 radar_source: None,
             }),
             station_grid: None,
+            period: None,
             preview: None,
             derive_wind: None,
             derive_geopotential_height: None,
@@ -11286,6 +11573,174 @@ prewarm_sweeps = 0
         let new = vec![new[0].clone(), changed];
         let r = super::reusable_collections(&old, &new, &live_of_any(&built, &["radar", "t2m"]));
         assert!(!r.contains("t2m"), "a changed grid is rebuilt");
+    }
+
+    /// The committed WGS84 radar frames (`testdata/radar`, five frames
+    /// 23:15–23:35) and a rain accumulation over them (#1379).
+    fn period_collections(source: &str) -> Vec<CollectionConfig> {
+        let mut radar = tm35_source_collection("radar");
+        radar.data_path = Some("../../testdata/radar".to_string());
+        radar.geotiff.as_mut().unwrap().filename_template =
+            Some("radar_%Y%m%dT%H%MZ.tif".to_string());
+        let mut rain = nowcast_test_collection("rain", "period", None);
+        rain.apis = ["wms", "maps", "tiles", "edr"].map(String::from).to_vec();
+        rain.period = Some(ds_core::config::PeriodConfig {
+            source: source.to_string(),
+            parameter: None,
+            statistic: "sum".into(),
+            windows: vec!["PT20M".into(), "PT1H".into()],
+            rain_rate: Some(ds_core::config::RainRateConfig {
+                a: 200.0,
+                b: 1.6,
+                min_dbz: 7.0,
+            }),
+            threshold: None,
+            min_coverage: 0.9,
+            cadence: None,
+            poll_interval_secs: 30,
+            max_pixels: 250_000,
+            max_reads_per_cycle: 16,
+            read_strip_cells: 4 * 1024 * 1024,
+        });
+        vec![radar, rain]
+    }
+
+    /// #1379: a period collection over a raster source is wired to every
+    /// API it lists, one layer per window and coverage, the accumulations
+    /// on the precipitation palette; degraded until a poll builds a window,
+    /// ready after.
+    #[test]
+    fn period_wires_maps_and_edr_over_a_raster_source() {
+        let result = load_with_reuse(&period_collections("radar"), super::EngineReuse::default());
+        let h = health_of(&result, "rain");
+        assert_eq!(h.status, super::CollectionStatus::Degraded, "{:?}", h.error);
+        assert_eq!(result.period_engines.len(), 1);
+        assert!(matches!(
+            result.engines_by_id.get("rain"),
+            Some(super::EngineHandle::Period(_))
+        ));
+        assert!(result.edr_state.engines.contains_key("rain"));
+        assert!(result.wms_state.engines.contains_key("rain"));
+        assert!(result.wms_state.point_engines.contains_key("rain"));
+        assert!(result.maps_state.engines.contains_key("rain"));
+        assert!(result.tiles_state.map_engines.contains_key("rain"));
+        for layer in [
+            "rain/precipitation_amount_PT20M",
+            "rain/precipitation_amount_PT1H",
+            "rain/coverage_PT20M",
+        ] {
+            assert!(result.wms_state.styles.contains_key(layer), "{layer}");
+        }
+        let style = result.wms_state.styles["rain/precipitation_amount_PT1H"]
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(style.palette.name, "precipitation");
+    }
+
+    /// #1379: `/health` follows the period engine live: degraded with the
+    /// windows' reasons until a poll builds one, then ready.
+    #[test]
+    fn period_health_turns_ready_once_a_window_is_built() {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [[collections]]\nid = \"radar\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"geotiff\"\napis = [\"wms\"]\ndata_path = \"{fixture}\"\n\
+                 [collections.geotiff]\nfilename_template = \"radar_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n\
+                 [[collections]]\nid = \"rain\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 engine_type = \"period\"\napis = [\"wms\", \"edr\"]\n\
+                 [collections.period]\nsource = \"radar\"\nwindows = [\"PT20M\", \"PT1H\"]\n\
+                 rain_rate = {{}}\nmax_pixels = 250000\n"
+            ),
+        )
+        .unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        let rain = |state: &super::AdminState| {
+            super::effective_health(state)
+                .into_iter()
+                .find(|h| h.id == "rain")
+                .unwrap()
+        };
+        let before = rain(&state);
+        assert_eq!(before.status, super::CollectionStatus::Degraded);
+        assert!(before.error.unwrap().contains("waiting for the first poll"));
+        let engine = state.period_engines.read().unwrap()[0].clone();
+        engine.poll_once();
+        let after = rain(&state);
+        assert_eq!(
+            after.status,
+            super::CollectionStatus::Ready,
+            "{:?}",
+            after.error
+        );
+        assert!(engine
+            .waiting_for()
+            .unwrap()
+            .contains("PT1H: the source holds 20 min"));
+    }
+
+    /// #1379: a source that is missing, not gridded observations, or lacks
+    /// the parameter fails the period collection alone.
+    #[test]
+    fn period_bad_sources_fail_that_collection_only() {
+        let failed = |configs: Vec<CollectionConfig>| {
+            let result = load_with_reuse(&configs, super::EngineReuse::default());
+            assert_eq!(
+                health_of(&result, "radar").status,
+                super::CollectionStatus::Ready
+            );
+            let h = health_of(&result, "rain").clone();
+            assert_eq!(h.status, super::CollectionStatus::Failed);
+            assert!(!result.wms_state.engines.contains_key("rain"));
+            h.error.unwrap_or_default()
+        };
+        assert!(failed(period_collections("no-such")).contains("not found"));
+        let mut nowcast = period_collections("nc");
+        nowcast.push(nowcast_test_collection("nc", "nowcast", Some("radar")));
+        assert!(failed(nowcast).contains("is a nowcast collection, not gridded observations"));
+        let mut unknown = period_collections("radar");
+        unknown[1].period.as_mut().unwrap().parameter = Some("rain_rate".into());
+        assert!(failed(unknown).contains("no parameter 'rain_rate'"));
+        let mut window = period_collections("radar");
+        window[1].period.as_mut().unwrap().windows = vec!["one hour".into()];
+        assert!(failed(window).contains("not an ISO 8601 duration"));
+        // ODIM composites serve undetect as nodata (#1379 review).
+        let mut odim = period_collections("dk");
+        odim.push(nowcast_test_collection("dk", "odim", None));
+        assert!(failed(odim).contains("is an ODIM composite, which serves undetect"));
+    }
+
+    /// #1379: an unchanged period collection keeps its engine, and the
+    /// windows summed in it, only with its source's.
+    #[test]
+    fn period_reuse_follows_its_source() {
+        let collections = period_collections("radar");
+        let built = load_with_reuse(&collections, super::EngineReuse::default());
+        let old: HashMap<String, CollectionConfig> = collections
+            .iter()
+            .map(|c| (c.id.clone(), c.clone()))
+            .collect();
+        let live = built.engines_by_id.clone();
+        let r = super::reusable_collections(&old, &collections, &live);
+        assert!(r.contains("radar") && r.contains("rain"), "{r:?}");
+        let mut source = collections.clone();
+        source[0].geotiff.as_mut().unwrap().tile_cache_mb = 8;
+        source[0].title = "changed".into();
+        let r = super::reusable_collections(&old, &source, &live);
+        assert!(
+            !r.contains("rain"),
+            "a rebuilt source rebuilds the windows: {r:?}"
+        );
+        let mut changed = collections;
+        changed[1].period.as_mut().unwrap().min_coverage = 0.5;
+        let r = super::reusable_collections(&old, &changed, &live);
+        assert!(r.contains("radar") && !r.contains("rain"), "{r:?}");
     }
 
     /// Live handles for `ids`, all the same engine: `reusable_collections`

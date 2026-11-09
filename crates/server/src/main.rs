@@ -654,6 +654,14 @@ async fn serve(cli: CliArgs) {
             poller.poll_loop().await;
         });
     }
+    // Period-product loop — reads the source's new and leaving frames into
+    // the rolling windows (blocking source I/O; background runtime only).
+    for engine in &result.period_engines {
+        let poller = engine.clone();
+        poll_runtime().spawn(async move {
+            poller.poll_loop().await;
+        });
+    }
 
     // Set initial health gauges
     admin::update_health_gauges(&result.health);
@@ -786,6 +794,7 @@ async fn serve(cli: CliArgs) {
         postgis_engines: RwLock::new(result.postgis_engines),
         nowcast_engines: RwLock::new(result.nowcast_engines),
         station_grid_engines: RwLock::new(result.station_grid_engines),
+        period_engines: RwLock::new(result.period_engines),
         reload_lock: Default::default(),
         learned_records,
         admin_token,
@@ -1028,6 +1037,7 @@ async fn serve(cli: CliArgs) {
         postgis_engines,
         nowcast_engines,
         station_grid_engines,
+        period_engines,
     );
     for flush in flushes {
         if let Err(e) = flush.await {

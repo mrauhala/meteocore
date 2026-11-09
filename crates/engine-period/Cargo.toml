@@ -1,0 +1,21 @@
+[package]
+name = "engine-period"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+# `zr`, `plan`, `accum` and `geometry` are dependency-free pure functions;
+# these serve the engine, its snapshot and its poll loop.
+ds-core = { path = "../core" }
+ds-poll = { path = "../ds-poll" }
+chrono = "0.4"
+arc-swap = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+# The end-to-end test reads the repository's committed radar frames
+# (`testdata/radar`) through the public GeoTIFF engine, the same
+# `Arc<dyn MapEngine>` the server hands the engine.
+engine-geotiff = { path = "../engine-geotiff" }

@@ -180,6 +180,7 @@ fn router_with_styles(engine: Arc<dyn EdrEngine>, styles: StyleLayers) -> axum::
             postgis: None,
             nowcast: None,
             station_grid: None,
+            period: None,
             bufr: None,
             satellite: None,
             netcdf: None,

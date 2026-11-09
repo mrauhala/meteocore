@@ -1,0 +1,49 @@
+id = "radar-no-rain-accumulation-local"
+title = "MET Norway — radar rain accumulation (local)"
+description = """
+Rain accumulated over rolling windows ending at the latest radar frame,
+derived from the MET Norway reflectivity mosaic: each frame's reflectivity
+as rain rate (Marshall–Palmer, Z = 200 R^1.6), times the 5 minutes it
+counts for, summed over the window. Each window's coverage is served too.
+"""
+engine_type = "period"
+apis = ["wms", "maps", "tiles", "edr"]
+keywords = ["radar", "precipitation", "accumulation", "Norway"]
+
+[period]
+source = "radar-no-composite-dbzh-local-cog-wgs84"
+parameter = "reflectivity"
+statistic = "sum"
+# One parameter per window: precipitation_amount_PT20M, ..._PT1H, ..._PT3H,
+# and coverage_PT20M, ... The committed sample is five frames 20 minutes
+# apart, so only PT20M is served locally; PT1H and PT3H wait for a source
+# that holds an hour or three (health says so). A production source keeps
+# the longest window plus one frame (geotiff `time_window`/`max_files`).
+windows = ["PT20M", "PT1H", "PT3H"]
+# Z = a·R^b; reflectivity below min_dbz (7 dBZ = 0.1 mm/h) counts as dry.
+rain_rate = { a = 200.0, b = 1.6, min_dbz = 7.0 }
+# A window is served while its frames cover at least 90% of it.
+min_coverage = 0.9
+poll_interval_secs = 30
+# The source's native 3249 x 1750 grid fits the default max_pixels
+# (40 000 000), so the windows are on the source's own pixels: 34 MB each.
+
+# The accumulations take the precipitation palette (0–50 mm) by default;
+# coverage is a share, 0–1.
+[[wms.parameters]]
+name = "coverage_PT20M"
+colormap = "viridis"
+min = 0.0
+max = 1.0
+
+[[wms.parameters]]
+name = "coverage_PT1H"
+colormap = "viridis"
+min = 0.0
+max = 1.0
+
+[[wms.parameters]]
+name = "coverage_PT3H"
+colormap = "viridis"
+min = 0.0
+max = 1.0

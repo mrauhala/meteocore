@@ -33,6 +33,7 @@ Each engine implements one or more of the core traits.
 | `engine-netcdf` | `MapEngine` + `EdrEngine` | CF-NetCDF gridded forecasts and analyses (MET Norway MEPS per-lead files first) from a local directory, or remote: read in place by HTTP range from a server that cannot be listed, or through OPeNDAP (thredds.met.no's MEPS): one layer per variable, pressure levels as the vertical axis, model runs from `forecast_reference_time` as EDR instances, EDR position/area/radius/trajectory/cube, wind speed derived from u/v |
 | `engine-postgis` | `EdrEngine` + `FeatureEngine` + `MapEngine` | PostgreSQL/PostGIS observation tables (TimescaleDB compatible); map layers draw stations as markers coloured by value, and lightning events by age |
 | `engine-station-grid` | `MapEngine` + `EdrEngine` + `FeatureEngine` | Derived: one time slice of a station collection (CSV, BUFR, PostGIS stations) interpolated on the fly (IDW, ADW, nearest) onto a CRS84 analysis grid, served as map layers and through EDR, with each station's leave-one-out residual as Features (see [Station grid](#station-grid)) |
+| `engine-period` | `MapEngine` + `EdrEngine` | Derived: rolling-window statistics over a gridded observation collection's frames, radar rain accumulation first (Z–R rain rate × time, summed over the last hour, three hours, a day), served as map layers and through EDR with each window's coverage (see [Period products](#period-products)) |
 
 ### OGC API Plugins
 
@@ -847,7 +848,7 @@ Zarr object cache keeps its pinned 4096 MiB.
 | `description` | yes | — | Collection description |
 | `data_path` | yes* | — | Path to data file (CSV, GeoJSON) or directory (GeoTIFF) |
 | `apis` | no | `["edr"]` | Which APIs expose this collection: `"edr"`, `"features"`, `"maps"`, `"tiles"`, `"wms"`, `"3dtiles"` |
-| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"`, `"satellite"`, `"netcdf"`, `"station-grid"` (station observations gridded on the fly) |
+| `engine_type` | no | `"csv"` | Data engine: `"csv"`, `"geojson"`, `"geotiff"`, `"grib"`, `"odim"` (radar composite), `"odim-volume"` (radar polar volumes), `"querydata"`, `"zarr"`, `"postgis"`, `"satellite"`, `"netcdf"`, `"station-grid"` (station observations gridded on the fly), `"period"` (rolling-window statistics such as rain accumulation) |
 | `keywords` | no | — | Array of discovery keyword strings, e.g. `["radar", "reflectivity"]`. Surfaced in collection JSON, WMS capabilities, and matched by `/collections?q=`. |
 | `license` | no | — | `[collections.license]` table with `title` (required — SPDX id or human name), optional `url` and optional `type`, the media type `url` serves (default `text/html`; only with `url`). When `url` is omitted and `title` is an SPDX id, the URL is synthesized from `https://spdx.org/licenses/<id>.html`. The `rel="license"` link carries the `type`. |
 | `discovery` | no | — | `[collections.discovery]` table: `wis2_topic`, a WIS2 topic served as the collection's `themes`, and `wcmp2_record`, a WCMP2 record id linked as `describedby`. See [Discovery](#discovery-wis2-topics-and-wcmp2-records). |
@@ -2253,6 +2254,62 @@ poll_interval_secs = 60
   [engine-station-grid](crates/engine-station-grid/README.md#corrections)
   and the disabled example `collections.d/weather-analysis-terrain.toml.disabled`.
 - **Not yet:** quality-flag filters and projected analysis grids.
+
+### Period products
+
+A derived collection (`engine_type = "period"`, #1379) of statistics over
+rolling windows of a gridded observation collection's frames: how much
+rain fell in the last hour, three hours or day, without a client fetching
+and summing every 5-minute radar frame.
+
+```toml
+[[collections]]
+id = "radar-rain"
+engine_type = "period"
+apis = ["wms", "maps", "tiles", "edr"]
+
+[collections.period]
+source = "radar"                     # radar GeoTIFF, satellite or a station grid
+statistic = "sum"                    # sum | mean | count_above
+windows = ["PT1H", "PT3H", "PT24H"]  # one parameter per window
+rain_rate = { a = 200.0, b = 1.6 }   # dBZ to mm/h, Z = a·R^b (Marshall–Palmer)
+min_coverage = 0.9
+```
+
+- Each window ends at the source's latest frame and holds the frames before
+  it; a frame counts for its spacing to the next, at most the source's
+  cadence. With `rain_rate`, reflectivity becomes rain rate (below
+  `min_dbz`, 7 dBZ by default, no rain) and `sum` is the accumulation in mm,
+  `precipitation_amount_PT1H`, on the precipitation palette.
+- A window below `min_coverage` serves nothing; `coverage_<window>` serves
+  the share its frames cover. Each window has its own time axis: its end at
+  the source's latest frame, and only that. Earlier ends are not kept, so
+  accumulations cannot be animated or asked for at an earlier frame.
+- The grid is a CRS84 grid with the source's cell counts while they fit
+  `max_pixels` (default 40 000 000, at most 64 000 000): a 36 M-cell
+  composite keeps them, at 218 MB per window. For a CRS84 source that is
+  its native grid; a projected one (TM35FIN, LAEA) is resampled onto it.
+  Past `max_pixels` the grid is halved and frames are read as the source
+  renders that size (a GeoTIFF's overview). The load logs the grid and its
+  bytes; [engine-period](crates/engine-period/README.md#memory-and-io) has
+  the sizing table.
+- Not over ODIM composites, which serve undetect (no echo) as nodata: a dry
+  cell would be null instead of 0 mm. A frame that fails to read is
+  retried at the next poll; one revised in place is never subtracted with
+  its new values. Any edit to the source collection's config rebuilds the
+  period collection.
+- One `f32` + `u16` grid per window (6 bytes a cell), kept up to date as
+  frames arrive: the leaving frame is read from the source again and
+  subtracted; every window is re-summed from scratch after four lengths.
+  Frames are read in strips of whole rows, at most `read_strip_cells` cells
+  (default 4 Mi), each folded in and dropped, so a poll holds about 84 MB
+  of frame values whatever the grid's size or the source's value type. A
+  late frame inside a window moves its content version. The source must
+  keep the longest window plus one frame.
+- See [engine-period](crates/engine-period/README.md); the runnable example
+  is `collections.d/radar-no-rain-accumulation-local.toml`.
+- **Not yet:** past window ends computed on demand, `max` and `min`,
+  forecast windows over a run's valid times, clock-aligned windows.
 
 ## OGC 3D Tiles
 

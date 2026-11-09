@@ -156,6 +156,7 @@ fn build_router() -> axum::Router {
             postgis: None,
             nowcast: None,
             station_grid: None,
+            period: None,
             bufr: None,
             satellite: None,
             netcdf: None,

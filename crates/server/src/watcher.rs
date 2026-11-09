@@ -438,6 +438,7 @@ pub(crate) mod tests {
             postgis_engines: RwLock::new(result.postgis_engines),
             nowcast_engines: RwLock::new(result.nowcast_engines),
             station_grid_engines: RwLock::new(result.station_grid_engines),
+            period_engines: RwLock::new(result.period_engines),
             reload_lock: Default::default(),
             learned_records,
             admin_token: None,
