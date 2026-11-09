@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::Extension;
@@ -1801,7 +1801,7 @@ pub async fn styled_map_tilesets(
     Path((id, style_id)): Path<(String, String)>,
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(query): Query<StyledTilesetQuery>,
+    JsonQuery(query): JsonQuery<StyledTilesetQuery>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
     shared_tilesets(
@@ -1822,7 +1822,7 @@ pub async fn styled_map_tileset(
     Path((id, style_id, tms_id)): Path<(String, String, String)>,
     State(state): State<AppState>,
     Extension(mount): Extension<Mount>,
-    Query(query): Query<StyledTilesetQuery>,
+    JsonQuery(query): JsonQuery<StyledTilesetQuery>,
     headers: HeaderMap,
 ) -> Result<Response, TilesError> {
     shared_tilesets(

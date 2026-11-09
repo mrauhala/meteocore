@@ -699,9 +699,10 @@ where
         // directly at the exact requested resolution instead.
         return Ok(MetaTilePixels::Fallback);
     }
-    let span = TILE_PX as f64 * grid.level_res(level); // tile edge length in metres
-                                                       // `on_steps_only` (contour lines): both axes exactly at the step, so
-                                                       // the assembly is a crop, never a downsample.
+    // Tile edge length in metres.
+    let span = TILE_PX as f64 * grid.level_res(level);
+    // `on_steps_only` (contour lines): both axes exactly at the step, so
+    // the assembly is a crop, never a downsample.
     if on_steps_only {
         let step = grid.level_res(level);
         let on_step = |res: f64| ((res - step) / step).abs() < 1e-6;

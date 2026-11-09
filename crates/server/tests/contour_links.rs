@@ -356,6 +356,20 @@ async fn styled_tilesets_resolve_the_parameter_layer() {
         item.ends_with("/{tileMatrix}/{tileRow}/{tileCol}?parameter-name=2t"),
         "{item}"
     );
+    // A repeated `parameter-name` is the same JSON 400 every Tiles route
+    // gives a malformed query, on the list and on one tileset.
+    for path in [list.clone(), format!("{list}/WebMercatorQuad")] {
+        let (status, body) = get(
+            &app,
+            &format!("{path}?parameter-name=msl&parameter-name=2t"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+        assert!(
+            serde_json::from_slice::<Value>(&body).is_ok(),
+            "{path}: not JSON"
+        );
+    }
     // The collection's own styles keep links without a parameter.
     let (status, _) = get(
         &app,
