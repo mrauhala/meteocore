@@ -244,7 +244,9 @@ async fn a_colon_name_without_its_layer_is_suggested_nothing() {
 }
 
 /// An unknown parameter of a listed collection lists the collection's
-/// layers, sorted, at most 20 of them and how many more.
+/// layers, sorted, at most 20 of them and how many more, in GetMap,
+/// GetFeatureInfo and GetLegendGraphic alike: the legend of a name GetMap
+/// refuses is no legend of the collection's (#1440).
 #[tokio::test]
 async fn an_unknown_parameter_lists_its_collections_layers_bounded() {
     let app = router();
@@ -270,9 +272,57 @@ async fn an_unknown_parameter_lists_its_collections_layers_bounded() {
                 .to_string(),
         ),
     ] {
-        let reply = exception(&app, &get_map(layer)).await;
-        assert_eq!(reply.code, "LayerNotDefined", "{layer}");
-        assert_eq!(reply.message, message, "{layer}");
+        for uri in [
+            get_map(layer),
+            get_feature_info(layer, layer),
+            get_legend(layer),
+            get_legend(layer).replace("image/png", "application/json"),
+        ] {
+            let reply = exception(&app, &uri).await;
+            assert_eq!(reply.code, "LayerNotDefined", "{uri}");
+            assert_eq!(reply.message, message, "{uri}");
+        }
+    }
+}
+
+/// The layers GetMap draws have legends, as they had: a parameter, a
+/// multi-parameter collection's root, which draws its default parameter
+/// (#1133), and a single-layer collection. Each name GetMap refuses, the
+/// legend refuses too (#1440).
+#[tokio::test]
+async fn get_legend_graphic_serves_the_layers_get_map_draws() {
+    let app = router();
+    let status = |uri: String| {
+        let app = app.clone();
+        async move {
+            app.oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    for (layer, served) in [
+        ("nwp/t2m", true),
+        ("nwp/msl", true),
+        ("nwp", true),
+        ("big/p24", true),
+        ("radar", true),
+        ("nwp/nope", false),
+        ("nwp/t2m/x", false),
+        ("nwp/", false),
+        ("nope/t2m", false),
+    ] {
+        let expected = if served {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        assert_eq!(status(get_map(layer)).await, expected, "GetMap {layer}");
+        assert_eq!(
+            status(get_legend(layer)).await,
+            expected,
+            "GetLegendGraphic {layer}"
+        );
     }
 }
 

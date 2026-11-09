@@ -3,6 +3,10 @@ use std::f64::consts::{FRAC_PI_2, PI};
 use crate::feature::Geometry;
 use crate::map_engine::OutputCrs;
 
+mod convergence;
+
+pub use convergence::Convergence;
+
 /// WGS84 semi-major axis in metres. Public so engines never hardcode the
 /// radius themselves (`scripts/check_geo_safety.sh` flags the literal);
 /// numerically equal to `web_mercator::EARTH_RADIUS` (the 3857 sphere).
@@ -1737,6 +1741,7 @@ impl GeoTransform {
 /// series to sixth order in the third flattening n = f / (2 − f) derives
 /// from the figure, once per transform (#1192). On a sphere n is 0, every
 /// coefficient vanishes and the series is the exact spherical projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct TmSeries {
     /// The eccentricity e.
     e: f64,

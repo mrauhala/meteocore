@@ -955,8 +955,10 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
 /// difference of the two areas' `NFmiArea::TrueNorthAzimuth`, which would be
 /// wrong for components already along east and north. So the components are
 /// grid-relative: on a lat/lon area that is east and north, giving speed and
-/// direction; on a rotated lat/lon, stereographic or LCC area `ds_core::wind`
-/// gives speed only until it can turn them to true north.
+/// direction; on a rotated lat/lon, stereographic or LCC area the grid's
+/// convergence (`GridAxes::of`, `ds_core::geo::Convergence`) turns them to
+/// true north for the direction, as `DoWindComponentFix` turns them by the
+/// areas' true-north azimuths.
 fn wind_facts(data: &QueryData) -> WindFacts {
     WindFacts {
         grid: GridAxes::of(&data.grid.area.crs),
