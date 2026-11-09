@@ -172,7 +172,7 @@ pub struct Catalog {
     /// Each run's valid times (run + leads), by reference-axis index —
     /// built once here so [`Self::valid_times`] is an O(1) borrow per
     /// request (Critical Rule 10). Empty for a non-forecast store.
-    run_valid_times: Vec<Vec<DateTime<Utc>>>,
+    run_valid_times: Vec<Arc<[DateTime<Utc>]>>,
     /// Latitude axis values (degrees north; may be ascending or descending).
     lats: Vec<f64>,
     /// Longitude axis values (degrees east).
@@ -251,6 +251,14 @@ impl Catalog {
             Some(v) => v,
             None => &self.times,
         }
+    }
+
+    /// The valid times of the run with reference time `reference_time`, for
+    /// a map naming it (#337): an `Arc` clone of the list built here.
+    /// `None` for a run the store does not have.
+    pub fn run_times(&self, reference_time: DateTime<Utc>) -> Option<Arc<[DateTime<Utc>]>> {
+        let &index = self.runs.get(&reference_time)?;
+        self.run_valid_times.get(index).cloned()
     }
 
     /// The reference time of `run`, for the run-axis cache key.
@@ -1172,7 +1180,7 @@ fn build_with_codec_setup(
     let extent = [west, south, east, north];
 
     let reference_times: Vec<DateTime<Utc>> = runs.keys().copied().collect();
-    let run_valid_times: Vec<Vec<DateTime<Utc>>> = ref_times
+    let run_valid_times: Vec<Arc<[DateTime<Utc>]>> = ref_times
         .iter()
         .map(|base| leads.iter().map(|d| *base + *d).collect())
         .collect();

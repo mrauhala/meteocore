@@ -710,6 +710,14 @@ fn forecast_runs_are_instances_and_selectable() {
         e.resolve_time(None, None),
         Some(run1 + chrono::Duration::hours(2))
     );
+    // A map naming run 0 selects on its own valid times (#337), which the
+    // advertised axis, run 1's, lacks.
+    assert_eq!(
+        e.run_times(Some("temp"), run0).as_deref(),
+        Some(inst[0].valid_times.as_slice())
+    );
+    assert!(!e.raster_info().times.contains(&run0));
+    assert_eq!(e.run_times(None, run0 + chrono::Duration::hours(3)), None);
 
     // A non-forecast store has no instances and ignores reference_time.
     let plain = engine();

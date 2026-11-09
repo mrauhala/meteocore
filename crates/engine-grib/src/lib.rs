@@ -2377,6 +2377,16 @@ impl MapEngine for GribEngine {
         self.catalog().parameter_times(parameter)
     }
 
+    /// A run's own valid times (#337): every step's, or the steps carrying
+    /// `parameter` where some of the run's steps lack it. From the snapshot.
+    fn run_times(
+        &self,
+        parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        self.catalog().run_times(parameter, run)
+    }
+
     fn raster_info(&self) -> RasterInfo {
         (*self.raster_info_shared()).clone()
     }

@@ -344,20 +344,15 @@ fn build_collection_metadata(
 }
 
 /// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
-/// vertical) including the `grid` resolution descriptors. Returns `None` when
-/// the collection advertises no spatial, temporal, or vertical extent.
+/// vertical, and the model runs as `reference_time` when the collection
+/// retains them, #337) including the `grid` resolution descriptors. Returns
+/// `None` when the collection advertises no spatial, temporal, or vertical
+/// extent.
 ///
 /// The assembly lives in `ds_core::ogc_extent` so Maps, Tiles, and Features
 /// share one definition (issue #263).
 fn build_extent(info: &ds_core::map_engine::RasterInfo) -> Option<serde_json::Value> {
-    let extent = ds_core::ogc_extent::build_extent(
-        info.spatial_extent,
-        info.grid_size,
-        &info.native_crs,
-        info.native_grid.as_ref(),
-        &info.times,
-        info.vertical.as_ref(),
-    )?;
+    let extent = ds_core::ogc_extent::raster_extent(info)?;
     Some(serde_json::to_value(extent).expect("Extent serializes to JSON"))
 }
 
@@ -696,7 +691,7 @@ pub(crate) fn openapi_components() -> serde_json::Value {
             "subset": {
                 "name": "subset",
                 "in": "query",
-                "description": "Retrieve only part of the data by slicing or trimming along one or more axis\nFor trimming: {axisAbbrev}({low}:{high}) (preserves dimensionality)\nFor slicing:  {axisAbbrev}({value})      (reduces dimensionality)\nAn asterisk (`*`) can be used instead of {low} or {high} to indicate the minimum/maximum value.\nFor a temporal dimension, a single asterisk can be used to indicate the high value.\nSupport for `*` is required for time, but optional for spatial and other dimensions.\n\nAxes: `Lon` and `Lat` (also `Long`, `Longitude`, `Latitude`) in a geographic `subset-crs`, `E` and `N` (also `X`, `Easting`, `Y`, `Northing`) in a projected one, each trimmed with an interval; `*` is the collection extent's edge, and an axis left out keeps the extent. A `Lon` low greater than its high crosses the antimeridian. `time` (also `t`) takes double-quoted RFC 3339 values or the partial forms `yyyy`, `yyyy-mm`, `yyyy-mm-dd`, `yyyy-mm-ddThhZ` and `yyyy-mm-ddThh:mmZ`: an instant is snapped like `datetime`, an interval, a partial value or `*` renders the latest time inside it. Any other axis is a 400; an interval entirely outside its axis' valid values, or holding no time, a 404. Spatial axes not with `bbox` or `center`, `time` not with `datetime` (400). Example: `subset=Lon(19:32),Lat(59:70)`.",
+                "description": "Retrieve only part of the data by slicing or trimming along one or more axis\nFor trimming: {axisAbbrev}({low}:{high}) (preserves dimensionality)\nFor slicing:  {axisAbbrev}({value})      (reduces dimensionality)\nAn asterisk (`*`) can be used instead of {low} or {high} to indicate the minimum/maximum value.\nFor a temporal dimension, a single asterisk can be used to indicate the high value.\nSupport for `*` is required for time, but optional for spatial and other dimensions.\n\nAxes: `Lon` and `Lat` (also `Long`, `Longitude`, `Latitude`) in a geographic `subset-crs`, `E` and `N` (also `X`, `Easting`, `Y`, `Northing`) in a projected one, each trimmed with an interval; `*` is the collection extent's edge, and an axis left out keeps the extent. A `Lon` low greater than its high crosses the antimeridian. `time` (also `t`) takes double-quoted RFC 3339 values or the partial forms `yyyy`, `yyyy-mm`, `yyyy-mm-dd`, `yyyy-mm-ddThhZ` and `yyyy-mm-ddThh:mmZ`: an instant is snapped like `datetime`, an interval, a partial value or `*` renders the latest time inside it. `reference_time`, on a collection whose `extent` has a `reference_time` dimension, selects its model run: one double-quoted RFC 3339 run of that dimension, the run's EDR instance id, or `*` for the latest run, as omitting it is. A named run is drawn exactly, the latest included: the time is one of that run's own valid times, by default its latest, an instant inside the run snaps to one of its steps, and an instant outside it or an interval holding none of them is a 404. With `*` or no run, the run is the one the collection draws the time from, an older one where the newest lacks it. A run the collection does not have is a 404; an interval of runs, or the axis on a collection without runs, a 400. Any other axis is a 400; an interval entirely outside its axis' valid values, or holding no time, a 404. Spatial axes not with `bbox` or `center`, `time` not with `datetime` (400). Examples: `subset=Lon(19:32),Lat(59:70)`, `subset=reference_time(\"2026-10-01T06:00:00Z\")`.",
                 "style": "form",
                 "explode": false,
                 "required": false,
@@ -770,7 +765,7 @@ pub(crate) fn openapi_components() -> serde_json::Value {
             "map-datetime": {
                 "name": "datetime",
                 "in": "query",
-                "description": "Either a date-time or an interval. Date and time expressions adhere to RFC 3339, section 5.6. Intervals may be bounded or half-bounded (double-dots at start or end).\n\nAn instant is snapped to an available time step; an interval renders the latest time step inside it, and is a 404 when it holds none. Without `datetime` or a `time` subset the map shows the collection's default (normally latest) time. `Content-Datetime` reports the instant rendered. Not with `subset=time(…)` (400). Examples: `2018-02-12T23:20:50Z`, `2018-02-12T00:00:00Z/2018-03-18T12:31:12Z`, `2018-02-12T00:00:00Z/..`.",
+                "description": "Either a date-time or an interval. Date and time expressions adhere to RFC 3339, section 5.6. Intervals may be bounded or half-bounded (double-dots at start or end).\n\nAn instant is snapped to an available time step; an interval renders the latest time step inside it, and is a 404 when it holds none. Without `datetime` or a `time` subset the map shows the collection's default (normally latest) time, or the latest time of the model run a `reference_time` subset names; with a named run, an instant outside it is a 404. `Content-Datetime` reports the instant rendered. Not with `subset=time(…)` (400). Examples: `2018-02-12T23:20:50Z`, `2018-02-12T00:00:00Z/2018-03-18T12:31:12Z`, `2018-02-12T00:00:00Z/..`.",
                 "required": false,
                 "schema": {"type": "string"},
                 "style": "form",
@@ -1327,16 +1322,17 @@ pub async fn get_styled_map(
     render_map(&id, &style_id, params, &subsets, headers, state).await
 }
 
-/// The instant a map renders for, before the engine snaps it (#507):
-/// [`subset::render_time`], shared with map tiles. A time that selects no
+/// The time step and model run a map draws (#507, #521):
+/// [`subset::resolve_frame`], shared with map tiles. A time that selects no
 /// time step is a 404 here (`/req/datetime/subset-definition` D).
-fn requested_time(
+fn drawn_frame(
     request: &MapRequest,
+    run: Option<chrono::DateTime<chrono::Utc>>,
     engine: &dyn MapEngine,
     info: &RasterInfo,
     parameter: Option<&str>,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, MapsError> {
-    subset::render_time(request.time.as_ref(), engine, info, parameter)
+) -> Result<subset::DrawnFrame, MapsError> {
+    subset::resolve_frame(request.time.as_ref(), run, engine, info, parameter)
         .map_err(|none| MapsError::NotFound(none.0))
 }
 
@@ -1386,8 +1382,13 @@ async fn render_map(
 ) -> Result<impl IntoResponse, MapsError> {
     let state = state.load_full();
     let (engine, config) = lookup_engine(&state, collection_id)?;
+    // Share one metadata snapshot across the `subset` axes, style
+    // resolution, default-time resolution, the map area and parameter-name
+    // validation.
+    let raster_info = engine.raster_info_shared();
 
-    let validated = params.validate(subsets)?;
+    // `reference_time` is an axis of a collection with model runs only.
+    let validated = params.validate_for(subsets, !raster_info.reference_times.is_empty())?;
     // The format as encoded: an explicit `quality`, else for WebP the
     // collection's `[wms] webp_quality`, else the format default (JPEG 85,
     // lossless WebP). It keys the rendered cache, so a lossy and a lossless
@@ -1403,10 +1404,6 @@ async fn render_map(
     // An RGB composite (#819) has no style map: its colours come from its
     // channels, and its one style is `default`.
     let composite = composite_parameter(engine.as_ref(), validated.parameter_name.as_deref());
-
-    // Share one metadata snapshot across style resolution, default-time
-    // resolution, the map area and parameter-name validation.
-    let raster_info = engine.raster_info_shared();
 
     // Look up style, and the parameter it draws. A `?parameter-name=`
     // request styles from that parameter's own layer when the collection
@@ -1449,11 +1446,6 @@ async fn render_map(
     };
 
     let content_type = format.content_type();
-    // Only an instant can pin the image: `*` and intervals follow new data.
-    let requested_instant = validated
-        .time
-        .as_ref()
-        .and_then(|time| time.selection.instant());
 
     // Parameter selection precedence: ?parameter-name= wins over style.parameter.
     // Validate against the engine's advertised parameters and composites
@@ -1467,31 +1459,28 @@ async fn render_map(
         validated.parameter_name.as_deref(),
     )?;
 
-    let time = requested_time(
+    // The model run named by `subset=reference_time(…)` (#337): a 404 for
+    // a run the collection does not have.
+    let run = subset::named_run(
+        validated.reference_time,
+        &raster_info.reference_times,
+        collection_id,
+    )
+    .map_err(MapsError::from)?;
+    // The time step and run drawn, resolved BEFORE the cache key is built
+    // (#507, #521): the concrete run the engine renders, the named one or its
+    // pick, and the step it draws in that run. Shared with map tiles.
+    let subset::DrawnFrame {
+        time,
+        reference_time,
+        pinned,
+    } = drawn_frame(
         &validated,
+        run,
         engine.as_ref(),
         &raster_info,
         effective_parameter.as_deref(),
     )?;
-    // #521: resolve the run axis to the CONCRETE run the engine will render
-    // before the cache key is built. The Maps `reference_time` query
-    // parameter is still a follow-up (#337 Phase 4) — the handler never pins
-    // a run — but the no-TTL rendered cache must key on the run actually
-    // rendered: keyed as `None`, the first-rendered run's pixels would keep
-    // serving after a newer run re-covers the same valid times (acute for
-    // nowcast generations, latent for NWP). Asking the engine (not
-    // `reference_times.last()`) preserves GRIB's cross-run fallback when the
-    // newest run doesn't cover the valid time yet. Engines without runs keep
-    // the identity default (`None` stays `None`). The run is the
-    // parameter's: GRIB renders an aggregate the newest run lacks at that
-    // time from an older run (#1005).
-    let reference_time =
-        engine.resolve_parameter_reference_time(effective_parameter.as_deref(), time, None);
-    // #507: snap to the exact timestep the engine will render before the
-    // cache key is built — a not-yet-ingested datetime must cache the
-    // previous timestep's pixels under the PREVIOUS timestep's key. A
-    // parameter with its own time axis snaps on that axis.
-    let time = engine.resolve_parameter_time(effective_parameter.as_deref(), time, reference_time);
 
     // Reject an `elevation` against a collection with no vertical axis
     // rather than silently rendering the default layer.
@@ -1542,8 +1531,8 @@ async fn render_map(
         time,
         parameter: effective_parameter.clone(),
         z: validated.z.map(ds_render::quantize_z),
-        // The engine's latest run, pinned above (#521); a `reference_time`
-        // query parameter is a follow-up (#337 Phase 4).
+        // The run drawn, resolved above (#521): the one named, or the
+        // engine's pick for the time when none is.
         reference_time,
         // Content revised in place under the same instant (a push-fed alert
         // set, a late GRIB file) must not hit a stale entry: the version of
@@ -1561,13 +1550,9 @@ async fn render_map(
     };
 
     // This request's, never the cached entry's: a snapped and an exact request
-    // for one timestep share the entry, not the header. Maps names no run, so
-    // only an engine without runs draws a fixed one (#1421).
-    let cache_control = cache_control_value(
-        subset::is_exact_time(requested_instant, time)
-            && subset::is_fixed_run(&raster_info.reference_times, None, reference_time),
-        cache_key.content_version,
-    );
+    // for one timestep share the entry, not the header. On an engine with
+    // runs only a named run the engine drew is fixed (#1421).
+    let cache_control = cache_control_value(pinned, cache_key.content_version);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
@@ -1732,9 +1717,9 @@ async fn render_map(
                 &output_crs,
                 render_parameter.as_deref(),
                 render_z,
-                // The run pinned before keying (#521): `Some(latest)` renders the
-                // same pixels as `None` by the engine contract, but survives a
-                // run swap mid-render without mixing runs in one response.
+                // The run resolved before keying (#521): `Some(latest)` renders
+                // the same pixels as `None` by the engine contract, but survives
+                // a run swap mid-render without mixing runs in one response.
                 reference_time,
             )?
             else {

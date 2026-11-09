@@ -1548,6 +1548,7 @@ impl NetcdfEngine {
         let info = catalog::raster_info(layout.as_deref(), &runs, &self.titles);
         Catalog {
             layout,
+            run_times: catalog::run_times(&runs),
             runs,
             info: Arc::new(info),
             content_version: state.content_version,
@@ -1712,6 +1713,15 @@ impl MapEngine for NetcdfEngine {
             Ok(selected) => Some(selected.valid),
             Err(_) => time,
         }
+    }
+
+    /// A run's own valid times (#337), from the catalog snapshot.
+    fn run_times(
+        &self,
+        _parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        self.catalog.load().run_times.get(&run).cloned()
     }
 
     /// The run `get_raster_tile` draws from, through the same

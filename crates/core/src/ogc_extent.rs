@@ -30,6 +30,79 @@ pub struct Extent {
     pub temporal: Option<TemporalExtent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vertical: Option<VerticalExtent>,
+    /// The model runs, on a collection that retains them (#337). Set by the
+    /// raster API layers ([`ReferenceTimeExtent::of`]); [`build_extent`]
+    /// leaves it `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_time: Option<ReferenceTimeExtent>,
+}
+
+/// `extent.reference_time`, the model runs (forecast reference times) a
+/// collection retains, as a Common Part 2 Uniform Additional Dimension
+/// (#337, #944). Its name is the `subset` axis that selects a run on a map
+/// or map tile, `subset=reference_time("<run>")`.
+///
+/// - `interval`: the first and last run.
+/// - `description`: what the dimension is, in words
+///   ([`REFERENCE_TIME_DESCRIPTION`]); the schema takes members beyond its
+///   own.
+/// - `definition`: the CF standard name `forecast_reference_time`
+///   ([`FORECAST_REFERENCE_TIME`]). Maps `/req/general-subsetting/
+///   uniform-additional-dimensions` describes a dimension by its semantic
+///   `definition`. Common Part 2 `/req/uad-collections/extent-uad-definition`
+///   takes one of `definition`, `trs` or `vrs`, and both schemas (`oneOf`)
+///   reject a dimension with two, so there is no `trs`; the values are
+///   RFC 3339 instants, as in `temporal`.
+/// - `grid`: an irregular grid listing every run, each written as its EDR
+///   instance id ([`crate::instances::format_instance_id`]), the value a
+///   request names it by. Past [`crate::time_axis::MAX_LISTED_VALUES`] runs
+///   (an archive's run axis, #1006) the list is not written: equally spaced
+///   runs are a regular grid from the first run, others have no grid, and
+///   EDR `/instances` pages them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReferenceTimeExtent {
+    pub interval: Vec<[String; 2]>,
+    pub description: &'static str,
+    pub definition: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grid: Option<TemporalGrid>,
+}
+
+/// The CF standard name of a model run's time, in the NERC vocabulary the
+/// MetOcean profiles use for `observedProperty` ids.
+pub const FORECAST_REFERENCE_TIME: &str =
+    "https://vocab.nerc.ac.uk/standard_name/forecast_reference_time/";
+
+/// `extent.reference_time.description`.
+pub const REFERENCE_TIME_DESCRIPTION: &str =
+    "Model run (forecast reference time), as RFC 3339; the collection's EDR instance ids where it serves EDR";
+
+impl ReferenceTimeExtent {
+    /// The dimension of `runs` (`RasterInfo::reference_times`, ascending);
+    /// `None` when there are none.
+    pub fn of(runs: &[DateTime<Utc>]) -> Option<Self> {
+        let (first, last) = (runs.first()?, runs.last()?);
+        let id = |t: &DateTime<Utc>| crate::instances::format_instance_id(*t);
+        let cells_count = runs.len();
+        let grid = if !crate::time_axis::is_long(runs) {
+            Some(TemporalGrid::Irregular {
+                cells_count,
+                coordinates: runs.iter().map(id).collect(),
+            })
+        } else {
+            crate::datetime::regular_step_duration(runs).map(|resolution| TemporalGrid::Regular {
+                cells_count,
+                resolution,
+                first_coordinate: id(first),
+            })
+        };
+        Some(Self {
+            interval: vec![[id(first), id(last)]],
+            description: REFERENCE_TIME_DESCRIPTION,
+            definition: FORECAST_REFERENCE_TIME,
+            grid,
+        })
+    }
 }
 
 /// `extent.spatial`: a single WGS84 (CRS84) bbox, the extent and per-axis
@@ -294,8 +367,25 @@ pub fn build_extent(
             spatial,
             temporal,
             vertical,
+            reference_time: None,
         })
     }
+}
+
+/// [`build_extent`] of a raster's [`RasterInfo`](crate::map_engine::RasterInfo),
+/// with its model runs ([`ReferenceTimeExtent`]): the extent Maps and map
+/// tiles advertise.
+pub fn raster_extent(info: &crate::map_engine::RasterInfo) -> Option<Extent> {
+    let mut extent = build_extent(
+        info.spatial_extent,
+        info.grid_size,
+        &info.native_crs,
+        info.native_grid.as_ref(),
+        &info.times,
+        info.vertical.as_ref(),
+    )?;
+    extent.reference_time = ReferenceTimeExtent::of(&info.reference_times);
+    Some(extent)
 }
 
 #[cfg(test)]
@@ -595,6 +685,68 @@ mod tests {
             ]]
         );
         assert!(matches!(tmp.grid, Some(TemporalGrid::Regular { .. })));
+    }
+
+    /// #337: a raster's model runs are the `reference_time` dimension, each
+    /// run as its instance id; without runs there is none.
+    #[test]
+    fn model_runs_are_the_reference_time_dimension() {
+        let runs = [t("2026-06-02T00:00:00Z"), t("2026-06-02T06:00:00Z")];
+        let info = crate::map_engine::RasterInfo {
+            native_crs: "CRS:84".into(),
+            spatial_extent: Some([0.0, 0.0, 10.0, 5.0]),
+            times: vec![t("2026-06-02T06:00:00Z"), t("2026-06-02T09:00:00Z")],
+            parameter: "t".into(),
+            unit: "K".into(),
+            parameters: Vec::new(),
+            vertical: None,
+            grid_size: None,
+            layer_subtitle: None,
+            reference_times: runs.to_vec(),
+            native_grid: None,
+        };
+        let extent = raster_extent(&info).unwrap();
+        let id = |s: &str| s.to_string();
+        assert_eq!(
+            extent.reference_time,
+            Some(ReferenceTimeExtent {
+                interval: vec![[id("2026-06-02T00:00:00Z"), id("2026-06-02T06:00:00Z")]],
+                description: "Model run (forecast reference time), as RFC 3339; the collection's EDR instance ids where it serves EDR",
+                definition: "https://vocab.nerc.ac.uk/standard_name/forecast_reference_time/",
+                grid: Some(TemporalGrid::Irregular {
+                    cells_count: 2,
+                    coordinates: vec![id("2026-06-02T00:00:00Z"), id("2026-06-02T06:00:00Z")],
+                }),
+            })
+        );
+        assert!(extent.temporal.is_some() && extent.spatial.is_some());
+        let without = crate::map_engine::RasterInfo {
+            reference_times: Vec::new(),
+            ..info
+        };
+        assert_eq!(raster_extent(&without).unwrap().reference_time, None);
+        // An archive's run axis is not listed (#1006): six-hourly runs are a
+        // regular grid, irregular ones have none.
+        let six_hourly: Vec<_> = (0..600)
+            .map(|i| t("2020-01-01T00:00:00Z") + chrono::Duration::hours(6 * i))
+            .collect();
+        assert_eq!(
+            ReferenceTimeExtent::of(&six_hourly).unwrap().grid,
+            Some(TemporalGrid::Regular {
+                cells_count: 600,
+                resolution: "PT6H".into(),
+                first_coordinate: id("2020-01-01T00:00:00Z"),
+            })
+        );
+        let mut gap = six_hourly.clone();
+        gap.remove(300);
+        let gappy = ReferenceTimeExtent::of(&gap).unwrap();
+        assert_eq!(gappy.grid, None);
+        assert_eq!(
+            gappy.interval,
+            vec![[id("2020-01-01T00:00:00Z"), id("2020-05-29T18:00:00Z")]]
+        );
+        assert_eq!(ReferenceTimeExtent::of(&[]), None);
     }
 
     #[test]

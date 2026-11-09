@@ -1029,6 +1029,16 @@ impl MapEngine for ZarrEngine {
         nearest_time_idx(times, time).map(|i| times[i]).or(time)
     }
 
+    /// A run's own valid times (#337): `RasterInfo::times` is the latest
+    /// run's. From the catalog snapshot.
+    fn run_times(
+        &self,
+        _parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        self.catalog.load().run_times(run)
+    }
+
     fn resolve_reference_time(
         &self,
         _time: Option<DateTime<Utc>>,

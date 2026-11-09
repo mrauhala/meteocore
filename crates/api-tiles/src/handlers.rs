@@ -455,9 +455,10 @@ fn collection_time(
 }
 
 /// Build the OGC API Common Part 2 `extent` object (spatial, temporal,
-/// vertical) including the `grid` resolution descriptors. The spatial bbox
-/// falls back to `feature_extent` for vector collections that have no
-/// `RasterInfo`. Returns `None` when there is no extent to advertise.
+/// vertical, and a raster's model runs as `reference_time`, #337) including
+/// the `grid` resolution descriptors. The spatial bbox falls back to
+/// `feature_extent` for vector collections that have no `RasterInfo`.
+/// Returns `None` when there is no extent to advertise.
 ///
 /// The assembly lives in `ds_core::ogc_extent` so Maps, Tiles, and Features
 /// share one definition (issue #263).
@@ -489,6 +490,10 @@ fn build_extent(
             temporal.grid = None;
         }
     }
+    // The model runs a map tile selects with `subset=reference_time(…)`
+    // (#337), as Maps advertises them.
+    extent.reference_time =
+        raster_info.and_then(|i| ds_core::ogc_extent::ReferenceTimeExtent::of(&i.reference_times));
     Some(serde_json::to_value(extent).expect("Extent serializes to JSON"))
 }
 
@@ -967,7 +972,7 @@ pub(crate) fn openapi_components() -> serde_json::Value {
             "datetime": {
                 "name": "datetime",
                 "in": "query",
-                "description": "Either a date-time or an interval, half-bounded or bounded. Date and time expressions adhere to RFC 3339. Half-bounded intervals are expressed using double-dots.\n\nExamples:\n\n* A date-time: \"2018-02-12T23:20:50Z\"\n* A bounded interval: \"2018-02-12T00:00:00Z/2018-03-18T12:31:12Z\"\n* Half-bounded intervals: \"2018-02-12T00:00:00Z/..\" or \"../2018-03-18T12:31:12Z\"\n\nOn map tiles: an instant is snapped to an available time step (the last one at or before it); an interval renders the latest time step inside it, and is an empty tile (204) when it holds none. Without `datetime` or a `datetime` subset the tile shows the collection's default (normally latest) time. `OGCAPI-datetime` reports the instant rendered. Not with `subset=datetime(…)` (400).\n\nOn vector tiles: only features whose temporal geometry intersects the instant or interval, as Features' `datetime` selects them; features without a time always match. Without a time the tile holds the collection's default features.",
+                "description": "Either a date-time or an interval, half-bounded or bounded. Date and time expressions adhere to RFC 3339. Half-bounded intervals are expressed using double-dots.\n\nExamples:\n\n* A date-time: \"2018-02-12T23:20:50Z\"\n* A bounded interval: \"2018-02-12T00:00:00Z/2018-03-18T12:31:12Z\"\n* Half-bounded intervals: \"2018-02-12T00:00:00Z/..\" or \"../2018-03-18T12:31:12Z\"\n\nOn map tiles: an instant is snapped to an available time step (the last one at or before it); an interval renders the latest time step inside it, and is an empty tile (204) when it holds none. Without `datetime` or a `datetime` subset the tile shows the collection's default (normally latest) time, or the latest time of the model run a `reference_time` subset names; with a named run, an instant outside it is an empty tile (204). `OGCAPI-datetime` reports the instant rendered. Not with `subset=datetime(…)` (400).\n\nOn vector tiles: only features whose temporal geometry intersects the instant or interval, as Features' `datetime` selects them; features without a time always match. Without a time the tile holds the collection's default features.",
                 "required": false,
                 "schema": {"type": "string"},
                 "style": "form",
@@ -978,7 +983,7 @@ pub(crate) fn openapi_components() -> serde_json::Value {
             "tile-subset": {
                 "name": "subset",
                 "in": "query",
-                "description": "Retrieve only part of the data by slicing or trimming along one or more axis\nFor trimming: {axisAbbrev}({low}:{high}) (preserves dimensionality)\n   An asterisk (`*`) can be used instead of {low} or {high} to indicate the minimum/maximum value.\nFor slicing:  {axisAbbrev}({value})      (reduces dimensionality)\n\nTiles take one axis, `datetime`, with double-quoted RFC 3339 values or the partial forms `yyyy`, `yyyy-mm`, `yyyy-mm-dd`, `yyyy-mm-ddThhZ` and `yyyy-mm-ddThh:mmZ`, and `*` for the first or last time step. On map tiles an instant is snapped like `datetime`, and an interval or a partial value renders the latest time step inside it. On vector tiles it selects features as `datetime` does. A value entirely outside the time axis (a vector collection's temporal extent), or a map tile interval holding no time step, is an empty tile (204). Any other axis is a 400. Not with `datetime` (400). Example: `subset=datetime(\"2018-02-12T00:00:00Z\":*)`.",
+                "description": "Retrieve only part of the data by slicing or trimming along one or more axis\nFor trimming: {axisAbbrev}({low}:{high}) (preserves dimensionality)\n   An asterisk (`*`) can be used instead of {low} or {high} to indicate the minimum/maximum value.\nFor slicing:  {axisAbbrev}({value})      (reduces dimensionality)\n\nTiles take the axis `datetime`, with double-quoted RFC 3339 values or the partial forms `yyyy`, `yyyy-mm`, `yyyy-mm-dd`, `yyyy-mm-ddThhZ` and `yyyy-mm-ddThh:mmZ`, and `*` for the first or last time step. On map tiles an instant is snapped like `datetime`, and an interval or a partial value renders the latest time step inside it. On vector tiles it selects features as `datetime` does. A value entirely outside the time axis (a vector collection's temporal extent), or a map tile interval holding no time step, is an empty tile (204). Map tiles also take `reference_time` on a collection whose `extent` has a `reference_time` dimension: one double-quoted RFC 3339 model run of that dimension, the run's EDR instance id, or `*` for the latest run, as omitting it is. A named run is drawn exactly, the latest included: the time is one of that run's own valid times, by default its latest, an instant inside the run snaps to one of its steps, and an instant outside it or an interval holding none of them is an empty tile (204). With `*` or no run, the run is the one the collection draws the time from, an older one where the newest lacks it. A run the collection does not have is a 404; an interval of runs, the axis on a collection without runs or on a vector tile, a 400. Any other axis is a 400. Not with `datetime` (400). Examples: `subset=datetime(\"2018-02-12T00:00:00Z\":*)`, `subset=reference_time(\"2026-10-01T06:00:00Z\")`.",
                 "style": "form",
                 "explode": false,
                 "required": false,
@@ -2455,8 +2460,14 @@ async fn render_tile(
         .tile_bbox(zoom, row, col)
         .ok_or_else(|| TilesError::Internal("Failed to compute tile bbox".into()))?;
 
-    // Validate query params
-    let validated = params.validate(subsets)?;
+    // Single `raster_info_shared()` call covers the `subset` axes, style
+    // resolution, default-time resolution and parameter-name validation.
+    // Trait contract is O(1) but we still avoid the redundant call.
+    let raster_info = engine.raster_info_shared();
+
+    // Validate query params; `reference_time` is an axis of a collection
+    // with model runs only.
+    let validated = params.validate_for(subsets, !raster_info.reference_times.is_empty())?;
     // The image's size: the tile matrix's tileWidth × tileHeight unless the
     // Maps Scaling parameters set it over the tile's area (Map Tilesets
     // `/req/tilesets/tiles-parameters`).
@@ -2477,11 +2488,6 @@ async fn render_tile(
     // An RGB composite (#819) has no style map: its colours come from its
     // channels, and its one style is `default`.
     let composite = composite_parameter(engine.as_ref(), validated.parameter_name.as_deref());
-
-    // Single `raster_info_shared()` call covers style resolution,
-    // default-time resolution and parameter-name validation. Trait contract
-    // is O(1) but we still avoid the redundant call.
-    let raster_info = engine.raster_info_shared();
 
     // Look up style, and the parameter it draws. A `?parameter-name=`
     // request styles from that parameter's own layer when the collection
@@ -2524,11 +2530,6 @@ async fn render_tile(
     };
 
     let content_type = format.content_type();
-    // Only an instant can pin the tile: intervals and `*` follow new data.
-    let requested_instant = validated
-        .time
-        .as_ref()
-        .and_then(|time| time.selection.instant());
 
     // Determine output CRS from TileMatrixSet
     let output_crs = match tms_id {
@@ -2560,20 +2561,36 @@ async fn render_tile(
         )));
     }
 
-    // The instant to render, shared with Maps ([`subset::render_time`]):
-    // omitted, the engine's default, else the parameter's (else the
-    // collection's) latest time; an instant as given, snapped below; an
-    // interval, a partial date or `*` the latest time step inside it. One
-    // that selects no time step is an empty tile, 204: a subset entirely
-    // outside the time axis (`/req/collections/rc-subset-definition` C), or
-    // an interval holding no data (`/req/core/tc-error` B).
-    let time = match subset::render_time(
+    // The model run named by `subset=reference_time(…)` (#337): a 404 for
+    // a run the collection does not have, as a Maps map's.
+    let run = subset::named_run(
+        validated.reference_time,
+        &raster_info.reference_times,
+        collection_id,
+    )
+    .map_err(TilesError::from)?;
+
+    // The time step and run drawn, shared with Maps
+    // ([`subset::resolve_frame`]) and resolved BEFORE the cache key is built
+    // (#507, #521): omitted, the engine's default, else the parameter's
+    // (else the collection's) latest time, or a named run's own latest; an
+    // instant as given, snapped to a step; an interval, a partial date or
+    // `*` the latest time step inside it. One that selects no time step is
+    // an empty tile, 204: a subset entirely outside the time axis
+    // (`/req/collections/rc-subset-definition` C), or an interval holding no
+    // data (`/req/core/tc-error` B).
+    let subset::DrawnFrame {
+        time,
+        reference_time,
+        pinned,
+    } = match subset::resolve_frame(
         validated.time.as_ref(),
+        run,
         engine.as_ref(),
         &raster_info,
         effective_parameter.as_deref(),
     ) {
-        Ok(time) => time,
+        Ok(frame) => frame,
         Err(none) => {
             tracing::debug!(
                 "Tiles: no time step for collection '{collection_id}': {}",
@@ -2586,20 +2603,6 @@ async fn render_tile(
                 .unwrap());
         }
     };
-    // #521: resolve the run axis to the CONCRETE run the engine will render
-    // before the cache key is built (see api-maps for the full rationale —
-    // the no-TTL rendered cache keyed on `None` would keep serving the
-    // first-rendered run's pixels after a newer run re-covers the same valid
-    // times; asking the engine preserves GRIB's cross-run fallback). Engines
-    // without runs keep the identity default (`None` stays `None`). The run
-    // is the parameter's (#1005), as in api-maps.
-    let reference_time =
-        engine.resolve_parameter_reference_time(effective_parameter.as_deref(), time, None);
-    // #507: snap to the exact timestep the engine will render before the
-    // cache key is built — a not-yet-ingested datetime must cache the
-    // previous timestep's pixels under the PREVIOUS timestep's key. A
-    // parameter with its own time axis snaps on that axis.
-    let time = engine.resolve_parameter_time(effective_parameter.as_deref(), time, reference_time);
     // `OGCAPI-datetime` (`/rec/datetime/actual-datetime`) on a collection with
     // a temporal extent: the instant rendered, not the one requested.
     let actual_datetime = time
@@ -2629,8 +2632,8 @@ async fn render_tile(
         time,
         parameter: effective_parameter.clone(),
         z: validated.z.map(ds_render::quantize_z),
-        // The engine's latest run, pinned above (#521); a `reference_time`
-        // query parameter is a follow-up (#337 Phase 4).
+        // The run drawn, resolved above (#521): the one named, or the
+        // engine's pick for the time when none is.
         reference_time,
         // Content revised in place under the same instant (a push-fed alert
         // set, a late GRIB file) must not hit a stale entry: the version of
@@ -2645,13 +2648,9 @@ async fn render_tile(
     };
 
     // This request's, never the cached entry's: a snapped and an exact request
-    // for one timestep share the entry, not the header. Tiles names no run,
-    // so only an engine without runs draws a fixed one (#1421).
-    let cache_control = cache_control_value(
-        subset::is_exact_time(requested_instant, time)
-            && subset::is_fixed_run(&raster_info.reference_times, None, reference_time),
-        cache_key.content_version,
-    );
+    // for one timestep share the entry, not the header. On an engine with
+    // runs only a named run the engine drew is fixed (#1421).
+    let cache_control = cache_control_value(pinned, cache_key.content_version);
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|h| h.to_str().ok())
