@@ -48,9 +48,20 @@
 //!    live window runs at a time, so the grids held are the windows' plus
 //!    at most one.
 //!
-//! A frame that cannot be read is left out of the targets for
-//! [`FAILED_RETRY_POLLS`] polls, then read again; while it is out, its
-//! window's coverage shows the gap.
+//! A frame that cannot be read is not added for a while: read again at the
+//! next poll, then after 2, 4 and at most [`MAX_RETRY_POLLS`] polls, its
+//! window's coverage showing the gap meanwhile. A window that already holds
+//! it keeps it, and reads it again when it leaves: one failed read breaks
+//! at most the window that had to take the frame out, never the longer
+//! windows holding it.
+//!
+//! # Revised frames
+//!
+//! Every strip a window adds is digested ([`Frame::digest`]), and a strip
+//! is taken out only if it reads back with the same digest. A frame the
+//! source revised in place (a station grid's late observation, a GeoTIFF
+//! object republished) is never subtracted with its new values: the windows
+//! holding it break and are rebuilt.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
@@ -66,8 +77,9 @@ use crate::plan::{self, Ledger};
 /// Frames one window may hold: the per-cell count is a `u16`.
 pub const MAX_WINDOW_FRAMES: usize = u16::MAX as usize;
 
-/// Polls a frame that could not be read stays out of the windows.
-pub const FAILED_RETRY_POLLS: u64 = 20;
+/// The longest a frame that could not be read waits to be read again, in
+/// polls: the next poll first, then twice as long each time, up to this.
+pub const MAX_RETRY_POLLS: u64 = 8;
 
 /// Window lengths a live window slides before it is re-summed from
 /// scratch: `f32` rounding over that many steps stays below 1e-6 of the
@@ -167,6 +179,8 @@ pub struct PollStats {
     pub strip_reads: usize,
     /// The most bytes of frame values held at once: one strip.
     pub peak_frame_bytes: u64,
+    /// The most bytes of grids held at once, live and rebuilding.
+    pub peak_grid_bytes: u64,
 }
 
 /// Reads one strip of one frame: `rows` of the working grid, every column,
@@ -207,18 +221,18 @@ impl Strips {
             .map(|r0| r0..(r0 + self.rows).min(self.height))
     }
 
-    /// Read frame `t` strip by strip, handing each strip and the grid index
-    /// of its first cell to `apply`. On a failed strip, the rows handed to
-    /// `apply` before it and the error.
+    /// Read frame `t` strip by strip, handing each strip, the grid index of
+    /// its first cell and its index to `apply`. On a failed strip, the rows
+    /// handed to `apply` before it and the error.
     fn read(
         &self,
         t: DateTime<Utc>,
         read: &mut ReadStrip<'_>,
         stats: &mut PollStats,
-        mut apply: impl FnMut(&Frame, usize),
+        mut apply: impl FnMut(&Frame, usize, usize),
     ) -> Result<(), (u32, DataServerError)> {
         stats.reads += 1;
-        for rows in self.ranges() {
+        for (k, rows) in self.ranges().enumerate() {
             let start = rows.start;
             let cells = rows.len() * self.width as usize;
             stats.strip_reads += 1;
@@ -233,7 +247,7 @@ impl Strips {
                 ));
             }
             stats.peak_frame_bytes = stats.peak_frame_bytes.max(frame.bytes());
-            apply(&frame, start as usize * self.width as usize);
+            apply(&frame, start as usize * self.width as usize, k);
         }
         Ok(())
     }
@@ -278,9 +292,14 @@ impl Ops {
     }
 }
 
+/// The digests of a frame's strips as a window added them.
+type Digests = BTreeMap<DateTime<Utc>, Vec<u64>>;
+
 /// A live window's ledger: the frames its served grids hold.
 struct Live {
     ledger: Ledger,
+    /// Each held frame's strip digests, checked when it is taken out.
+    digests: Digests,
     /// Grid operations since the grids were last summed from scratch.
     ops: u64,
 }
@@ -289,8 +308,11 @@ struct Live {
 struct Rebuild {
     grids: Grids,
     ledger: Ledger,
+    digests: Digests,
     /// This poll's remaining operations.
     ops: Ops,
+    /// A frame being taken out read back changed: start over.
+    spoiled: bool,
     /// Whether replacing the live grids changes what they show beyond
     /// rounding (a new or broken window, or revised source frames).
     changes_content: bool,
@@ -301,29 +323,43 @@ impl Rebuild {
         Self {
             grids: Grids::new(cells),
             ledger: Ledger::new(),
+            digests: Digests::new(),
             ops: Ops::default(),
+            spoiled: false,
             changes_content,
         }
     }
 
-    /// Apply the operations frame `t` has here to one of its strips.
-    fn feed_strip(&mut self, t: DateTime<Utc>, frame: &Frame, statistic: Statistic, offset: usize) {
+    /// Apply the operations frame `t` has here to its strip `k`, digest
+    /// `digest`: a strip is taken out only if it reads back as it went in.
+    fn feed_strip(&mut self, t: DateTime<Utc>, strip: Strip<'_>, statistic: Statistic) {
+        if self.spoiled || !self.takes(&t) {
+            return;
+        }
         if let Some(&secs) = self.ops.remove.get(&t) {
+            if !same_strip(&self.digests, t, strip) {
+                self.spoiled = true;
+                return;
+            }
             self.grids
-                .apply_at(frame, statistic, secs, Op::Remove, offset);
+                .apply_at(strip.frame, statistic, secs, Op::Remove, strip.offset);
         }
         if let Some(&secs) = self.ops.add.get(&t) {
-            self.grids.apply_at(frame, statistic, secs, Op::Add, offset);
+            self.grids
+                .apply_at(strip.frame, statistic, secs, Op::Add, strip.offset);
         }
     }
 
-    /// Frame `t` was fed whole: its operations are done.
-    fn commit(&mut self, t: DateTime<Utc>) {
+    /// Frame `t` was fed whole, its strips digested `digests`: its
+    /// operations are done.
+    fn commit(&mut self, t: DateTime<Utc>, digests: &[u64]) {
         if self.ops.remove.remove(&t).is_some() {
             self.ledger.remove(&t);
+            self.digests.remove(&t);
         }
         if let Some(secs) = self.ops.add.remove(&t) {
             self.ledger.insert(t, secs);
+            self.digests.insert(t, digests.to_vec());
         }
     }
 
@@ -337,6 +373,29 @@ impl Rebuild {
         *self = Rebuild::new(cells, self.changes_content);
         self.ops = Ops::new(plan::diff(&Ledger::new(), target), statistic);
     }
+}
+
+/// One strip of a frame being read: its values, the grid index of its
+/// first cell, its index among the frame's strips and its digest.
+#[derive(Clone, Copy)]
+struct Strip<'a> {
+    frame: &'a Frame,
+    offset: usize,
+    index: usize,
+    digest: u64,
+}
+
+/// Whether strip `strip` of frame `t` reads back as `digests` recorded it.
+fn same_strip(digests: &Digests, t: DateTime<Utc>, strip: Strip<'_>) -> bool {
+    digests.get(&t).and_then(|d| d.get(strip.index)) == Some(&strip.digest)
+}
+
+/// A frame that could not be read: when it is read again, and how often it
+/// failed.
+#[derive(Debug, Clone, Copy)]
+struct Failure {
+    retry_at: u64,
+    attempts: u32,
 }
 
 struct WindowState {
@@ -356,8 +415,8 @@ pub struct Roller {
     cfg: RollerCfg,
     windows: Vec<WindowState>,
     cadence: Option<Duration>,
-    /// Frames that could not be read, until the poll they are read again.
-    failed: BTreeMap<DateTime<Utc>, u64>,
+    /// Frames that could not be read: not added until their retry poll.
+    failed: BTreeMap<DateTime<Utc>, Failure>,
     poll: u64,
     versions: std::sync::Arc<Versions>,
 }
@@ -430,26 +489,34 @@ impl Roller {
         let n = self.windows.len();
         self.poll += 1;
         let poll = self.poll;
-        self.failed.retain(|_, retry| *retry > poll);
-
         let in_source: BTreeSet<DateTime<Utc>> = times.iter().copied().collect();
-        let usable: Vec<DateTime<Utc>> = times
+        self.failed.retain(|t, _| in_source.contains(t));
+        // Frames waiting for their retry: not added, but kept where held.
+        let waiting_retry: BTreeSet<DateTime<Utc>> = self
+            .failed
             .iter()
-            .copied()
-            .filter(|t| !self.failed.contains_key(t))
+            .filter(|(_, f)| f.retry_at > poll)
+            .map(|(&t, _)| t)
             .collect();
         self.cadence = self
             .cfg
             .cadence
-            .or_else(|| plan::cadence(&usable, self.cadence));
+            .or_else(|| plan::cadence(times, self.cadence));
         let cap = self.cadence.unwrap_or_else(|| Duration::seconds(1));
-        let end = usable.last().copied();
+        let end = times.last().copied();
         let targets: Vec<Ledger> = self
             .cfg
             .lengths
             .iter()
-            .map(|&length| plan::target(&usable, length, cap))
+            .map(|&length| plan::target(times, length, cap))
             .collect();
+        // A window's target, less the frames waiting for a retry that it
+        // does not hold already.
+        let target_for = |w: usize, held: &Ledger| -> Ledger {
+            let mut target = targets[w].clone();
+            target.retain(|t, _| !waiting_retry.contains(t) || held.contains_key(t));
+            target
+        };
         let mut waiting: Vec<Option<String>> = vec![None; n];
 
         // 1. What each live window needs this poll; shortest first, so a
@@ -468,19 +535,15 @@ impl Roller {
                 waiting[w] = Some(too_many(targets[w].len()));
                 continue;
             }
-            let ops = Ops::new(plan::diff(&live.ledger, &targets[w]), statistic);
+            let ops = Ops::new(
+                plan::diff(&live.ledger, &target_for(w, &live.ledger)),
+                statistic,
+            );
             if let Some(t) = ops.remove.keys().find(|t| !in_source.contains(t)) {
                 broken[w] = true;
                 self.windows[w].needs_margin = true;
                 waiting[w] = Some(format!(
                     "rebuilding: frame {t} left the source while it was in the window"
-                ));
-                continue;
-            }
-            if let Some(t) = ops.remove.keys().find(|t| self.failed.contains_key(t)) {
-                broken[w] = true;
-                waiting[w] = Some(format!(
-                    "rebuilding: frame {t} could not be read to take it out"
                 ));
                 continue;
             }
@@ -498,6 +561,11 @@ impl Roller {
             needed = more;
             live_ops[w] = Some(ops);
         }
+        // A broken window's grids go now, before step 2 allocates its
+        // rebuild: never a broken window's grids and its rebuild's at once.
+        for (w, _) in broken.iter().enumerate().filter(|(_, &b)| b) {
+            self.drop_live(w, slots);
+        }
 
         // 2. Start, keep or drop rebuilds, and plan this poll's part.
         let mut resumming = (0..n).any(|w| {
@@ -511,14 +579,21 @@ impl Roller {
             } else {
                 Duration::zero()
             };
-            let blocked = if targets[w].is_empty() {
+            let blocked = if targets[w].is_empty() && length < cap {
+                Some(format!(
+                    "the window ({}) is shorter than the source's frame spacing ({}), so it \
+                     never holds a frame",
+                    human(length),
+                    human(cap)
+                ))
+            } else if targets[w].is_empty() {
                 Some("waiting for the source's frames".to_string())
             } else if targets[w].len() > MAX_WINDOW_FRAMES {
                 Some(too_many(targets[w].len()))
-            } else if !plan::holds(&usable, length, margin) {
+            } else if !plan::holds(times, length, margin) {
                 Some(format!(
                     "the source holds {} of frames; this window needs {}{}",
-                    span(&usable),
+                    span(times),
                     human(length + margin),
                     if margin > Duration::zero() {
                         " (the window and one frame before it: the source dropped a frame \
@@ -555,7 +630,17 @@ impl Roller {
                 }
             }
             if let Some(rebuild) = &mut state.rebuild {
-                let ops = Ops::new(plan::diff(&rebuild.ledger, &targets[w]), statistic);
+                // A re-sum keeps every frame its live window holds, waiting
+                // for one that failed rather than swapping in grids without
+                // it; a new window's rebuild skips it for now.
+                let mut held = rebuild.ledger.clone();
+                if let Some(live) = state.live.as_ref().filter(|_| has_live) {
+                    held.extend(live.ledger.iter().map(|(&t, &secs)| (t, secs)));
+                }
+                let ops = Ops::new(
+                    plan::diff(&rebuild.ledger, &target_for(w, &held)),
+                    statistic,
+                );
                 for &(t, secs) in &ops.retime {
                     rebuild.ledger.insert(t, secs);
                 }
@@ -565,6 +650,10 @@ impl Roller {
                 };
             }
         }
+        let mut stats = PollStats {
+            peak_grid_bytes: self.grid_bytes(slots),
+            ..PollStats::default()
+        };
 
         // 3. Live windows, frame by frame in time order, each frame strip
         // by strip: a strip goes into every window that takes the frame,
@@ -572,7 +661,6 @@ impl Roller {
         // it, and is dropped. A frame that fails part way breaks the windows
         // it reached and restarts the rebuilds: part of a frame cannot be
         // taken out again.
-        let mut stats = PollStats::default();
         let frames: BTreeSet<DateTime<Utc>> =
             live_ops.iter().flatten().flat_map(Ops::frames).collect();
         let mut grid_ops = vec![0u64; n];
@@ -590,18 +678,38 @@ impl Roller {
             if takers.is_empty() {
                 continue;
             }
-            let done = if self.failed.contains_key(&t) {
-                Err(0)
-            } else {
+            // Takers whose frame to take out read back changed.
+            let mut changed = vec![false; n];
+            let mut digests: Vec<u64> = Vec::new();
+            let result = {
                 let windows = &mut self.windows;
                 let fluxed = &mut fluxed;
-                let result = strips.read(t, read, &mut stats, |frame, offset| {
+                let changed = &mut changed;
+                let digests = &mut digests;
+                strips.read(t, read, &mut stats, |frame, offset, index| {
+                    let strip = Strip {
+                        frame,
+                        offset,
+                        index,
+                        digest: frame.digest(),
+                    };
+                    digests.push(strip.digest);
                     for &w in &takers {
+                        if changed[w] {
+                            continue;
+                        }
+                        let ops = live_ops[w].as_ref().expect("a taker has ops");
+                        if ops.remove.contains_key(&t) {
+                            let live = windows[w].live.as_ref().expect("live");
+                            if !same_strip(&live.digests, t, strip) {
+                                changed[w] = true;
+                                continue;
+                            }
+                        }
                         if !fluxed[w] {
                             versions.flux(w);
                             fluxed[w] = true;
                         }
-                        let ops = live_ops[w].as_ref().expect("a taker has ops");
                         let mut slot = slots[w].write().unwrap_or_else(|e| e.into_inner());
                         let grids = slot.as_mut().expect("a live window has grids");
                         if let Some(&secs) = ops.remove.get(&t) {
@@ -613,47 +721,53 @@ impl Roller {
                     }
                     for state in windows.iter_mut() {
                         if let Some(rebuild) = &mut state.rebuild {
-                            rebuild.feed_strip(t, frame, statistic, offset);
+                            rebuild.feed_strip(t, strip, statistic);
                         }
                     }
-                });
-                result.map_err(|(rows, e)| {
-                    self.fail(t, &e);
-                    rows
                 })
             };
-            match done {
+            match result {
                 Ok(()) => {
+                    self.failed.remove(&t);
                     for &w in &takers {
+                        if changed[w] {
+                            broken[w] = true;
+                            waiting[w] = Some(format!(
+                                "rebuilding: frame {t} changed in the source since the window \
+                                 added it"
+                            ));
+                            continue;
+                        }
                         let ops = live_ops[w].as_ref().expect("a taker has ops");
                         let live = self.windows[w].live.as_mut().expect("live");
                         if ops.remove.contains_key(&t) {
                             live.ledger.remove(&t);
+                            live.digests.remove(&t);
                             grid_ops[w] += 1;
                         }
                         if let Some(&secs) = ops.add.get(&t) {
                             live.ledger.insert(t, secs);
+                            live.digests.insert(t, digests.clone());
                             grid_ops[w] += 1;
                         }
                     }
-                    self.commit(t);
+                    self.commit(t, &digests, &targets);
                 }
-                Err(rows) => {
+                Err((rows, e)) => {
+                    self.fail(t, &e);
                     for &w in &takers {
                         let removes = live_ops[w]
                             .as_ref()
                             .is_some_and(|ops| ops.remove.contains_key(&t));
                         // An add that never started leaves the frame out,
                         // and the coverage shows it.
-                        if removes || rows > 0 {
+                        if removes || rows > 0 || changed[w] {
                             broken[w] = true;
                             waiting[w] =
                                 Some(format!("rebuilding: frame {t} could not be read whole"));
                         }
                     }
-                    if rows > 0 {
-                        self.reset_rebuilds(t, &targets);
-                    }
+                    self.unread(t, rows, &targets);
                 }
             }
         }
@@ -683,10 +797,6 @@ impl Roller {
             .flat_map(|r| r.ops.remove.keys().copied())
             .collect();
         for t in removals {
-            if self.failed.contains_key(&t) {
-                self.reset_rebuilds(t, &targets);
-                continue;
-            }
             // Out of budget: taken out next poll.
             if budget == 0 {
                 continue;
@@ -705,7 +815,7 @@ impl Roller {
             if budget == 0 {
                 break;
             }
-            if self.failed.contains_key(&t) {
+            if waiting_retry.contains(&t) {
                 continue;
             }
             budget -= 1;
@@ -715,11 +825,8 @@ impl Roller {
         // 5. Swap in finished rebuilds, drop broken windows, report.
         let mut statuses = Vec::with_capacity(n);
         for w in 0..n {
-            if broken[w] && self.windows[w].live.is_some() {
-                self.versions.flux(w);
-                *slots[w].write().unwrap_or_else(|e| e.into_inner()) = None;
-                self.windows[w].live = None;
-                self.bump(w);
+            if broken[w] {
+                self.drop_live(w, slots);
             }
             let finished = self.windows[w]
                 .rebuild
@@ -738,6 +845,7 @@ impl Roller {
                 *slots[w].write().unwrap_or_else(|e| e.into_inner()) = Some(rebuild.grids);
                 self.windows[w].live = Some(Live {
                     ledger: rebuild.ledger,
+                    digests: rebuild.digests,
                     ops: 0,
                 });
                 if changes {
@@ -767,21 +875,68 @@ impl Roller {
         (statuses, stats)
     }
 
-    /// Frame `t` went whole into the rebuilds that needed it.
-    fn commit(&mut self, t: DateTime<Utc>) {
+    /// Drop window `w`'s live grids, if any: in-flux version first, so no
+    /// render of the emptied slot is keyed on the version it served.
+    fn drop_live(&mut self, w: usize, slots: &[RwLock<Option<Grids>>]) {
+        if self.windows[w].live.take().is_some() {
+            self.versions.flux(w);
+            *slots[w].write().unwrap_or_else(|e| e.into_inner()) = None;
+            self.bump(w);
+        }
+    }
+
+    /// Bytes of every grid held now: live and rebuilding.
+    fn grid_bytes(&self, slots: &[RwLock<Option<Grids>>]) -> u64 {
+        let live: u64 = slots
+            .iter()
+            .filter_map(|s| {
+                s.read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(Grids::bytes)
+            })
+            .sum();
+        live + self.rebuild_bytes()
+    }
+
+    /// Frame `t` went whole into the rebuilds that needed it; a rebuild
+    /// that found a frame to take out changed starts over.
+    fn commit(&mut self, t: DateTime<Utc>, digests: &[u64], targets: &[Ledger]) {
         for state in &mut self.windows {
+            if let Some(rebuild) = state.rebuild.as_mut().filter(|r| !r.spoiled) {
+                rebuild.commit(t, digests);
+            }
+        }
+        self.reset_rebuilds(targets, |r| r.spoiled);
+    }
+
+    /// Frame `t` failed after `rows` rows went in. A rebuild that took part
+    /// of it, or had to take it out, starts over. A new window's rebuild
+    /// that was only to add it leaves it out this poll, as a live window
+    /// does, and can finish without it (its coverage shows the gap); a
+    /// re-sum waits for it, its live window still serving.
+    fn unread(&mut self, t: DateTime<Utc>, rows: u32, targets: &[Ledger]) {
+        self.reset_rebuilds(targets, |r| {
+            r.spoiled || rows > 0 && r.takes(&t) || r.ops.remove.contains_key(&t)
+        });
+        for state in &mut self.windows {
+            if state.live.is_some() {
+                continue;
+            }
             if let Some(rebuild) = &mut state.rebuild {
-                rebuild.commit(t);
+                if !rebuild.ops.remove.contains_key(&t) {
+                    rebuild.ops.add.remove(&t);
+                }
             }
         }
     }
 
-    /// Restart every rebuild that needed frame `t`, which went in part way
-    /// or cannot be taken out.
-    fn reset_rebuilds(&mut self, t: DateTime<Utc>, targets: &[Ledger]) {
+    /// Restart every rebuild `which` picks: part of a frame went in that
+    /// cannot be taken out, or a frame to take out cannot be.
+    fn reset_rebuilds(&mut self, targets: &[Ledger], which: impl Fn(&Rebuild) -> bool) {
         let statistic = self.cfg.statistic;
         for (state, target) in self.windows.iter_mut().zip(targets) {
-            if let Some(rebuild) = state.rebuild.as_mut().filter(|r| r.takes(&t)) {
+            if let Some(rebuild) = state.rebuild.as_mut().filter(|r| which(r)) {
                 rebuild.reset(target, statistic);
             }
         }
@@ -798,35 +953,47 @@ impl Roller {
         let statistic = self.cfg.statistic;
         let strips = self.cfg.strips;
         let windows = &mut self.windows;
-        let result = strips.read(t, read, stats, |frame, offset| {
+        let mut digests = Vec::new();
+        let result = strips.read(t, read, stats, |frame, offset, index| {
+            let strip = Strip {
+                frame,
+                offset,
+                index,
+                digest: frame.digest(),
+            };
+            digests.push(strip.digest);
             for state in windows.iter_mut() {
                 if let Some(rebuild) = &mut state.rebuild {
-                    rebuild.feed_strip(t, frame, statistic, offset);
+                    rebuild.feed_strip(t, strip, statistic);
                 }
             }
         });
         match result {
-            Ok(()) => self.commit(t),
+            Ok(()) => {
+                self.failed.remove(&t);
+                self.commit(t, &digests, targets);
+            }
             Err((rows, e)) => {
                 self.fail(t, &e);
-                // Nothing went in: the frame stays out until it reads. A
-                // frame to take out restarts its rebuilds either way.
-                let partial = rows > 0;
-                let statistic = self.cfg.statistic;
-                for (state, target) in self.windows.iter_mut().zip(targets) {
-                    if let Some(rebuild) = state.rebuild.as_mut() {
-                        if partial && rebuild.takes(&t) || rebuild.ops.remove.contains_key(&t) {
-                            rebuild.reset(target, statistic);
-                        }
-                    }
-                }
+                self.unread(t, rows, targets);
             }
         }
     }
 
+    /// Frame `t` could not be read: not added before the next poll, then
+    /// after twice as many polls each time, at most [`MAX_RETRY_POLLS`].
     fn fail(&mut self, t: DateTime<Utc>, e: &DataServerError) {
-        tracing::warn!("period: source frame {t} could not be read ({e}); left out for now");
-        self.failed.insert(t, self.poll + FAILED_RETRY_POLLS);
+        let poll = self.poll;
+        let failure = self.failed.entry(t).or_insert(Failure {
+            retry_at: poll,
+            attempts: 0,
+        });
+        failure.attempts += 1;
+        let wait = (1u64 << (failure.attempts - 1).min(8)).min(MAX_RETRY_POLLS);
+        failure.retry_at = poll + wait;
+        tracing::warn!(
+            "period: source frame {t} could not be read ({e}); read again in {wait} poll(s)"
+        );
     }
 }
 

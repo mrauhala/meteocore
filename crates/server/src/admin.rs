@@ -3212,7 +3212,8 @@ impl EngineHandle {
     /// a non-derived raster collection's `MapEngine`, or a station grid's,
     /// whichever APIs it lists. `None` for station, vector, polar-volume,
     /// nowcast and period engines; a forecast raster is refused by the
-    /// period engine itself.
+    /// period engine itself, and an ODIM composite by the fourth load pass
+    /// (it serves undetect as nodata).
     fn period_source(&self) -> Option<Arc<dyn ds_core::map_engine::MapEngine>> {
         match self {
             Self::StationGrid(e) => Some(e.clone()),
@@ -6302,6 +6303,23 @@ pub fn load_collections(
             fail("missing [collections.period] config".into());
             continue;
         };
+        // An ODIM composite reads undetect (scanned, no echo) and masked
+        // cells as nodata, the same as unscanned ones: a cell dry all window
+        // would be null instead of 0 mm, `mean` would average rainy frames
+        // only, and coverage would count dry frames as gaps. Refused until
+        // the source API tells undetect from nodata.
+        if collections
+            .iter()
+            .any(|c| c.id == period_config.source && c.engine_type == "odim")
+        {
+            fail(format!(
+                "period source '{}' is an ODIM composite, which serves undetect (no echo) as \
+                 nodata: dry cells would be null instead of 0 mm, and means and coverage wrong; \
+                 period products over ODIM composites are not supported yet",
+                period_config.source
+            ));
+            continue;
+        }
         let source = match engines_by_id
             .get(&period_config.source)
             .and_then(EngineHandle::period_source)
@@ -6316,7 +6334,7 @@ pub fn load_collections(
                         ),
                         Some(c) if engines_by_id.contains_key(&c.id) => format!(
                             "period source '{}' is a {} collection, not gridded observations \
-                         (geotiff, odim, satellite, zarr, netcdf or station-grid)",
+                         (geotiff, satellite, zarr, netcdf or station-grid)",
                             c.id, c.engine_type
                         ),
                         Some(c) => format!("period source '{}' failed to load", c.id),
@@ -11692,6 +11710,10 @@ prewarm_sweeps = 0
         let mut window = period_collections("radar");
         window[1].period.as_mut().unwrap().windows = vec!["one hour".into()];
         assert!(failed(window).contains("not an ISO 8601 duration"));
+        // ODIM composites serve undetect as nodata (#1379 review).
+        let mut odim = period_collections("dk");
+        odim.push(nowcast_test_collection("dk", "odim", None));
+        assert!(failed(odim).contains("is an ODIM composite, which serves undetect"));
     }
 
     /// #1379: an unchanged period collection keeps its engine, and the

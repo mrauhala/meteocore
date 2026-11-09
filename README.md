@@ -2269,7 +2269,7 @@ engine_type = "period"
 apis = ["wms", "maps", "tiles", "edr"]
 
 [collections.period]
-source = "radar"                     # radar, satellite or a station grid
+source = "radar"                     # radar GeoTIFF, satellite or a station grid
 statistic = "sum"                    # sum | mean | count_above
 windows = ["PT1H", "PT3H", "PT24H"]  # one parameter per window
 rain_rate = { a = 200.0, b = 1.6 }   # dBZ to mm/h, Z = a·R^b (Marshall–Palmer)
@@ -2285,12 +2285,19 @@ min_coverage = 0.9
   the share its frames cover. Each window has its own time axis: its end at
   the source's latest frame, and only that. Earlier ends are not kept, so
   accumulations cannot be animated or asked for at an earlier frame.
-- The grid is the source's native grid while it fits `max_pixels` (default
-  40 000 000, at most 64 000 000): a 36 M-cell composite stays native, at
-  218 MB per window. Past it the grid is halved and frames are read as the
-  source renders that size (a GeoTIFF's overview). The load logs the grid
-  and its bytes; [engine-period](crates/engine-period/README.md#memory-and-io)
-  has the sizing table.
+- The grid is a CRS84 grid with the source's cell counts while they fit
+  `max_pixels` (default 40 000 000, at most 64 000 000): a 36 M-cell
+  composite keeps them, at 218 MB per window. For a CRS84 source that is
+  its native grid; a projected one (TM35FIN, LAEA) is resampled onto it.
+  Past `max_pixels` the grid is halved and frames are read as the source
+  renders that size (a GeoTIFF's overview). The load logs the grid and its
+  bytes; [engine-period](crates/engine-period/README.md#memory-and-io) has
+  the sizing table.
+- Not over ODIM composites, which serve undetect (no echo) as nodata: a dry
+  cell would be null instead of 0 mm. A frame that fails to read is
+  retried at the next poll; one revised in place is never subtracted with
+  its new values. Any edit to the source collection's config rebuilds the
+  period collection.
 - One `f32` + `u16` grid per window (6 bytes a cell), kept up to date as
   frames arrive: the leaving frame is read from the source again and
   subtracted; every window is re-summed from scratch after four lengths.

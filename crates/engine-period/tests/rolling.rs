@@ -3,8 +3,8 @@
 //! `f64` computation from the same frames, through the public `MapEngine`
 //! and `EdrEngine` surfaces the API layers use.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -65,6 +65,10 @@ struct Source {
     /// answered: a request arriving while a poll folds strips in.
     #[allow(clippy::type_complexity)]
     hook: Mutex<Option<Box<dyn Fn(DateTime<Utc>, u32) + Send + Sync>>>,
+    /// Frames revised in place: every cell has a value, 3 dB more.
+    revised: Mutex<BTreeSet<DateTime<Utc>>>,
+    /// The source reports no grid.
+    lost_grid: AtomicBool,
 }
 
 impl Source {
@@ -78,6 +82,8 @@ impl Source {
             version: AtomicU64::new(0),
             broken: Mutex::new(Vec::new()),
             hook: Mutex::new(None),
+            revised: Mutex::new(BTreeSet::new()),
+            lost_grid: AtomicBool::new(false),
         })
     }
 
@@ -89,9 +95,17 @@ impl Source {
         self.reads.load(Ordering::SeqCst)
     }
 
+    /// The reflectivity a frame holds at a cell now, revisions included.
+    fn dbz(&self, t: DateTime<Utc>, cell: usize) -> Option<f64> {
+        if self.revised.lock().unwrap().contains(&t) {
+            return Some(dbz(t, cell).unwrap_or(20.0) + 3.0);
+        }
+        dbz(t, cell)
+    }
+
     /// The value a frame holds at a cell, as the engine reads it.
     fn value(&self, t: DateTime<Utc>, cell: usize) -> Option<f64> {
-        let v = dbz(t, cell)?;
+        let v = self.dbz(t, cell)?;
         Some(if self.raw {
             ((v + 32.0) / 0.5).round() * 0.5 - 32.0
         } else {
@@ -158,7 +172,10 @@ impl MapEngine for Source {
         let values = if self.raw {
             RasterValues::U8 {
                 data: cells
-                    .map(|c| dbz(t, c).map_or(255, |v| ((v + 32.0) / 0.5).round() as u8))
+                    .map(|c| {
+                        self.dbz(t, c)
+                            .map_or(255, |v| ((v + 32.0) / 0.5).round() as u8)
+                    })
                     .collect(),
                 nodata: Some(255),
                 gain: 0.5,
@@ -167,7 +184,7 @@ impl MapEngine for Source {
         } else {
             RasterValues::F32 {
                 data: cells
-                    .map(|c| dbz(t, c).map_or(-999.0, |v| v as f32))
+                    .map(|c| self.dbz(t, c).map_or(-999.0, |v| v as f32))
                     .collect(),
                 nodata: Some(-999.0),
             }
@@ -182,7 +199,7 @@ impl MapEngine for Source {
     fn raster_info(&self) -> RasterInfo {
         RasterInfo {
             native_crs: "CRS:84".into(),
-            spatial_extent: Some(EXTENT),
+            spatial_extent: (!self.lost_grid.load(Ordering::SeqCst)).then_some(EXTENT),
             times: self.times.read().unwrap().clone(),
             parameter: "reflectivity".into(),
             unit: "dBZ".into(),
@@ -958,4 +975,227 @@ fn a_render_mid_fold_never_lands_under_a_live_key() {
     // A poll that changes nothing moves nothing.
     e.poll_once();
     assert_eq!(cache_key(&e, p), after);
+}
+
+/// One transient read failure breaks at most the window that had to take
+/// the frame out: a longer window that holds the frame keeps it, and keeps
+/// serving. (A failed frame used to drop out of every target, so every
+/// window holding it had to take it out and broke for ~20 polls.)
+#[test]
+fn one_failed_read_breaks_no_longer_window() {
+    let source = Source::new(times(0..300), false);
+    let e = engine(&source, &config("sum", &["PT1H", "PT24H"]));
+    for _ in 0..25 {
+        e.poll_once();
+    }
+    assert_eq!(
+        e.parameter_times("precipitation_amount_PT24H").unwrap()[..],
+        [step(299)]
+    );
+    // PT1H's next leaving frame, 287, fails for three polls (an S3 error,
+    // the GeoTIFF decode budget's ResourceExhausted under load).
+    source.broken.lock().unwrap().push((step(287), 0));
+    for k in 300..303 {
+        source.set_times(times(0..k + 1));
+        e.poll_once();
+        assert_eq!(
+            e.parameter_times("precipitation_amount_PT24H").unwrap()[..],
+            [step(k)],
+            "PT24H holds frame 287 and keeps serving"
+        );
+        if k == 300 {
+            // PT1H had to take 287 out: it alone broke, and rebuilds
+            // without it at the next poll.
+            assert!(e
+                .parameter_times("precipitation_amount_PT1H")
+                .unwrap()
+                .is_empty());
+            assert!(e.waiting_for().unwrap().contains("PT1H: rebuilding"));
+        }
+    }
+    source.broken.lock().unwrap().clear();
+    for k in 303..305 {
+        source.set_times(times(0..k + 1));
+        e.poll_once();
+        assert_eq!(
+            e.parameter_times("precipitation_amount_PT24H").unwrap()[..],
+            [step(k)]
+        );
+    }
+    let all = times(0..305);
+    for (name, length) in [("PT1H", 1), ("PT24H", 24)] {
+        let want = direct(&source, &all, Duration::hours(length), "sum");
+        let got = served(&e, &format!("precipitation_amount_{name}"));
+        assert!(max_relative(&got, &want) < 1e-6, "{name}");
+    }
+}
+
+/// A new frame that fails once is read again at the next poll, not ten
+/// minutes later: a 20-minute window of 5-minute frames is back at full
+/// coverage one poll after the failure.
+#[test]
+fn a_failed_new_frame_is_read_again_at_the_next_poll() {
+    let source = Source::new(times(0..20), false);
+    let e = engine(&source, &config("sum", &["PT20M"]));
+    settle(&e);
+    // Frame 19 gets its successor and fails once.
+    source.broken.lock().unwrap().push((step(19), 0));
+    source.set_times(times(0..21));
+    e.poll_once();
+    assert!(
+        e.parameter_times("coverage_PT20M").unwrap().is_empty(),
+        "15 of 20 min"
+    );
+    source.broken.lock().unwrap().clear();
+    e.poll_once();
+    assert_eq!(e.parameter_times("coverage_PT20M").unwrap()[..], [step(20)]);
+    let want = direct(&source, &times(0..21), Duration::minutes(20), "sum");
+    assert!(max_relative(&served(&e, "precipitation_amount_PT20M"), &want) < 1e-6);
+}
+
+/// When every window breaks at once (a burst after a source outage), each
+/// window's grids go before its rebuild's are allocated: the poll never
+/// holds more than the windows' grids and one more, plus a strip.
+#[test]
+fn breaking_every_window_holds_no_more_than_one_extra_grid() {
+    let source = Source::new(times(0..100), false);
+    let mut cfg = config("sum", &["PT1H", "PT3H", "PT6H"]);
+    cfg.read_strip_cells = 4 * NX as usize;
+    let e = engine(&source, &cfg);
+    for _ in 0..8 {
+        e.poll_once();
+    }
+    let grid = 6 * CELLS as u64;
+    assert_eq!(e.grid_bytes(), 3 * grid);
+    // 20 frames at once: more than max_reads_per_cycle for every window.
+    source.set_times(times(0..120));
+    e.poll_once();
+    // Every window broke; PT1H's rebuild already finished in the same poll.
+    let why = e.waiting_for().unwrap();
+    assert!(
+        why.contains("PT3H: rebuilding") && why.contains("PT6H: rebuilding"),
+        "{why}"
+    );
+    assert!(
+        e.peak_grid_bytes() <= 4 * grid,
+        "{} > {}",
+        e.peak_grid_bytes(),
+        4 * grid
+    );
+    assert!(e.peak_frame_bytes() <= 4 * NX as u64 * 4);
+    for _ in 0..8 {
+        e.poll_once();
+    }
+    assert!(e.has_data());
+    assert!(e.peak_grid_bytes() <= 4 * grid);
+}
+
+/// A frame the source revised in place since a window added it is never
+/// subtracted with its new values: the strip reads back with another
+/// digest, the window breaks and is rebuilt from the revised frames. The
+/// revision gives cells that were nodata a value, so subtracting it would
+/// take a count below zero (the `debug_assert!` in `accum::step`).
+#[test]
+fn a_frame_revised_in_place_is_never_subtracted_with_its_new_values() {
+    let source = Source::new(times(0..30), false);
+    let mut cfg = config("sum", &["PT1H"]);
+    cfg.read_strip_cells = 4 * NX as usize;
+    let e = engine(&source, &cfg);
+    settle(&e);
+    // Frame 17, the next to leave, is revised in place; the source's
+    // version does not move (a source may not say).
+    source.revised.lock().unwrap().insert(step(17));
+    source.set_times(times(0..31));
+    e.poll_once();
+    assert!(e.waiting_for().unwrap().contains("changed in the source"));
+    for _ in 0..3 {
+        e.poll_once();
+    }
+    let want = direct(&source, &times(0..31), Duration::hours(1), "sum");
+    assert!(max_relative(&served(&e, "precipitation_amount_PT1H"), &want) < 1e-6);
+}
+
+/// A window shorter than the source's frame spacing never holds a frame:
+/// refused at load with a configured cadence, explained in health without.
+#[test]
+fn a_window_shorter_than_the_cadence_is_refused_or_explained() {
+    let source = Source::new(times(0..20), false);
+    let mut cfg = config("sum", &["PT4M", "PT1H"]);
+    cfg.cadence = Some("PT5M".into());
+    let err = PeriodEngine::new("rain", "radar", source.clone(), &cfg)
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(
+        err.contains("window 'PT4M' is shorter than the cadence"),
+        "{err}"
+    );
+    cfg.cadence = None;
+    let e = engine(&source, &cfg);
+    settle(&e);
+    let why = e.waiting_for().unwrap();
+    assert!(
+        why.contains("PT4M: the window (4 min) is shorter than the source's frame spacing (5 min)"),
+        "{why}"
+    );
+}
+
+/// A source that loses its grid serves nothing: every window is dropped
+/// (health stops saying ready), and rebuilt once the grid is back.
+#[test]
+fn a_source_losing_its_grid_serves_nothing_until_it_is_back() {
+    let source = Source::new(times(0..20), false);
+    let e = engine(&source, &config("sum", &["PT1H"]));
+    settle(&e);
+    assert!(e.has_data());
+    let before = e.content_version_for(Some("precipitation_amount_PT1H"), None, None, None);
+    source.lost_grid.store(true, Ordering::SeqCst);
+    e.poll_once();
+    assert!(!e.has_data());
+    assert!(e
+        .parameter_times("precipitation_amount_PT1H")
+        .unwrap()
+        .is_empty());
+    assert!(e
+        .waiting_for()
+        .unwrap()
+        .contains("the source reports no grid"));
+    assert_ne!(
+        e.content_version_for(Some("precipitation_amount_PT1H"), None, None, None),
+        before
+    );
+    assert_eq!(e.grid_bytes(), 0);
+    source.lost_grid.store(false, Ordering::SeqCst);
+    settle(&e);
+    assert!(e.has_data());
+}
+
+/// A frame that keeps failing while a window holds it stays in that
+/// window: the live window keeps serving at full coverage, and a re-sum
+/// running meanwhile waits for the frame instead of swapping in grids
+/// without it, then finishes once it reads.
+#[test]
+fn a_held_frame_that_keeps_failing_stays_held() {
+    let source = Source::new(times(0..30), false);
+    let e = engine(&source, &config("sum", &["PT1H"]));
+    settle(&e);
+    let c = (0..CELLS)
+        .find(|&c| !c.is_multiple_of(17) && times(17..29).iter().all(|&t| dbz(t, c).is_some()))
+        .unwrap();
+    // The source revises (a re-sum starts) while held frame 20 fails.
+    source.broken.lock().unwrap().push((step(20), 0));
+    source.version.fetch_add(1, Ordering::SeqCst);
+    for poll in 0..6 {
+        e.poll_once();
+        assert!(e.has_data(), "poll {poll}");
+        let coverage = served(&e, "coverage_PT1H")[c].unwrap();
+        assert!((coverage - 1.0).abs() < 1e-6, "poll {poll}: {coverage}");
+    }
+    source.broken.lock().unwrap().clear();
+    for _ in 0..10 {
+        e.poll_once();
+    }
+    let want = direct(&source, &times(0..30), Duration::hours(1), "sum");
+    assert!(max_relative(&served(&e, "precipitation_amount_PT1H"), &want) < 1e-6);
+    assert!((served(&e, "coverage_PT1H")[c].unwrap() - 1.0).abs() < 1e-6);
 }

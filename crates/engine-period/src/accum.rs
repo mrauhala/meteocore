@@ -78,6 +78,24 @@ impl Frame {
         }
     }
 
+    /// A digest of the values, as the statistic's input, cell by cell (NaN
+    /// as one value): equal for a strip read again unchanged, so a frame
+    /// revised in place since it was added is never subtracted with its new
+    /// values. Not cryptographic: it guards against revisions, not attacks.
+    pub fn digest(&self) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ self.len() as u64;
+        let mut mix = |v: f32| {
+            let bits = if v.is_nan() { 0x7fc0_0000 } else { v.to_bits() };
+            h = (h ^ u64::from(bits)).wrapping_mul(0x0000_0100_0000_01b3);
+            h ^= h >> 29;
+        };
+        match self {
+            Frame::U8 { data, table } => data.iter().for_each(|&raw| mix(table[raw as usize])),
+            Frame::F32(values) => values.iter().for_each(|&v| mix(v)),
+        }
+        h
+    }
+
     /// Bytes its buffer holds.
     pub fn bytes(&self) -> u64 {
         match self {
@@ -302,6 +320,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The digest is the values': raw bytes and the same values as `f32`
+    /// agree, and one changed cell changes it.
+    #[test]
+    fn a_digest_follows_the_values() {
+        let mut table = Box::new([f32::NAN; 256]);
+        for (i, v) in table.iter_mut().enumerate().take(255) {
+            *v = i as f32 * 0.5;
+        }
+        let raw = Frame::U8 {
+            data: vec![0, 7, 255, 200],
+            table,
+        };
+        let float = frame(&[0.0, 3.5, f32::NAN, 100.0]);
+        assert_eq!(raw.digest(), float.digest());
+        assert_ne!(float.digest(), frame(&[0.0, 3.5, 0.0, 100.0]).digest());
+        assert_ne!(float.digest(), frame(&[0.0, 3.5, f32::NAN]).digest());
     }
 
     #[test]

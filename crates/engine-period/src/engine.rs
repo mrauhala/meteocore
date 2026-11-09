@@ -153,6 +153,8 @@ pub struct PeriodEngine {
     grid_bytes: AtomicU64,
     /// The most bytes of source frames one poll has held at once.
     peak_frame_bytes: AtomicU64,
+    /// The most bytes of grids any poll has held at once.
+    peak_grid_bytes: AtomicU64,
 }
 
 impl PeriodEngine {
@@ -243,6 +245,14 @@ impl PeriodEngine {
                     .map_err(|e| err(format!("cadence '{raw}': {e}")))?;
                 if d < Duration::seconds(1) {
                     return Err(err(format!("cadence '{raw}' must be at least one second")));
+                }
+                // A window shorter than one frame never holds one.
+                if let Some(short) = windows.iter().find(|w| w.length < d) {
+                    return Err(err(format!(
+                        "window '{}' is shorter than the cadence '{raw}': it would never hold \
+                         a frame",
+                        short.label
+                    )));
                 }
                 Some(d)
             }
@@ -417,6 +427,7 @@ impl PeriodEngine {
             last_poll_ms: AtomicU64::new(0),
             grid_bytes: AtomicU64::new(0),
             peak_frame_bytes: AtomicU64::new(0),
+            peak_grid_bytes: AtomicU64::new(0),
         };
         let statuses: Vec<WindowStatus> = engine
             .windows
@@ -505,6 +516,13 @@ impl PeriodEngine {
         self.grid_bytes.load(Ordering::Relaxed)
     }
 
+    /// The most bytes of grids any poll has held at once, live and
+    /// rebuilding: at most one window's more than the windows', also while
+    /// windows break and rebuild.
+    pub fn peak_grid_bytes(&self) -> u64 {
+        self.peak_grid_bytes.load(Ordering::Relaxed)
+    }
+
     /// The most bytes of frame values one poll has held at once: one strip
     /// of one frame, as the statistic's input (the source's own tile for the
     /// strip, which it may box at 16 bytes a cell, comes and goes with it).
@@ -540,8 +558,8 @@ impl PeriodEngine {
         let info = self.source.raster_info_shared();
         let mut poll = self.poll.lock().unwrap_or_else(|e| e.into_inner());
         if !info.reference_times.is_empty() {
-            self.publish_waiting(
-                poll.geom,
+            self.unusable(
+                &mut poll,
                 "the source has model runs; windows over a forecast run are not supported yet",
             );
             return;
@@ -550,7 +568,11 @@ impl PeriodEngine {
             .spatial_extent
             .zip(info.grid_size)
             .and_then(|(extent, size)| GridGeom::over(extent, size, self.max_pixels));
-        if geom != poll.geom {
+        let Some(geom) = geom else {
+            self.unusable(&mut poll, "the source reports no grid");
+            return;
+        };
+        if Some(geom) != poll.geom {
             if poll.geom.is_some() {
                 warn!(
                     "[{}] source '{}' changed its grid; rebuilding every window",
@@ -562,30 +584,21 @@ impl PeriodEngine {
                 *slot.write().unwrap_or_else(|e| e.into_inner()) = None;
             }
             // Logged at load already when the source had its grid then.
-            if let Some(g) = geom
-                .as_ref()
-                .filter(|g| self.snapshot.load().geom != Some(**g))
-            {
-                self.log_grid(g, info.grid_size);
+            if self.snapshot.load().geom != Some(geom) {
+                self.log_grid(&geom, info.grid_size);
             }
-            poll.geom = geom;
-            poll.roller = geom.map(|g| {
-                Roller::new(
-                    RollerCfg {
-                        statistic: self.statistic,
-                        lengths: self.windows.iter().map(|w| w.length).collect(),
-                        strips: Strips::new(g.nx, g.ny, self.read_strip_cells),
-                        max_reads: self.max_reads,
-                        cadence: self.cadence,
-                    },
-                    self.versions.clone(),
-                )
-            });
+            poll.geom = Some(geom);
+            poll.roller = Some(Roller::new(
+                RollerCfg {
+                    statistic: self.statistic,
+                    lengths: self.windows.iter().map(|w| w.length).collect(),
+                    strips: Strips::new(geom.nx, geom.ny, self.read_strip_cells),
+                    max_reads: self.max_reads,
+                    cadence: self.cadence,
+                },
+                self.versions.clone(),
+            ));
         }
-        let Some(geom) = poll.geom else {
-            self.publish_waiting(None, "the source reports no grid yet");
-            return;
-        };
         let version = self.source.content_version();
         let revised = poll.source_version.is_some_and(|v| v != version);
         poll.source_version = Some(version);
@@ -618,8 +631,10 @@ impl PeriodEngine {
                     .map(Grids::bytes)
             })
             .sum();
-        self.grid_bytes
-            .store(live_bytes + rebuild_bytes, Ordering::Relaxed);
+        // The most the poll held, so the memory plan sees a rebuild's peak.
+        let held = stats.peak_grid_bytes.max(live_bytes + rebuild_bytes);
+        self.grid_bytes.store(held, Ordering::Relaxed);
+        self.peak_grid_bytes.fetch_max(held, Ordering::Relaxed);
         self.polls_total.fetch_add(1, Ordering::Relaxed);
         self.reads_total
             .fetch_add(stats.reads as u64, Ordering::Relaxed);
@@ -672,19 +687,33 @@ impl PeriodEngine {
         Ok(to_frame(tile.values, self.zr.as_ref()))
     }
 
-    fn publish_waiting(&self, geom: Option<GridGeom>, reason: &str) {
-        let old = self.snapshot.load();
-        let statuses: Vec<WindowStatus> = old
+    /// The source cannot be summarised now (it lost its grid, or has model
+    /// runs): drop every window's grids and the bookkeeping, serve nothing,
+    /// and say why. The windows are built again once it can.
+    fn unusable(&self, poll: &mut PollState, reason: &str) {
+        if poll.roller.is_some() || poll.geom.is_some() {
+            warn!(
+                "[{}] source '{}' cannot be summarised: {reason}; dropping every window",
+                self.collection_id, self.source_id
+            );
+        }
+        for (w, slot) in self.slots.iter().enumerate() {
+            self.versions.flux(w);
+            *slot.write().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        poll.geom = None;
+        poll.roller = None;
+        let statuses: Vec<WindowStatus> = self
             .windows
             .iter()
-            .enumerate()
-            .map(|(w, served)| WindowStatus {
-                built: served.built,
-                version: self.versions.get(w),
+            .map(|_| WindowStatus {
+                built: None,
+                version: self.versions.fresh(),
                 waiting: Some(reason.to_string()),
             })
             .collect();
-        self.publish(geom.or(old.geom), &statuses);
+        self.publish(self.snapshot.load().geom, &statuses);
+        self.grid_bytes.store(0, Ordering::Relaxed);
     }
 
     /// Publish a poll's snapshot, THEN serve each window's new version: a

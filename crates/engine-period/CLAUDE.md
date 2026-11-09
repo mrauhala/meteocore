@@ -15,7 +15,10 @@ rain accumulation first. Read the root `CLAUDE.md` first — Critical Rules
   `PeriodEngine::new` and, should runs appear later, by every poll.
 - Reused across a reload only when its config is unchanged AND its source
   is reused (`admin::reusable_collections`): it holds the source's `Arc`
-  and the windows summed from it.
+  and the windows summed from it. So ANY edit to the source collection's
+  config (a title, a style) rebuilds the source and with it this engine,
+  whose windows are summed again from scratch. Deliberate (equal metadata
+  does not prove the frames are the same source's); documented, not fixed.
 - `zr`, `plan`, `accum` and `geometry` are dependency-free pure functions —
   keep them that way. `rolling` is the poll-side bookkeeping (no I/O of its
   own: it is handed the frame times and a read function); `engine` owns
@@ -58,6 +61,13 @@ rain accumulation first. Read the root `CLAUDE.md` first — Critical Rules
   left out (an add) or breaks the windows that must take it out.
 - A cell's count reaching 0 resets its accumulator to exactly 0, so no
   rounding remainder of frames long gone survives.
+- **A broken window's grids go BEFORE its rebuild's are allocated**
+  (`drop_live` right after step 1; step 5 for windows broken mid-fold).
+  Allocating the rebuild first held two grids per broken window: a burst
+  breaking three 218 MB windows peaked at ~1.3 GB, unseen by
+  `period_grid_bytes`. `PollStats::peak_grid_bytes` samples after step 2
+  (the allocation point) and the gauge reports the poll's peak; pinned by
+  `breaking_every_window_holds_no_more_than_one_extra_grid`.
 - **Resolution (maintainer's decision): native when it fits.** The working
   grid is the source's own cell counts while they fit `max_pixels`
   (default 40 M, cap `geometry::MAX_CELLS` = 64 M, the GeoTIFF engine's
@@ -92,8 +102,36 @@ rain accumulation first. Read the root `CLAUDE.md` first — Critical Rules
   window is then built only while the source holds the window plus one
   frame (`plan::holds`), so a source retaining exactly one window does not
   trigger a rebuild every poll. It breaks once and says what it needs.
-- Failed reads: the frame is left out of every target for
-  `FAILED_RETRY_POLLS` polls (coverage shows it), then read again.
+- **Failed reads only keep a frame from being ADDED.** A frame whose read
+  fails waits for its retry (next poll, then 2, 4, at most
+  `MAX_RETRY_POLLS` = 8) out of every target that does not hold it; a
+  window, or a re-sum's live window, that holds it keeps it and reads it
+  again when it leaves. Dropping it from every target (the first version)
+  made one transient S3 error or decode-budget refusal break every longer
+  window holding the frame for ~20 polls. A new window's rebuild finishes
+  without a frame that failed this poll; a re-sum waits for it. Pinned by
+  `one_failed_read_breaks_no_longer_window`,
+  `a_failed_new_frame_is_read_again_at_the_next_poll` and
+  `a_held_frame_that_keeps_failing_stays_held`.
+- **Revised frames: digest every strip.** Each strip a window or rebuild
+  adds is digested (`Frame::digest`, per strip, kept per held frame), and a
+  strip is subtracted only if it reads back with the same digest; else the
+  window breaks (a rebuild starts over). Subtracting a revised frame's new
+  values corrupts the sums and can take a valid count below zero (the
+  `debug_assert!` in `accum::step`). Per-frame digests, not the source's
+  `content_version`: a station grid's version is collection-wide and moves
+  with every late observation, which would break every window every poll.
+  The collection-wide version still schedules a re-sum (one at a time).
+  Pinned by `a_frame_revised_in_place_is_never_subtracted_with_its_new_values`.
+- **ODIM composites are refused** in `server/src/admin.rs` (fourth pass):
+  their `sample` maps Undetect and Masked to nodata like unscanned cells,
+  so dry cells would be null, `mean` would average rainy frames only and
+  coverage would count dry frames as gaps. Lift it only once the source
+  API tells undetect from nodata.
+- **A source that cannot be summarised** (no grid, model runs) drops every
+  window (`PeriodEngine::unusable`: flux, slots cleared, `built: None`,
+  fresh versions) — never publish the old `built` with the slots gone, or
+  `/health` says Ready and renders are empty.
 - Re-sum after `RESUM_AFTER_LENGTHS` (4) window lengths of grid operations,
   or when the source's `content_version` moves (frames revised in place).
   A drift-only swap keeps the version; any other swap moves it.
@@ -139,7 +177,9 @@ rain accumulation first. Read the root `CLAUDE.md` first — Critical Rules
 - `tests/integration.rs`: the committed `testdata/radar` frames through the
   GeoTIFF engine. At the default `max_pixels` the grid is native
   (3249 × 1750) and the wettest cell equals the Marshall–Palmer sum of the
-  source's own EDR position series there. On the native and a coarse grid,
+  source's own EDR position series there — which holds only because the
+  fixture is CRS84: a projected source (TM35FIN, LAEA) is resampled onto a
+  CRS84 grid with its cell counts, cell ≠ source pixel. On the native and a coarse grid,
   the whole field equals the frames read from the source's map path at the
   same size. On a coarse grid compare with that map path, never the
   position query: it reads a GeoTIFF's overview (smoke test on the
