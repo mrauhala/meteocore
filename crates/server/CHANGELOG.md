@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.15.0](https://github.com/mrauhala/meteocore/compare/v0.14.0...v0.15.0) (2026-11-11)
+
+
+### Features
+
+* **cache:** engines publish cache demand; the plan suggests sizes and warns below it ([#1372](https://github.com/mrauhala/meteocore/issues/1372)) ([a73cc0d](https://github.com/mrauhala/meteocore/commit/a73cc0d430b36e9637e2b2017bfd05d690c13701))
+* **cache:** resize caches and budgets in place; a reload resizes instead of rebuilding ([#1374](https://github.com/mrauhala/meteocore/issues/1374)) ([3c2d472](https://github.com/mrauhala/meteocore/commit/3c2d472a63eabada86b97fcd3189c11e09ea4b89))
+* **cache:** fit every cache and budget to the memory total, reported next to its configured size ([#1384](https://github.com/mrauhala/meteocore/issues/1384)) ([007162a](https://github.com/mrauhala/meteocore/commit/007162aef474735630de5957c782cb2831cdc781))
+* **ops:** ship Prometheus alert rules for stale collections and errors ([#1385](https://github.com/mrauhala/meteocore/issues/1385)) ([794d07d](https://github.com/mrauhala/meteocore/commit/794d07de1ee392a377e411f2f215e47d0efe3bbe))
+* **engine-nowcast:** score skill at +30 and +60 min against persistence ([#1392](https://github.com/mrauhala/meteocore/issues/1392)) ([a4b581c](https://github.com/mrauhala/meteocore/commit/a4b581c79b94361c10c215d7f8e70a2772259d97))
+* **server:** allow for each feed's delivery delay in CollectionStale ([#1393](https://github.com/mrauhala/meteocore/issues/1393)) ([ddcf82f](https://github.com/mrauhala/meteocore/commit/ddcf82fad6e2d3ca2efd71baf50053bc7b81c3b2))
+* **engine-odim:** PVOL scan and catalog metrics, per-site data age ([#1397](https://github.com/mrauhala/meteocore/issues/1397)) ([e1c0db3](https://github.com/mrauhala/meteocore/commit/e1c0db3f69044d994d4dabf90ba9d0323a2e1c2f))
+* **cache:** [memory] mode = "auto" applies the memory plan, counting what caches cannot shrink yet ([#1396](https://github.com/mrauhala/meteocore/issues/1396)) ([48bb3e9](https://github.com/mrauhala/meteocore/commit/48bb3e9dbee3257373be79962b4ef78556964035))
+* **core:** honour X-Forwarded-Prefix in self-links ([#1404](https://github.com/mrauhala/meteocore/issues/1404)) ([12de2c0](https://github.com/mrauhala/meteocore/commit/12de2c053cd6348ecef96be92344b1efba58159e))
+* **preview:** EDR parameters and click-to-query for collections without map tiles ([#1429](https://github.com/mrauhala/meteocore/issues/1429)) ([2310dd9](https://github.com/mrauhala/meteocore/commit/2310dd9492e70266fe2759cc1e2f7c50777886bb))
+* **wms:** hint at the intended layer in LayerNotDefined errors ([#1439](https://github.com/mrauhala/meteocore/issues/1439)) ([dfb11e0](https://github.com/mrauhala/meteocore/commit/dfb11e00b357039b8cc93aac3c8fad0c2055970d))
+* **edr:** fit gridded area answers to the value budget instead of 256 cells per axis ([#1444](https://github.com/mrauhala/meteocore/issues/1444)) ([a4acd55](https://github.com/mrauhala/meteocore/commit/a4acd5589e619481159f6859eb7abc6a4ac464b3))
+* **postgis:** serve events as Features items with keyset cursor paging ([#1445](https://github.com/mrauhala/meteocore/issues/1445)) ([0ef74e9](https://github.com/mrauhala/meteocore/commit/0ef74e97a02006dd4eea191e132fb5489e87fbe2))
+* **wind:** turn grid-relative u/v to true north for wind direction on projected grids ([#1449](https://github.com/mrauhala/meteocore/issues/1449)) ([60acf89](https://github.com/mrauhala/meteocore/commit/60acf8923ce2616fd247722b1fd302b45689a6df))
+* **maps:** select a model run with subset=reference_time on maps and map tiles ([#1450](https://github.com/mrauhala/meteocore/issues/1450)) ([13d6656](https://github.com/mrauhala/meteocore/commit/13d6656cfb1fe3b6b0474a399679f505f89909fc))
+* **period:** rolling-window period products, radar rain accumulation first ([#1458](https://github.com/mrauhala/meteocore/issues/1458)) ([169d8c8](https://github.com/mrauhala/meteocore/commit/169d8c86f1689ccd9f39294211d4cc5e5249ff9a))
+* **maps:** contour line styles with built-in isobars, isotherms and height contours ([#1457](https://github.com/mrauhala/meteocore/issues/1457)) ([b398cf5](https://github.com/mrauhala/meteocore/commit/b398cf5fe3b28a38dfe4a730522479223653a3c7))
+
+
+### Bug Fixes
+
+* **engine-grib:** a truncated or corrupt message is a decode error, not a grib panic ([#1382](https://github.com/mrauhala/meteocore/issues/1382)) ([b768e04](https://github.com/mrauhala/meteocore/commit/b768e046d7355025004583a4e1068ff5b3d34458))
+* **errors:** one DataServerError classification decides every API's status ([#1383](https://github.com/mrauhala/meteocore/issues/1383)) ([e46c169](https://github.com/mrauhala/meteocore/commit/e46c169105ac6550e21769ecbbe919c0b62cc567))
+* **engine-grib:** end each wgrib2 message where the next index record starts ([#1391](https://github.com/mrauhala/meteocore/issues/1391)) ([fc9ca25](https://github.com/mrauhala/meteocore/commit/fc9ca256a41702fe51726053a40ff7e92d078de0))
+* **engine-geotiff:** bound STAC load waits by the request deadline and start no work past it ([#1394](https://github.com/mrauhala/meteocore/issues/1394)) ([a6761f1](https://github.com/mrauhala/meteocore/commit/a6761f1853fb3c52a84fc04a1edea2026e55c386))
+* **edr:** always report the served steps on an area or radius t axis ([#1413](https://github.com/mrauhala/meteocore/issues/1413)) ([c40dc10](https://github.com/mrauhala/meteocore/commit/c40dc10406c30df19bc4a3c636f6907c4d7871ba))
+* **geotiff:** list a STAC collection's last hour at startup ([#1416](https://github.com/mrauhala/meteocore/issues/1416)) ([1436331](https://github.com/mrauhala/meteocore/commit/1436331acdbeb4b147bbe298f43930f883014247))
+* **server:** keep the reload lock until the reload ends when a client disconnects ([#1417](https://github.com/mrauhala/meteocore/issues/1417)) ([45d880b](https://github.com/mrauhala/meteocore/commit/45d880b6fe5647aef5187d6ca1eecad882af527a))
+* **cache:** pin a map response only when it draws the time requested ([#1420](https://github.com/mrauhala/meteocore/issues/1420)) ([fa0b3c7](https://github.com/mrauhala/meteocore/commit/fa0b3c7548224bfa339928e0fa773ab4f902c3f3))
+* **engine-geotiff:** stop installing a STAC listing cut by its page or time cap ([#1419](https://github.com/mrauhala/meteocore/issues/1419)) ([f587de0](https://github.com/mrauhala/meteocore/commit/f587de095b20aaa02a0349777f90de316606d9bf))
+* **odim:** read a volume the catalog leaves out only once ([#1423](https://github.com/mrauhala/meteocore/issues/1423)) ([89653e3](https://github.com/mrauhala/meteocore/commit/89653e3de9b278b0451b12b397f78248b976b51b))
+* **geotiff:** open-ended STAC windows and circuit breaker scope ([#1426](https://github.com/mrauhala/meteocore/issues/1426)) ([76d2215](https://github.com/mrauhala/meteocore/commit/76d221554faebb43346d44553e2a2095c7cbe914))
+* **geotiff:** STAC raster info keeps its CRS and grid after the first poll ([#1428](https://github.com/mrauhala/meteocore/issues/1428)) ([7dc913e](https://github.com/mrauhala/meteocore/commit/7dc913e794ef2f38c3105055644f6daf65c744d0))
+* **cache:** pin a map frame only from a fixed run, and a lightning frame only once settled ([#1430](https://github.com/mrauhala/meteocore/issues/1430)) ([a862c4a](https://github.com/mrauhala/meteocore/commit/a862c4a3904c719f0485549d5d7fd13fcdd225a7))
+* **engines:** bound single-flight waits on another request's fill by the request deadline ([#1431](https://github.com/mrauhala/meteocore/issues/1431)) ([5786f16](https://github.com/mrauhala/meteocore/commit/5786f164ef03138b117cea597f0211a9d8fe31ea))
+* **grib:** insert and keep each message-cache fill as one step ([#1433](https://github.com/mrauhala/meteocore/issues/1433)) ([bb2270c](https://github.com/mrauhala/meteocore/commit/bb2270c6fff5ce296af9a7e0de40cb0074bd2936))
+* **edr:** answer a z list in the axis order, each level once ([#1443](https://github.com/mrauhala/meteocore/issues/1443)) ([e93ba84](https://github.com/mrauhala/meteocore/commit/e93ba84268e2d6f9aa6bf1094cc0dd36d910e07c))
+* **geotiff:** answer EDR area on a projected source as a regular CRS84 grid ([#1441](https://github.com/mrauhala/meteocore/issues/1441)) ([9268c69](https://github.com/mrauhala/meteocore/commit/9268c6952669e0a757d99ab666a4e215930c8adf))
+* **wms:** answer GetLegendGraphic for an unknown parameter layer with LayerNotDefined ([#1447](https://github.com/mrauhala/meteocore/issues/1447)) ([c8f6e0d](https://github.com/mrauhala/meteocore/commit/c8f6e0de53a4e9f2298be9b0dd97fcdba8c2315f))
+* **postgis:** order by the table's columns, answer a statement timeout 503 ([#1448](https://github.com/mrauhala/meteocore/issues/1448)) ([c50fbe8](https://github.com/mrauhala/meteocore/commit/c50fbe8fa2660f07f9a6c974636ee059befae74a))
+
+
+### Performance Improvements
+
+* **engine-zarr:** fetch a query's cold Icechunk inner chunks together and bound the preload ([#1388](https://github.com/mrauhala/meteocore/issues/1388)) ([3b627fe](https://github.com/mrauhala/meteocore/commit/3b627feef192025fc35fd57f8241fa5ebda2cfb6))
+* **engine-grib:** read the next steps of a map animation ahead into the message cache ([#1386](https://github.com/mrauhala/meteocore/issues/1386)) ([f51dfb8](https://github.com/mrauhala/meteocore/commit/f51dfb81786420c966a14e017ed939fb2bf68c63))
+
 ## [0.14.0](https://github.com/mrauhala/meteocore/compare/v0.13.0...v0.14.0) (2026-10-30)
 
 
