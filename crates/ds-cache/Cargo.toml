@@ -5,4 +5,4 @@ edition = "2021"
 license.workspace = true
 
 [dependencies]
-quick_cache = "0.6"
+quick_cache = "0.7"

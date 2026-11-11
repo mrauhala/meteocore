@@ -13,9 +13,10 @@
 //! lock, and note whether `before_evict` announced it. [`Counting::record`]
 //! weighs, hashes and counts them once the insert has released the lock:
 //! nothing extra runs under it. A resize ([`crate::ByteBoundedCache::set_capacity`])
-//! is a request `quick_cache` finishes itself, under each shard's lock: its
-//! `end_request` only parks the evicted entries, which the resize counts
-//! and drops once `quick_cache` returns (#1311).
+//! is a request `quick_cache` finishes itself: it drops each shard's request
+//! state after releasing that shard's lock, and the state's `Drop` hands it
+//! to [`Counting::finish`], which parks the evicted entries for the resize
+//! to count and drop once `quick_cache` returns (#1311).
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
@@ -353,7 +354,9 @@ impl<K: Hash, V> Counting<K, V> {
     ///   fill claimed then: nothing is counted, even if a resize enabled
     ///   the cache before it landed. Its value may be one the new hot
     ///   target refuses, which would read as an eviction.
-    pub(crate) fn record(&self, evicted: Evicted<K, V>, insert: Option<Insert>) {
+    pub(crate) fn record(&self, mut evicted: Evicted<K, V>, insert: Option<Insert>) {
+        // Counted here or not at all: never again when it drops.
+        evicted.unbind();
         let counters = &*self.counters;
         let Some(insert) = insert else {
             return;
@@ -404,38 +407,15 @@ impl<K: Hash, V> Counting<K, V> {
         }
         replaced
     }
-}
 
-impl<K: Hash, V> Lifecycle<K, V> for Counting<K, V> {
-    type RequestState = Evicted<K, V>;
-
-    #[inline]
-    fn begin_request(&self) -> Evicted<K, V> {
-        Evicted::default()
-    }
-
-    #[inline]
-    fn before_evict(&self, state: &mut Evicted<K, V>, _key: &K, _val: &mut V) {
-        state.announced = true;
-    }
-
-    #[inline]
-    fn on_evict_cold(&self, state: &mut Evicted<K, V>, key: K, val: V) {
-        state.push(key, val, Ring::Cold);
-    }
-
-    #[inline]
-    fn on_evict_hot(&self, state: &mut Evicted<K, V>, key: K, val: V) {
-        state.push(key, val, Ring::Hot);
-    }
-
-    /// For the requests `quick_cache` finishes itself. The cache's own
-    /// inserts take the `_with_lifecycle` forms and call
-    /// [`Counting::record`] with what they inserted. `quick_cache`'s
-    /// `set_capacity`, the only other request, calls this under the shard
-    /// lock: while [`Counting::park`]ed it only keeps the entries, for the
-    /// resize to count and drop once the lock is released.
-    fn end_request(&self, state: Evicted<K, V>) {
+    /// Finish a request `quick_cache` finishes itself, from its state's
+    /// `Drop`. The cache's own inserts take the `_with_lifecycle` forms and
+    /// call [`Counting::record`] with what they inserted. `quick_cache`'s
+    /// `set_capacity`, the only other request, drops each shard's state
+    /// after releasing that shard's lock: while [`Counting::park`]ed this
+    /// only keeps the entries, for the resize to count and drop once every
+    /// shard is resized.
+    fn finish(&self, state: Evicted<K, V>) {
         let mut parked = self.parked();
         match parked.as_mut() {
             Some(parked) => parked.push(state),
@@ -447,14 +427,49 @@ impl<K: Hash, V> Lifecycle<K, V> for Counting<K, V> {
     }
 }
 
+impl<K: Hash, V> Lifecycle<K, V> for Counting<K, V> {
+    type RequestState = Evicted<K, V>;
+
+    #[inline]
+    fn before_evict(&self, state: &mut Evicted<K, V>, _key: &K, _val: &mut V) {
+        state.bind(self);
+        state.announced = true;
+    }
+
+    #[inline]
+    fn on_evict_cold(&self, state: &mut Evicted<K, V>, key: K, val: V) {
+        state.bind(self);
+        state.push(key, val, Ring::Cold);
+    }
+
+    #[inline]
+    fn on_evict_hot(&self, state: &mut Evicted<K, V>, key: K, val: V) {
+        state.bind(self);
+        state.push(key, val, Ring::Hot);
+    }
+}
+
+/// How a request state that drops still bound finishes: [`Counting::finish`].
+/// A function pointer rather than a call in `Drop`, which cannot require
+/// the `K: Hash` that counting needs.
+type Finish<K, V> = fn(&Counting<K, V>, Evicted<K, V>);
+
 /// The entries one request evicted, held so they are counted and dropped
 /// after the shard lock is released. Two fit without an allocation, which
 /// covers nearly every insert; more spill to a vector.
+///
+/// `quick_cache` (0.7) builds the state of a request it finishes itself
+/// with `Default` and only drops it, so the first eviction binds the state
+/// to its lifecycle, and `Drop` finishes it there ([`Counting::finish`]).
+/// [`Counting::record`] unbinds the state of the cache's own inserts,
+/// which it counts itself.
 pub(crate) struct Evicted<K, V> {
     first: [Option<Removed<K, V>>; 2],
     rest: Vec<Removed<K, V>>,
     /// `before_evict` announced the next entry.
     announced: bool,
+    /// Who finishes the state when it drops; `None` until it evicts.
+    bound: Option<(Counting<K, V>, Finish<K, V>)>,
 }
 
 /// An entry a request took out of the cache.
@@ -472,11 +487,36 @@ impl<K, V> Default for Evicted<K, V> {
             first: [None, None],
             rest: Vec::new(),
             announced: false,
+            bound: None,
+        }
+    }
+}
+
+impl<K, V> Drop for Evicted<K, V> {
+    fn drop(&mut self) {
+        if let Some((lifecycle, finish)) = self.bound.take() {
+            finish(&lifecycle, std::mem::take(self));
+        }
+    }
+}
+
+impl<K: Hash, V> Evicted<K, V> {
+    /// Bind the state to `lifecycle`, once: an eviction is the first time
+    /// `quick_cache` hands a hook both.
+    fn bind(&mut self, lifecycle: &Counting<K, V>) {
+        if self.bound.is_none() {
+            let finish: Finish<K, V> = Counting::finish;
+            self.bound = Some((lifecycle.clone(), finish));
         }
     }
 }
 
 impl<K, V> Evicted<K, V> {
+    /// The state is counted now, by whoever holds it: not when it drops.
+    fn unbind(&mut self) {
+        self.bound = None;
+    }
+
     fn push(&mut self, key: K, value: V, from: Ring) {
         let entry = Removed {
             key,
@@ -490,8 +530,11 @@ impl<K, V> Evicted<K, V> {
         }
     }
 
-    fn into_iter(self) -> impl Iterator<Item = Removed<K, V>> {
-        self.first.into_iter().flatten().chain(self.rest)
+    fn into_iter(mut self) -> impl Iterator<Item = Removed<K, V>> {
+        self.unbind();
+        let first = std::mem::take(&mut self.first);
+        let rest = std::mem::take(&mut self.rest);
+        first.into_iter().flatten().chain(rest)
     }
 }
 

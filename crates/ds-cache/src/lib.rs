@@ -41,7 +41,7 @@ pub mod plan;
 pub use churn::{Churn, GHOST_DEPTHS};
 pub use entry::{CacheEntry, CacheFillGuard, Joined};
 
-use churn::{Counters, Counting, Insert};
+use churn::{Counters, Counting, Evicted, Insert};
 
 /// One mebibyte, for `*_MB` → bytes conversions.
 pub const MIB: u64 = 1024 * 1024;
@@ -421,7 +421,8 @@ fn publish<K: Eq + Hash, V: Clone>(
     value: V,
     weight: Option<u64>,
 ) -> Result<(), V> {
-    let evicted = claim.insert_with_lifecycle(value)?;
+    let mut evicted = Evicted::default();
+    claim.insert_with_lifecycle(value, &mut evicted)?;
     let insert = weight.map(|weight| Insert { weight });
     lifecycle.record(evicted, insert);
     Ok(())
@@ -884,7 +885,10 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         let insert = self.inner.counters().counting().then(|| Insert {
             weight: self.inner.lifecycle.weigh(&key, &value),
         });
-        let evicted = self.inner.cache.insert_with_lifecycle(key, value);
+        let mut evicted = Evicted::default();
+        self.inner
+            .cache
+            .insert_with_lifecycle(key, value, &mut evicted);
         self.inner.lifecycle.record(evicted, insert);
     }
 
