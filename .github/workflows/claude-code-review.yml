@@ -54,7 +54,7 @@ jobs:
       - name: Run Claude Code Review
         id: review
         continue-on-error: true
-        uses: anthropics/claude-code-action@6d5ae526d25ce88daa2200be073e1a373167f064 # v1
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1
         with: &review-inputs
           # A scoped workflow token avoids the App token service's default-
           # branch workflow-identity check (which skips reviews of workflow PRs).
@@ -186,7 +186,7 @@ jobs:
         id: review_retry
         if: steps.post.outputs.retry == 'true'
         continue-on-error: true
-        uses: anthropics/claude-code-action@6d5ae526d25ce88daa2200be073e1a373167f064 # v1
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1
         with: *review-inputs
 
       - name: Post retried review summary
