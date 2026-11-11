@@ -720,12 +720,13 @@ ones only in the legacy layout.
   the engine's reads in `point_index/complex_reads.rs`; `PointError`
   (`point_index.rs`) serves both.
 - Every value is a running sum of all differences before it, so
-  `ComplexIndex` keeps one 28 B `Checkpoint` per grid row: the decoder state
+  `ComplexIndex` keeps one 40 B `Checkpoint` per grid row: the decoder state
   before the row's first value (packed index, group, offset in it, the
-  group's data bit, values seen, the last two undifferenced). It also keeps
-  the message's packed group descriptors (refs, widths, lengths): a row's
-  three descriptor slices lie about 90 KB apart, so keeping them is what
-  holds a warm read to ONE GET. 100–142 KB per GFS 0.25° message, against
+  group's data bit, values seen, the last two undifferenced as `i64`). It
+  also keeps the message's packed group descriptors (refs, widths, lengths):
+  a row's three descriptor slices lie about 90 KB apart, so keeping them is
+  what holds a warm read to ONE GET. 100–142 KB per GFS 0.25° message,
+  measured with 28 B checkpoints (40 B add 8.7 KB on 721 rows), against
   1–6 KB for CCSDS; the weigher counts all of it. The descriptors dominate,
   so the size barely follows the message's: 13–20 % of a TMP message,
   20–23 % of a PRATE one, 18 % on average (48 real messages, #1333).
@@ -748,12 +749,18 @@ ones only in the legacy layout.
 - Bit identity with `decode_message` is the contract: `grib`'s release-build
   integer arithmetic (wrapping), its missing values (management 1 and 2)
   and bitmap, `NonZeroSimplePackingDecoder` op for op, the shared
-  `Bilinear`.
+  `Bilinear`. The first values are unsigned and only the overall minimum is
+  sign and magnitude (Data Template 7.3 note 4; wgrib2, g2c, ecCodes);
+  values undifference in `i64`. `grib` before 0.20.1 read the first values
+  signed and summed in `i32`, so a first value with its top bit set decoded
+  to garbage (grib-rs PR 257); the reader follows the corrected decode.
+  `synthetic_layouts_are_bit_identical` covers top-bit first values at
+  every width.
 - Readable: order 1 or 2, group splitting 1, extra descriptors of 1–4
   octets, descriptor and group widths ≤ 31 bits, |E| ≤ 126, bitmap indicator
   0 or 255, canonical scan. Else `Unsupported`. Corrupt or truncated bytes
-  are `Invalid`, never a panic: `grib` itself panics on a Section 7 shorter
-  than its groups, so keep
+  are `Invalid`, never a panic: `grib` panicked on a Section 7 shorter than
+  its groups before 0.20.2, so keep
   `malformed_messages_fail_or_agree_with_the_full_decode`.
 - What `grib` takes on trust is checked before it runs (#1325):
   - Sections: `ccsds::check_sections` runs before every whole-message parse
