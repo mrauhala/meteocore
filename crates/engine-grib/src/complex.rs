@@ -61,8 +61,9 @@ struct Scale {
 
 impl Scale {
     /// The value of undifferenced integer `v`, NaN for a missing one: the
-    /// `grib` crate's `NonZeroSimplePackingDecoder`, op for op.
-    fn value(&self, v: Option<i32>) -> f32 {
+    /// `grib` crate's `NonZeroSimplePackingDecoder`, op for op. `grib`
+    /// undifferences in `i64` since 0.20.1, converting with `as f32`.
+    fn value(&self, v: Option<i64>) -> f32 {
         let encoded = v.map_or(f32::NAN, |v| v as f32);
         let diff = encoded * self.binary;
         (self.reference + diff) * self.decimal
@@ -175,10 +176,11 @@ impl Layout {
 /// packing decoder (templates 5.2 and 5.3) slices out of it to decode
 /// `values` packed values, before it runs (#1325): the extra and group
 /// descriptors, then every group it enters, in full, through the one holding
-/// the last value, none longer than the field. `grib` slices them without a
-/// bounds check and panics on a Section 7 shorter than its groups. The walk
-/// is a point read's ([`Descriptors::find`]), with the same arithmetic.
-/// Other templates pass.
+/// the last value, none longer than the field. `grib` sliced them without a
+/// bounds check and panicked on a Section 7 shorter than its groups before
+/// 0.20.2, and it still allocates a constant group's length whole, however
+/// long. The walk is a point read's ([`Descriptors::find`]), with the same
+/// arithmetic. Other templates pass.
 pub(crate) fn check_section7(
     template: &DataRepresentationTemplate,
     values: usize,
@@ -373,26 +375,42 @@ impl Data<'_> {
 
 /// Section 7's extra descriptors: the first undifferenced values and the
 /// overall minimum of the differences.
+///
+/// The first values are original scaled values, never negative, and stored
+/// unsigned: Data Template 7.3 gives a sign bit only to the overall minimum
+/// (its note 4), and wgrib2, g2c and ecCodes read them so. `grib` read them
+/// as sign and magnitude too before 0.20.1 (grib-rs PR 257), which turned a
+/// first value with its top bit set, as in a GFS field whose second value
+/// is the one octet 0x80, into a negative one and every value after it into
+/// garbage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Extra {
-    first: [i32; 2],
+    first: [i64; 2],
     minimum: i32,
 }
 
 impl Extra {
     /// Read from `payload`, Section 7's payload from its start.
     fn read(layout: &Layout, payload: &[u8]) -> Self {
-        let at = |i: usize| grib_int(&payload[i * layout.octets..(i + 1) * layout.octets]);
+        let at = |i: usize| &payload[i * layout.octets..(i + 1) * layout.octets];
         let order = usize::from(layout.order);
         Self {
-            first: [at(0), if order == 2 { at(1) } else { 0 }],
-            minimum: at(order),
+            first: [
+                unsigned_int(at(0)),
+                if order == 2 { unsigned_int(at(1)) } else { 0 },
+            ],
+            minimum: grib_int(at(order)),
         }
     }
 }
 
-/// A sign-and-magnitude integer of 1 to 4 octets, as `grib` reads an extra
-/// descriptor.
+/// An unsigned integer of 1 to 4 octets, as `grib` reads a first value.
+fn unsigned_int(bytes: &[u8]) -> i64 {
+    bytes.iter().fold(0, |acc, &b| acc << 8 | i64::from(b))
+}
+
+/// A sign-and-magnitude integer of 1 to 4 octets, as `grib` reads the
+/// overall minimum.
 fn grib_int(bytes: &[u8]) -> i32 {
     let raw = bytes.iter().fold(0u32, |acc, &b| acc << 8 | u32::from(b));
     let sign = 1u32 << (8 * bytes.len() - 1);
@@ -417,16 +435,19 @@ pub(crate) struct Checkpoint {
     /// The data bit at which the group's values start.
     group_bit: u32,
     /// Values the spatial differencing has taken, the missing ones skipped,
-    /// up to its order; and the last two of them, undifferenced.
+    /// up to its order; and the last two of them, undifferenced, in `i64`
+    /// as `grib` keeps them: a 4-octet first value can exceed `i32::MAX`.
     seen: u8,
-    prev1: i32,
-    prev2: i32,
+    prev1: i64,
+    prev2: i64,
 }
 
 impl Checkpoint {
     /// Undifference `value`, as `grib`'s spatial differencing decoders do:
-    /// the first `order` values are the extra descriptors' `first`.
-    fn undifference(&mut self, order: u8, first: &[i32; 2], value: i32) -> i32 {
+    /// the first `order` values are the extra descriptors' `first`, the rest
+    /// sums in `i64` (wrapping, as its release build does).
+    fn undifference(&mut self, order: u8, first: &[i64; 2], value: i32) -> i64 {
+        let value = i64::from(value);
         let next = match (order, self.seen) {
             (_, 0) => first[0],
             (2, 1) => first[1],
@@ -800,8 +821,8 @@ impl Header {
 }
 
 /// A message's [`Header`], its descriptors, and the decoder's state at each
-/// grid row's first value: about 20 KB of checkpoints and 75 to 100 KB of
-/// descriptors for a GFS 0.25° field.
+/// grid row's first value: about 29 KB of checkpoints (40 B each) and 75 to
+/// 100 KB of descriptors for a GFS 0.25° field.
 ///
 /// The checkpoints may cover only the first rows, as a decode of a message
 /// prefix finds them; a read from a later row decodes on from the last one.
@@ -1199,7 +1220,7 @@ impl ComplexIndex {
         data: Data<'_>,
         mut at: Checkpoint,
         end: usize,
-        mut each: impl FnMut(&Checkpoint, Option<i32>),
+        mut each: impl FnMut(&Checkpoint, Option<i64>),
     ) -> Result<Checkpoint, PointError> {
         let layout = &self.header.layout;
         let descriptors = self.descriptors();

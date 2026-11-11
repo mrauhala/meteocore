@@ -357,7 +357,7 @@ fn synthetic_layouts_are_bit_identical() {
             present(&field),
         ),
     ];
-    // Descriptor octets, a negative first value, wide differences.
+    // Descriptor octets, negative values, wide differences.
     for (octets, scale) in [(1u8, 1i64), (3, 300), (4, 70_000)] {
         let values: Vec<i64> = field
             .iter()
@@ -378,6 +378,40 @@ fn synthetic_layouts_are_bit_identical() {
                 decimal: 1,
                 reference: -40.5,
                 ..global.clone()
+            },
+            present(&values),
+        ));
+    }
+    // First values with their top bit set, which are unsigned (Data
+    // Template 7.3; `grib` since 0.20.1, as wgrib2): a GFS 70 mb wind field
+    // whose second value is the one octet 0x80 decoded to garbage when read
+    // as sign and magnitude. Four octets reach past `i32::MAX`, which `grib`
+    // undifferences in `i64`. On a 3° global grid, which is enough rows.
+    let coarse = Complex {
+        ni: 120,
+        nj: 61,
+        step: 3_000_000,
+        ..global.clone()
+    };
+    for (octets, base, scale, order) in [
+        (1u8, 160i64, 1i64, 2u8),
+        (2, 40_000, 100, 2),
+        (3, 9_000_000, 1_000, 2),
+        (4, 3_000_000_000, 10_000, 2),
+        (4, 3_000_000_000, 10_000, 1),
+    ] {
+        let values: Vec<i64> = field[..120 * 61]
+            .iter()
+            .map(|v| base + (v - 20_000) * scale / 100)
+            .collect();
+        let top = 1i64 << (8 * octets - 1);
+        assert!(values[..usize::from(order)].iter().all(|&v| v >= top));
+        cases.push((
+            format!("{octets} octets, order {order}, top bit set"),
+            Complex {
+                octets,
+                order,
+                ..coarse.clone()
             },
             present(&values),
         ));
@@ -488,6 +522,58 @@ fn synthetic_layouts_are_bit_identical() {
         assert_eq!(header.layout.missing, spec.missing, "{name}");
         let checked = catch_unwind(AssertUnwindSafe(|| assert_identical(&message, &coords)));
         assert!(checked.is_ok(), "{name}");
+    }
+}
+
+/// Data Template 7.3's extra descriptors at every width: the first values
+/// unsigned, the overall minimum in sign and magnitude. The bytes are those
+/// of `grib`'s own test of the reading (grib-rs PR 257).
+#[test]
+fn first_values_are_unsigned_and_the_minimum_signed() {
+    let layout = Header::parse(&temperature()).unwrap().layout;
+    let cases: [(usize, &[u8], [i64; 2], i32); 4] = [
+        (1, &[0x7f, 0x80, 0x9d], [127, 128], -29),
+        (2, &[0x00, 0x7f, 0x80, 0x00, 0x80, 0x01], [127, 32_768], -1),
+        (
+            3,
+            &[0x00, 0x00, 0x7f, 0x80, 0x00, 0x00, 0x80, 0x00, 0x01],
+            [127, 8_388_608],
+            -1,
+        ),
+        (
+            4,
+            &[
+                0x00, 0x00, 0x00, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x01,
+            ],
+            [127, 2_147_483_648],
+            -1,
+        ),
+    ];
+    for (octets, bytes, first, minimum) in cases {
+        let second = Layout {
+            order: 2,
+            octets,
+            ..layout
+        };
+        assert_eq!(
+            Extra::read(&second, bytes),
+            Extra { first, minimum },
+            "{octets} octets"
+        );
+        // At order 1 the second descriptor is the minimum.
+        let first_order = Layout {
+            order: 1,
+            octets,
+            ..layout
+        };
+        assert_eq!(
+            Extra::read(&first_order, &bytes[octets..]),
+            Extra {
+                first: [first[1], 0],
+                minimum
+            },
+            "{octets} octets, order 1"
+        );
     }
 }
 

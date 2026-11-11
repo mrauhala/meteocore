@@ -567,13 +567,21 @@ impl Complex {
             .collect();
         let len_bits = bits_for(entries.iter().copied().max().unwrap_or(0));
 
+        // Data Template 7.3: the first values unsigned, the overall minimum
+        // in sign and magnitude (its note 4).
         let mut s7 = section(7, 5);
-        let magnitude_bits = 8 * u32::from(self.octets) - 1;
-        for v in first.iter().copied().chain([minimum]) {
-            assert!(v.unsigned_abs() >> magnitude_bits == 0);
-            let raw = v.unsigned_abs() | if v < 0 { 1 << magnitude_bits } else { 0 };
-            s7.extend(&raw.to_be_bytes()[8 - usize::from(self.octets)..]);
+        let octets = usize::from(self.octets);
+        let bits = 8 * u32::from(self.octets);
+        for &v in &first {
+            assert!(v >= 0 && v >> bits == 0, "first value {v}");
+            s7.extend(&v.to_be_bytes()[8 - octets..]);
         }
+        assert!(
+            minimum.unsigned_abs() >> (bits - 1) == 0,
+            "minimum {minimum}"
+        );
+        let raw = minimum.unsigned_abs() | if minimum < 0 { 1 << (bits - 1) } else { 0 };
+        s7.extend(&raw.to_be_bytes()[8 - octets..]);
         let mut refs = BitWriter::default();
         let mut widths = BitWriter::default();
         let mut lens = BitWriter::default();
