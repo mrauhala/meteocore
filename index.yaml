@@ -4,6 +4,28 @@ entries:
   - annotations:
       licenses: MIT OR Apache-2.0
     apiVersion: v2
+    appVersion: 0.15.0
+    created: "2026-11-12T11:17:48.672657589Z"
+    description: MeteoCore, a server for weather data over OGC API - EDR, Features,
+      Maps and Tiles, OGC WMS 1.3.0 and OGC 3D Tiles.
+    digest: 94c80dccb2d5013e73d0ebf0d11381f2193b0955e8e4187c92a9b9922edc3794
+    home: https://github.com/mrauhala/meteocore
+    keywords:
+    - weather
+    - meteorology
+    - ogc
+    - edr
+    - wms
+    name: meteocore
+    sources:
+    - https://github.com/mrauhala/meteocore
+    type: application
+    urls:
+    - https://github.com/mrauhala/meteocore/releases/download/v0.15.0/meteocore-0.15.0.tgz
+    version: 0.15.0
+  - annotations:
+      licenses: MIT OR Apache-2.0
+    apiVersion: v2
     appVersion: 0.14.0
     created: "2026-10-30T07:30:18.532679586Z"
     description: MeteoCore, a server for weather data over OGC API - EDR, Features,
@@ -23,4 +45,4 @@ entries:
     urls:
     - https://github.com/mrauhala/meteocore/releases/download/v0.14.0/meteocore-0.14.0.tgz
     version: 0.14.0
-generated: "2026-10-30T07:30:18.529667119Z"
+generated: "2026-11-12T11:17:48.668721728Z"
