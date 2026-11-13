@@ -2,8 +2,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use axum::response::IntoResponse;
+use ds_core::config::{ServerConfig, DEFAULT_METATILE_CACHE_MB};
 
 use super::*;
+use crate::memory_caches::{CacheSettings, RenderCacheSizes, Sized};
 
 fn testdata(path: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -738,6 +740,8 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
             "capacity_bytes": 1536 * MIB,
             "configured_bytes": 1536 * MIB,
             "source": "collection:[grib] grid_cache_mb",
+            "floor_bytes": null,
+            "ceiling_bytes": null,
             "used_bytes": 768 * MIB,
             "entries": 3,
             "hits": 5,
@@ -779,6 +783,8 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
             "capacity_bytes": 4096 * MIB,
             "configured_bytes": 4096 * MIB,
             "source": "env:MC_RENDER_MEMORY_MB",
+            "floor_bytes": null,
+            "ceiling_bytes": null,
             "used_bytes": 2048 * MIB,
             "entries": null,
             "hits": null,
@@ -996,25 +1002,31 @@ fn sizes_print_in_mib() {
     assert_eq!(mib(MIB + MIB / 2), "1.50 MiB");
 }
 
-/// The render caches' sources follow the config: the `[server]` keys, the
-/// deprecated `[wms]` fallback, else the defaults.
+/// The render caches' sizes and sources follow the config: their
+/// `[memory.caches]` keys (#1313), the `[server]` keys, the deprecated
+/// `[wms]` fallback, else the defaults. An explicit value equal to the
+/// default names its key.
 #[test]
 fn render_cache_sources_follow_the_config() {
+    let sized = |mb, source| Sized { mb, source };
+    let of = |config: &ServerConfig| RenderCacheSizes::of(config, &CacheSettings::known(config));
     let mut config = ServerConfig::default_for_auto();
     assert_eq!(
-        RenderCacheSources::of(&config),
-        RenderCacheSources {
-            metatile: SizeSource::Default,
-            rendered: SizeSource::Default,
+        of(&config),
+        RenderCacheSizes {
+            metatile: sized(1024, SizeSource::Default),
+            rendered: sized(256, SizeSource::Default),
+            vector_tile: sized(128, SizeSource::Constant),
         }
     );
-    config.server.metatile_cache_mb = 8192;
+    config.server.metatile_cache_mb = Some(1024);
     config.server.rendered_cache_mb = Some(512);
     assert_eq!(
-        RenderCacheSources::of(&config),
-        RenderCacheSources {
-            metatile: SizeSource::Config("[server] metatile_cache_mb"),
-            rendered: SizeSource::Config("[server] rendered_cache_mb"),
+        of(&config),
+        RenderCacheSizes {
+            metatile: sized(1024, SizeSource::Config("[server] metatile_cache_mb")),
+            rendered: sized(512, SizeSource::Config("[server] rendered_cache_mb")),
+            vector_tile: sized(128, SizeSource::Constant),
         }
     );
     config.server.rendered_cache_mb = None;
@@ -1024,8 +1036,27 @@ fn render_cache_sources_follow_the_config() {
     )
     .unwrap()];
     assert_eq!(
-        RenderCacheSources::of(&config).rendered,
-        SizeSource::Collection("[wms] rendered_cache_mb")
+        of(&config).rendered,
+        sized(512, SizeSource::Collection("[wms] rendered_cache_mb"))
+    );
+    // [memory.caches] wins over every alias; a range takes the default
+    // clamped into it.
+    let caches: ds_core::config::MemoryConfig = toml::from_str(
+        "[caches]\nmetatile = 8192\nrendered = { min = 300, max = 400 }\nvector_tile = 64\n",
+    )
+    .unwrap();
+    config.memory = Some(caches);
+    config.server.rendered_cache_mb = Some(512);
+    assert_eq!(
+        of(&config),
+        RenderCacheSizes {
+            metatile: sized(8192, SizeSource::Config("[memory.caches] metatile")),
+            rendered: sized(
+                300,
+                SizeSource::Bounds("[memory.caches] rendered", Bounds::mib(300, 400))
+            ),
+            vector_tile: sized(64, SizeSource::Config("[memory.caches] vector_tile")),
+        }
     );
 }
 
@@ -1306,13 +1337,16 @@ fn a_reused_grib_engine_keeps_the_plans_sizes() {
     let engine = engine_grib::GribEngine::new("kept", &grib).unwrap();
     assert_eq!(engine.resize_grid_cache(456 * MIB), 456 * MIB);
     let kept = plan_kept_grib(&grib, &engine);
-    assert_eq!(kept.grid_cache_mb, 456);
-    assert_eq!(kept.message_cache_mb, 0);
+    assert_eq!(kept.grid_cache_mb, Some(CacheSize::Mib(456)));
+    assert_eq!(kept.effective_message_cache_mb(), 0);
     engine.apply_cache_sizes(&kept);
     assert_eq!(engine.grid_cache_metrics().capacity_bytes, 456 * MIB);
     // A pin wins.
     let pinned_grid = config("grid_cache_mb = 512\n");
-    assert_eq!(plan_kept_grib(&pinned_grid, &engine).grid_cache_mb, 512);
+    assert_eq!(
+        plan_kept_grib(&pinned_grid, &engine).effective_grid_cache_mb(),
+        512
+    );
     // Built off, the message cache stays off; and the grid cache stops
     // where its hot share still holds a 0.1° fill.
     assert_eq!(engine.resize_message_cache(64 * MIB), 0);
@@ -1322,7 +1356,7 @@ fn a_reused_grib_engine_keeps_the_plans_sizes() {
     assert_eq!(engine.resize_point_index_cache(64 * MIB), 64 * MIB);
     assert_eq!(
         plan_kept_grib(&grib, &engine).point_index_cache_mb,
-        Some(64)
+        Some(CacheSize::Mib(64))
     );
     assert_eq!(engine.resize_point_index_cache(16 * MIB), 16 * MIB);
 }
@@ -1472,4 +1506,209 @@ fn an_unparsable_cache_variable_pins_and_warns() {
         ]
     );
     assert!(plan::grant::pinned(&rows[0].entry.source));
+}
+
+/// #1313 acceptance: `[memory.caches]` sizes the process-wide caches and
+/// budgets, over their variables and `[server]` aliases, and the plan
+/// report names the key as the source; a `{ min, max }` key shows as the
+/// floor and ceiling, the size in report mode the default clamped into
+/// them, the plan's in auto, never outside. A reload that changes a key
+/// resizes its cache in place, one that removes it gives back what the
+/// variable or default says, and an unknown key rejects the reload.
+///
+/// Runs in a child process: the process-wide caches must be built after
+/// this test's config, and `MC_PVOL_PIXEL_CACHE_MB` set first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_caches_size_the_process_wide_caches_and_a_reload_resizes_them_in_place() {
+    const CHILD: &str = "MC_TEST_MEMORY_CACHES_CHILD";
+    const NAME: &str = "cache_plan::tests::\
+                        memory_caches_size_the_process_wide_caches_and_a_reload_resizes_them_in_place";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, "1")
+            .env("MC_PVOL_PIXEL_CACHE_MB", "2048")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{NAME} failed in its child process");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let radar = format!(
+        "[[collections]]\nid = \"radar\"\ntitle = \"t\"\ndescription = \"d\"\n\
+         engine_type = \"geotiff\"\ndata_path = {:?}\napis = [\"wms\", \"edr\"]\n\
+         [collections.geotiff]\nfilename_template = \"radar_%Y%m%dT%H%MZ.tif\"\n\
+         parameter = \"reflectivity\"\nunit = \"dBZ\"\n",
+        testdata("radar").to_str().unwrap()
+    );
+    let write = |memory: &str, caches: &str| {
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\nmetatile_cache_mb = 2048\n\
+                 [memory]\n{memory}[memory.caches]\n{caches}{radar}"
+            ),
+        )
+        .unwrap();
+    };
+    write(
+        "",
+        "metatile = 3072\npvol_pixel = 512\nrender_budget = 768\nstation_frame = 48\n\
+         geotiff_decoded_chunk = { min = 600, max = 1200 }\n",
+    );
+    let state = crate::watcher::tests::build_state(&config_path);
+    // Built only with a PVOL collection, which this config has none of:
+    // built now, after the config, it takes its key's size.
+    engine_odim::pixel_cache_metrics();
+    let boot = log(&state, Occasion::Boot);
+    let sized = |id: &str| {
+        let rows = snapshot(&state);
+        let row = rows
+            .iter()
+            .find(|r| r.entry.id == id)
+            .unwrap_or_else(|| panic!("{id} is not in the plan"));
+        (row.usage.capacity_bytes / MIB, row.source().to_string())
+    };
+    // The key wins over the `[server]` alias and the variable, and is the
+    // source the report names.
+    assert_eq!(
+        sized("metatile_cache"),
+        (3072, "config:[memory.caches] metatile".into())
+    );
+    assert_eq!(
+        sized("pvol_pixel_cache"),
+        (512, "config:[memory.caches] pvol_pixel".into())
+    );
+    assert_eq!(
+        sized("render_budget"),
+        (768, "config:[memory.caches] render_budget".into())
+    );
+    assert_eq!(
+        sized("station_frame_cache"),
+        (48, "config:[memory.caches] station_frame".into())
+    );
+    // A range: the default, 512 MiB, clamped into it, its floor and
+    // ceiling in the endpoint and the log block, its grant within them.
+    assert_eq!(
+        sized("geotiff_decoded_chunk_cache"),
+        (600, "bounds:[memory.caches] geotiff_decoded_chunk".into())
+    );
+    let rows = snapshot(&state);
+    let memory = crate::admin::refresh_metrics(&state);
+    let document = to_json(&rows, &memory, Some(&boot));
+    let chunks = document["caches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "geotiff_decoded_chunk_cache")
+        .unwrap();
+    assert_eq!(chunks["floor_bytes"], 600 * MIB);
+    assert_eq!(chunks["ceiling_bytes"], 1200 * MIB);
+    let metatile = document["caches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "metatile_cache")
+        .unwrap();
+    assert_eq!(metatile["source"], "config:[memory.caches] metatile");
+    assert_eq!(metatile["floor_bytes"], Value::Null);
+    let block = render(&rows, "at boot", None, Some(&boot));
+    assert!(
+        block.contains(
+            "bounds:[memory.caches] geotiff_decoded_chunk (floor 600 MiB, ceiling 1200 MiB)"
+        ),
+        "{block}"
+    );
+    let chunks_entry = Entry::cache(
+        "geotiff_decoded_chunk_cache",
+        Scope::Engine("geotiff"),
+        SizeSource::Default,
+    );
+    let grant = boot
+        .plan
+        .as_ref()
+        .unwrap()
+        .grant(&chunks_entry)
+        .unwrap()
+        .bytes;
+    assert!((600 * MIB..=1200 * MIB).contains(&grant), "{}", mib(grant));
+
+    // A reload that changes the keys resizes in place: the meta-tile cache
+    // keeps its warm tiles; the pixel cache is back at its variable's size
+    // and the frame cache at its default, their keys removed.
+    let tiles = state.wms.load().tile_cache.clone();
+    tiles.fill_for_test("radar", 64);
+    let held = tiles.weight();
+    write(
+        "",
+        "metatile = 4096\nrender_budget = 512\n\
+         geotiff_decoded_chunk = { min = 700, max = 1100 }\n",
+    );
+    crate::admin::do_reload(&state).unwrap();
+    assert!(
+        Arc::ptr_eq(&tiles, &state.wms.load().tile_cache),
+        "in place"
+    );
+    assert_eq!(tiles.weight(), held, "its tiles kept");
+    assert_eq!(
+        sized("metatile_cache"),
+        (4096, "config:[memory.caches] metatile".into())
+    );
+    assert_eq!(
+        sized("pvol_pixel_cache"),
+        (2048, "env:MC_PVOL_PIXEL_CACHE_MB".into())
+    );
+    assert_eq!(
+        sized("render_budget"),
+        (512, "config:[memory.caches] render_budget".into())
+    );
+    assert_eq!(ds_executor::budget::RENDER_MEMORY.capacity(), 512 * MIB);
+    assert_eq!(sized("station_frame_cache"), (32, "default".into()));
+    assert_eq!(
+        ds_render::station_symbols::station_frame_cache_metrics().capacity_bytes,
+        32 * MIB
+    );
+    assert_eq!(
+        sized("geotiff_decoded_chunk_cache"),
+        (700, "bounds:[memory.caches] geotiff_decoded_chunk".into())
+    );
+
+    // In auto, a range is the plan's to size: the meta-tile cache, which
+    // the plan would grow past 2 GiB at this total, stops at its ceiling.
+    write(
+        "mode = \"auto\"\ntotal_mb = 8192\n",
+        "metatile = { min = 512, max = 1536 }\n",
+    );
+    crate::admin::do_reload(&state).unwrap();
+    let auto = memory_plan::last().unwrap();
+    let entry = Entry::cache("metatile_cache", Scope::Process, SizeSource::Default);
+    let ideal = auto.ideal.as_ref().unwrap().grant(&entry).unwrap();
+    assert_eq!(ideal.bytes, 1536 * MIB, "{}", ideal.reason);
+    assert_eq!(sized("metatile_cache"), (1536, "plan:auto".into()));
+    let rows = snapshot(&state);
+    let row = rows
+        .iter()
+        .find(|r| r.entry.id == "metatile_cache")
+        .unwrap();
+    assert_eq!(
+        row.configured_bytes,
+        1024 * MIB,
+        "the default, within the range"
+    );
+    assert_eq!(
+        row.entry.source.bounds(),
+        Some(plan::Bounds::mib(512, 1536))
+    );
+
+    // An unknown key rejects the reload, naming it.
+    write("", "metatil = 1\n");
+    let Err(crate::admin::ReloadError::ConfigRead(error)) = crate::admin::do_reload(&state) else {
+        panic!("the reload was not rejected");
+    };
+    assert!(
+        error.contains("unknown key metatil; the keys are"),
+        "{error}"
+    );
+    assert_eq!(sized("metatile_cache").0, 1536, "the live state kept");
 }

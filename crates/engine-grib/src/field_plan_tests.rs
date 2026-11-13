@@ -68,8 +68,8 @@ fn engine_on(
     store: Option<Arc<TestStore>>,
 ) -> GribEngine {
     let mut config = source.config();
-    config.grid_cache_mb = 0;
-    config.message_cache_mb = message_cache_mb;
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
+    config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(message_cache_mb));
     config.level_types = Some(vec![GribLevelType::Pressure]);
     config.parameters = Some(vec!["TMP".into(), "RH".into()]);
     let mut owner = GribEngine::new("fields", &config).unwrap();

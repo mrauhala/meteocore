@@ -534,7 +534,7 @@ fn forecast_uses_latest_run_with_lead_as_time() {
         zarr_version: Some(3),
         parameters: None,
         poll_interval_secs: 300,
-        cache_mb: 16,
+        cache_mb: Some(ds_core::config::CacheSize::Mib(16)),
         icechunk: None,
     };
     let e = ZarrEngine::new("fc", &cfg).expect("open forecast store");
@@ -738,7 +738,7 @@ fn config(parameters: Option<Vec<String>>) -> ZarrConfig {
         zarr_version: Some(3),
         parameters,
         poll_interval_secs: 300,
-        cache_mb: 256,
+        cache_mb: Some(ds_core::config::CacheSize::Mib(256)),
         icechunk: None,
     }
 }

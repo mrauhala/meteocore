@@ -45,7 +45,7 @@ available.
   Europe's (EPSG:3035) parameters, else its WKT2. The engine never claims a
   `storageCrs`. Decoded
   grids live in one byte-bounded LRU shared by all composite collections
-  (`MC_ODIM_COMPOSITE_CACHE_MB`, default 2048, `0` disables).
+  (`[memory.caches] odim_composite`, default 2048, `0` disables).
 - **Polar volumes (`PolarVolumeEngine`).** One source holds a radar
   network. The scan parses every `.h5` file's metadata (site, sweeps,
   moments) and groups volumes by the radar's ODIM node id (`NOD`). The
@@ -54,7 +54,7 @@ available.
   source parses only the newest volume per radar; the first poll fills in
   the rest of the window.
 - **Lazy polar pixels.** Pixel arrays are decoded per moment on first use
-  into a shared byte-bounded cache (`MC_PVOL_PIXEL_CACHE_MB`, default
+  into a shared byte-bounded cache (`[memory.caches] pvol_pixel`, default
   1024). Each scan pre-decodes the default quantity, or the
   `prewarm_quantities`, of the lowest `prewarm_sweeps` sweeps of every
   volume it reads, so the first map of a new volume is a cache hit. The
@@ -75,7 +75,7 @@ available.
   cache, at most four reads at once: the retry finds them there, or joins
   the download still running, instead of starting it again.
 - **EDR read memory.** The volumes an EDR query (or a WMS GetFeatureInfo)
-  reads are admitted by one process-wide budget, `MC_PVOL_READ_MEMORY_MB`
+  reads are admitted by one process-wide budget, `[memory.caches] pvol_read`
   (default 1024). Before a volume's file is read, the query reserves the
   bytes it fetches until they are decoded, and the moments it decodes, at
   four bytes a sample, until it moves on to the next volume; moments
@@ -156,8 +156,8 @@ available.
   × azimuth × height up to 20 km); the caller picks its size, at most 32 M
   cells. Clear air is filled at −32 dBZ and unobserved cells are NaN. A
   volume without echoes is a 404. Grids and cell sets are cached
-  (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512;
-  `MC_PVOL_CELL_SET_CACHE_MB`, default 64).
+  (`[memory.caches] pvol_voxel_grid`, default 512;
+  `[memory.caches] pvol_cell_set`, default 64).
 - **Site inventory** (`FeatureEngine`, with `features` in `apis`, under
   the base id `{id}`): one Point feature per radar at its antenna, id =
   `NOD`, with `nod`, `name`, `wmo`, `longitude`, `latitude`,
@@ -221,7 +221,7 @@ max_files = 24
 | `cadence_secs` | — | `odim`, template | Spacing of probed timestamps; required in template mode |
 | `resampling` | `"nearest"` | `odim-volume` | Map render: `"nearest"` or `"bilinear"` (EDR and 3D Tiles always use nearest) |
 | `prewarm_sweeps` | `1` | `odim-volume` | Lowest sweeps pre-decoded per volume; `0` disables |
-| `prewarm_quantities` | default quantity | `odim-volume` | Quantities pre-decoded at those sweeps, e.g. `["DBZH", "VRADH"]`; one a volume lacks is skipped. `/admin/cache-plan` reports the floor this puts on `MC_PVOL_PIXEL_CACHE_MB`, twice the pre-warm set, and a WARN names it when the cache is below |
+| `prewarm_quantities` | default quantity | `odim-volume` | Quantities pre-decoded at those sweeps, e.g. `["DBZH", "VRADH"]`; one a volume lacks is skipped. `/admin/cache-plan` reports the floor this puts on `[memory.caches] pvol_pixel`, twice the pre-warm set, and a WARN names it when the cache is below |
 
 Example collections in `collections.d/`: `radar-eu-composite-dbzh-s3-h5`
 (public S3 bucket), `radar-de-composite-dbzh-http-h5` (HTTP template

@@ -111,9 +111,9 @@ async fn fixture_with_codecs(
 
 fn config(dir: &std::path::Path) -> ZarrConfig {
     let mut config = ZarrConfig::auto_local(dir.to_string_lossy().into_owned());
-    config.cache_mb = 4;
+    config.cache_mb = Some(ds_core::config::CacheSize::Mib(4));
     config.icechunk = Some(IcechunkConfig {
-        decoded_cache_mb: 0,
+        decoded_cache_mb: Some(ds_core::config::CacheSize::Mib(0)),
         branch: Some("main".into()),
         tag: None,
         snapshot: None,
@@ -143,7 +143,8 @@ async fn blosc_maps_reject_oversized_inner_frames_and_recover_after_refresh() {
         .into_iter()
         .map(|decoded_mb| {
             let mut config = config(dir.path());
-            config.icechunk.as_mut().unwrap().decoded_cache_mb = decoded_mb;
+            config.icechunk.as_mut().unwrap().decoded_cache_mb =
+                Some(ds_core::config::CacheSize::Mib(decoded_mb));
             let engine = ZarrEngine::new("blosc", &config).unwrap();
             for _ in 0..2 {
                 assert!(render(&engine)
@@ -298,7 +299,7 @@ async fn cache_override_preserves_persisted_repository_settings() {
 
         for cache_mb in [0, 4] {
             let mut config = config(dir.path());
-            config.cache_mb = cache_mb;
+            config.cache_mb = Some(ds_core::config::CacheSize::Mib(cache_mb));
             let source = Source::open("config-merge", &config).unwrap();
             let mut expected = original.clone();
             // The payload cache is the meter's; Icechunk's own keeps nothing.
@@ -322,7 +323,7 @@ async fn payload_cache_obeys_budget_and_zero_disables_retention() {
         fixture(dir.path()).await;
         let mut config = config(dir.path());
         if !enabled {
-            config.cache_mb = 0;
+            config.cache_mb = Some(ds_core::config::CacheSize::Mib(0));
         }
         let engine = ZarrEngine::new("cache", &config).unwrap();
         assert!(render(&engine)
@@ -350,7 +351,7 @@ async fn encoded_full_and_range_reads_reserve_before_external_payload_io() {
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path()).await;
     let mut config = config(dir.path());
-    config.cache_mb = 0;
+    config.cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     let source = Source::open("encoded", &config).unwrap();
     let store = source.snapshot(None).unwrap().unwrap();
     let key = StoreKey::new("temp/c/0/0/0").unwrap();
@@ -431,7 +432,7 @@ async fn decoded_cache_hits_need_no_encoded_reservation_and_misses_keep_typed_er
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path()).await;
     let mut config = config(dir.path());
-    config.cache_mb = 0;
+    config.cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     let source = Source::open("encoded", &config).unwrap();
     let store = source.snapshot(None).unwrap().unwrap();
     let array = Array::open(store.clone(), "/temp").unwrap();
@@ -503,7 +504,7 @@ async fn cold_shards_keep_encoded_and_blosc_scratch_headroom_under_tight_budgets
         let dir = tempfile::tempdir().unwrap();
         fixture_with_codec(dir.path(), codec).await;
         let mut config = config(dir.path());
-        config.cache_mb = 0;
+        config.cache_mb = Some(ds_core::config::CacheSize::Mib(0));
         let source = Source::open("headroom", &config).unwrap();
         let store = source.snapshot(None).unwrap().unwrap();
         let array =
@@ -578,7 +579,7 @@ async fn stacked_blosc_shards_fit_peak_scratch_headroom_with_cold_and_cached_pay
     let options = crate::catalog::single_threaded_opts();
     for cache_mb in [0, 4] {
         let mut config = config(dir.path());
-        config.cache_mb = cache_mb;
+        config.cache_mb = Some(ds_core::config::CacheSize::Mib(cache_mb));
         let source = Source::open("peak-scratch", &config).unwrap();
         let store = source.snapshot(None).unwrap().unwrap();
         let array =
@@ -668,10 +669,11 @@ async fn outer_compressed_shards_release_temporary_admission_between_chunks() {
     let options = crate::catalog::single_threaded_opts();
     for cache_mb in [0, 4] {
         let mut config = config(dir.path());
-        config.cache_mb = cache_mb;
+        config.cache_mb = Some(ds_core::config::CacheSize::Mib(cache_mb));
         // Even with decoded retention enabled, outer transforms use the serial
         // path and admit full stored chunks plus intermediate shard bodies.
-        config.icechunk.as_mut().unwrap().decoded_cache_mb = 1;
+        config.icechunk.as_mut().unwrap().decoded_cache_mb =
+            Some(ds_core::config::CacheSize::Mib(1));
         let open = || {
             let source = Source::open("scopes", &config).unwrap();
             let store = source.snapshot(None).unwrap().unwrap();
@@ -798,8 +800,9 @@ async fn concurrent_maps_read_icechunk_through_render_executor() {
     fixture(dir.path()).await;
     for (cache_mb, decoded_mb) in [(0, 0), (4, 0), (0, 4)] {
         let mut config = config(dir.path());
-        config.cache_mb = cache_mb;
-        config.icechunk.as_mut().unwrap().decoded_cache_mb = decoded_mb;
+        config.cache_mb = Some(ds_core::config::CacheSize::Mib(cache_mb));
+        config.icechunk.as_mut().unwrap().decoded_cache_mb =
+            Some(ds_core::config::CacheSize::Mib(decoded_mb));
         let engine = Arc::new(ZarrEngine::new("render-executor", &config).unwrap());
         let slots = Arc::new(tokio::sync::Semaphore::new(4));
         for _ in 0..3 {
@@ -868,8 +871,8 @@ async fn decoded_inner_chunks_reuse_other_leads_and_preserve_deadlines_without_p
     let dir = tempfile::tempdir().unwrap();
     fixture(dir.path()).await;
     let mut config = config(dir.path());
-    config.cache_mb = 0;
-    config.icechunk.as_mut().unwrap().decoded_cache_mb = 4;
+    config.cache_mb = Some(ds_core::config::CacheSize::Mib(0));
+    config.icechunk.as_mut().unwrap().decoded_cache_mb = Some(ds_core::config::CacheSize::Mib(4));
     let engine = ZarrEngine::new("decoded", &config).unwrap();
     render(&engine).unwrap();
     let metrics = engine.decoded_cache_metrics();
@@ -984,8 +987,8 @@ async fn polling_swaps_snapshots_preserves_old_readers_and_versions_render_conte
     let dir = tempfile::tempdir().unwrap();
     let repo = fixture(dir.path()).await;
     let mut config = config(dir.path());
-    config.cache_mb = 0;
-    config.icechunk.as_mut().unwrap().decoded_cache_mb = 4;
+    config.cache_mb = Some(ds_core::config::CacheSize::Mib(0));
+    config.icechunk.as_mut().unwrap().decoded_cache_mb = Some(ds_core::config::CacheSize::Mib(4));
     let engine = ZarrEngine::new("refresh", &config).unwrap();
     render(&engine).unwrap();
     let old = engine.catalog.load_full();
@@ -1103,9 +1106,9 @@ fn public_aifs_config() -> ZarrConfig {
         zarr_version: None,
         parameters: Some(vec!["temperature_2m".into()]),
         poll_interval_secs: 300,
-        cache_mb: 0,
+        cache_mb: Some(ds_core::config::CacheSize::Mib(0)),
         icechunk: Some(IcechunkConfig {
-            decoded_cache_mb: 0,
+            decoded_cache_mb: Some(ds_core::config::CacheSize::Mib(0)),
             branch: Some("main".into()),
             tag: None,
             snapshot: None,
@@ -1124,8 +1127,9 @@ async fn map_cache_latency_probe() {
     let mut config = public_aifs_config();
     let mut baseline = Vec::new();
     for (cache_mb, decoded_mb) in [(0, 0), (256, 0), (256, 256)] {
-        config.cache_mb = cache_mb;
-        config.icechunk.as_mut().unwrap().decoded_cache_mb = decoded_mb;
+        config.cache_mb = Some(ds_core::config::CacheSize::Mib(cache_mb));
+        config.icechunk.as_mut().unwrap().decoded_cache_mb =
+            Some(ds_core::config::CacheSize::Mib(decoded_mb));
         let engine = ZarrEngine::new("cache-probe", &config).unwrap();
         let cat = engine.catalog.load_full();
         let ic = config.icechunk.as_mut().unwrap();

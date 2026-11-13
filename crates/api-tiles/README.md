@@ -197,7 +197,7 @@ colormap = "radar_dbz"        # the `default` style
 | `[server] render_concurrency` | 2 × CPUs, min 8 | Render slots shared with WMS and Maps |
 | `[server] rendered_cache_mb` | 256 | Rendered-image cache size, shared with WMS and Maps. Unset, the deprecated `[wms] rendered_cache_mb` sizes it: the largest value among the WMS, Maps and Tiles collections |
 | `MC_RENDER_TIMEOUT_MS` | 3000 | Queue and render deadline, MVT encoding included |
-| `MC_RENDER_MEMORY_MB` | 1024 | Output-memory budget for map renders |
+| `[memory.caches] render_budget` (deprecated: `MC_RENDER_MEMORY_MB`) | 1024 | Output-memory budget for map renders |
 
 Runnable examples: `collections.d/municipalities.toml` (GeoJSON, vector
 tiles) and `collections.d/zarr-era5-t2m-local.toml` (Zarr, map tiles).

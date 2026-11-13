@@ -133,7 +133,7 @@ fn windows_larger_than_the_cache_are_not_downloaded_in_a_loop() {
         "{warning}"
     );
     assert!(
-        warning.contains("set MC_SATELLITE_FRAME_CACHE_MB to 2 MiB or more"),
+        warning.contains("set [memory.caches] satellite_frame to 2 MiB or more"),
         "{warning}"
     );
     let a_window = a.frame_window();

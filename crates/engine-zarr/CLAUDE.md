@@ -130,7 +130,7 @@ pool: they do not use the Icechunk runtime bridge.
   weights sum to one, so this equals converting after sampling. Never convert
   a second time on a read path, and keep caches holding native values.
 - **Source memory admission:** `read_budget::BUDGET` is process-wide and
-  survives reload/snapshot changes (`MC_ZARR_READ_MEMORY_MB`, default 1024 MiB).
+  survives reload/snapshot changes (`[memory.caches] zarr_read`, default 1024 MiB).
   `read_budget` keeps the planning and deadline checks; the accounting is
   `ds_executor::budget::ByteBudget`, shared with engine-geotiff.
   Reserve before variable payload reads: native subset + typed conversion +

@@ -153,7 +153,7 @@ pub(crate) fn field_demand(
         CacheDemand::demand(
             DEMAND_FIELDS * field,
             FIELD_DEMAND_RULE,
-            "MC_NETCDF_FIELD_CACHE_MB",
+            "[memory.caches] netcdf_field",
         )
         .input("fields", DEMAND_FIELDS)
         .input("cells", cells)

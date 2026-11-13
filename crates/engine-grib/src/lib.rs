@@ -402,11 +402,11 @@ impl GribEngine {
         let source = &*self.source;
         fits(
             source.grid_cache.as_ref(),
-            config.grid_cache_mb,
+            config.effective_grid_cache_mb(),
             GridCache::resizes_in_place_to,
         ) && fits(
             source.message_cache.as_ref(),
-            config.message_cache_mb,
+            config.effective_message_cache_mb(),
             message_cache::MessageCache::resizes_in_place_to,
         ) && fits(
             source.point_index.as_ref(),
@@ -434,15 +434,18 @@ impl GribEngine {
             }
         };
         if let Some(cache) = &source.grid_cache {
-            resize("grid cache", cache.capacity(), config.grid_cache_mb, &|b| {
-                cache.resize(b)
-            });
+            resize(
+                "grid cache",
+                cache.capacity(),
+                config.effective_grid_cache_mb(),
+                &|b| cache.resize(b),
+            );
         }
         if let Some(cache) = &source.message_cache {
             resize(
                 "message cache",
                 cache.capacity_bytes(),
-                config.message_cache_mb,
+                config.effective_message_cache_mb(),
                 &|b| cache.resize(b),
             );
         }
@@ -634,8 +637,9 @@ impl GribEngine {
             )
         };
 
-        let grid_cache = GridCache::new(config.grid_cache_mb);
-        let mut message_cache = message_cache::MessageCache::new(config.message_cache_mb);
+        let grid_cache = GridCache::new(config.effective_grid_cache_mb());
+        let mut message_cache =
+            message_cache::MessageCache::new(config.effective_message_cache_mb());
         if config.prewarm {
             // Filled ahead of its reads: its churn reports say so (#1335).
             message_cache = message_cache.map(message_cache::MessageCache::prewarmed);

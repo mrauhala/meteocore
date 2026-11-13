@@ -379,8 +379,7 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   metrics plumbing (including single-flight `get_or_insert_with`, and
   `get_or_join`, which reads a resident value or joins a fill in flight
   without ever inserting: a reader that must not evict, #1297); call
-  sites keep their key type, weight fn, `MC_*_CACHE_MB` env var name and
-  defaults. A request-path fill that does I/O, which another request may
+  sites keep their key type, weight fn, size variable name and defaults. A request-path fill that does I/O, which another request may
   be waiting on, goes through `get_or_insert_with_until(key,
   ds_core::deadline::current(), ..)`: the wait ends at the request
   deadline with `DeadlineExceeded` and no fill starts past it (#1399).
@@ -412,7 +411,17 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   process-wide cache is built from `plan::env_bytes(VAR, default)` and
   `.registered(id, Scope::Engine(..), source)`; a `ByteBudget` or
   `RenderBudget` calls `.register`; per-collection caches are entered in
-  `server/src/cache_plan.rs`. `cache_plan::tests::
+  `server/src/cache_plan.rs`. Its size's one config home is a
+  `[memory.caches]` key (#1313): a new process-wide cache or budget adds
+  a row to `ds_cache::plan::keys::KEYS` (key = the `/metrics` family
+  without `_cache`, its plan id, its `MC_…_MB` variable), which
+  `env_size` then reads before the variable and `keys::set` resizes in
+  place on reload. `keys::tests::every_size_variable_has_a_key_and_every_
+  key_its_variable` fails when a `"MC_…_CACHE_MB"`/`"MC_…_MEMORY_MB"`
+  literal has no row. Per-collection size keys are `Option<CacheSize>`
+  (`ds_core::config::CacheSize`: MiB, or `{ min, max }`), read through the
+  config's `effective_*` accessors; never a bare `u64` with a serde
+  default, which cannot tell set from unset. `cache_plan::tests::
   every_cache_and_budget_on_metrics_is_in_the_plan` fails when a
   `*_cache_bytes` or `*_capacity_bytes` family has no entry: a new engine
   type adds its fixture collection there.
@@ -834,17 +843,17 @@ one never implies the other.
 |---|---|---|---|
 | `MAX_MAP_DIMENSION` / `MAX_MAP_PIXELS` (api-wms `params.rs`; `api_common::map_frame` for Maps and map tiles) | output px per side / `width × height` | 8000 / 64 M | 400 at validation (WMS `InvalidParameterValue`, Maps/Tiles `BadRequest`): "… must not exceed 8000" |
 | `api_tiles::params::TILE_SIZE` | output, a map tile's default (`width`/`height`/`scale-denominator` resize it within the caps above) | 256 × 256 | never |
-| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`); a WMS GetMap of several layers adds 4 B for the image below, once (`acquire_layered_raster`) | `MC_RENDER_MEMORY_MB`, 1024 MiB ⇒ 33 554 432 px; unset in `[memory] mode = "auto"`, the plan's 10 % of the total, 128 MiB–4 GiB (128 MiB ⇒ 4 194 304 px) | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
+| `ds_executor::budget::RENDER_MEMORY` | output px × 32 B, every WMS/Maps/Tiles cache miss; an RGB composite adds 16 B per band plane past the first (`acquire_raster_planes`); a WMS GetMap of several layers adds 4 B for the image below, once (`acquire_layered_raster`) | `[memory.caches] render_budget`, 1024 MiB ⇒ 33 554 432 px; unset in `[memory] mode = "auto"`, the plan's 10 % of the total, 128 MiB–4 GiB (128 MiB ⇒ 4 194 304 px) | 503 "Server busy, try again later" + `Retry-After: 1`: after queueing to the deadline, or at once if larger than the whole budget |
 | engine-period `max_pixels` (`geometry::MAX_CELLS` cap) | cells of a period collection's working grid, 6 B each per window | 40 M default (a 4963 × 7316 composite stays native, 218 MB per window), 64 M cap | never at serve time: past it the source grid is halved along the longer axis at load; outside 65 536..=64 M a load error |
 | `engine_geotiff::reader::MAX_MAP_PIXELS` | native source px of one full-resolution map read | 64 M | Maps/Tiles 400 "Invalid parameter: Map render source area N pixels exceeds maximum 64000000."; WMS red error tile, HTTP 200 `x-cache: ERROR` |
-| `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `MC_GEOTIFF_DECODE_MEMORY_MB`, 1024 MiB | 503 in every API |
-| engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `MC_ZARR_READ_MEMORY_MB`, 1024 MiB | 503 |
-| engine-netcdf `decode_budget::BUDGET` (a `ByteBudget`) | bytes of one field read in progress: 3 × decoded + 3 × compressed, the decoded chunk bounding the compressed one (~24 MB per MEPS field); cache waiters and hits reserve nothing; a remote fill detached from its request and a poll's prewarm reserve it too | `MC_NETCDF_READ_MEMORY_MB`, 1024 MiB | 503 |
-| engine-odim `read_budget::BUDGET` (a `ByteBudget`) | bytes a PVOL EDR walk (`walk_volumes`, GetFeatureInfo's position query included) holds per volume, reserved before its file is read: the bytes fetched (a read ahead's whole file, else the moments' byte ranges or the whole file) until decoded, and the moments decoded at 4 B/sample until the walk moves on; resident moments cost nothing; at most four volumes per walk; map, 3D Tiles and cell reads not counted | `MC_PVOL_READ_MEMORY_MB`, 1024 MiB: an all-quantity profile of a 41 MB FMI volume reserves ~196 MB, ~750 MB for a walk reading three ahead | 503 in EDR and GetFeatureInfo; a read ahead with no room is not started, not rejected |
+| `engine_geotiff::decode_budget::BUDGET` (a `ByteBudget`) | bytes per source tile fetched or decoded | `[memory.caches] geotiff_decode`, 1024 MiB | 503 in every API |
+| engine-zarr `read_budget::BUDGET` (over a `ByteBudget`) | bytes of native reads + conversion buffers | `[memory.caches] zarr_read`, 1024 MiB | 503 |
+| engine-netcdf `decode_budget::BUDGET` (a `ByteBudget`) | bytes of one field read in progress: 3 × decoded + 3 × compressed, the decoded chunk bounding the compressed one (~24 MB per MEPS field); cache waiters and hits reserve nothing; a remote fill detached from its request and a poll's prewarm reserve it too | `[memory.caches] netcdf_read`, 1024 MiB | 503 |
+| engine-odim `read_budget::BUDGET` (a `ByteBudget`) | bytes a PVOL EDR walk (`walk_volumes`, GetFeatureInfo's position query included) holds per volume, reserved before its file is read: the bytes fetched (a read ahead's whole file, else the moments' byte ranges or the whole file) until decoded, and the moments decoded at 4 B/sample until the walk moves on; resident moments cost nothing; at most four volumes per walk; map, 3D Tiles and cell reads not counted | `[memory.caches] pvol_read`, 1024 MiB: an all-quantity profile of a 41 MB FMI volume reserves ~196 MB, ~750 MB for a walk reading three ahead | 503 in EDR and GetFeatureInfo; a read ahead with no room is not started, not rejected |
 | engine-netcdf `edr::QUERY_BYTES` | decoded bytes of the reads one EDR query plans (`edr::Job::bytes`), from the file metadata: a whole field `FieldRead::decoded_bytes` (4.06 MB for MEPS), an OPeNDAP window its cells × the stored levels of its hyperslab × 4 B; only fields read count (a trajectory each (step, level) its plan reads, a cube the levels its z positions take, a per-step amount's steps before) | `MC_NETCDF_EDR_QUERY_MB`, 544 MiB: read whole, one parameter over one MEPS run (67 leads) as the client sees it, including a derived wind speed, which reads both components (134 fields); not three variables over a run, nor one over a run at all 13 MEPS pressure levels (871 fields). OPeNDAP windows hardly count | 400 "Query too large: Query would decode N fields …", before any read |
 | engine-netcdf `edr::QUERY_FIELD_READS` | reads one EDR query plans, any access: a field of one level is one read, an OPeNDAP request one, holding the windows of a step's variables, each over every level asked, up to `edr::MAX_REQUEST_PLANES` (16) planes | `MC_NETCDF_EDR_QUERY_READS`, 200: through OPeNDAP a six-variable surface meteogram over a MEPS run is 67, one variable at all 13 levels 67, a derived wind speed at all 13 134, three variables at all 13 201 (refused); ≤ 0.55 s per request of ≤ 16 planes (0.25 s + 0.016 s per plane, measured), four at once, ~27 s inside the 30 s deadline. Read whole, `QUERY_BYTES` binds first (140 MEPS fields) | 400 "Query too large: Query would make N field reads …", before any read |
 | `ds_core::feature::MAX_AREA_VALUES` | EDR area output values per response (timesteps × cells × parameters) | 1 M | engines on `QueryPolygon::fit_grid` (ODIM, QueryData, Satellite, Zarr, NetCDF, station grids): coarsened evenly to fit, the domain's `meteocore:resolution` member saying so; 400 "Query too large: …" only when one cell cannot fit. GRIB, GeoTIFF: 400 |
-| api-edr `response_budget` (a `ByteBudget`) | bytes of every EDR response body in memory, each buffer charged before it is allocated and until the body is delivered or dropped: CoverageJSON (serialised straight into it), EDR GeoJSON, CSV (its counted size), an HTML data page (its estimate, before it renders) and `/locations`; not PNG plots, `items`, metadata, the engine result or the HTML page's `Value` document | `MC_EDR_RESPONSE_MEMORY_MB`, 512 MiB; `/locations` also `MC_EDR_LOCATIONS_MAX_BYTES`, 16 MiB per body | 503 `ServerBusy` + `Retry-After: 1` at once; a `/locations` body over its cap 503 `ResponseLimit` |
+| api-edr `response_budget` (a `ByteBudget`) | bytes of every EDR response body in memory, each buffer charged before it is allocated and until the body is delivered or dropped: CoverageJSON (serialised straight into it), EDR GeoJSON, CSV (its counted size), an HTML data page (its estimate, before it renders) and `/locations`; not PNG plots, `items`, metadata, the engine result or the HTML page's `Value` document | `[memory.caches] edr_response`, 512 MiB; `/locations` also `MC_EDR_LOCATIONS_MAX_BYTES`, 16 MiB per body | 503 `ServerBusy` + `Retry-After: 1` at once; a `/locations` body over its cap 503 `ResponseLimit` |
 | `engine_geotiff::STAC_REQUEST_MAX_COLD_ITEMS` | STAC items whose header one EDR query reads (items in its window with no metadata yet; without `datetime`, in the whole catalog) | 400 (a closed day of 5-minute frames is 289) | 400 "Query too large: …", counted from the STAC response before it is installed or anything loads (#889) |
 | EDR `f=png` plot, WMS `GetLegendGraphic` | output px | 160–2000 × 120–2000 / ≤ 512 × 1024 | never: clamped silently |
 
@@ -856,7 +865,7 @@ one never implies the other.
   batch probe (`try_reserve`) or background reservation
   (`try_reserve_background`, at most half the budget) is not a counted
   rejection.
-- At the default `MC_RENDER_MEMORY_MB` the API caps' full 64 M px is
+- At the default `[memory.caches] render_budget` the API caps' full 64 M px is
   unreachable: anything over 33 554 432 output px (e.g. 5793 × 5793) is a 503
   on every retry. To serve larger images, raise the budget (README "Sizing
   render memory"). In `[memory] mode = "auto"` the plan sizes it unless the
@@ -1097,7 +1106,7 @@ one never implies the other.
   frame window, `LatestValues`, `MAX_FRAME_ROWS`) and
   `ds_render::station_symbols` (overlap order around the server-handed
   midpoint, `draw_markers` projecting per station, `NODATA_MARKER` for
-  `SymbolColorMap`, the shared `MC_STATION_FRAME_CACHE_MB` frame cache keyed
+  `SymbolColorMap`, the shared `[memory.caches] station_frame` frame cache keyed
   by a `next_frame_source()` id, `StationLayers` for in-memory engines).
   The server wires them with `admin::station_map_wiring`. Never fork it per
   engine.
@@ -1242,7 +1251,7 @@ one never implies the other.
 | Satellite | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius) — geostationary imagery (GOES-R ABI NetCDF-4, Himawari-9 ISatSS tiles, GK2A AMI L1B and NOAA's hourly GMGSI global mosaic on AWS, or a local mirror); one parameter per band/product, each with its own time axis (`parameter_times`, `get_parameter_available_times`, #819). GMGSI serves 8-bit display counts (unit `"1"`) on a spherical-Mercator grid recognised from its 2-D lat/lon; RGB composites (`[[satellite.composites]]`) are layers of their own (`MapEngine::composites`), not parameters: WMS child layer `coll/<composite>`, Maps/Tiles `parameter-name=<composite>`, channel-list legend; EDR skips them |
 | NetCDF | `MapEngine` + `EdrEngine` | WMS, Maps, Tiles, EDR (position, area, radius, trajectory incl. LINESTRING Z/M/ZM, cube) — CF-NetCDF gridded fields (MEPS per-lead files first) from a local directory, or read in place by HTTP range from a server found by template probing (thredds.met.no's fileServer: ≤ 8 requests per host, metadata blocks, compressed chunks, cold fills detached from the 3 s deadline); one layer per variable on one grid (1-D lat/lon, projected x/y with a CF `grid_mapping`, or a curvilinear grid of 2-D lat/lon placed by an inverse lookup over its nodes, #1174); runs from `forecast_reference_time` (`reference_times`, newest covering run, pinned runs never fall back); single-level fields, or fields on one pressure axis (`RasterInfo.vertical`: hPa, bottom first; WMS `ELEVATION`, Maps/Tiles `elevation`, EDR `z`; a map without one draws the bottom level, EDR without `z` reads every level; the MEPS `pl` family is a collection of its own). EDR samples each point, area or cube cell, or trajectory sample as the map draws it (one projection per point; CRS84 area and cube grids, a cube's native cells never coarsened), runs as instances, GetFeatureInfo through position at the level drawn; a query decodes at most `MC_NETCDF_EDR_QUERY_MB` and makes at most `MC_NETCDF_EDR_QUERY_READS` reads, both counted from its read plan before any read (a whole field its size, an OPeNDAP window its cells; a trajectory or cube counts only the fields it reads); through OPeNDAP a query reads only the windows it samples, a step's variables and levels in one request of up to 16 planes; derived wind speed and direction from CF `x_wind`/`y_wind`, per pressure level (direction turned to true north by the Lambert grid's convergence); derived geopotential height from CF `geopotential`, `geopotential_pl` → `geopotential_height_pl` per level (#948); derived dew point and relative humidity from CF ingredients, `air_temperature_pl` + `relative_humidity_pl` → `dew_point_temperature_pl` per level, specific humidity on the pressure axis (#898); per-step amounts of run-start `_acc` accumulations in mm, e.g. `precipitation_amount` (#1165); values and units in display units from CF `units` and `standard_name` through `ds_core::units::cf_display_conversion` (°C, hPa, mm, % for a CF fraction in unit 1; geopotential as stored in m² s⁻²; #1209, #948) |
 | BUFR | `EdrEngine` + `FeatureEngine` + `MapEngine` | EDR (locations, position, area, radius) over decoded SYNOP/SHIP station reports (in-memory, `retention` window); Features (station inventory: Point + last_report/report_count); WMS/Maps/Tiles station symbol layers when opted in (`[bufr.map]`, or any map API in `apis`; #1204), `content_version` = the metadata snapshot version. Sources: polled `data_path` or a WIS2 subscription (`[bufr.wis2]`; its store persists across restarts with `[server] state_dir`) |
-| Station grid | `MapEngine` + `EdrEngine` + `FeatureEngine` (derived: wraps a CSV, BUFR or PostGIS stations collection's `EdrEngine`) | WMS, Maps, Tiles (one layer per parameter), EDR (position, area, radius, cube without `z`) — one time slice of the source's observations (latest per station within `max_age`, one area query) interpolated by IDW, ADW or nearest onto a CRS84 analysis grid (#1082); great-circle neighbours via a 3-D k-d tree (seam and poles); grids cached per (parameter, time, revision of its input) in `MC_STATION_GRID_CACHE_MB`, computed on a dedicated pool under the request deadline (503, never partial); `cadence` axis, or the source's `observation_instants` (CSV, BUFR; #1206); content_version moves with revised input fingerprints, which the poll re-checks for the latest `precompute` times and a bounded round-robin of older cached ones; EDR samples the grid the maps draw; Features (`features` in `apis`) — each station's leave-one-out residual per parameter and analysis time, computed with the grid and cached with it; `/items` never waits (a cold analysis is a 503 with `Retry-After`), no EDR `items`; optional lapse-rate correction over a terrain collection (`elevation_source`, −6.5 K/km by default only for a source-identified air temperature), a land/sea mask collection (`land_mask_source`, nodata outside in maps and EDR) and `exclude_where` station exclusions, the terrain and mask sampled once per engine by the poll (no analysis time until then) (#1206) |
+| Station grid | `MapEngine` + `EdrEngine` + `FeatureEngine` (derived: wraps a CSV, BUFR or PostGIS stations collection's `EdrEngine`) | WMS, Maps, Tiles (one layer per parameter), EDR (position, area, radius, cube without `z`) — one time slice of the source's observations (latest per station within `max_age`, one area query) interpolated by IDW, ADW or nearest onto a CRS84 analysis grid (#1082); great-circle neighbours via a 3-D k-d tree (seam and poles); grids cached per (parameter, time, revision of its input) in `[memory.caches] station_grid`, computed on a dedicated pool under the request deadline (503, never partial); `cadence` axis, or the source's `observation_instants` (CSV, BUFR; #1206); content_version moves with revised input fingerprints, which the poll re-checks for the latest `precompute` times and a bounded round-robin of older cached ones; EDR samples the grid the maps draw; Features (`features` in `apis`) — each station's leave-one-out residual per parameter and analysis time, computed with the grid and cached with it; `/items` never waits (a cold analysis is a 503 with `Retry-After`), no EDR `items`; optional lapse-rate correction over a terrain collection (`elevation_source`, −6.5 K/km by default only for a source-identified air temperature), a land/sea mask collection (`land_mask_source`, nodata outside in maps and EDR) and `exclude_where` station exclusions, the terrain and mask sampled once per engine by the poll (no analysis time until then) (#1206) |
 | Period | `MapEngine` + `EdrEngine` (derived: wraps a gridded observation collection's `MapEngine`, a raster or a station grid; not an ODIM composite, whose undetect reads as nodata) | WMS, Maps, Tiles, EDR (position, area, radius) — rolling windows ending at the source's latest frame (#1379): `sum` (radar rain accumulation in mm through a Z–R relation, Marshall–Palmer by default, or a per-hour rate's amount), `mean`, `count_above`; one parameter per window plus `coverage_<window>`, each window its own time axis `[end]`, served only at or above `min_coverage`, latest end only (no past window ends in v1); per window one `f32` + `u16` grid (6 B/cell) on the source's native grid while it fits `max_pixels` (default 40 M), frames read in row strips of at most `read_strip_cells` (default 4 Mi) and folded in strip by strip (one strip held per poll, bit for bit as whole frames), the leaving frame read again and subtracted, re-summed every four window lengths; `content_version_for` per window moves with late frames and rebuilds |
 
 ## Config Format
@@ -1308,10 +1317,25 @@ rate_limit_per_min = 60     # PER BUCKET — authenticated requests and failed
 # Optional: the memory this server may use, in MiB (at least 256), which the
 # memory plan fits every cache and budget into (#1312). Top-level config.toml
 # only. Unset: 80 % of a cgroup limit, else min(50 % of MemTotal, 80 % of
-# MemAvailable at boot), with a WARN. For now a report (/admin/cache-plan
-# planned_bytes, cache_planned_bytes): nothing is resized.
+# MemAvailable at boot), with a WARN. mode = "report" (default) only shows
+# the plan (/admin/cache-plan planned_bytes, cache_planned_bytes); "auto"
+# resizes what no setting pins.
 [memory]
 total_mb = 28672
+# mode = "auto"
+
+# Optional: the one home for process-wide cache and budget sizes (#1313),
+# one key per /metrics family without `_cache` (keys:
+# ds_cache::plan::keys::KEYS). A number of MiB pins it; { min, max } leaves
+# it to the plan within a floor and a ceiling. Wins over its MC_…_MB
+# variable (deprecated since 0.16.0, ignored from 0.18.0) and its [server]
+# alias (one WARN). Unknown key = LOAD
+# ERROR; per-collection files may not set it. A reload resizes in place.
+# Per-collection size keys ([grib] grid_cache_mb, …) take the same forms.
+[memory.caches]
+metatile = 8192
+pvol_pixel = { min = 2048, max = 8192 }
+render_budget = 4096
 
 # Optional named colormaps. Like [[style_bundles]], MUST live in top-level
 # config.toml (rejected in per-collection files). Registered next to the
@@ -1709,9 +1733,10 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   patterns, never raw URLs (cardinality explosion).
 - **Memory plan:** `GET /admin/cache-plan` (behind `ADMIN_TOKEN`) lists
   every cache and budget with its size and size source, the same list the
-  INFO block at boot and after each accepted reload logs (#1306). Sizes
-  from a config key with a serde default are inferred by
-  `SizeSource::unless_default` until #1313 makes the keys `Option`.
+  INFO block at boot and after each accepted reload logs (#1306). A size
+  key set is its source, even at its default's value; `[memory.caches]`
+  keys read `config:[memory.caches] <key>`, a `{ min, max }` key
+  `bounds:<key>` with its `floor_bytes`/`ceiling_bytes` (#1313).
   Memory outside the caches is metered too (#1307): each in-memory store
   keeps an estimate of its heap through `ds_core::heap` (`HeapSize`),
   computed when it changes and read O(1) by `/metrics`; a new store adds its

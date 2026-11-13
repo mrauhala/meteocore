@@ -394,6 +394,13 @@ pub(crate) mod tests {
                 .expect("test config palette registry builds"),
         );
         let learned_records = Arc::new(ds_core::discovery::LearnedRecords::default());
+        // As `main` does: `[memory.caches]` before the collections load.
+        let cache_settings = crate::memory_caches::CacheSettings::of(&config).unwrap();
+        let memory = config.memory.clone().unwrap_or_default();
+        crate::memory_caches::apply(
+            &cache_settings,
+            crate::memory_plan::plans_sizes(memory.mode, memory.total_mb),
+        );
         let result = load_collections(
             &style_ctx,
             &config.collections,
@@ -401,8 +408,7 @@ pub(crate) mod tests {
             &config.server.base_url(),
             config.server.trust_proxy_headers,
             &config.discovery(learned_records.clone()),
-            config.server.metatile_cache_mb,
-            config.rendered_cache_mb().0,
+            crate::memory_caches::RenderCacheSizes::of(&config, &cache_settings),
             ReusableCaches::default(),
             EngineReuse::default(),
         );

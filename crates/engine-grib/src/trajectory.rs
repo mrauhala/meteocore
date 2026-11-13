@@ -223,7 +223,7 @@ mod tests {
 
     fn engine(source: &TestSource, family: Option<GribLevelType>) -> GribEngine {
         let mut config = source.config();
-        config.grid_cache_mb = 0; // one read per field without cache help
+        config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0)); // one read per field without cache help
         config.parameters = Some(vec!["TMP".into()]);
         config.level_types = family.map(|f| vec![f]);
         GribEngine::new("trajectory", &config).unwrap()

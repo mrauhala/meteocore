@@ -35,6 +35,12 @@
 //! whether its capacity is the plan's ([`SizeSource::Planned`]), and
 //! [`Row::least_bytes`], the least it can take in place now, which the
 //! plan never goes below when it is applied.
+//!
+//! `[memory.caches]` sizes the process-wide entries from the config
+//! ([`keys`], #1313): a cache built after the server read it is built at
+//! its key's size, one built before is resized in place, and each lists the
+//! key as its source. A key's `{ min, max }` form ([`SizeSource::Bounds`])
+//! bounds what the plan gives it.
 
 use std::any::Any;
 use std::collections::VecDeque;
@@ -47,6 +53,7 @@ use crate::{CacheMetrics, Churn, MIB};
 
 pub mod demand;
 pub mod grant;
+pub mod keys;
 pub use demand::{check_rows, CacheDemand, Demand, DemandSlot, Shortfall, DEMAND_FIELDS};
 
 /// A cache holds entries for reuse; a budget admits transient work.
@@ -111,20 +118,51 @@ impl Scope {
     }
 }
 
+/// A floor and a ceiling on the size the memory plan gives a cache or
+/// budget, in bytes (#1313): a `{ min = …, max = … }` value of
+/// `[memory.caches]` or of a per-collection size key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Bounds {
+    pub min_bytes: u64,
+    pub max_bytes: u64,
+}
+
+impl Bounds {
+    /// Bounds of `min` to `max` MiB.
+    pub fn mib(min: u64, max: u64) -> Self {
+        Bounds {
+            min_bytes: min.saturating_mul(MIB),
+            max_bytes: max.saturating_mul(MIB),
+        }
+    }
+
+    /// `bytes`, no lower than the floor nor higher than the ceiling.
+    pub fn clamp(&self, bytes: u64) -> u64 {
+        bytes.clamp(self.min_bytes, self.max_bytes.max(self.min_bytes))
+    }
+}
+
 /// Where a size came from, in the words `/admin/cache-plan` and the
 /// `cache_size_source` metric use: `default`, `env:MC_…`,
-/// `config:[server] …`, `collection:[grib] …`, `derived:[grib] …`,
-/// `constant` or `plan:auto`.
+/// `config:[memory.caches] …`, `config:[server] …`, `collection:[grib] …`,
+/// `bounds:[memory.caches] …`, `derived:[grib] …`, `constant` or
+/// `plan:auto`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SizeSource {
     /// The built-in default: nothing set this size.
     Default,
     /// An environment variable.
     Env(&'static str),
-    /// A server-wide config key, e.g. `[server] metatile_cache_mb`.
+    /// A server-wide config key: `[memory.caches] metatile`, or an alias of
+    /// one, `[server] metatile_cache_mb`.
     Config(&'static str),
     /// A collection's config key, e.g. `[grib] grid_cache_mb`.
     Collection(&'static str),
+    /// A config key's `{ min, max }`: `[memory.caches] pvol_pixel`, `[grib]
+    /// grid_cache_mb` (#1313). Not a pin: the memory plan sizes it, never
+    /// outside the bounds, and until it does the size is the default
+    /// clamped into them.
+    Bounds(&'static str, Bounds),
     /// Computed from another collection key's size, this one unset: the
     /// GRIB point-index cache from `[grib] message_cache_mb` (#1333).
     Derived(&'static str),
@@ -137,17 +175,11 @@ pub enum SizeSource {
 }
 
 impl SizeSource {
-    /// `source` when a config key's value differs from its built-in default,
-    /// else [`SizeSource::Default`]: the one place a size source is
-    /// inferred from a value. The keys it serves have serde defaults and
-    /// keep no record of having been set, so an explicit value equal to the
-    /// default reports as `default` until #1313 makes them `Option<u64>`;
-    /// then each caller names its key when it is `Some`, and this goes.
-    pub fn unless_default(value: u64, default: u64, source: SizeSource) -> SizeSource {
-        if value == default {
-            SizeSource::Default
-        } else {
-            source
+    /// The floor and ceiling of a [`SizeSource::Bounds`].
+    pub fn bounds(&self) -> Option<Bounds> {
+        match self {
+            SizeSource::Bounds(_, bounds) => Some(*bounds),
+            _ => None,
         }
     }
 }
@@ -159,6 +191,7 @@ impl fmt::Display for SizeSource {
             SizeSource::Env(var) => write!(f, "env:{var}"),
             SizeSource::Config(key) => write!(f, "config:{key}"),
             SizeSource::Collection(key) => write!(f, "collection:{key}"),
+            SizeSource::Bounds(key, _) => write!(f, "bounds:{key}"),
             SizeSource::Derived(key) => write!(f, "derived:{key}"),
             SizeSource::Constant => f.write_str("constant"),
             SizeSource::Planned => f.write_str("plan:auto"),
@@ -166,14 +199,21 @@ impl fmt::Display for SizeSource {
     }
 }
 
-/// A size in MB from the environment and where it came from: `var` when it
-/// is set to a whole number (trimmed), else `default_mb` and
+/// A size in MB and where it came from: the `[memory.caches]` key that
+/// replaces `var` when the config sets it ([`keys`], #1313), else `var`
+/// when it is set to a whole number (trimmed), else `default_mb` and
 /// [`SizeSource::Default`]. `0` conventionally disables a cache. A value
 /// set but not a whole number (`2G`) gives `default_mb`, as [`crate::env_mb`]
 /// does, but pins it ([`SizeSource::Env`]): the operator meant to size the
 /// cache, so the memory plan leaves it alone, and the server warns
 /// ([`env_unparsable`]).
 pub fn env_size(var: &'static str, default_mb: u64) -> (u64, SizeSource) {
+    keys::note_default(var, default_mb);
+    keys::configured(var, default_mb).unwrap_or_else(|| from_env(var, default_mb))
+}
+
+/// [`env_size`] from `var` alone.
+fn from_env(var: &'static str, default_mb: u64) -> (u64, SizeSource) {
     match crate::parse_env_mb(var) {
         Some(mb) => (mb, SizeSource::Env(var)),
         None if env_unparsable(var).is_some() => (default_mb, SizeSource::Env(var)),
@@ -521,6 +561,10 @@ struct Sizing {
     /// The capacity the plan gave it ([`apply`]), until the cache has
     /// another.
     planned: Option<u64>,
+    /// Where its size comes from since a `[memory.caches]` key set it, or
+    /// stopped setting it ([`configure`], #1313), when that is not the
+    /// source it was registered with.
+    source: Option<SizeSource>,
 }
 
 struct Registered {
@@ -661,6 +705,7 @@ fn insert<T: Send + Sync + 'static>(
             Arc::new(Mutex::new(Sizing {
                 configured: configured.unwrap_or(capacity),
                 planned: None,
+                source: None,
             })),
         ),
     };
@@ -731,6 +776,76 @@ pub fn restore(entry: &Entry) -> Option<u64> {
     Some(applied)
 }
 
+/// [`keys::set`] for the newest live process-wide registration of `key`'s
+/// entry: give it `source` and `configured_bytes`, the size its settings
+/// now give it, and with `resize`, that capacity in place when the change
+/// moves it. `set`: the key is set; unset, an entry no key ever set is left
+/// as it was registered. Returns what changed; `None` when nothing is
+/// registered as the key's entry, or nothing changed. A pin takes away the
+/// plan's mark ([`Row::planned`]).
+fn configure(
+    key: &keys::Key,
+    source: SizeSource,
+    configured_bytes: u64,
+    set: bool,
+    resize: bool,
+) -> Option<keys::Configured> {
+    let registered = {
+        let registry = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        registry
+            .iter()
+            .filter(|r| {
+                r.owner.strong_count() > 0
+                    && r.entry.kind == key.kind
+                    && r.entry.id == key.id
+                    && matches!(r.entry.scope, Scope::Process | Scope::Engine(_))
+            })
+            .max_by_key(|r| r.seq)
+            .cloned()?
+    };
+    let changed = {
+        let mut sizing = registered.sizing.lock().unwrap_or_else(|e| e.into_inner());
+        let current = sizing
+            .source
+            .clone()
+            .unwrap_or_else(|| registered.entry.source.clone());
+        let from_key = matches!(
+            &current,
+            SizeSource::Config(label) | SizeSource::Bounds(label, _) if *label == key.label
+        );
+        if !set && !from_key {
+            return None;
+        }
+        let changed = current != source || sizing.configured != configured_bytes;
+        sizing.source = (source != registered.entry.source).then(|| source.clone());
+        sizing.configured = configured_bytes;
+        if grant::pinned(&source) {
+            sizing.planned = None;
+        }
+        changed
+    };
+    // Read outside the lock: a cache's usage takes its own shard locks.
+    let capacity = (registered.read)()?.capacity_bytes;
+    let to = match &registered.resize {
+        Some(hook) if resize && changed && capacity != configured_bytes => {
+            let applied = (hook.to)(configured_bytes).unwrap_or(capacity);
+            let mut sizing = registered.sizing.lock().unwrap_or_else(|e| e.into_inner());
+            sizing.planned = None;
+            applied
+        }
+        _ => capacity,
+    };
+    changed.then(|| keys::Configured {
+        entry: Entry {
+            source,
+            ..registered.entry.clone()
+        },
+        from_bytes: capacity,
+        to_bytes: to,
+        configured_bytes,
+    })
+}
+
 /// Drop every entry of the cache `entry` names and keep its capacity
 /// ([`Resize::clear`]): for a cache no collection can reach. `false` when
 /// no live registration of it can be cleared.
@@ -764,8 +879,12 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
             let usage = (r.read)()?;
             // The plan's while the capacity is the one it applied: one
             // changed since, by a setting or a resize in progress, is not.
+            let mut entry = r.entry.clone();
             let (configured_bytes, planned) = {
                 let sizing = r.sizing.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(source) = &sizing.source {
+                    entry.source = source.clone();
+                }
                 (
                     sizing.configured,
                     sizing.planned == Some(usage.capacity_bytes),
@@ -787,7 +906,7 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
             Some((
                 r.seq,
                 Row {
-                    entry: r.entry.clone(),
+                    entry,
                     usage,
                     window,
                     demand,
@@ -1036,7 +1155,9 @@ mod tests {
             SizeSource::Default,
             SizeSource::Env("MC_PVOL_PIXEL_CACHE_MB"),
             SizeSource::Config("[server] metatile_cache_mb"),
+            SizeSource::Config("[memory.caches] metatile"),
             SizeSource::Collection("[grib] grid_cache_mb"),
+            SizeSource::Bounds("[memory.caches] pvol_pixel", Bounds::mib(2048, 8192)),
             SizeSource::Derived("[grib] message_cache_mb"),
             SizeSource::Constant,
             SizeSource::Planned,
@@ -1050,18 +1171,24 @@ mod tests {
                 "default",
                 "env:MC_PVOL_PIXEL_CACHE_MB",
                 "config:[server] metatile_cache_mb",
+                "config:[memory.caches] metatile",
                 "collection:[grib] grid_cache_mb",
+                "bounds:[memory.caches] pvol_pixel",
                 "derived:[grib] message_cache_mb",
                 "constant",
                 "plan:auto",
             ]
         );
-        let key = SizeSource::Collection("[grib] grid_cache_mb");
+        let bounds = Bounds::mib(64, 512);
+        assert_eq!(bounds.clamp(MIB), 64 * MIB);
+        assert_eq!(bounds.clamp(1024 * MIB), 512 * MIB);
+        assert_eq!(bounds.clamp(100 * MIB), 100 * MIB);
         assert_eq!(
-            SizeSource::unless_default(256, 256, key.clone()),
-            SizeSource::Default
+            SizeSource::Bounds("k", bounds).bounds(),
+            Some(bounds),
+            "bounds are data the plan reads"
         );
-        assert_eq!(SizeSource::unless_default(512, 256, key.clone()), key);
+        assert_eq!(SizeSource::Config("k").bounds(), None);
     }
 
     /// An hour of a cache of 1000 bytes: `hits`, `misses`, bytes admitted

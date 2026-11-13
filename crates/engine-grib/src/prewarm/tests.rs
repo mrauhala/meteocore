@@ -64,9 +64,9 @@ fn served(
     delay: Duration,
 ) -> (GribEngine, GribEngine, Arc<TestStore>) {
     let mut config = source.config();
-    config.message_cache_mb = message_mb;
-    config.point_index_cache_mb = Some(16);
-    config.grid_cache_mb = 0;
+    config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(message_mb));
+    config.point_index_cache_mb = Some(ds_core::config::CacheSize::Mib(16));
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     config.level_types = Some(vec![GribLevelType::Pressure]);
     let mut owner = GribEngine::new("prewarm", &config).unwrap();
     let store = Arc::new(TestStore {
@@ -424,7 +424,7 @@ fn a_derived_wind_query_prewarms_its_components() {
     };
     write(0);
     let mut config = source.config();
-    config.message_cache_mb = 1;
+    config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(1));
     let engine = Arc::new(GribEngine::new("gfs", &config).unwrap());
     let log: OutcomeLog = Arc::new(|_: &str, _: &PairOutcome| {});
     let wind = DerivedWind::new("gfs", engine.clone(), log);

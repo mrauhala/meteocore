@@ -375,7 +375,7 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   pace and `Retry-After` waits count against the deadline. Tests against
   a throttling `TestServer` use `ds_storage::test_util::quick_backoff`. `ds_storage::host_requests` reports the current
   limit, in flight and queued per host.
-- **Blocks** (`BLOCKS`, `MC_NETCDF_BLOCK_CACHE_MB`, default 64 MiB, floor
+- **Blocks** (`BLOCKS`, `[memory.caches] netcdf_block`, default 64 MiB, floor
   8): reads ≤ `Tuning::bypass_over` (256 KiB) come from 64 KiB blocks keyed
   by `FileId` (URL + version) and index, `approx_entry_bytes` 64 KiB. A
   read's missing blocks are claimed with zero-timeout guards and fetched
@@ -384,7 +384,7 @@ Read in place by HTTP range, never downloaded whole (decision 4).
   first 1 MiB in one GET before the reader parses it (MEPS keeps all its
   metadata there, measured). Keyed by identity, not ingest: a second open
   of the same version (reload, a closed file kept again) makes 0 GETs.
-- **Chunks** (`CHUNKS`, `MC_NETCDF_CHUNK_CACHE_MB`, default 512 MiB): reads
+- **Chunks** (`CHUNKS`, `[memory.caches] netcdf_chunk`, default 512 MiB): reads
   over 256 KiB, cached whole by (identity, offset, length), single-flight:
   8 renders of a cold field make one GET. Equivalent to the issue's
   (identity, variable, time, level) key without passing a field context
@@ -638,7 +638,7 @@ access = "opendap"` reads a remote family through DAP2.
 - Never call netcdf-reader/hdf5-reader `*_parallel`/`*_in_pool` (rayon;
   Critical Rule 7). netcdf-reader enables hdf5-reader's rayon feature even
   with default features off; only those calls use it.
-- **One engine-wide `ByteBoundedCache`** (`FIELDS`, `MC_NETCDF_FIELD_CACHE_MB`,
+- **One engine-wide `ByteBoundedCache`** (`FIELDS`, `[memory.caches] netcdf_field`,
   default 256), process-global across collections, keyed by the file's
   ingest id (unique in the process: a replaced file never reads the old
   file's fields), variable, time index and level (the served pressure-level
@@ -649,7 +649,7 @@ access = "opendap"` reads a remote family through DAP2.
   (`block_in_place` on a Tokio worker, directly elsewhere), as engine-zarr's
   store does. Only the fill owner reserves the transient peak from the
   decode budget
-  (`decode_budget::BUDGET`, `MC_NETCDF_READ_MEMORY_MB`, default 1024):
+  (`decode_budget::BUDGET`, `[memory.caches] netcdf_read`, default 1024):
   3 × decoded + 3 × compressed, where hdf5-reader exposes no chunk's stored
   size before reading it, so the decoded chunk bounds the compressed one
   (~24 MB for a MEPS field). Waiters and hits reserve nothing. Exhaustion is

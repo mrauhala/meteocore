@@ -113,12 +113,12 @@ must keep immediate sheds and deadline expiries apart.
 
 `budget::ByteBudget` / `BytePermit` is the engines' source-read admission,
 not render admission: engine-geotiff's `decode_budget::BUDGET`
-(`MC_GEOTIFF_DECODE_MEMORY_MB`) and engine-zarr's `read_budget::BUDGET`
-(`MC_ZARR_READ_MEMORY_MB`) are instances, and the next engine's budget is
+(`[memory.caches] geotiff_decode`) and engine-zarr's `read_budget::BUDGET`
+(`[memory.caches] zarr_read`) are instances, and the next engine's budget is
 another one, never a copy (#1067). Each instance enters the memory plan
 with `register(id, scope, source)`, the id its `/metrics` family prefix
 (`geotiff_decode`); `RENDER_MEMORY` registers as `render_budget` (#1306). Both budgets keep a high-water mark (`take_peak`: the most reserved at once since the previous read); only `/metrics` takes it (#1307). Outside the engines, api-edr's
-`response_budget` (`MC_EDR_RESPONSE_MEMORY_MB`, #1041) admits response
+`response_budget` (`[memory.caches] edr_response`, #1041) admits response
 bodies on the same type. Keep it apart from `RenderBudget`: it
 never waits, because its callers hold an executor slot and may hold another
 reservation. `reserve` fails at once with `ResourceExhausted` and counts a

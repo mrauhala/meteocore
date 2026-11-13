@@ -176,9 +176,9 @@ pub(super) async fn correct_latest_run(repo: &Repository, shift: f32) {
 
 pub(super) fn config(dir: &std::path::Path) -> ZarrConfig {
     let mut config = ZarrConfig::auto_local(dir.to_string_lossy().into_owned());
-    config.cache_mb = 4;
+    config.cache_mb = Some(ds_core::config::CacheSize::Mib(4));
     config.icechunk = Some(IcechunkConfig {
-        decoded_cache_mb: 4,
+        decoded_cache_mb: Some(ds_core::config::CacheSize::Mib(4)),
         branch: Some("main".into()),
         tag: None,
         snapshot: None,

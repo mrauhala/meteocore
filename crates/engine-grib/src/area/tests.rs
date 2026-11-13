@@ -58,7 +58,7 @@ fn fixture(
         }
     }
     let mut config = source.config();
-    config.grid_cache_mb = 0;
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     config.level_types = kind.map(|kind| vec![kind]);
     config.parameters = Some((0..params).map(parameter).collect());
     let engine = GribEngine::new("area", &config).unwrap();
@@ -532,7 +532,7 @@ fn area_on_ecmwf_global_grids_returns_exactly_the_nodes_of_the_polygon() {
             0,
         );
         let mut config = source.config();
-        config.grid_cache_mb = 0;
+        config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
         config.parameters = Some(vec![parameter(0)]);
         let engine = GribEngine::new("area", &config).unwrap();
         for coords in ["POLYGON((20 55,30 55,30 65,20 65,20 55))", "20,55,30,65"] {
@@ -666,7 +666,7 @@ fn invalid_requests_and_oversized_areas_stop_before_loading_other_fields() {
         );
     }
     let mut config = source.config();
-    config.grid_cache_mb = 0;
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     let mut engine = GribEngine::new("budget", &config).unwrap();
     let store = instrument(&source, &mut engine, Duration::ZERO, &[]);
     for (coords, params, z) in [

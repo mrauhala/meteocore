@@ -142,7 +142,7 @@ async fn a_cold_blosc_decode_reads_each_inner_chunk_as_one_range_of_its_index() 
     let dir = tempfile::tempdir().unwrap();
     forecast_repository_with(dir.path(), &[("msl", 1000.0)], &LONS, blosc()).await;
     let mut oracle = config(dir.path());
-    oracle.cache_mb = 0;
+    oracle.cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     let oracle = Source::open("oracle", &oracle).unwrap();
     let oracle = oracle.snapshot(None).unwrap().unwrap();
     let source = Source::open("blosc", &config(dir.path())).unwrap();
@@ -427,7 +427,7 @@ async fn ranges_fetched_ahead_fill_the_payload_cache_as_serial_reads_do() {
     let dir = tempfile::tempdir().unwrap();
     forecast_repository_with(dir.path(), &NINE, &LONS[..4], blosc()).await;
     let mut config = config(dir.path());
-    config.icechunk.as_mut().unwrap().decoded_cache_mb = 0;
+    config.icechunk.as_mut().unwrap().decoded_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     let (ahead, _) = engine("ahead", &config);
     let (serial, _) = engine("serial", &config);
     let names: Vec<String> = NINE.iter().map(|(name, _)| name.to_string()).collect();
@@ -850,7 +850,7 @@ async fn a_second_plan_never_takes_a_first_plans_staged_ranges() {
     // room one MiB of payload cache gives.
     grid_repository(dir.path(), &refs, [3, 64, 256], [3, 64, 256], [3, 64, 128]).await;
     let mut config = config(dir.path());
-    config.cache_mb = 1;
+    config.cache_mb = Some(ds_core::config::CacheSize::Mib(1));
     let (engine, _) = engine("plans", &config);
     let catalog = engine.catalog.load();
     let steps: Vec<usize> = (0..3).collect();

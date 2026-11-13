@@ -36,9 +36,9 @@ fn source(param: &str, level: &str, messages: &[Vec<u8>]) -> TestSource {
 /// MiB, 0 disabling each.
 fn view(source: &TestSource, point_index_mb: u64, message_mb: u64, grid_mb: u64) -> GribEngine {
     let mut config = source.config();
-    config.point_index_cache_mb = Some(point_index_mb);
-    config.message_cache_mb = message_mb;
-    config.grid_cache_mb = grid_mb;
+    config.point_index_cache_mb = Some(ds_core::config::CacheSize::Mib(point_index_mb));
+    config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(message_mb));
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(grid_mb));
     config.level_types = Some(vec![GribLevelType::Pressure]);
     config.parameters = Some(vec!["q".into(), "TMP".into()]);
     let owner = GribEngine::new("points", &config).unwrap();

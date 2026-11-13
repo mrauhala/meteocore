@@ -349,7 +349,7 @@ impl StationGridEngine {
         if resident > compute::cache_capacity() {
             return Err(bad(format!(
                 "one grid of {} cells is {} MiB with its terrain and mask, more than the {} MiB \
-                 grid cache (MC_STATION_GRID_CACHE_MB) holds, so every map tile would recompute \
+                 grid cache ([memory.caches] station_grid) holds, so every map tile would recompute \
                  it; raise the cache or coarsen the grid",
                 geom.cells(),
                 resident.div_ceil(ds_cache::MIB),
@@ -361,7 +361,7 @@ impl StationGridEngine {
         if job_bytes > budget / 2 {
             return Err(bad(format!(
                 "computing one grid of {} cells needs {} MiB, more than half the {} MiB \
-                 computation budget (MC_STATION_GRID_MEMORY_MB); raise it or coarsen the grid",
+                 computation budget ([memory.caches] station_grid_compute); raise it or coarsen the grid",
                 geom.cells(),
                 job_bytes.div_ceil(ds_cache::MIB),
                 budget / ds_cache::MIB
@@ -481,14 +481,18 @@ impl StationGridEngine {
         let grid = compute::entry_bytes(cells, stations);
         let parameters = inner.params.len() as u64;
         let grids = parameters * inner.precompute.max(1) as u64;
-        CacheDemand::demand(grids * grid, GRID_DEMAND_RULE, "MC_STATION_GRID_CACHE_MB")
-            .ahead()
-            .input("parameters", parameters)
-            .input("precompute", inner.precompute as u64)
-            .input("cells", cells as u64)
-            .input("stations", stations as u64)
-            .input("grid_bytes", grid)
-            .input("terrain_mask_bytes", inner.corrections.resident_bytes())
+        CacheDemand::demand(
+            grids * grid,
+            GRID_DEMAND_RULE,
+            "[memory.caches] station_grid",
+        )
+        .ahead()
+        .input("parameters", parameters)
+        .input("precompute", inner.precompute as u64)
+        .input("cells", cells as u64)
+        .input("stations", stations as u64)
+        .input("grid_bytes", grid)
+        .input("terrain_mask_bytes", inner.corrections.resident_bytes())
     }
 
     /// Publish [`Self::grid_demand`], and log the plan's WARN when the grid

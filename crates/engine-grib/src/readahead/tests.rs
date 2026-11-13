@@ -109,9 +109,9 @@ fn served(
     store: TestStore,
 ) -> (GribEngine, GribEngine, Arc<TestStore>) {
     let mut config = source.config();
-    config.message_cache_mb = message_mb;
-    config.grid_cache_mb = grid_mb;
-    config.point_index_cache_mb = Some(16);
+    config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(message_mb));
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(grid_mb));
+    config.point_index_cache_mb = Some(ds_core::config::CacheSize::Mib(16));
     config.read_ahead = depth;
     config.level_types = Some(vec![GribLevelType::Pressure]);
     let mut owner = GribEngine::new("readahead", &config).unwrap();

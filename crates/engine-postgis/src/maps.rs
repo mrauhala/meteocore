@@ -354,8 +354,8 @@ fn fetch_window(
                 window_start = %start,
                 window_end = %end,
                 cap = MAX_WINDOW_STRIKES,
-                "lightning map window truncated to the newest strikes — widen \
-                 MC_LIGHTNING_STRIKE_CACHE_MB has no effect on this cap; the \
+                "lightning map window truncated to the newest strikes — \
+                 [memory.caches] lightning_strike has no effect on this cap; the \
                  window simply holds more events than the splat cap"
             );
         }

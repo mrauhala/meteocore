@@ -16,7 +16,7 @@ fn base_config() -> GeoTiffConfig {
         poll_interval_secs: 30,
         exclude_patterns: vec![],
         max_files: None,
-        tile_cache_mb: 0,
+        tile_cache_mb: Some(ds_core::config::CacheSize::Mib(0)),
         band: 1,
         nodata: None,
         scale: None,

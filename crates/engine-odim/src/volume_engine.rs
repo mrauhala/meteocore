@@ -3357,7 +3357,7 @@ fn prewarm_floor(source: &Source, catalog: &Catalog, prewarm: &Prewarm) -> Cache
     CacheDemand::floor(
         crate::pixel_cache::prewarm_floor(bytes),
         PREWARM_FLOOR_RULE,
-        "MC_PVOL_PIXEL_CACHE_MB",
+        "[memory.caches] pvol_pixel",
     )
     .input("sites", catalog.by_site.len() as u64)
     .input("volumes", volumes)
@@ -8378,7 +8378,7 @@ mod tests {
         // The default quantity of the lowest sweep: one entry per volume.
         let floor = prewarm_floor(&source, &catalog, &Prewarm::default_quantity(1));
         assert!(floor.floor);
-        assert_eq!(floor.setting, "MC_PVOL_PIXEL_CACHE_MB");
+        assert_eq!(floor.setting, "[memory.caches] pvol_pixel");
         let set = 2 * u16_entry + f32_entry;
         assert_eq!(floor.bytes, 2 * set);
         assert_eq!(

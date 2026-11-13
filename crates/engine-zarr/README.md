@@ -87,7 +87,7 @@ or map window. Nothing is converted or copied first.
   before. Shards of runs other than the default are fetched ahead only
   once a first read has loaded their index.
 - **Memory admission.** A read first reserves its estimated source buffers
-  from one process-wide budget, `MC_ZARR_READ_MEMORY_MB` (default 1024 MiB,
+  from one process-wide budget, `[memory.caches] zarr_read` (default 1024 MiB,
   an estimate, not a RAM limit); one that does not fit fails at once with
   503. gzip, zstd and Blosc output is capped at the chunk's decoded size.
 - **Diagnostics.** Catalog builds log chunk shapes and warn when each time
@@ -203,7 +203,7 @@ styles draws a generic palette.
 | `path` | – | Store path in the bucket, or a sub-path under `data_path`; relative, no `..` |
 | `parameters` | every variable | Variables to serve (names ignore case) |
 | `poll_interval_secs` | `300` | Catalog rebuild period; must be above 0 |
-| `cache_mb` | `256` | Plain: whole-object byte cache. Icechunk: compressed chunk-range cache (`zarr_icechunk_payload_cache`). `0` keeps nothing |
+| `cache_mb` | `256` | Plain: whole-object byte cache. Icechunk: compressed chunk-range cache (`zarr_icechunk_payload_cache`). `0` keeps nothing; `{ min, max }` leaves it to the memory plan within those bounds |
 | `zarr_version` | – | `2` or `3`; validated only, the version is read from the metadata |
 
 **Icechunk.** A `[zarr.icechunk]` table reads the source (a local
@@ -218,7 +218,7 @@ theirs. At most one of `branch`, `tag` and `snapshot` may be set.
 | `branch` | `main` | Read the head of this branch |
 | `tag` | – | Read this tag |
 | `snapshot` | – | Read this snapshot id |
-| `decoded_cache_mb` | `256` | Decoded inner-chunk cache, on top of `cache_mb`; `0` keeps nothing |
+| `decoded_cache_mb` | `256` | Decoded inner-chunk cache, on top of `cache_mb`; `0` keeps nothing; `{ min, max }` leaves it to the memory plan within those bounds |
 | `region` | – | S3 region of the repository |
 | `force_path_style` | `true` | S3 path-style addressing; `false` for virtual-host style |
 

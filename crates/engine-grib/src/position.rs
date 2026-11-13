@@ -348,7 +348,7 @@ mod tests {
 
     fn config(source: &TestSource, family: Option<GribLevelType>) -> GribConfig {
         let mut config = source.config();
-        config.grid_cache_mb = 0; // prove reuse without relying on cache residency
+        config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0)); // prove reuse without relying on cache residency
         config.parameters = Some(vec!["TMP".into()]);
         config.level_types = family.map(|f| vec![f]);
         config

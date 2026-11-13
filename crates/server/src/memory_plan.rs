@@ -49,6 +49,14 @@ pub(crate) fn read_at_boot() -> &'static detect::Reading {
     READING.get_or_init(|| detect::read(Path::new("/")))
 }
 
+/// Whether the plan applies its sizes: `[memory] mode = "auto"` with a
+/// total, `[memory] total_mb` or one detected. `[memory.caches]` leaves
+/// a size the plan would set to it then, and applies it itself otherwise
+/// (#1313).
+pub(crate) fn plans_sizes(mode: MemoryMode, total_mb: Option<u64>) -> bool {
+    mode == MemoryMode::Auto && detect::total(total_mb, read_at_boot()).is_some()
+}
+
 /// A plan and the total it was fitted to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Report {

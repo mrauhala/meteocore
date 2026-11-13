@@ -35,7 +35,7 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
   `cache::STRIPS`, which keeps its phase-2 name, env var and metric family.
 - **No request-time S3 in the steady state: the window stays in memory.**
   The poll loop downloads each new scan whole into `cache::FRAMES`, which
-  every satellite collection shares (`MC_SATELLITE_FRAME_CACHE_MB`).
+  every satellite collection shares (`[memory.caches] satellite_frame`).
   Production 2026-09-29: scans were never removed when they left the
   window, the cache filled with dead scans, and its LRU evicted in-window
   scans nobody had read yet. A 12-frame Himawari animation then refetched
@@ -303,7 +303,7 @@ Each scan is downloaded whole: GOES-19 band 13 ~24 MB, cloud top temperature
 ~30 MB per 10 minutes, Himawari-9 band 13 ~26 MB in 88 tiles, GK2A IR105
 ~35 MB, a GMGSI mosaic ~7.4 MB per hour; startup ingests the whole window.
 A recipe multiplies it: `goes19-fd-rgb`'s six bands are ~135 MB per scan,
-~810 MB an hour, and hold ~157 MB per scan in `MC_SATELLITE_FRAME_CACHE_MB`,
+~810 MB an hour, and hold ~157 MB per scan in `[memory.caches] satellite_frame`,
 which every satellite collection shares. Size that cache above the windows
 of all satellite collections together: in production, `goes19-fd` and
 `goes18-fd` (C13 + ACHT) and `himawari9-fd` at `-PT2H` hold ~1.6 GB. The

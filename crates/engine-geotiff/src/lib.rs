@@ -782,7 +782,9 @@ impl GeoTiffEngine {
         if self.reads_local_files() {
             0
         } else {
-            config.tile_cache_mb.saturating_mul(ds_cache::MIB)
+            config
+                .effective_tile_cache_mb()
+                .saturating_mul(ds_cache::MIB)
         }
     }
 
@@ -1002,7 +1004,7 @@ impl GeoTiffEngine {
         // cache, never the compressed tile cache.
         let cache_bytes = match store_mode {
             StoreMode::Local { .. } => 0,
-            _ => config.tile_cache_mb * 1024 * 1024,
+            _ => config.effective_tile_cache_mb() * 1024 * 1024,
         };
         let tile_cache = cache::TileCache::new(cache_bytes);
 
@@ -3546,7 +3548,7 @@ mod tests {
             parameter: "reflectivity".to_string(),
             unit: "dBZ".to_string(),
             poll_interval_secs: 3600,
-            tile_cache_mb: 16,
+            tile_cache_mb: Some(ds_core::config::CacheSize::Mib(16)),
             band: 1,
             max_files: None,
             nodata: None,

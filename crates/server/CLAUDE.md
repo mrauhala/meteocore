@@ -391,8 +391,26 @@ need no reload pruning.
   goes back to its default through the plan.
 - An `MC_…` variable that is not a whole number pins its cache at its
   default (`plan::env_size`), and `cache_plan::unparsable_env` warns from
-  the plan log. A collection key equal to its default does not pin until
-  #1313.
+  the plan log. A collection key is `Option<CacheSize>`: set, even to its
+  default, it is the source (`cache_plan::key_source`); `{ min, max }` is
+  `SizeSource::Bounds`, not a pin, and the plan clamps every size of it.
+- `[memory.caches]` (#1313, `memory_caches.rs`): `CacheSettings::of`
+  rejects an unknown key (boot exits, reload is `ConfigRead`);
+  `memory_caches::apply` hands the values to `ds_cache::plan::keys::set`
+  in `main` BEFORE `load_collections` (a static built later reads its key
+  in `env_size`, so it is built at that size) and in `apply_load` after
+  the staged resizes, before `cache_plan::log` (a built static is resized
+  in place, with its registry source and configured size moved).
+  `plans_sizes` (auto with a total) leaves a range or an unset key to the
+  plan; a pin, and everything in report mode, is applied there. The
+  render caches are not statics: `RenderCacheSizes::of` resolves
+  `[memory.caches]` > `[server]` alias > `[wms]` > default (vector_tile:
+  > constant), stored on `AcceptedLoad`, reused/resized as before.
+  `log_warnings`: a size set in two places, once per config read; a
+  deprecated variable, once per process. `watcher::tests::build_state`
+  mirrors `main`; a test that sets keys runs in a child process (the
+  statics are process-wide), as
+  `memory_caches_size_the_process_wide_caches_and_a_reload_resizes_them_in_place`.
 - A cache off by default (`[grib] message_cache_mb` unset) plans
   `Reason::Off`, 0, and counts nothing.
 - `memory_plan::unreachable` treats a Collection- or Source-scoped entry
@@ -553,7 +571,7 @@ need no reload pruning.
   `rotate_poll_loops!(<field>, take_over)`, as CAP and BUFR are (#1036).
 
 - Raster memory admission uses the process-wide `ds_executor::budget::RENDER_MEMORY`,
-  configured by `MC_RENDER_MEMORY_MB` (default 1024 MiB; restart to change).
+  configured by `[memory.caches] render_budget` (default 1024 MiB; a reload resizes it in place).
   It deliberately survives reloads so old and new render tasks share one limit.
   The 32-byte/output-pixel estimate covers output buffers/scratch, not source
   decoding or resident caches. An RGB composite render adds 16 bytes per

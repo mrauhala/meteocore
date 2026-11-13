@@ -153,7 +153,7 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
 ## Execution (compute.rs) — never on a request worker
 
 - Request misses: claim the grid's fill guard (single-flight), reserve its
-  bytes (`MC_STATION_GRID_MEMORY_MB`, fail-fast `ResourceExhausted`), queue
+  bytes (`[memory.caches] station_grid_compute`, fail-fast `ResourceExhausted`), queue
   the job on the station-grid pool (its own multi-thread runtime,
   `MC_STATION_GRID_WORKERS` permits, job inside `block_in_place` so a
   PostGIS source's sync bridge finds a runtime), and wait until the request

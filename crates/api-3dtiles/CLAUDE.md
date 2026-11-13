@@ -150,7 +150,7 @@ Opened from disk, the viewer targets the public instance.
   disabled). A cache-owned task finishes and caches an encode even if HTTP
   waiters disconnect; RAII cleans up flights on panic. Blocking encodes own
   semaphore permits through completion.
-  `MC_3DTILES_CONTENT_CACHE_MB` (default 512, 0 disables retention).
+  `[memory.caches] tiles3d_content` (default 512, 0 disables retention).
 - The engine-side `VOXEL_GRID_CACHE` is the second layer (see engine-odim
   notes).
 - **Cache-Control:** a `?datetime=` exactly matching an advertised volume

@@ -65,7 +65,7 @@ fn remote_engine(local: &EmptyDir, flaky: &Arc<FlakyStore>) -> GeoTiffEngine {
         store: DataStore::new(flaky.clone()),
         prefix: ObjectPath::from("d"),
     };
-    engine.tile_cache = cache::TileCache::new(config.tile_cache_mb * 1024 * 1024);
+    engine.tile_cache = cache::TileCache::new(config.effective_tile_cache_mb() * 1024 * 1024);
     engine.poll_once();
     assert_eq!(
         engine.catalog.load().entries.len(),

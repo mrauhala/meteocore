@@ -423,7 +423,7 @@ fn stac_engine_with(
         poll_interval_secs: 3600,
         exclude_patterns: vec![],
         max_files,
-        tile_cache_mb,
+        tile_cache_mb: Some(ds_core::config::CacheSize::Mib(tile_cache_mb)),
         band: 1,
         nodata: None,
         scale: None,

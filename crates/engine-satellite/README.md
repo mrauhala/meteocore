@@ -172,9 +172,9 @@ number, in `K`. Recipes exist for `goes-r` (ABI) and `isatss` (AHI) only:
 `night_microphysics` ABI 7, 13, 15 (AHI 7, 13, 14, 15). Unknown keys in a
 composite are a load error (`ds_core::config::validate_satellite`).
 
-`MC_SATELLITE_FRAME_CACHE_MB` (default 1024) bounds the scans in memory
+`[memory.caches] satellite_frame` (default 1024) bounds the scans in memory
 for all satellite collections together: size it above their windows
-combined. `MC_SATELLITE_STRIP_CACHE_MB` (default 256) bounds decoded
+combined. `[memory.caches] satellite_strip` (default 256) bounds decoded
 blocks. `/health` reports a collection degraded until its first complete
 poll, when no poll has listed every product for 5 poll intervals (at
 least 10 minutes), or while a product has no scan in the window.

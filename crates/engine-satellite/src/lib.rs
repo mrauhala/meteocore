@@ -554,7 +554,7 @@ impl SatelliteEngine {
         CacheDemand::demand(
             catalog.window_bytes,
             WINDOW_RULE,
-            "MC_SATELLITE_FRAME_CACHE_MB",
+            "[memory.caches] satellite_frame",
         )
         .ahead()
         .input("products", self.products.len() as u64)
