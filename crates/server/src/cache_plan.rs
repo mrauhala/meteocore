@@ -3,10 +3,13 @@
 //!
 //! The list is `ds_cache::plan`'s registry. Process-wide caches and budgets
 //! enter it from their own crates when they are built, sized from their
-//! `MC_*` variables. This module enters the rest, whose sizes come from the
-//! config: the render output caches of each load ([`register_render_caches`])
-//! and the per-collection caches, through the accessors `/metrics` reads
-//! ([`register_geotiff`], [`register_grib`], [`register_zarr`]).
+//! `[memory.caches]` keys, else their deprecated `MC_*` variables
+//! (`crate::memory_caches`, #1313). This module enters the rest, whose
+//! sizes come from the config: the render output caches of each load
+//! ([`register_render_caches`]) and the per-collection caches, through the
+//! accessors `/metrics` reads ([`register_geotiff`], [`register_grib`],
+//! [`register_zarr`]). A size key's `{ min, max }` form shows as its floor
+//! and ceiling.
 //!
 //! It is shown three ways from one [`snapshot`]: `GET /admin/cache-plan`
 //! ([`handler`]), one INFO block at boot and after each accepted reload
@@ -41,13 +44,11 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use ds_cache::plan::{
-    self, grant::pinned, Activity, Demand, Entry, Kind, Row, Scope, SizeSource, Usage,
+    self, grant::pinned, Activity, Bounds, Demand, Entry, Kind, Row, Scope, SizeSource, Usage,
 };
 use ds_cache::{Churn, MIB};
 use ds_core::config::{
-    CollectionConfig, GeoTiffConfig, GribConfig, ServerConfig, DEFAULT_GRID_CACHE_MB,
-    DEFAULT_METATILE_CACHE_MB, DEFAULT_POINT_INDEX_CACHE_MB, DEFAULT_TILE_CACHE_MB,
-    DEFAULT_ZARR_CACHE_MB,
+    CacheSize, CollectionConfig, GeoTiffConfig, GribConfig, DEFAULT_POINT_INDEX_CACHE_MB,
 };
 use serde_json::{json, Value};
 use tracing::{info, warn};
@@ -55,36 +56,23 @@ use tracing::{info, warn};
 use crate::admin::{AdminState, MemoryReading, ServerState};
 use crate::memory_plan::{self, Report};
 
-/// Where the meta-tile and rendered-image cache sizes came from.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RenderCacheSources {
-    pub metatile: SizeSource,
-    pub rendered: SizeSource,
-}
-
-impl RenderCacheSources {
-    pub(crate) fn of(config: &ServerConfig) -> Self {
-        let rendered = match config.rendered_cache_key() {
-            Some(key @ "[server] rendered_cache_mb") => SizeSource::Config(key),
-            Some(key) => SizeSource::Collection(key),
-            None => SizeSource::Default,
-        };
-        RenderCacheSources {
-            metatile: SizeSource::unless_default(
-                config.server.metatile_cache_mb,
-                DEFAULT_METATILE_CACHE_MB,
-                SizeSource::Config("[server] metatile_cache_mb"),
-            ),
-            rendered,
-        }
+/// Where a per-collection size key's value came from: the key, named as
+/// config writes it, when set (#1313), its bounds when a range; else the
+/// default.
+pub(crate) fn key_source(key: &'static str, size: Option<CacheSize>) -> SizeSource {
+    match size {
+        None => SizeSource::Default,
+        Some(CacheSize::Mib(_)) => SizeSource::Collection(key),
+        Some(CacheSize::Range { min, max }) => SizeSource::Bounds(key, Bounds::mib(min, max)),
     }
 }
 
-/// Enter the live render output caches in the plan: the meta-tile and
-/// rendered-image caches, sized by the accepted config, and the MVT cache
-/// and solid-image memo, constants. Again after every accepted load: a
-/// cache a reload keeps is entered again, with the source and size of the
-/// config that kept it, whatever size the plan gave it (#1312).
+/// Enter the live render output caches in the plan: the meta-tile,
+/// rendered-image and vector-tile (MVT) caches, sized by the accepted
+/// config, and the solid-image memo, a constant. Again after every
+/// accepted load: a cache a reload keeps is entered again, with the source
+/// and size of the config that kept it, whatever size the plan gave it
+/// (#1312).
 pub(crate) fn register_render_caches(state: &ServerState) {
     let Some(accepted) = state
         .accepted_load
@@ -94,17 +82,17 @@ pub(crate) fn register_render_caches(state: &ServerState) {
     else {
         return;
     };
-    let sources = accepted.render_cache_sources();
+    let sizes = accepted.render_cache_sizes();
     let wms = state.wms.load();
     wms.rendered_cache
-        .register(sources.rendered.clone(), accepted.rendered_cache_mb());
+        .register(sizes.rendered.source.clone(), sizes.rendered.mb);
     wms.tile_cache
-        .register(sources.metatile.clone(), accepted.metatile_cache_mb());
+        .register(sizes.metatile.source.clone(), sizes.metatile.mb);
     state
         .tiles
         .load()
         .vector_tile_cache
-        .register(SizeSource::Constant, crate::admin::VECTOR_TILE_CACHE_MB);
+        .register(sizes.vector_tile.source.clone(), sizes.vector_tile.mb);
     ds_render::init_solid_image_cache();
 }
 
@@ -113,13 +101,9 @@ fn geotiff_source(collection: &CollectionConfig, local: bool) -> SizeSource {
     if local {
         SizeSource::Constant
     } else {
-        SizeSource::unless_default(
-            collection
-                .geotiff
-                .as_ref()
-                .map_or(DEFAULT_TILE_CACHE_MB, |g| g.tile_cache_mb),
-            DEFAULT_TILE_CACHE_MB,
-            SizeSource::Collection("[geotiff] tile_cache_mb"),
+        key_source(
+            "[geotiff] tile_cache_mb",
+            collection.geotiff.as_ref().and_then(|g| g.tile_cache_mb),
         )
     }
 }
@@ -139,7 +123,9 @@ pub(crate) fn register_geotiff(
         collection
             .geotiff
             .as_ref()
-            .map_or(DEFAULT_TILE_CACHE_MB, |g| g.tile_cache_mb)
+            .map_or(ds_core::config::DEFAULT_TILE_CACHE_MB, |g| {
+                g.effective_tile_cache_mb()
+            })
             .saturating_mul(MIB)
     };
     let scope = Scope::Collection {
@@ -171,7 +157,8 @@ pub(crate) fn plan_kept_geotiff(
 ) -> Option<GeoTiffConfig> {
     let mut config = collection.geotiff.clone()?;
     if !pinned(&geotiff_source(collection, engine.reads_local_files())) {
-        config.tile_cache_mb = engine.tile_cache_metrics().capacity_bytes.div_ceil(MIB);
+        let live = engine.tile_cache_metrics().capacity_bytes.div_ceil(MIB);
+        config.tile_cache_mb = Some(CacheSize::Mib(live));
     }
     Some(config)
 }
@@ -180,16 +167,8 @@ pub(crate) fn plan_kept_geotiff(
 /// came from.
 fn grib_sources(grib: &GribConfig) -> (SizeSource, SizeSource) {
     (
-        SizeSource::unless_default(
-            grib.grid_cache_mb,
-            DEFAULT_GRID_CACHE_MB,
-            SizeSource::Collection("[grib] grid_cache_mb"),
-        ),
-        SizeSource::unless_default(
-            grib.message_cache_mb,
-            0,
-            SizeSource::Collection("[grib] message_cache_mb"),
-        ),
+        key_source("[grib] grid_cache_mb", grib.grid_cache_mb),
+        key_source("[grib] message_cache_mb", grib.message_cache_mb),
     )
 }
 
@@ -199,19 +178,15 @@ fn grib_sources(grib: &GribConfig) -> (SizeSource, SizeSource) {
 pub(crate) fn plan_kept_grib(grib: &GribConfig, engine: &engine_grib::GribEngine) -> GribConfig {
     let (grid, message) = grib_sources(grib);
     let mut kept = grib.clone();
+    let live = |bytes: u64| Some(CacheSize::Mib(bytes.div_ceil(MIB)));
     if !pinned(&grid) {
-        kept.grid_cache_mb = engine.grid_cache_metrics().capacity_bytes.div_ceil(MIB);
+        kept.grid_cache_mb = live(engine.grid_cache_metrics().capacity_bytes);
     }
     if !pinned(&message) {
-        kept.message_cache_mb = engine.message_cache_metrics().capacity_bytes.div_ceil(MIB);
+        kept.message_cache_mb = live(engine.message_cache_metrics().capacity_bytes);
     }
     if !pinned(&point_index_source(grib)) {
-        kept.point_index_cache_mb = Some(
-            engine
-                .point_index_cache_metrics()
-                .capacity_bytes
-                .div_ceil(MIB),
-        );
+        kept.point_index_cache_mb = live(engine.point_index_cache_metrics().capacity_bytes);
     }
     kept
 }
@@ -230,7 +205,7 @@ pub(crate) fn register_grib(collection: &CollectionConfig, engine: &Arc<engine_g
     let (grid, message) = grib_sources(grib);
     plan::register_sized(
         Entry::cache("grid_cache", scope(), grid),
-        grib.grid_cache_mb.saturating_mul(MIB),
+        grib.effective_grid_cache_mb().saturating_mul(MIB),
         engine,
         |e| {
             let entries = e.grid_cache_utilization().2 as u64;
@@ -244,7 +219,7 @@ pub(crate) fn register_grib(collection: &CollectionConfig, engine: &Arc<engine_g
     );
     plan::register_sized(
         Entry::cache("grib_message_cache", scope(), message),
-        grib.message_cache_mb.saturating_mul(MIB),
+        grib.effective_message_cache_mb().saturating_mul(MIB),
         engine,
         |e| Usage::cache(e.message_cache_metrics(), None),
         plan::Resize {
@@ -267,12 +242,17 @@ pub(crate) fn register_grib(collection: &CollectionConfig, engine: &Arc<engine_g
 }
 
 /// Where a GRIB source's point-index cache size came from: its key when
-/// set, whatever the value; unset, `message_cache_mb` when its share of it
-/// is above the default floor (#1333).
-fn point_index_source(grib: &GribConfig) -> SizeSource {
+/// set, whatever the value; unset, a pinned `message_cache_mb` when its
+/// share of it is above the default floor (#1333). A message cache the
+/// plan sizes within a range leaves the point-index cache to the plan too
+/// (`default`): a size derived from the range's floor, pinned, would never
+/// follow the plan.
+pub(crate) fn point_index_source(grib: &GribConfig) -> SizeSource {
     match grib.point_index_cache_mb {
-        Some(_) => SizeSource::Collection("[grib] point_index_cache_mb"),
-        None if grib.effective_point_index_cache_mb() > DEFAULT_POINT_INDEX_CACHE_MB => {
+        size @ Some(_) => key_source("[grib] point_index_cache_mb", size),
+        None if grib.message_cache_mb.is_some_and(CacheSize::is_pinned)
+            && grib.derived_point_index_cache_mb() > DEFAULT_POINT_INDEX_CACHE_MB =>
+        {
             SizeSource::Derived("[grib] message_cache_mb")
         }
         None => SizeSource::Default,
@@ -292,12 +272,11 @@ pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_z
     };
     let (decoded, decoded_mb) = match &zarr.icechunk {
         Some(icechunk) => (
-            SizeSource::unless_default(
+            key_source(
+                "[zarr.icechunk] decoded_cache_mb",
                 icechunk.decoded_cache_mb,
-                DEFAULT_ZARR_CACHE_MB,
-                SizeSource::Collection("[zarr.icechunk] decoded_cache_mb"),
             ),
-            icechunk.decoded_cache_mb,
+            icechunk.effective_decoded_cache_mb(),
         ),
         None => (SizeSource::Constant, 0),
     };
@@ -312,14 +291,8 @@ pub(crate) fn register_zarr(collection: &CollectionConfig, engine: &Arc<engine_z
             clear: |e| e.clear_decoded_cache(),
         },
     );
-    let cache_mb = zarr.cache_mb.saturating_mul(MIB);
-    let object_or_payload = || {
-        SizeSource::unless_default(
-            zarr.cache_mb,
-            DEFAULT_ZARR_CACHE_MB,
-            SizeSource::Collection("[zarr] cache_mb"),
-        )
-    };
+    let cache_mb = zarr.effective_cache_mb().saturating_mul(MIB);
+    let object_or_payload = || key_source("[zarr] cache_mb", zarr.cache_mb);
     if engine.object_cache_metrics().is_some() {
         plan::register_sized(
             Entry::cache("zarr_object_cache", scope(), object_or_payload()),
@@ -452,7 +425,9 @@ pub async fn handler(
 /// `plan` has the total, the reserves and the pool, the mode and what it
 /// resized (`memory_plan::header_json`). Every entry has its
 /// `configured_bytes`, the size its settings give it; `source` is
-/// `plan:auto` while its capacity is the plan's.
+/// `plan:auto` while its capacity is the plan's. One sized by a `{ min,
+/// max }` key (#1313) has its `floor_bytes` and `ceiling_bytes`, which no
+/// planned size falls outside; null otherwise.
 pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Report>) -> Value {
     let entries = |kind: Kind| -> Vec<Value> {
         rows.iter()
@@ -468,6 +443,8 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Repo
                     "capacity_bytes": usage.capacity_bytes,
                     "configured_bytes": row.configured_bytes,
                     "source": row.source().to_string(),
+                    "floor_bytes": entry.source.bounds().map(|b| b.min_bytes),
+                    "ceiling_bytes": entry.source.bounds().map(|b| b.max_bytes),
                     "used_bytes": usage.used_bytes,
                     "entries": usage.entries,
                     "hits": usage.hits,
@@ -658,7 +635,8 @@ pub(crate) fn mib(bytes: u64) -> String {
 /// budget, grouped by scope, with its capacity and source. A line whose
 /// size differs from `previous` shows the size it had; a cache with a
 /// demand (#1309) shows it and the size it suggests; an entry the plan
-/// sizes, its planned size and why.
+/// sizes, its planned size and why; one a `{ min, max }` key bounds
+/// (#1313), its floor and ceiling.
 pub(crate) fn render(
     rows: &[Row],
     heading: &str,
@@ -706,6 +684,14 @@ pub(crate) fn render(
         );
         if row.planned {
             let _ = write!(out, " (configured {})", mib(row.configured_bytes));
+        }
+        if let Some(bounds) = entry.source.bounds() {
+            let _ = write!(
+                out,
+                " (floor {}, ceiling {})",
+                mib(bounds.min_bytes),
+                mib(bounds.max_bytes)
+            );
         }
         let was = previous
             .and_then(|p| p.get(&(entry.kind, entry.id, entry.scope.clone())))

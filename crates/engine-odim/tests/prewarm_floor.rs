@@ -128,7 +128,7 @@ fn a_floor_above_the_pixel_cache_warns_once() {
         "pvol_pixel_cache is 1 MiB (env:MC_PVOL_PIXEL_CACHE_MB), below its floor of",
         "pvol-floor ",
         "from sites 1, volumes 1000, sweeps 2, quantities 2, sweep_bytes ",
-        "set MC_PVOL_PIXEL_CACHE_MB to ",
+        "set [memory.caches] pvol_pixel to ",
     ] {
         assert!(warning.contains(expected), "{expected:?} not in {warning}");
     }

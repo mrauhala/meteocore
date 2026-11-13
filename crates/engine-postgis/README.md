@@ -219,7 +219,7 @@ on the events shape. An unknown key in it is a load error.
   an explicit `TIME` therefore revalidate rather than being `immutable`.
   A late row older than the advertised frames' windows is not detected.
 - A frame is one set-based read over every cached station, cached
-  (`MC_STATION_FRAME_CACHE_MB`, default 32) so the tiles of one map share
+  (`[memory.caches] station_frame`, default 32) so the tiles of one map share
   it. A frame that would read over 2 000 000 rows (every station's rows
   within `max_age`) fails with an error that names `max_age`.
 - WMS GetFeatureInfo does not answer these layers (`queryable="0"`): a
@@ -261,7 +261,7 @@ events of the `default_datetime` window ending at `TIME` (floored to the
 minute) as discs of 2-pixel radius, valued by age in minutes. Advertised
 times are one-minute steps over the newest six hours of data; without `TIME`
 the frame follows the newest step, updated on refresh. Each window is one
-read, cached (`MC_LIGHTNING_STRIKE_CACHE_MB`, default 32) and capped at the
+read, cached (`[memory.caches] lightning_strike`, default 32) and capped at the
 newest 200 000 events.
 
 Events can land late and out of order: the table's writer inserts what its

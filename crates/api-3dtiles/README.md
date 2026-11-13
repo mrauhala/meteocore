@@ -93,7 +93,7 @@ kept refusing the read. A 500 never carries internal detail.
 ## Caching
 
 - A process-wide, byte-bounded LRU holds encoded content and its strong
-  ETag: `MC_3DTILES_CONTENT_CACHE_MB` (default 512; `0` keeps nothing). The
+  ETag: `[memory.caches] tiles3d_content` (default 512; `0` keeps nothing). The
   key covers collection, product, quantity, time, parameters, grid size,
   colour ramp, and a version hashed from the volume time axis, so a new
   volume moves "latest" while an exactly advertised time keeps its entry.
@@ -106,7 +106,7 @@ kept refusing the read. A 500 never carries internal detail.
   times get `public, max-age=60`. The viewer page and script are `no-cache`.
 - Metrics: the `tiles3d_content_cache_*` family on `/metrics`. engine-odim
   keeps a second cache of resampled voxel grids, shared by isosurface,
-  echo-top and voxels (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512;
+  echo-top and voxels (`[memory.caches] pvol_voxel_grid`, default 512;
   `pvol_voxel_grid_cache_*`).
 
 ## Viewer

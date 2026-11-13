@@ -3851,7 +3851,7 @@
         "spec": {
           "id": 112,
           "title": "Render pressure",
-          "description": "Share of the render executor in use: render slots busy (`[server] render_concurrency`), the admission queue filled, and the render memory budget reserved (MC_RENDER_MEMORY_MB). Dashed lines mark 70 % and 90 %. Brief peaks are normal during animation; lines that stay high mean renders wait, and a full queue or budget answers 503.",
+          "description": "Share of the render executor in use: render slots busy (`[server] render_concurrency`), the admission queue filled, and the render memory budget reserved ([memory.caches] render_budget). Dashed lines mark 70 % and 90 %. Brief peaks are normal during animation; lines that stay high mean renders wait, and a full queue or budget answers 503.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -5795,7 +5795,7 @@
         "spec": {
           "id": 12,
           "title": "Render memory reserved",
-          "description": "Share of the transient raster render budget (MC_RENDER_MEMORY_MB) reserved by renders in flight.",
+          "description": "Share of the transient raster render budget ([memory.caches] render_budget) reserved by renders in flight.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -6414,7 +6414,7 @@
         "spec": {
           "id": 39,
           "title": "Render memory",
-          "description": "Transient output-buffer estimate (32 bytes per output pixel; composites add a plane per band) reserved by renders in flight, against MC_RENDER_MEMORY_MB. Separate from source decoding and resident caches.",
+          "description": "Transient output-buffer estimate (32 bytes per output pixel; composites add a plane per band) reserved by renders in flight, against [memory.caches] render_budget. Separate from source decoding and resident caches.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -9381,7 +9381,7 @@
         "spec": {
           "id": 59,
           "title": "Admission budgets — use",
-          "description": "Transient memory reserved against each admission budget: render (MC_RENDER_MEMORY_MB), GeoTIFF decode (MC_GEOTIFF_DECODE_MEMORY_MB), Zarr read (MC_ZARR_READ_MEMORY_MB), NetCDF field read (MC_NETCDF_READ_MEMORY_MB), station-grid compute (MC_STATION_GRID_MEMORY_MB), EDR response bodies (MC_EDR_RESPONSE_MEMORY_MB), PVOL EDR reads (MC_PVOL_READ_MEMORY_MB). These are admission estimates, not measured RSS; a request that does not fit is answered 503.",
+          "description": "Transient memory reserved against each admission budget: render ([memory.caches] render_budget), GeoTIFF decode ([memory.caches] geotiff_decode), Zarr read ([memory.caches] zarr_read), NetCDF field read ([memory.caches] netcdf_read), station-grid compute ([memory.caches] station_grid_compute), EDR response bodies ([memory.caches] edr_response), PVOL EDR reads ([memory.caches] pvol_read). These are admission estimates, not measured RSS; a request that does not fit is answered 503.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -11415,7 +11415,7 @@
         "spec": {
           "id": 70,
           "title": "PVOL pixel cache — churn",
-          "description": "The pre-warm keeps every advertised timestep's lowest prewarm_sweeps sweeps of the default quantity (or of prewarm_quantities) resident, if it fits. Sustained inserts while entries sit flat at capacity = churn: pre-warmed frames are evicted and the next animation pays burst re-reads from storage. Fix: raise MC_PVOL_PIXEL_CACHE_MB to about twice the working set (sites × window ÷ cadence × prewarm_sweeps × pre-warmed quantities × one sweep). Read failures = moments that degraded to nodata (missing file, decode failure). Aborted reads = reads that failed their request instead, by reason: deadline (cut off by the request deadline; the read is finished in the background for the retry) or storage (a failure a retry can heal, or a 401/403 refusal).",
+          "description": "The pre-warm keeps every advertised timestep's lowest prewarm_sweeps sweeps of the default quantity (or of prewarm_quantities) resident, if it fits. Sustained inserts while entries sit flat at capacity = churn: pre-warmed frames are evicted and the next animation pays burst re-reads from storage. Fix: raise [memory.caches] pvol_pixel to about twice the working set (sites × window ÷ cadence × prewarm_sweeps × pre-warmed quantities × one sweep). Read failures = moments that degraded to nodata (missing file, decode failure). Aborted reads = reads that failed their request instead, by reason: deadline (cut off by the request deadline; the read is finished in the background for the retry) or storage (a failure a retry can heal, or a 401/403 refusal).",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -11598,7 +11598,7 @@
         "spec": {
           "id": 71,
           "title": "PVOL pixel cache — resident",
-          "description": "Resident bytes against MC_PVOL_PIXEL_CACHE_MB, and the entry count (right axis).",
+          "description": "Resident bytes against [memory.caches] pvol_pixel, and the entry count (right axis).",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -14064,7 +14064,7 @@
         "spec": {
           "id": 89,
           "title": "Scan windows vs scan cache",
-          "description": "Bytes of the scans in each satellite collection's time window, the part held in memory, and MC_SATELLITE_FRAME_CACHE_MB (dashed). Bad: all windows above capacity (the poll logs a WARN and stops downloading back), or resident below window for more than a poll or two: requests then download scans within the render deadline, and an animation's older frames answer 503.",
+          "description": "Bytes of the scans in each satellite collection's time window, the part held in memory, and [memory.caches] satellite_frame (dashed). Bad: all windows above capacity (the poll logs a WARN and stops downloading back), or resident below window for more than a poll or two: requests then download scans within the render deadline, and an animation's older frames answer 503.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -14576,7 +14576,7 @@
         "spec": {
           "id": 93,
           "title": "Analyses, failures & duration",
-          "description": "Analyses in the trailing hour (request misses plus the poll's pre-compute and revisions), failed analyses and source reads, analyses rejected (503) because MC_STATION_GRID_MEMORY_MB was full, and the last analysis's duration (right axis). A duration near the 3 s render deadline means cold map requests answer 503 until the pre-compute catches up.",
+          "description": "Analyses in the trailing hour (request misses plus the poll's pre-compute and revisions), failed analyses and source reads, analyses rejected (503) because [memory.caches] station_grid_compute was full, and the last analysis's duration (right axis). A duration near the 3 s render deadline means cold map requests answer 503 until the pre-compute catches up.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -14796,7 +14796,7 @@
         "spec": {
           "id": 94,
           "title": "Station-grid cache",
-          "description": "Hit ratio of the shared analysis cache and its fill against MC_STATION_GRID_CACHE_MB. Every revision of the observations re-keys a collection's grids, so a burst of misses after a late report is expected; a low ratio otherwise means the cache holds fewer grids than the maps animate over. A gap is a minute with no lookups: the traffic comes in bursts with the 5-minute radar cadence.",
+          "description": "Hit ratio of the shared analysis cache and its fill against [memory.caches] station_grid. Every revision of the observations re-keys a collection's grids, so a burst of misses after a late report is expected; a low ratio otherwise means the cache holds fewer grids than the maps animate over. A gap is a minute with no lookups: the traffic comes in bursts with the 5-minute radar cadence.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -14951,7 +14951,7 @@
         "spec": {
           "id": 95,
           "title": "Computation admission",
-          "description": "Bytes reserved by analyses being computed, against MC_STATION_GRID_MEMORY_MB (dashed).",
+          "description": "Bytes reserved by analyses being computed, against [memory.caches] station_grid_compute (dashed).",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -18371,7 +18371,7 @@
         "spec": {
           "id": 120,
           "title": "Cache plan",
-          "description": "Every cache and admission budget with where its size came from: default, env:<variable>, config:<[server] key>, collection:<collection key>, derived:<key>, constant, or plan:auto while [memory] mode = \"auto\" gives it its planned size (/admin/cache-plan has the same list, with the configured size beside it). Capacity is the size it has and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used. Demand is what the engines say the cache must hold for their data (cache_demand_bytes; a floor for PVOL pixels), empty for a cache without one; /admin/cache-plan has its inputs and the suggested size. Planned is the size the memory plan gives each one (cache_planned_bytes), fitted at boot and at each reload to the plan's total; 0 for a cache no collection can reach. In report mode the configured size is unchanged; in auto mode every cache and budget no setting pins takes it, a warm cache at most a quarter smaller per reload. /admin/cache-plan says why each size.",
+          "description": "Every cache and admission budget with where its size came from: default, config:[memory.caches] <key> (or its [server] alias), env:<deprecated variable>, collection:<collection key>, bounds:<key> for a { min, max } key, which the plan sizes within its floor and ceiling, derived:<key>, constant, or plan:auto while [memory] mode = \"auto\" gives it its planned size (/admin/cache-plan has the same list, with the configured size beside it). Capacity is the size it has and Used what the cache holds or the budget has reserved now. A cache without a byte gauge yet (MVT, solid images, plain-Zarr objects) shows no Used. Demand is what the engines say the cache must hold for their data (cache_demand_bytes; a floor for PVOL pixels), empty for a cache without one; /admin/cache-plan has its inputs and the suggested size. Planned is the size the memory plan gives each one (cache_planned_bytes), fitted at boot and at each reload to the plan's total; 0 for a cache no collection can reach. In report mode the configured size is unchanged; in auto mode every cache and budget no setting pins takes it, a warm cache at most a quarter smaller per reload. /admin/cache-plan says why each size.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -23126,7 +23126,7 @@
         "spec": {
           "id": 170,
           "title": "Icechunk inner chunks fetched ahead",
-          "description": "Cold inner chunks per second that EDR position, MULTIPOINT, area and trajectory queries plan to fetch together, eight at a time, before decoding their variables one after another (#1353); each planned chunk is counted once, by outcome. used: fetched, staged and taken by its decode, which then filled the payload cache as a serial read would. unused: staged but dropped after 30 s with no decode asking. skipped: nothing to fetch, as the payload cache or staging had it already, or it is inline or absent. serial: left to the decode's own read, because staging (one shard of cache_mb, shared by concurrent queries) had no room or less than half the read budget (MC_ZARR_READ_MEMORY_MB) was free. failed: the fetch failed and the decode read it again. expired: the request's deadline cut the fetch off. Steady serial points at concurrent queries outgrowing staging or a read budget under pressure; steady unused at queries that ended before their decodes.",
+          "description": "Cold inner chunks per second that EDR position, MULTIPOINT, area and trajectory queries plan to fetch together, eight at a time, before decoding their variables one after another (#1353); each planned chunk is counted once, by outcome. used: fetched, staged and taken by its decode, which then filled the payload cache as a serial read would. unused: staged but dropped after 30 s with no decode asking. skipped: nothing to fetch, as the payload cache or staging had it already, or it is inline or absent. serial: left to the decode's own read, because staging (one shard of cache_mb, shared by concurrent queries) had no room or less than half the read budget ([memory.caches] zarr_read) was free. failed: the fetch failed and the decode read it again. expired: the request's deadline cut the fetch off. Steady serial points at concurrent queries outgrowing staging or a read budget under pressure; steady unused at queries that ended before their decodes.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

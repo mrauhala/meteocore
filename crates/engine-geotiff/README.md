@@ -167,7 +167,7 @@ Pick one source. `data_path` is a collection field, outside `[geotiff]`.
 | `poll_interval_secs` | `30` | must be > 0; failing polls back off up to 16× |
 | `exclude_patterns` | `["*.tmp", "*.part"]` | basenames to skip: `*.ext` or an exact name |
 | `max_files` | none | keep the newest N timesteps |
-| `tile_cache_mb` | `256` | compressed tile cache for remote sources, none for a local one; `0` disables it |
+| `tile_cache_mb` | `256` | compressed tile cache for remote sources, none for a local one; `0` disables it; `{ min, max }` leaves it to the memory plan within those bounds |
 | `endpoint`, `bucket` | – | S3-compatible endpoint and bucket, both or neither |
 | `prefix_pattern` | `""` | object prefix with date or hour specifiers; an hour specifier needs a `time_window` of at most 24 h |
 | `time_window` | none | ISO 8601 duration, bucket mode only: `-PT2H` past, `PT6H` future |
@@ -176,12 +176,12 @@ Pick one source. `data_path` is a collection field, outside `[geotiff]`.
 | `stac_asset_key` | `"data"` | asset to read from each item |
 | `stac_asset_allowlist` | required with `stac_url` | URL prefixes every asset URL must match |
 
-Process-wide environment variables:
+Process-wide settings: `[memory.caches]` keys in `config.toml` (#1313; their `MC_…_MB` variables are deprecated) and environment variables:
 
-| Variable | Default | Meaning |
+| Setting | Default | Meaning |
 |---|---|---|
-| `MC_GEOTIFF_DECODE_MEMORY_MB` | `1024` | memory for transient tile decoding across all GeoTIFF collections; past it a request is a 503 |
-| `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB` | `512` | decoded-tile cache; `0` disables it |
+| `[memory.caches] geotiff_decode` (deprecated: `MC_GEOTIFF_DECODE_MEMORY_MB`) | `1024` | memory for transient tile decoding across all GeoTIFF collections; past it a request is a 503 |
+| `[memory.caches] geotiff_decoded_chunk` (deprecated: `MC_GEOTIFF_DECODED_CHUNK_CACHE_MB`) | `512` | decoded-tile cache; `0` disables it |
 | `MC_COG_TILE_CONCURRENCY` | `16` | remote tile fetches in flight across all requests (1–1024) |
 | `MC_COG_PREWARM_MB` | `32` | per-frame cap on the poll-time pre-warm, also at most 1/8 of `tile_cache_mb`; an unread collection warms its newest frame only; `0` turns it off |
 | `MC_COG_RANGE_BATCH_TILES` | `1` (off) | coalesce up to N nearby tile reads into one range request (max 16) |

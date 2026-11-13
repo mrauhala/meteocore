@@ -224,7 +224,7 @@ runs offline on a fixture in `testdata/`. Server-wide settings for Maps:
 |---|---|---|
 | `[server] render_concurrency` | 2 × CPUs, min 8 | Render slots shared with WMS, Tiles and 3D Tiles |
 | `MC_RENDER_QUEUE_CAPACITY` | 3 × render slots | Renders that may wait for admission; past it a 503 at once |
-| `MC_RENDER_MEMORY_MB` | 1024 | Output-memory budget: 32 bytes per output pixel, 16 more per extra composite band |
+| `[memory.caches] render_budget` (deprecated: `MC_RENDER_MEMORY_MB`) | 1024 | Output-memory budget: 32 bytes per output pixel, 16 more per extra composite band |
 | `MC_RENDER_TIMEOUT_MS` | 3000 | Queue and render deadline |
 | `[server] rendered_cache_mb` | 256 | Size of the one rendered-image cache shared by WMS, Maps and Tiles; `0` disables it. Unset, the deprecated `[wms] rendered_cache_mb` sizes it: the largest value among the WMS, Maps and Tiles collections |
 
@@ -235,7 +235,7 @@ runs offline on a fixture in `testdata/`. Server-wide settings for Maps:
   (QueryData, Zarr, nowcast). EDR `/instances/{id}` lists each run's.
 - Maps are two-dimensional: a six-value `bbox` or a spatial slice such as
   `Lat(60)` is a 400, and `elevation` selects one level.
-- At the default `MC_RENDER_MEMORY_MB`, a map over 33 554 432 pixels (about
+- At the default `[memory.caches] render_budget`, a map over 33 554 432 pixels (about
   5793 × 5793) is always a 503. Raise the budget to serve larger maps.
 
 ## Testing

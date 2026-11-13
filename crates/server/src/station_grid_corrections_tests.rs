@@ -110,8 +110,7 @@ fn load(collections: &[CollectionConfig]) -> super::LoadResult {
         "http://x",
         false,
         &Default::default(),
-        0,
-        ds_core::config::DEFAULT_RENDERED_CACHE_MB,
+        crate::memory_caches::RenderCacheSizes::mb(0, ds_core::config::DEFAULT_RENDERED_CACHE_MB),
         super::ReusableCaches::default(),
         super::EngineReuse::default(),
     )

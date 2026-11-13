@@ -5,6 +5,7 @@ mod colormaps;
 mod delivery_delay;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc;
+mod memory_caches;
 mod memory_plan;
 mod preview;
 mod robots;
@@ -497,6 +498,24 @@ async fn serve(cli: CliArgs) {
     // The memory plan's facts (#1312), before loading takes any of the
     // memory available at boot.
     memory_plan::read_at_boot();
+    // `[memory.caches]` (#1313), before the collections load: the caches
+    // and budgets they build are built at their keys' sizes. An unknown key
+    // fails the boot.
+    let cache_settings = match memory_caches::CacheSettings::of(&config) {
+        Ok(settings) => settings,
+        Err(e) => {
+            tracing::error!("Invalid memory configuration: {e}");
+            std::process::exit(1);
+        }
+    };
+    memory_caches::log_warnings(&config, &cache_settings);
+    memory_caches::apply(
+        &cache_settings,
+        memory_plan::plans_sizes(
+            config.memory.as_ref().map(|m| m.mode).unwrap_or_default(),
+            config.memory.as_ref().and_then(|m| m.total_mb),
+        ),
+    );
     // Likewise: engines restore their snapshots from it while being built.
     admin::init_state_store(
         config
@@ -504,12 +523,10 @@ async fn serve(cli: CliArgs) {
             .state_dir_path(std::path::Path::new(&config_path)),
     );
 
-    // `[server] rendered_cache_mb`, else the deprecated `[wms]` fallback over
-    // the effective collections (#1028).
-    let (rendered_cache_mb, rendered_cache_warnings) = config.rendered_cache_mb();
-    for warning in &rendered_cache_warnings {
-        tracing::warn!("{warning}");
-    }
+    // The render output caches: `[memory.caches]`, else `[server]`, else
+    // the deprecated `[wms]` fallback over the effective collections
+    // (#1028, #1313), whose warnings `log_warnings` logged.
+    let render_cache_sizes = memory_caches::RenderCacheSizes::of(&config, &cache_settings);
     // Keys a style entry does not know load, but are reported (#1378).
     for warning in config.style_key_warnings() {
         tracing::warn!("{warning}");
@@ -525,8 +542,7 @@ async fn serve(cli: CliArgs) {
         &base_url,
         config.server.trust_proxy_headers,
         &config.discovery(learned_records.clone()),
-        config.server.metatile_cache_mb,
-        rendered_cache_mb,
+        render_cache_sizes.clone(),
         // Startup builds the render caches fresh; reloads reuse them.
         admin::ReusableCaches::default(),
         // Startup has no live engines to reuse; incremental reloads do (#574).

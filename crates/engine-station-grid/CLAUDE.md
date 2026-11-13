@@ -153,7 +153,7 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
 ## Execution (compute.rs) — never on a request worker
 
 - Request misses: claim the grid's fill guard (single-flight), reserve its
-  bytes (`MC_STATION_GRID_MEMORY_MB`, fail-fast `ResourceExhausted`), queue
+  bytes (`[memory.caches] station_grid_compute`, fail-fast `ResourceExhausted`), queue
   the job on the station-grid pool (its own multi-thread runtime,
   `MC_STATION_GRID_WORKERS` permits, job inside `block_in_place` so a
   PostGIS source's sync bridge finds a runtime), and wait until the request
@@ -173,7 +173,17 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   `build_2d_within` over the footprint window with an unwrapped envelope).
 - Load-time limits: ≤ 16 777 216 cells; one grid must fit the cache and
   one computation half the budget, else the collection fails at load
-  (otherwise every tile would recompute it, or no request could).
+  (otherwise every tile would recompute it, or no request could). One
+  check, `engine::check_sizes`, against the sizes the load being built
+  gives them (`compute::cache_capacity_for_load`, `budget_for_load`,
+  through `ds_cache::plan::keys::pending_bytes`, #1313): with nothing
+  staged (boot, tests) the live sizes; with a reload's keys staged, the
+  size `keys::set` then gives each, or in `[memory] mode = "auto"` where the
+  plan sizes it, its live size clamped into a range. So a reload raising
+  `[memory.caches] station_grid` loads the grid at once, and one lowering it
+  or `station_grid_compute` rebuilds, and fails, only the live grids it no
+  longer holds (`StationGridEngine::fits_the_load`, run by the server on
+  each live grid).
 
 ## EDR
 

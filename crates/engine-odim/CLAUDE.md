@@ -106,7 +106,7 @@ around `ds-storage` calls (Critical Rules 6–7).
   `ds-3dtiles` applies its own 3-D `smooth_grid` blur; the point cloud is
   raw).
 - **COMP composites: one fetch and decode per file** (`load_composite`,
-  `COMPOSITE_CACHE`, `MC_ODIM_COMPOSITE_CACHE_MB`), shared by renders and
+  `COMPOSITE_CACHE`, `[memory.caches] odim_composite`), shared by renders and
   EDR. A request waits for another's fill until its deadline
   (`get_or_insert_with_until`, #1399), then `DeadlineExceeded`; the fill
   lands for later requests, and none starts past the deadline. A fetch's
@@ -141,7 +141,7 @@ around `ds-storage` calls (Critical Rules 6–7).
   reflectivity frames; other quantities and EDR read lazily. Best-effort +
   additive (never marks known-bad; `PixelCache::contains` skips
   already-resident moments); bounded by the pixel-cache byte budget
-  (`MC_PVOL_PIXEL_CACHE_MB`). `0` disables; default `1` warms the base tilt
+  (`[memory.caches] pvol_pixel`). `0` disables; default `1` warms the base tilt
   (the standard reflectivity animation view). Each scan publishes the
   source's floor on the cache (`prewarm_floor`, #1309): 2 × the entries
   `prewarm_moments` names for every retained volume, weighed by
@@ -187,7 +187,7 @@ around `ds-storage` calls (Critical Rules 6–7).
   arrays for a 41 MB FMI volume (160 moments), times the EDR queries
   running at once. The PVOL read budget counts it (next bullet).
 - **EDR walks reserve their reads (#1041).** `read_budget::BUDGET`
-  (`MC_PVOL_READ_MEMORY_MB`, default 1024 MiB, a `ByteBudget`) admits
+  (`[memory.caches] pvol_read`, default 1024 MiB, a `ByteBudget`) admits
   every volume of `walk_volumes` before its file is read. A batch with
   nothing read ahead reserves inside `load_moments_from`'s loader, once
   `load_many` has named the missing moments: their arrays at `sweep_bytes`
@@ -469,7 +469,7 @@ in `crates/api-3dtiles/CLAUDE.md`.
 - **`VOXEL_GRID_CACHE`**: `read_voxel_grid` returns `Arc<VoxelGrid>` from a
   global LRU keyed (file, quantity, dims) — isosurface/echo-top/voxels and
   threshold changes share one polar resample
-  (`MC_PVOL_VOXEL_GRID_CACHE_MB`, default 512). The resample resolves each
+  (`[memory.caches] pvol_voxel_grid`, default 512). The resample resolves each
   `(radius, height)` column once (`ColumnTarget`) instead of per-cell
   lookups. A request waits for another's fill until its deadline (#1399):
   a `CELLS` tile's 3 s can sit behind a 3D Tiles request's 30 s fill. Then
@@ -503,7 +503,7 @@ not guarantee monotonic improvement. This baseline does not enable #642.
 - Generic surface: `VolumeEngine::read_cells(CellQuery)` (default impl over
   `read_voxel_grid`; window clamped to `MAX_TRACK_SCANS`; an empty target
   scan is a valid empty result, NOT 404). The PVOL view overrides it with
-  the byte-bounded per-volume `CELL_SET_CACHE` (`MC_PVOL_CELL_SET_CACHE_MB`,
+  the byte-bounded per-volume `CELL_SET_CACHE` (`[memory.caches] pvol_cell_set`,
   default 64; volumes are immutable ⇒ never stale) and gates to dBZ-unit
   quantities (VIL/linear-Z is reflectivity physics → else 400).
 - **A cold `CELLS` window (#1155).** A tile segments the scan it draws and

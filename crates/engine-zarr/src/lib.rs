@@ -133,7 +133,7 @@ impl ZarrEngine {
             config
                 .icechunk
                 .as_ref()
-                .map_or(0, |ic| ic.decoded_cache_mb)
+                .map_or(0, |ic| ic.effective_decoded_cache_mb())
                 .saturating_mul(ds_cache::MIB),
         ));
         let catalog = catalog::build(
@@ -849,7 +849,7 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
         return Ok(DsStore::new(
             ds.for_collection(collection_id),
             path,
-            config.cache_mb,
+            config.effective_cache_mb(),
         ));
     }
 
@@ -876,7 +876,7 @@ fn build_store(collection_id: &str, config: &ZarrConfig) -> Result<DsStore, Data
     Ok(DsStore::new(
         ds.for_collection(collection_id),
         prefix.as_ref().to_string(),
-        config.cache_mb,
+        config.effective_cache_mb(),
     ))
 }
 

@@ -52,7 +52,7 @@ fn fixture(family: Option<GribLevelType>) -> (TestSource, GribEngine) {
         }
     }
     let mut config = source.config();
-    config.grid_cache_mb = 0;
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     config.level_types = family.map(|family| vec![family]);
     config.parameters = Some(vec!["P0".into(), "P1".into()]);
     let owner = GribEngine::new("cube", &config).unwrap();
@@ -242,7 +242,7 @@ fn native_cube_on_a_tenth_degree_grid_has_the_nodes_decimals() {
         0,
     );
     let mut config = source.config();
-    config.grid_cache_mb = 0;
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
     config.level_types = Some(vec![GribLevelType::Pressure]);
     config.parameters = Some(vec!["P0".into()]);
     let owner = GribEngine::new("cube", &config).unwrap();

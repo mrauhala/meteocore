@@ -25,7 +25,7 @@ static BUDGET: LazyLock<Arc<ByteBudget>> = LazyLock::new(|| {
     if std::env::var_os(RETIRED_LOCATIONS_MEMORY).is_some() {
         tracing::warn!(
             "{RETIRED_LOCATIONS_MEMORY} is retired and ignored: /locations shares the EDR \
-             response memory budget, MC_EDR_RESPONSE_MEMORY_MB (default 512)"
+             response memory budget, [memory.caches] edr_response (default 512)"
         );
     }
     let (bytes, source) = size("MC_EDR_RESPONSE_MEMORY_MB");

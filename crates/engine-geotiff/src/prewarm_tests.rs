@@ -51,7 +51,7 @@ fn config() -> GeoTiffConfig {
         poll_interval_secs: 3600,
         exclude_patterns: vec![],
         max_files: None,
-        tile_cache_mb: 64,
+        tile_cache_mb: Some(ds_core::config::CacheSize::Mib(64)),
         band: 1,
         nodata: None,
         scale: None,
@@ -84,7 +84,7 @@ fn remote_engine(local: &TempDir, remote: &TempDir) -> GeoTiffEngine {
         store,
         prefix: ObjectPath::from("d"),
     };
-    engine.tile_cache = TileCache::new(config().tile_cache_mb * 1024 * 1024);
+    engine.tile_cache = TileCache::new(config().effective_tile_cache_mb() * 1024 * 1024);
     engine
 }
 
@@ -570,7 +570,7 @@ async fn benchmark_first_view_over_latency() {
             store: store.clone(),
             prefix: ObjectPath::from(""),
         };
-        engine.tile_cache = TileCache::new(config().tile_cache_mb * 1024 * 1024);
+        engine.tile_cache = TileCache::new(config().effective_tile_cache_mb() * 1024 * 1024);
         engine.catalog.store(Arc::new(catalog));
         engine
     };

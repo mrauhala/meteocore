@@ -722,7 +722,7 @@ fn the_grid_cache_demand_counts_the_grids_computed_ahead() {
     let cells: u64 = 60 * 40;
     let empty_grid = cells * 4 + 128;
     let before = engine.grid_demand();
-    assert_eq!(before.setting, "MC_STATION_GRID_CACHE_MB");
+    assert_eq!(before.setting, "[memory.caches] station_grid");
     assert_eq!(
         before.inputs,
         [

@@ -54,7 +54,7 @@ fn write_store(path: &std::path::Path, times: &[f64], longitude: f64, value: f32
 
 fn engine(path: &std::path::Path, cache_mb: u64) -> ZarrEngine {
     let mut config = ZarrConfig::auto_local(path.to_string_lossy().into());
-    config.cache_mb = cache_mb;
+    config.cache_mb = Some(ds_core::config::CacheSize::Mib(cache_mb));
     ZarrEngine::new("refresh", &config).unwrap()
 }
 

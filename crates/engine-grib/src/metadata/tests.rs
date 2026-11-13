@@ -260,7 +260,7 @@ async fn concurrent_probes_keep_order_isolate_failures_and_drain_at_deadline() {
 async fn engine(count: usize, delay: Duration, cache_mb: u64) -> (GribEngine, Vec<MessageEntry>) {
     let temporary = TestSource::new();
     let mut config = temporary.config();
-    config.grid_cache_mb = cache_mb;
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(cache_mb));
     let mut engine = GribEngine::new("probes", &config).unwrap();
     let observed = Arc::new(TestStore {
         suffix: ".grib2",

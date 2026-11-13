@@ -67,7 +67,9 @@ impl Source {
             |msg: String| DataServerError::Config(format!("Collection '{collection_id}': {msg}"));
 
         let version = version_info(collection_id, ic)?;
-        let meter = Arc::new(Meter::new(config.cache_mb.saturating_mul(ds_cache::MIB)));
+        let meter = Arc::new(Meter::new(
+            config.effective_cache_mb().saturating_mul(ds_cache::MIB),
+        ));
         let repo = runtime::run(async {
             let backend = wrap(build_storage(collection_id, config).await?);
             let storage = Arc::new(MeteredStorage::new(backend, meter.clone()));

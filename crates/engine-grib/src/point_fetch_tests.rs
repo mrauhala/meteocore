@@ -56,9 +56,9 @@ pub(crate) fn counted(
     grid_mb: u64,
 ) -> (GribEngine, Arc<TestStore>) {
     let mut config = source.config();
-    config.point_index_cache_mb = Some(point_index_mb);
-    config.message_cache_mb = message_mb;
-    config.grid_cache_mb = grid_mb;
+    config.point_index_cache_mb = Some(ds_core::config::CacheSize::Mib(point_index_mb));
+    config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(message_mb));
+    config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(grid_mb));
     config.level_types = Some(vec![GribLevelType::Pressure]);
     let mut owner = GribEngine::new("fetches", &config).unwrap();
     let store = Arc::new(TestStore {

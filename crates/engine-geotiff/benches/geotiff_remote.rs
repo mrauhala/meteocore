@@ -31,7 +31,7 @@ fn make_config(cache_mb: u64) -> GeoTiffConfig {
         parameter: "reflectivity".to_string(),
         unit: "dBZ".to_string(),
         poll_interval_secs: 3600,
-        tile_cache_mb: cache_mb,
+        tile_cache_mb: Some(ds_core::config::CacheSize::Mib(cache_mb)),
         band: 1,
         max_files: None,
         nodata: Some(255.0),

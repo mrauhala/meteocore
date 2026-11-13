@@ -267,7 +267,7 @@ fn main() -> ExitCode {
         parameter: "reflectivity".to_string(),
         unit: "dBZ".to_string(),
         poll_interval_secs: 3600,
-        tile_cache_mb: 256,
+        tile_cache_mb: Some(ds_core::config::CacheSize::Mib(256)),
         band: 1,
         max_files: None,
         nodata: args.nodata,

@@ -177,8 +177,8 @@ only this collection. A grid has at most 16 777 216 cells. One grid (4 bytes
 a cell), with its terrain (4 bytes a cell of the widened grid) and mask (1
 byte a cell), must fit the grid cache and one computation half the
 admission budget, or the collection fails to load.
-Every station grid shares the cache (`MC_STATION_GRID_CACHE_MB`, default
-256 MiB), the budget (`MC_STATION_GRID_MEMORY_MB`, default 512 MiB) and the
+Every station grid shares the cache (`[memory.caches] station_grid`, default
+256 MiB), the budget (`[memory.caches] station_grid_compute`, default 512 MiB) and the
 pool (`MC_STATION_GRID_WORKERS` grids at once, at most 64; default half the
 CPUs, between 1 and 4).
 

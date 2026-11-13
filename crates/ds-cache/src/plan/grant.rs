@@ -30,6 +30,11 @@
 //!    order until they fit. What still does not fit is the plan's
 //!    shortfall, never an error.
 //! 8. A grant carries the cache's entry size, for its shard layout.
+//! 9. A cache or budget sized by a `{ min, max }` key
+//!    ([`SizeSource::Bounds`], #1313) is planned by its rule, every size of
+//!    it (its want, floor, ceiling and grant) clamped into those bounds: no
+//!    grant falls outside them, even below what applying the plan can take
+//!    it to now, or for one no collection can reach.
 //!
 //! A cache's expected use is what the plan counts it at: its grant for a
 //! traffic-driven cache, a pinned or fixed one, and one whose demand is not
@@ -176,12 +181,19 @@ pub fn class(id: &str) -> Class {
 }
 
 /// Whether a size came from a setting: an environment variable, a config
-/// key, or a key it follows. A pinned size is never changed.
+/// key, or a key it follows. A pinned size is never changed. A key's
+/// `{ min, max }` ([`SizeSource::Bounds`]) is not a pin: it bounds the
+/// plan's size.
 pub fn pinned(source: &SizeSource) -> bool {
     !matches!(
         source,
-        SizeSource::Default | SizeSource::Constant | SizeSource::Planned
+        SizeSource::Default | SizeSource::Constant | SizeSource::Planned | SizeSource::Bounds(..)
     )
+}
+
+/// `bytes` clamped into `source`'s bounds, when it has any (rule 9).
+fn bounded_by(source: &SizeSource, bytes: u64) -> u64 {
+    source.bounds().map_or(bytes, |bounds| bounds.clamp(bytes))
 }
 
 /// The most one resize by the plan evicts of what a warm cache holds, in
@@ -444,6 +456,9 @@ pub enum Reason {
     Today,
     /// Off: its configured size is 0, and only its setting turns it on.
     Off,
+    /// The floor of its `{ min, max }` range, above the size its rule gives
+    /// it (rule 9): an off cache a range turns on.
+    RangeFloor,
     /// The least applying the plan can give it now ([`Least`]).
     Held(Hold),
     /// A budget scaled to the total.
@@ -465,6 +480,7 @@ impl fmt::Display for Reason {
             Reason::Share(weight) => write!(f, "share by weight {weight}"),
             Reason::Today => f.write_str("size today"),
             Reason::Off => f.write_str("off: its setting turns it on"),
+            Reason::RangeFloor => f.write_str("the floor of its range"),
             Reason::Held(Hold::Warm) => {
                 f.write_str("held: a warm cache gives up at most 25 % of what it holds at once")
             }
@@ -671,11 +687,14 @@ fn of_cache(input: &CacheInput, floors_only: bool, keep: Option<&Plan>) -> Plann
         planned.set(today);
         return planned;
     }
+    let bound = |bytes: u64| bounded_by(&input.entry.source, bytes);
     if let Some(why) = &input.unreachable {
+        // Holds nothing, whatever its floor.
+        planned.need = Some(0);
         planned.grant.reason = Reason::Unreachable(why.clone());
-        planned.grant.floor_bytes = 0;
-        planned.want = 0;
-        planned.set(0);
+        planned.grant.floor_bytes = bound(0);
+        planned.want = bound(0);
+        planned.set(bound(0));
         return planned;
     }
     // Never below what applying the plan can take it to now.
@@ -683,17 +702,21 @@ fn of_cache(input: &CacheInput, floors_only: bool, keep: Option<&Plan>) -> Plann
     if today == 0 {
         // Off: its setting turns it on, never the plan. What it still
         // holds goes as it can.
-        planned.grant.floor_bytes = least;
-        planned.want = least;
-        planned.grant.reason = Reason::Off;
-        planned.set(least);
+        planned.grant.floor_bytes = bound(least);
+        planned.want = bound(least);
+        planned.grant.reason = if bound(least) > least {
+            Reason::RangeFloor
+        } else {
+            Reason::Off
+        };
+        planned.set(bound(least));
         return planned;
     }
     let (want, floor, reason) = match class {
         Class::Fixed => {
-            planned.grant.floor_bytes = today.max(least);
-            planned.want = today.max(least);
-            planned.set(today.max(least));
+            planned.grant.floor_bytes = bound(today.max(least));
+            planned.want = bound(today.max(least));
+            planned.set(bound(today.max(least)));
             return planned;
         }
         Class::Demand => {
@@ -744,11 +767,11 @@ fn of_cache(input: &CacheInput, floors_only: bool, keep: Option<&Plan>) -> Plann
                 .map_or(0, Demand::suggested_bytes);
             let floor = mib_up((today / TRAFFIC_RANGE).max(MIN_FLOOR)).max(planned.base);
             let want = floor.max(today);
-            planned.ceiling = today.saturating_mul(TRAFFIC_RANGE).max(want).max(least);
+            planned.ceiling = bound(today.saturating_mul(TRAFFIC_RANGE).max(want).max(least));
             (want, floor, Reason::Share(weight))
         }
     };
-    let (want, floor) = (want.max(least), floor.max(least));
+    let (want, floor) = (bound(want.max(least)), bound(floor.max(least)));
     planned.want = want;
     planned.grant.floor_bytes = floor;
     planned.grant.reason = if floors_only { Reason::Floor } else { reason };
@@ -793,22 +816,23 @@ fn of_budget(
     if pinned(&input.entry.source) {
         return planned;
     }
+    let bound = |bytes: u64| bounded_by(&input.entry.source, bytes);
     if let Some(why) = &input.unreachable {
-        planned.want = 0;
-        planned.grant.floor_bytes = 0;
+        planned.want = bound(0);
+        planned.grant.floor_bytes = bound(0);
         planned.grant.reason = Reason::Unreachable(why.clone());
-        planned.set(0);
+        planned.set(bound(0));
         return planned;
     }
     let scale = if render { RENDER_BUDGET } else { READ_BUDGET };
     planned.cut = true;
-    planned.want = if render {
+    planned.want = bound(if render {
         scale.of(total)
     } else {
         // Capped at its size today until the #1307 peaks justify more.
         scale.of(total).min(today)
-    };
-    planned.grant.floor_bytes = scale.min.min(planned.want);
+    });
+    planned.grant.floor_bytes = bound(scale.min.min(planned.want));
     // A warm cache's passing hold never cuts a budget below the plan
     // without it.
     if let Some(grant) = keep.and_then(|keep| keep.grant(&input.entry)) {
@@ -816,7 +840,7 @@ fn of_budget(
     }
     if floors_only {
         planned.grant.reason = Reason::Floor;
-        planned.set(scale.min);
+        planned.set(bound(scale.min));
     } else {
         planned.grant.reason = Reason::Scaled;
         planned.set(planned.want);
@@ -1150,6 +1174,19 @@ fn fit(inputs: &Inputs, keep: Option<&Plan>, ideal: Option<&Plan>) -> Plan {
             if c.grant.bytes == least.bytes && above {
                 c.grant.reason = Reason::Held(least.why);
             }
+        }
+    }
+    // Rule 9, whatever moved a size since: never outside its bounds.
+    for c in caches.iter_mut() {
+        let bytes = bounded_by(&c.grant.entry.source, c.grant.bytes);
+        if bytes != c.grant.bytes {
+            c.set(bytes);
+        }
+    }
+    for b in budgets.iter_mut() {
+        let bytes = bounded_by(&b.grant.entry.source, b.grant.bytes);
+        if bytes != b.grant.bytes {
+            b.set(bytes);
         }
     }
     let (pool, slack) = pool_of(total, baseline, &budgets);

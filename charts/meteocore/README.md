@@ -173,9 +173,11 @@ extraEnv:
 An `s3://` data path reads the standard `AWS_*` variables, region, endpoint
 and credentials, from the environment.
 
-`env` holds plain variables, name to value: `LOG_FORMAT`, `RUST_LOG`, the
-`MC_*` cache and budget sizes. Set a name to `null` to drop one of the
-defaults.
+`env` holds plain variables, name to value: `LOG_FORMAT`, `RUST_LOG`.
+Set a name to `null` to drop one of the defaults. Cache and budget sizes
+belong in `config.toml`'s `[memory.caches]`; the `MC_*_CACHE_MB` and
+`MC_*_MEMORY_MB` variables are deprecated since 0.16.0: they still work,
+each with a deprecation warning, until they are ignored from 0.18.0.
 
 ## State and replicas
 
@@ -259,9 +261,9 @@ public.
 
 ## Memory
 
-The server's memory is mostly caches and admission budgets, each sized by an
-`MC_*` variable or a config key. `GET /admin/cache-plan` lists them all with
-their sizes. The server does not size them from the container's memory
+The server's memory is mostly caches and admission budgets, each sized by a
+`[memory.caches]` key or a collection key in `config.toml`.
+`GET /admin/cache-plan` lists them all with their sizes. The server does not size them from the container's memory
 limit, so set the limit above the cache plan plus headroom for requests, or
 lower the sizes. `MALLOC_ARENA_MAX=2` is set by default; it limits only C
 libraries that allocate with glibc malloc, since the server itself uses

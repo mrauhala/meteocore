@@ -297,9 +297,9 @@ async fn probe_models() {
             zarr_version: None,
             parameters: None,
             poll_interval_secs: 300,
-            cache_mb: 128,
+            cache_mb: Some(ds_core::config::CacheSize::Mib(128)),
             icechunk: Some(IcechunkConfig {
-                decoded_cache_mb: 0,
+                decoded_cache_mb: Some(ds_core::config::CacheSize::Mib(0)),
                 branch: Some("main".into()),
                 tag: None,
                 snapshot: None,
@@ -355,9 +355,9 @@ async fn reads_local_icechunk_repo() {
         zarr_version: Some(3),
         parameters: None,
         poll_interval_secs: 300,
-        cache_mb: 64,
+        cache_mb: Some(ds_core::config::CacheSize::Mib(64)),
         icechunk: Some(IcechunkConfig {
-            decoded_cache_mb: 0,
+            decoded_cache_mb: Some(ds_core::config::CacheSize::Mib(0)),
             branch: Some("main".into()),
             tag: None,
             snapshot: None,

@@ -176,7 +176,7 @@ fn the_field_cache_demands_sixteen_fields_of_the_grid() {
     let [width, height] = engine.raster_info().grid_size.unwrap();
     let cells = u64::from(width) * u64::from(height);
     let demand = engine.field_cache_demand().expect("published by the scan");
-    assert_eq!(demand.setting, "MC_NETCDF_FIELD_CACHE_MB");
+    assert_eq!(demand.setting, "[memory.caches] netcdf_field");
     assert_eq!(demand.inputs[..2], [("fields", 16), ("cells", cells)]);
     // The values, the longest name ("air_pressure_at_sea_level") and 96
     // bytes of overhead.

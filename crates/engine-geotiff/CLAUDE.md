@@ -234,7 +234,7 @@ apply here.
 
 ## Decode admission
 
-`MC_GEOTIFF_DECODE_MEMORY_MB` (default 1024; 0 rejects cold decodes) bounds
+`[memory.caches] geotiff_decode` (default 1024; 0 rejects cold decodes) bounds
 transient local/remote GeoTIFF decoding across collections and APIs.
 Decoded-chunk cache hits bypass it; cache retention has its own budget. Local
 misses reserve native output plus the decoder’s capped 64 MiB intermediate
@@ -277,7 +277,7 @@ engine-zarr.
   across WMS/Maps/Tiles; see `crates/api-wms/CLAUDE.md`.
 - **Decoded-chunk cache (#463, #468):** process-global byte-bounded LRU of
   *decoded* native source tiles for local files **and** remote COGs
-  (`MC_GEOTIFF_DECODED_CHUNK_CACHE_MB`, default 512, 0 disables; one shared
+  (`[memory.caches] geotiff_decoded_chunk`, default 512, 0 disables; one shared
   budget). The WMS meta-tile loop renders one viewport as ~50–190
   independent `get_raster_tile` calls whose covering source tiles overlap;
   without the memo each source tile is LZW/DEFLATE-decoded 4–8× per frame.

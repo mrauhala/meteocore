@@ -1,5 +1,5 @@
 use super::*;
-use crate::plan::{CacheDemand, Scope};
+use crate::plan::{Bounds, CacheDemand, Scope};
 
 const MB: u64 = MIB;
 
@@ -899,6 +899,7 @@ fn reasons_print_for_the_report() {
         Reason::Share(45),
         Reason::Today,
         Reason::Off,
+        Reason::RangeFloor,
         Reason::Held(Hold::Warm),
         Reason::Held(Hold::InPlace),
         Reason::Scaled,
@@ -920,6 +921,7 @@ fn reasons_print_for_the_report() {
             "share by weight 45",
             "size today",
             "off: its setting turns it on",
+            "the floor of its range",
             "held: a warm cache gives up at most 25 % of what it holds at once",
             "held: it shrinks no further in place",
             "scaled to the total",
@@ -1244,4 +1246,104 @@ fn a_0_1_and_a_0_25_degree_source_get_different_grid_caches() {
         assert_eq!(b.reason, Reason::Today);
         assert_eq!((a.entry_bytes, b.entry_bytes), (Some(tenth), Some(quarter)));
     }
+}
+
+/// `input` sized by a `{ min, max }` key, at the default clamped into it
+/// as its configured size (`mb`).
+fn within(mut input: CacheInput, mb: u64, min: u64, max: u64) -> CacheInput {
+    input.entry.source = SizeSource::Bounds("[memory.caches] k", Bounds::mib(min, max));
+    input.capacity_bytes = mb * MB;
+    input
+}
+
+/// Every process-wide cache and budget, the meta-tile cache, PVOL pixel
+/// cache and render budget bounded when `bounds`, at `total_gib`.
+fn bounded_plan(total_gib: f64, bounds: bool) -> Plan {
+    let (caches, mut budgets) = process_wide(&[]);
+    let caches = caches
+        .into_iter()
+        .map(|c| match (bounds, c.entry.id) {
+            (true, "metatile_cache") => within(c, 1024, 512, 1536),
+            (true, "pvol_pixel_cache") => within(c, 2048, 2048, 4096),
+            (true, "tiles3d_content_cache") => within(unreachable(c), 512, 128, 1024),
+            (false, "tiles3d_content_cache") => unreachable(c),
+            _ => c,
+        })
+        .collect();
+    if bounds {
+        let render = budgets
+            .iter_mut()
+            .find(|b| b.entry.id == "render_budget")
+            .unwrap();
+        render.entry.source = SizeSource::Bounds("[memory.caches] k", Bounds::mib(256, 512));
+    }
+    plan(&inputs(total_gib, 10, Baseline::Estimated, caches, budgets))
+}
+
+/// #1313 acceptance: a `{ min, max }` cache or budget is planned by its
+/// rule within its bounds. Unbounded, a large total takes the meta-tile
+/// cache and render budget above the ceiling and a small one cuts them
+/// below the floor; bounded, neither goes outside, and one no collection
+/// can reach is at its floor, expected to hold nothing.
+#[test]
+fn a_bounded_size_never_falls_outside_its_bounds() {
+    let free = bounded_plan(64.0, false);
+    assert!(mb(&free, "metatile_cache") > 1536, "{free:#?}");
+    assert!(mb(&free, "render_budget") > 512);
+    let tight = bounded_plan(1.0, false);
+    assert!(mb(&tight, "metatile_cache") < 512, "{tight:#?}");
+    assert!(mb(&tight, "pvol_pixel_cache") < 2048);
+
+    for total in [1.0, 4.0, 16.0, 64.0] {
+        let plan = bounded_plan(total, true);
+        for g in plan.caches.iter().chain(&plan.budgets) {
+            if let Some(bounds) = g.entry.source.bounds() {
+                assert!(
+                    (bounds.min_bytes..=bounds.max_bytes).contains(&g.bytes),
+                    "{total} GiB: {} at {} MiB ({})",
+                    g.entry.id,
+                    g.bytes / MB,
+                    g.reason
+                );
+                assert!(g.floor_bytes >= bounds.min_bytes, "{g:?}");
+            }
+        }
+        let content = grant(&plan, "tiles3d_content_cache", None);
+        assert_eq!((content.bytes, content.expected_bytes), (128 * MB, 0));
+    }
+    let large = bounded_plan(64.0, true);
+    assert_eq!(mb(&large, "metatile_cache"), 1536, "at its ceiling");
+    assert_eq!(mb(&large, "render_budget"), 512);
+    assert_eq!(large.reserves.render_bytes, 512 * MB);
+    let small = bounded_plan(1.0, true);
+    assert_eq!(mb(&small, "metatile_cache"), 512, "at its floor");
+    assert_eq!(mb(&small, "pvol_pixel_cache"), 2048);
+    assert_eq!(mb(&small, "render_budget"), 256);
+    // Not pinned: the plan sizes it.
+    assert!(!pinned(&SizeSource::Bounds("k", Bounds::mib(1, 2))));
+}
+
+/// An off cache a range's floor turns on says so: its reason is the
+/// range's floor, not "off".
+#[test]
+fn an_off_cache_lifted_by_its_range_floor_says_so() {
+    let (mut caches, budgets) = process_wide(&[]);
+    caches.push(within(
+        cache(
+            "netcdf_chunk_cache",
+            Scope::Engine("probe"),
+            SizeSource::Default,
+            0,
+        ),
+        0,
+        64,
+        512,
+    ));
+    let plan = plan(&inputs(16.0, 10, Baseline::Estimated, caches, budgets));
+    let g = plan
+        .caches
+        .iter()
+        .find(|g| g.entry.scope == Scope::Engine("probe"))
+        .unwrap();
+    assert_eq!((g.bytes, &g.reason), (64 * MB, &Reason::RangeFloor));
 }

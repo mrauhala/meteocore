@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 
 use serde::Deserialize;
 
+mod cache_size;
 mod period;
 mod station_grid;
+pub use cache_size::{resolve as resolve_cache_size, CacheSize};
 pub use period::{PeriodConfig, RainRateConfig};
 pub use station_grid::{
     StationExclusionRule, StationExclusions, StationGridParameter, StationGridParameterOptions,
@@ -57,6 +59,15 @@ pub struct MemoryConfig {
     /// Whether the plan only reports its sizes or applies them.
     #[serde(default)]
     pub mode: MemoryMode,
+    /// `[memory.caches]` (#1313): the size of a process-wide cache or
+    /// admission budget by its key, the `/metrics` family without its
+    /// `_cache` suffix (`metatile`, `pvol_pixel`, `render_budget`, …). A
+    /// number of MiB pins it; `{ min, max }` leaves it to the plan within
+    /// those bounds. The server rejects an unknown key at load, naming the
+    /// valid ones; it wins over the key's `MC_…_MB` variable and `[server]`
+    /// alias.
+    #[serde(default)]
+    pub caches: BTreeMap<String, CacheSize>,
 }
 
 /// `[memory] mode` (#1312): what the memory plan does with its sizes.
@@ -198,11 +209,12 @@ pub struct ServerSettings {
     /// (#202). A single server-wide cache, not per-collection. Currently
     /// consumed only by the WMS GetMap path; api-maps/api-tiles still render
     /// directly and would share this same cache once meta-tiling is extended to
-    /// them (follow-up). Default: 1024. Set to `0` to disable meta-tiling
-    /// entirely (EPSG:3857/3067/3035 GetMap reverts to a direct single-shot
-    /// render), reversible via config reload.
-    #[serde(default = "default_metatile_cache_mb")]
-    pub metatile_cache_mb: u64,
+    /// them (follow-up). Unset: [`DEFAULT_METATILE_CACHE_MB`]. Set to `0` to
+    /// disable meta-tiling entirely (EPSG:3857/3067/3035 GetMap reverts to a
+    /// direct single-shot render), reversible via config reload. An alias of
+    /// `[memory.caches] metatile` (#1313), which wins when both are set.
+    #[serde(default)]
+    pub metatile_cache_mb: Option<u64>,
     /// Size in MB of the rendered-image cache: the encoded images WMS, Maps
     /// and Tiles serve again on a repeated request (#1028). A single
     /// server-wide cache, like `metatile_cache_mb`. Unset (default): the
@@ -302,7 +314,7 @@ impl ServerConfig {
                 admin_token: None,
                 collections_dir: None,
                 colormaps_dir: None,
-                metatile_cache_mb: default_metatile_cache_mb(),
+                metatile_cache_mb: None,
                 rendered_cache_mb: None,
                 watch_collections_dir: false,
                 watch_debounce_ms: default_watch_debounce_ms(),
@@ -504,6 +516,31 @@ pub const DERIVE_GEOPOTENTIAL_HEIGHT_ENGINES: [&str; 3] = ["grib", "zarr", "netc
 pub const DERIVE_HUMIDITY_ENGINES: [&str; 4] = ["grib", "querydata", "zarr", "netcdf"];
 
 impl CollectionConfig {
+    /// The per-collection cache size keys this collection sets, each named
+    /// as config writes it (`[grib] grid_cache_mb`), with its value (#1313).
+    pub fn cache_sizes(&self) -> Vec<(&'static str, CacheSize)> {
+        let mut sizes = Vec::new();
+        let mut push = |key: &'static str, size: Option<CacheSize>| {
+            if let Some(size) = size {
+                sizes.push((key, size));
+            }
+        };
+        if let Some(geotiff) = &self.geotiff {
+            push("[geotiff] tile_cache_mb", geotiff.tile_cache_mb);
+        }
+        if let Some(grib) = &self.grib {
+            push("[grib] grid_cache_mb", grib.grid_cache_mb);
+            push("[grib] message_cache_mb", grib.message_cache_mb);
+            push("[grib] point_index_cache_mb", grib.point_index_cache_mb);
+        }
+        if let Some(zarr) = &self.zarr {
+            push("[zarr] cache_mb", zarr.cache_mb);
+            let decoded = zarr.icechunk.as_ref().and_then(|i| i.decoded_cache_mb);
+            push("[zarr.icechunk] decoded_cache_mb", decoded);
+        }
+        sizes
+    }
+
     /// Whether this collection serves wind derived from u/v components:
     /// on by default for [`DERIVE_WIND_ENGINES`], off with
     /// `derive_wind = false`.
@@ -1330,6 +1367,13 @@ impl ServerConfig {
         warnings
     }
 
+    /// The collections whose deprecated `[wms] rendered_cache_mb`
+    /// [`select_rendered_cache_mb`] reads: those that serve WMS, Maps or
+    /// Tiles, by id, with the value.
+    pub fn deprecated_rendered_cache_mb(&self) -> impl Iterator<Item = (&str, u64)> + '_ {
+        rendered_cache_keyed(&self.collections)
+    }
+
     /// [`select_rendered_cache_mb`] over this config: `[server]
     /// rendered_cache_mb` and the collections.
     pub fn rendered_cache_mb(&self) -> (u64, Vec<String>) {
@@ -1352,10 +1396,6 @@ impl ServerConfig {
 
 /// Default `[server] metatile_cache_mb`.
 pub const DEFAULT_METATILE_CACHE_MB: u64 = 1024;
-
-fn default_metatile_cache_mb() -> u64 {
-    DEFAULT_METATILE_CACHE_MB
-}
 
 fn default_watch_debounce_ms() -> u64 {
     500
@@ -1590,9 +1630,12 @@ pub struct GeoTiffConfig {
     pub max_files: Option<usize>,
     /// Tile cache size in megabytes for remote COG byte-range reads.
     /// Caches compressed tile bytes to avoid repeated S3/HTTP fetches.
-    /// Default: [`DEFAULT_TILE_CACHE_MB`]. Set to 0 to disable.
-    #[serde(default = "default_tile_cache_mb")]
-    pub tile_cache_mb: u64,
+    /// Unset: [`DEFAULT_TILE_CACHE_MB`], which `[memory] mode = "auto"`
+    /// may resize. Set to 0 to disable; `{ min, max }` leaves it to the
+    /// memory plan within those bounds (#1313). The size is
+    /// [`Self::effective_tile_cache_mb`].
+    #[serde(default)]
+    pub tile_cache_mb: Option<CacheSize>,
 
     /// Band number to read (1-based). Default: 1.
     /// For multi-band files, selects which band contains the parameter values.
@@ -1646,8 +1689,12 @@ fn default_stac_asset_key() -> String {
 /// Default `[geotiff] tile_cache_mb`.
 pub const DEFAULT_TILE_CACHE_MB: u64 = 256;
 
-fn default_tile_cache_mb() -> u64 {
-    DEFAULT_TILE_CACHE_MB
+impl GeoTiffConfig {
+    /// The tile cache size in MiB `tile_cache_mb` gives a remote source:
+    /// [`DEFAULT_TILE_CACHE_MB`] when unset, a range's clamped into it.
+    pub fn effective_tile_cache_mb(&self) -> u64 {
+        resolve_cache_size(self.tile_cache_mb, DEFAULT_TILE_CACHE_MB)
+    }
 }
 
 fn default_band() -> u32 {
@@ -3443,10 +3490,6 @@ pub const DEFAULT_POINT_INDEX_CACHE_MB: u64 = 16;
 /// CCSDS source, at 1–6 KB an index, fills only a small part of it.
 const POINT_INDEX_SHARE_OF_MESSAGE_CACHE_PERCENT: u64 = 25;
 
-fn default_grid_cache_mb() -> u64 {
-    DEFAULT_GRID_CACHE_MB
-}
-
 /// Default `[grib] read_ahead`: the steps a map render reads ahead (#1335).
 /// A client waiting on each frame asks for the next once this one is drawn,
 /// while that step's GET, started when this frame's message was read, may
@@ -3529,22 +3572,26 @@ pub struct GribConfig {
     pub time_window: Option<String>,
     /// Optional parameter filter — only expose these params. Default: all.
     pub parameters: Option<Vec<String>>,
-    /// Grid cache size in MB. Default: 256.
-    #[serde(default = "default_grid_cache_mb")]
-    pub grid_cache_mb: u64,
-    /// Compressed GRIB message cache in MiB, separate from decoded grids.
-    /// Default: 0 (disabled). Shared by every level collection of this source.
+    /// Grid cache size in MB. Unset: [`DEFAULT_GRID_CACHE_MB`]. Like every
+    /// size key, `{ min, max }` leaves it to the memory plan within those
+    /// bounds (#1313). The size is [`Self::effective_grid_cache_mb`].
     #[serde(default)]
-    pub message_cache_mb: u64,
+    pub grid_cache_mb: Option<CacheSize>,
+    /// Compressed GRIB message cache in MiB, separate from decoded grids.
+    /// Unset: 0 (disabled). Shared by every level collection of this
+    /// source. The size is [`Self::effective_message_cache_mb`].
+    #[serde(default)]
+    pub message_cache_mb: Option<CacheSize>,
     /// Point-index cache in MiB, one shard: position queries on CCSDS
     /// (5.42, #1300) and complex-packed (5.3, #1302) fields decode only the
     /// blocks or rows their points need. Unset: 25 % of `message_cache_mb`,
     /// never below 16, so the indexes stay resident with the messages kept
     /// (#1333); 16 without a message cache. A value set here, `0` included,
-    /// is the size. `0` disables that path; every field is decoded in full.
+    /// is the size; a range clamps the derived size. `0` disables that
+    /// path; every field is decoded in full.
     /// The size is [`Self::effective_point_index_cache_mb`].
     #[serde(default)]
-    pub point_index_cache_mb: Option<u64>,
+    pub point_index_cache_mb: Option<CacheSize>,
     /// Pre-warm, as the poll catalogues new steps of the newest run, the
     /// messages of the parameters and levels EDR position queries read in
     /// the last 24 hours (#1335), within a quarter of `message_cache_mb`
@@ -3598,8 +3645,8 @@ impl GribConfig {
             max_runs: None,
             time_window: None,
             parameters: None,
-            grid_cache_mb: default_grid_cache_mb(),
-            message_cache_mb: 0,
+            grid_cache_mb: None,
+            message_cache_mb: None,
             point_index_cache_mb: None,
             prewarm: true,
             read_ahead: DEFAULT_GRIB_READ_AHEAD,
@@ -3609,17 +3656,37 @@ impl GribConfig {
         }
     }
 
+    /// The decoded-grid cache size in MiB: [`DEFAULT_GRID_CACHE_MB`] when
+    /// `grid_cache_mb` is unset, a range's clamped into it.
+    pub fn effective_grid_cache_mb(&self) -> u64 {
+        resolve_cache_size(self.grid_cache_mb, DEFAULT_GRID_CACHE_MB)
+    }
+
+    /// The compressed-message cache size in MiB: 0 when `message_cache_mb`
+    /// is unset, a range's minimum.
+    pub fn effective_message_cache_mb(&self) -> u64 {
+        resolve_cache_size(self.message_cache_mb, 0)
+    }
+
     /// The point-index cache size in MiB: `point_index_cache_mb` when set,
     /// else 25 % of `message_cache_mb`, never below
-    /// [`DEFAULT_POINT_INDEX_CACHE_MB`] (#1333).
+    /// [`DEFAULT_POINT_INDEX_CACHE_MB`] (#1333); a range clamps that.
     pub fn effective_point_index_cache_mb(&self) -> u64 {
-        self.point_index_cache_mb.unwrap_or_else(|| {
-            (self
-                .message_cache_mb
-                .saturating_mul(POINT_INDEX_SHARE_OF_MESSAGE_CACHE_PERCENT)
-                / 100)
-                .max(DEFAULT_POINT_INDEX_CACHE_MB)
-        })
+        resolve_cache_size(
+            self.point_index_cache_mb,
+            self.derived_point_index_cache_mb(),
+        )
+    }
+
+    /// The point-index cache size an unset `point_index_cache_mb` takes:
+    /// 25 % of the message cache, never below
+    /// [`DEFAULT_POINT_INDEX_CACHE_MB`].
+    pub fn derived_point_index_cache_mb(&self) -> u64 {
+        (self
+            .effective_message_cache_mb()
+            .saturating_mul(POINT_INDEX_SHARE_OF_MESSAGE_CACHE_PERCENT)
+            / 100)
+            .max(DEFAULT_POINT_INDEX_CACHE_MB)
     }
 }
 
@@ -3630,8 +3697,12 @@ fn default_zarr_poll_interval() -> u64 {
 /// Default `[zarr] cache_mb` and `[zarr.icechunk] decoded_cache_mb`.
 pub const DEFAULT_ZARR_CACHE_MB: u64 = 256;
 
-fn default_zarr_cache_mb() -> u64 {
-    DEFAULT_ZARR_CACHE_MB
+impl IcechunkConfig {
+    /// The decoded-chunk cache size in MiB: [`DEFAULT_ZARR_CACHE_MB`] when
+    /// `decoded_cache_mb` is unset, a range's clamped into it.
+    pub fn effective_decoded_cache_mb(&self) -> u64 {
+        resolve_cache_size(self.decoded_cache_mb, DEFAULT_ZARR_CACHE_MB)
+    }
 }
 
 /// Configuration for the Zarr engine (`engine_type = "zarr"`).
@@ -3669,9 +3740,12 @@ pub struct ZarrConfig {
     /// Chunk LRU cache size in MB. Caches full chunk-object bytes for the
     /// byte-range reader (most useful for the remote S3/HTTP backends).
     /// For Icechunk, bounds compressed chunk/range bytes shared across
-    /// snapshots; 0 disables payload retention. Default: 256.
-    #[serde(default = "default_zarr_cache_mb")]
-    pub cache_mb: u64,
+    /// snapshots; 0 disables payload retention. Unset:
+    /// [`DEFAULT_ZARR_CACHE_MB`]; `{ min, max }` leaves it to the memory
+    /// plan within those bounds (#1313). The size is
+    /// [`Self::effective_cache_mb`].
+    #[serde(default)]
+    pub cache_mb: Option<CacheSize>,
     /// Read the source as an **Icechunk** repository (transactional/versioned
     /// Zarr) rather than a plain Zarr store. Requires the server to be built
     /// with the `icechunk` feature. The repo location reuses `data_path`
@@ -3693,9 +3767,15 @@ impl ZarrConfig {
             zarr_version: None,
             parameters: None,
             poll_interval_secs: default_zarr_poll_interval(),
-            cache_mb: default_zarr_cache_mb(),
+            cache_mb: None,
             icechunk: None,
         }
+    }
+
+    /// The object or payload cache size in MiB: [`DEFAULT_ZARR_CACHE_MB`]
+    /// when `cache_mb` is unset, a range's clamped into it.
+    pub fn effective_cache_mb(&self) -> u64 {
+        resolve_cache_size(self.cache_mb, DEFAULT_ZARR_CACHE_MB)
     }
 }
 
@@ -3707,8 +3787,11 @@ impl ZarrConfig {
 pub struct IcechunkConfig {
     /// Per-collection decoded native chunk cache in MiB, separate from the
     /// compressed payload cache (`zarr.cache_mb`). 0 disables retention.
-    #[serde(default = "default_zarr_cache_mb")]
-    pub decoded_cache_mb: u64,
+    /// Unset: [`DEFAULT_ZARR_CACHE_MB`]; `{ min, max }` leaves it to the
+    /// memory plan within those bounds (#1313). The size is
+    /// [`Self::effective_decoded_cache_mb`].
+    #[serde(default)]
+    pub decoded_cache_mb: Option<CacheSize>,
     /// Read the HEAD of this branch (default: `main`).
     pub branch: Option<String>,
     /// Read this tag.
@@ -4901,8 +4984,8 @@ impl ServerConfig {
             }
             if raw.contains_key("memory") {
                 return Err(crate::error::DataServerError::Config(format!(
-                    "{filename}: [memory] is not allowed in per-collection files — \
-                     move the block to the top-level config.toml"
+                    "{filename}: [memory] and [memory.caches] are not allowed in \
+                     per-collection files — move the block to the top-level config.toml"
                 )));
             }
             if raw.contains_key("parameter_defaults") {
@@ -4968,6 +5051,10 @@ impl ServerConfig {
                      omit it to detect the total"
                 )));
             }
+        }
+        for (key, size) in self.memory.iter().flat_map(|m| &m.caches) {
+            size.validate(&format!("[memory.caches] {key}"))
+                .map_err(crate::error::DataServerError::Config)?;
         }
 
         // [mcp]: an enabled endpoint MUST have a resolvable token. Failing
@@ -5196,6 +5283,12 @@ impl ServerConfig {
                 return Err(crate::error::DataServerError::Config(format!(
                     "Collection '{id}': 'keywords' must not contain empty strings"
                 )));
+            }
+
+            for (key, size) in collection.cache_sizes() {
+                size.validate(key).map_err(|e| {
+                    crate::error::DataServerError::Config(format!("Collection '{id}': {e}"))
+                })?;
             }
 
             // License, when present, needs a non-empty title and an http(s) url
@@ -6470,19 +6563,21 @@ url = "https://creativecommons.org/licenses/by/4.0/"
     fn grib_message_cache_is_opt_in_and_changes_reload_identity() {
         let cfg = grib_collection("data_path = \"testdata/grib-local\"\n");
         let original = cfg.collections[0].grib.as_ref().unwrap();
-        assert_eq!(original.message_cache_mb, 0);
+        assert_eq!(original.message_cache_mb, None);
+        assert_eq!(original.effective_message_cache_mb(), 0);
         let local = GribConfig::auto_local(
             "x".into(),
             ".idx".into(),
             ".grib2".into(),
             Some("wgrib2".into()),
         );
-        assert_eq!(local.message_cache_mb, 0);
+        assert_eq!(local.message_cache_mb, None);
         let enabled =
             grib_collection("data_path = \"testdata/grib-local\"\nmessage_cache_mb = 128\n");
         enabled.validate().unwrap();
         let updated = enabled.collections[0].grib.as_ref().unwrap();
-        assert_eq!(updated.message_cache_mb, 128);
+        assert_eq!(updated.message_cache_mb, Some(CacheSize::Mib(128)));
+        assert_eq!(updated.effective_message_cache_mb(), 128);
         assert_eq!(updated.grid_cache_mb, original.grid_cache_mb);
         assert_ne!(
             updated, original,
@@ -6508,7 +6603,7 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             grib_collection("data_path = \"testdata/grib-local\"\npoint_index_cache_mb = 0\n");
         disabled.validate().unwrap();
         let updated = disabled.collections[0].grib.as_ref().unwrap();
-        assert_eq!(updated.point_index_cache_mb, Some(0));
+        assert_eq!(updated.point_index_cache_mb, Some(CacheSize::Mib(0)));
         assert_eq!(updated.effective_point_index_cache_mb(), 0);
         assert_ne!(updated, original, "the kill switch must rebuild the engine");
     }
@@ -6543,7 +6638,11 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             ("point_index_cache_mb = 64\n", Some(64), 64),
         ] {
             let config = grib(body);
-            assert_eq!(config.point_index_cache_mb, set, "{body}");
+            assert_eq!(
+                config.point_index_cache_mb,
+                set.map(CacheSize::Mib),
+                "{body}"
+            );
             assert_eq!(config.effective_point_index_cache_mb(), effective, "{body}");
             assert_eq!(
                 config,
@@ -6729,8 +6828,10 @@ url = "https://creativecommons.org/licenses/by/4.0/"
             ));
             assert!(cfg.validate().is_ok());
             let zarr = cfg.collections[0].zarr.as_ref().unwrap();
-            assert_eq!(zarr.cache_mb, 17);
-            assert_eq!(zarr.icechunk.as_ref().unwrap().decoded_cache_mb, expected);
+            assert_eq!(zarr.cache_mb, Some(CacheSize::Mib(17)));
+            assert_eq!(zarr.effective_cache_mb(), 17);
+            let icechunk = zarr.icechunk.as_ref().unwrap();
+            assert_eq!(icechunk.effective_decoded_cache_mb(), expected);
         }
     }
 
@@ -8496,6 +8597,7 @@ colormap = "radar_dbz"
             Some(MemoryConfig {
                 total_mb: Some(4096),
                 mode: MemoryMode::Report,
+                caches: BTreeMap::new(),
             })
         );
         assert_eq!(load("", "").unwrap().memory, None);
@@ -8527,8 +8629,133 @@ colormap = "radar_dbz"
         assert!(unknown.contains("unknown field `apply`"), "{unknown}");
         let per_collection = error("", "[memory]\ntotal_mb = 4096\n");
         assert!(
-            per_collection.contains("nwp.toml: [memory] is not allowed in per-collection files"),
+            per_collection.contains(
+                "nwp.toml: [memory] and [memory.caches] are not allowed in per-collection files"
+            ),
             "{per_collection}"
+        );
+        // #1313: [memory.caches] too, never silently dropped.
+        let per_collection = error("", "[memory.caches]\nmetatile = 4096\n");
+        assert!(
+            per_collection.contains(
+                "nwp.toml: [memory] and [memory.caches] are not allowed in per-collection files"
+            ),
+            "{per_collection}"
+        );
+    }
+
+    /// #1313: `[memory.caches]` takes a number of MiB or `{ min, max }` per
+    /// key; a reversed or empty range is a load error naming the key. Key
+    /// names are the server's to check (its key table lives in ds-cache).
+    #[test]
+    fn memory_caches_take_a_size_or_a_range() {
+        let load = |body: &str| {
+            let tmp = TempDir::new().unwrap();
+            let path = tmp.path().join("config.toml");
+            std::fs::write(
+                &path,
+                format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{body}"),
+            )
+            .unwrap();
+            ServerConfig::from_file(path.to_str().unwrap()).map(|(config, _)| config)
+        };
+        let config =
+            load("[memory.caches]\nmetatile = 8192\npvol_pixel = { min = 2048, max = 8192 }\n")
+                .unwrap();
+        let caches = config.memory.unwrap().caches;
+        assert_eq!(caches["metatile"], CacheSize::Mib(8192));
+        assert_eq!(
+            caches["pvol_pixel"],
+            CacheSize::Range {
+                min: 2048,
+                max: 8192
+            }
+        );
+        let reversed = load("[memory.caches]\npvol_pixel = { min = 9, max = 8 }\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reversed.contains("[memory.caches] pvol_pixel: min (9) must not be above max (8)"),
+            "{reversed}"
+        );
+        let unit = load("[memory.caches]\nmetatile = \"8G\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(unit.contains("a size in MiB"), "{unit}");
+    }
+
+    /// #1313 review: a range from 0 is a load error, on every key: on the
+    /// GRIB message cache, whose default is 0, it would build no cache,
+    /// which the plan never turns on.
+    #[test]
+    fn a_range_from_zero_is_a_load_error() {
+        let error = grib_collection(
+            "data_path = \"testdata/grib-local\"\nmessage_cache_mb = { min = 0, max = 2048 }\n",
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Collection 'c': [grib] message_cache_mb: min must be at least 1 MiB"),
+            "{error}"
+        );
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+             [memory.caches]\npvol_pixel = { min = 0, max = 8 }\n",
+        )
+        .unwrap();
+        let error = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[memory.caches] pvol_pixel: min must be at least 1 MiB"),
+            "{error}"
+        );
+    }
+
+    /// #1313: every per-collection size key takes the same two forms, and a
+    /// bad range is a load error naming the collection and key.
+    #[test]
+    fn per_collection_size_keys_take_a_size_or_a_range() {
+        let range = CacheSize::Range { min: 64, max: 512 };
+        let grib = grib_collection(
+            "data_path = \"testdata/grib-local\"\ngrid_cache_mb = { min = 64, max = 512 }\n\
+             message_cache_mb = { min = 64, max = 512 }\n\
+             point_index_cache_mb = { min = 64, max = 512 }\n",
+        );
+        grib.validate().unwrap();
+        let config = grib.collections[0].grib.as_ref().unwrap();
+        assert_eq!(config.grid_cache_mb, Some(range));
+        assert_eq!(config.effective_grid_cache_mb(), 256);
+        assert_eq!(config.effective_message_cache_mb(), 64, "0 clamped");
+        assert_eq!(config.effective_point_index_cache_mb(), 64, "16 clamped");
+        let zarr = zarr_collection(
+            "data_path = \"x\"\ncache_mb = { min = 1, max = 2 }\n\
+             [collections.zarr.icechunk]\ndecoded_cache_mb = { min = 300, max = 400 }\n",
+        );
+        zarr.validate().unwrap();
+        let config = zarr.collections[0].zarr.as_ref().unwrap();
+        assert_eq!(config.effective_cache_mb(), 2);
+        assert_eq!(
+            config
+                .icechunk
+                .as_ref()
+                .unwrap()
+                .effective_decoded_cache_mb(),
+            300
+        );
+        let bad = grib_collection(
+            "data_path = \"testdata/grib-local\"\nmessage_cache_mb = { min = 8, max = 4 }\n",
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            bad.contains("[grib] message_cache_mb: min (8) must not be above max (4)"),
+            "{bad}"
         );
     }
 

@@ -49,6 +49,15 @@
 host = "127.0.0.1"
 port = 8000
 
+# The render memory budget admits the suite's largest map,
+# getmap:large-size, the advertised MaxWidth x MaxHeight, 8000 x 8000.
+# Admission charges 32 B per output pixel; the 1024 MiB default admits
+# 33 554 432 pixels and answers 64 M with a 503 (the "Pixel budgets" table
+# in the root CLAUDE.md). 64 000 000 x 32 B is 1953 MiB, so 2560 MiB
+# leaves headroom. Production sizes its own budget.
+[memory.caches]
+render_budget = 2560
+
 [[collections]]
 id = "ets-geotiff"
 title = "Plain raster (GeoTIFF, EPSG:3067)"

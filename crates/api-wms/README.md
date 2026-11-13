@@ -492,7 +492,7 @@ from an older run, revalidates.
 | Layers per GetMap or GetFeatureInfo | 5 |
 | Render slots | `[server] render_concurrency`: default 2× CPUs, at least 8; shared with Maps, Tiles and 3D Tiles |
 | Waiting queue | `MC_RENDER_QUEUE_CAPACITY`: default 3× the render slots |
-| Render memory | `MC_RENDER_MEMORY_MB`, default 1024: 32 B per output pixel, 16 B more per further band of an RGB composite |
+| Render memory | `[memory.caches] render_budget` (deprecated: `MC_RENDER_MEMORY_MB`), default 1024: 32 B per output pixel, 16 B more per further band of an RGB composite |
 | Render deadline | `MC_RENDER_TIMEOUT_MS`, default 3000, once per layer; it covers the wait for admission |
 | GetFeatureInfo deadline | `MC_FEATURE_INFO_TIMEOUT_MS`, default 10000; it covers the wait for a slot |
 

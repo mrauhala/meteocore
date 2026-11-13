@@ -336,14 +336,14 @@ and `meps-netcdf-thredds-catalog.toml.disabled` read them by HTTP range
 from its fileServer, by HEAD probing or through its catalogs, which now
 answers 403 for MEPS.
 
-Process-wide environment variables, shared by every NetCDF collection:
+Process-wide settings, shared by every NetCDF collection: `[memory.caches]` keys in `config.toml` (#1313; their `MC_…_MB` variables are deprecated) and environment variables:
 
-| Variable | Default | Bounds |
+| Setting | Default | Bounds |
 |---|---|---|
-| `MC_NETCDF_FIELD_CACHE_MB` | `256` | Decoded fields (~4 MB per MEPS field) |
-| `MC_NETCDF_CHUNK_CACHE_MB` | `512` | Compressed chunks of remote files read by range (~1.5 MB per MEPS field), and the `.dods` replies of fields read through OPeNDAP (~4.06 MB) and of the windows EDR queries read (428 bytes at a point) |
-| `MC_NETCDF_BLOCK_CACHE_MB` | `64` | 64 KiB metadata blocks of remote files read by range; at least 8 |
-| `MC_NETCDF_READ_MEMORY_MB` | `1024` | Buffers of field reads in progress; a read that does not fit is a 503 |
+| `[memory.caches] netcdf_field` (deprecated: `MC_NETCDF_FIELD_CACHE_MB`) | `256` | Decoded fields (~4 MB per MEPS field) |
+| `[memory.caches] netcdf_chunk` (deprecated: `MC_NETCDF_CHUNK_CACHE_MB`) | `512` | Compressed chunks of remote files read by range (~1.5 MB per MEPS field), and the `.dods` replies of fields read through OPeNDAP (~4.06 MB) and of the windows EDR queries read (428 bytes at a point) |
+| `[memory.caches] netcdf_block` (deprecated: `MC_NETCDF_BLOCK_CACHE_MB`) | `64` | 64 KiB metadata blocks of remote files read by range; at least 8 |
+| `[memory.caches] netcdf_read` (deprecated: `MC_NETCDF_READ_MEMORY_MB`) | `1024` | Buffers of field reads in progress; a read that does not fit is a 503 |
 | `MC_NETCDF_EDR_QUERY_MB` | `544` | Decoded bytes one EDR query may read, checked from the metadata before any read: each read at what it decodes, a whole field its size (4.06 MB for MEPS), a window read through OPeNDAP its cells × the levels of its hyperslab × 4 bytes. Only the fields read count: a trajectory the (step, level) fields its path reads, a cube the levels its `z` positions take, a per-step amount its accumulation at the step before each step too. Over it a 400. Read whole, fits one variable, or a derived wind speed (both components), over a 67-lead MEPS run, but not one variable at all 13 pressure levels (871 fields) |
 | `MC_NETCDF_EDR_QUERY_READS` | `200` | Field reads one EDR query may make, counted from the same plan before any read, for every access: a field of one level is one read, and through OPeNDAP one request is one, holding the window of every level asked of a variable at one step and the windows of up to 16 planes of a step's variables. Over it a 400. Through OPeNDAP, a six-variable surface meteogram over a 67-lead MEPS run is 67 reads, one variable at every pressure level over the run 67 and a derived wind speed 134; three variables at every level, 201, are just over it. 200 requests of up to 16 planes, four at a time at up to 0.55 s each, take about 27 s, inside the 30 s EDR deadline. Read whole, `MC_NETCDF_EDR_QUERY_MB` binds first (140 MEPS fields) |
 

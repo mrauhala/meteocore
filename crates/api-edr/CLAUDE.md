@@ -412,7 +412,7 @@ budget before fetching. The executor installs `ds_core::deadline` for storage
 and engine loops; propagate it explicitly to field workers and map expiry to 504.
 
 Response bodies (#1041) go through `response_budget`: one process-wide
-`ds_executor::budget::ByteBudget`, `MC_EDR_RESPONSE_MEMORY_MB` (512 MiB),
+`ds_executor::budget::ByteBudget`, `[memory.caches] edr_response` (512 MiB),
 for every body a data query or `/locations` encodes. Render every body on
 the executor, inside `execute_query`, never after its `.await`.
 CoverageJSON (`response::CoverageJson`) and EDR GeoJSON are serialised
