@@ -226,6 +226,20 @@ pub(crate) fn relieve(slots: &[Slot]) -> Vec<(Key, u64)> {
         .collect()
 }
 
+/// Raise each of the valve's ceilings to its cache's floor (`floor_of`): a
+/// ceiling under it (a range's `min` a reload gave the cache, a plan floor
+/// that rose) holds nothing below it, and a restore steps up from there.
+pub(crate) fn floor_ceilings(
+    caps: &mut HashMap<Key, Ceiling>,
+    floor_of: &dyn Fn(&Key) -> Option<u64>,
+) {
+    for (key, ceiling) in caps.iter_mut() {
+        if let Some(floor) = floor_of(key) {
+            ceiling.bytes = ceiling.bytes.max(floor);
+        }
+    }
+}
+
 /// A restore step: raise each of the valve's ceilings by
 /// [`RESTORE_PERCENT`] of its cache's grant (`grant_of`), at least 1 MiB,
 /// and lift those that reach their grant, or whose cache the plan no longer

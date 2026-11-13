@@ -460,7 +460,7 @@ fn every_change_is_logged_and_counted() {
     assert!(block.contains("\n  governor_test_cache 1024 MiB → 2048 MiB (share by weight 45)"));
     assert!(block.contains("\n  governor_test_other_cache 512 MiB → 256 MiB"));
     assert_eq!(tick_block(&[], 0, 0), None);
-    let relief = relief_block(9 * GIB, 8 * GIB, moved, true);
+    let relief = relief_block(9 * GIB, 8 * GIB, moved, &[], true);
     assert!(
         relief.starts_with(
             "Memory pressure: jemalloc holds 9216 MiB resident, above the total of 8192 MiB \
@@ -473,6 +473,49 @@ fn every_change_is_logged_and_counted() {
     assert!(restored.contains(
         "2 caches the pressure valve lowered restored by 5 % of their grant, 1 back at it"
     ));
+}
+
+/// The valve's words when it could lower nothing: every flexible cache at
+/// its floor, or each cache that refused its shrink named, with what a
+/// restart does; and a refused shrink beside a relief.
+#[test]
+fn the_valve_names_the_caches_that_refuse_their_shrink() {
+    let at_floors = stuck_block(9 * GIB, 8 * GIB, &[]);
+    assert!(
+        at_floors.starts_with(
+            "Memory pressure: jemalloc still holds 9216 MiB resident, above the total of 8192 \
+             MiB, and every flexible cache is at its floor"
+        ),
+        "{at_floors}"
+    );
+    let refused = Change {
+        held: Some(Held::Refused),
+        target_bytes: 810 * MIB,
+        ..change("governor_test_stubborn_cache", 1024, 1024)
+    };
+    let stuck = stuck_block(9 * GIB, 8 * GIB, std::slice::from_ref(&refused));
+    assert!(!stuck.contains("at its floor"), "{stuck}");
+    assert!(
+        stuck.contains(
+            "the valve could lower nothing: 1 cache refused its shrink in place and keeps its \
+             size, with no ceiling\n  governor_test_stubborn_cache kept at 1024 MiB"
+        ),
+        "{stuck}"
+    );
+    assert!(
+        stuck.contains("toward 810 MiB: its resize stopped short"),
+        "{stuck}"
+    );
+    assert!(stuck.contains("a restart reaches the size"), "{stuck}");
+    let lowered = [change("governor_test_cache", 1024, 900)];
+    let relief = relief_block(9 * GIB, 8 * GIB, &lowered, &[refused], true);
+    assert!(
+        relief.contains(
+            "\n  1 cache refused its shrink in place and keeps its size, with no ceiling:"
+        ),
+        "{relief}"
+    );
+    assert!(relief.contains("a restart reaches the size"), "{relief}");
 }
 
 /// The valve acts on `[memory] total_mb` or a cgroup limit's share, in
@@ -727,22 +770,51 @@ async fn a_ceiling_never_holds_a_cache_below_its_floor_or_a_reloads_range() {
     );
     assert!(!governor().caps.contains_key(&key), "superseded");
 
-    // A ceiling under the range itself stops at its min, in a reload's plan
-    // and in a tick.
+    // A ceiling under the range itself is raised to its floor, the min, in
+    // a reload's plan and in a tick: the cache stops there, and so does
+    // what /admin/cache-plan shows.
+    let floor = || {
+        let metatile = row(&state, "metatile_cache");
+        floor_of(&metatile.entry, &grant_of(&metatile.entry))
+    };
     hold(&metatile, 512 * MIB);
-    let grant = grant_of(&metatile.entry);
-    assert!(capped(&metatile.entry, &grant) >= 2048 * MIB);
     crate::admin::do_reload(&state).unwrap();
-    assert!(governor().caps.contains_key(&key), "the same source");
-    assert!(row(&state, "metatile_cache").usage.capacity_bytes >= 2048 * MIB);
+    assert!(floor() >= 2048 * MIB);
+    assert_eq!(governor().caps[&key].bytes, floor(), "a reload");
+    assert_eq!(row(&state, "metatile_cache").usage.capacity_bytes, floor());
+    hold(&metatile, 512 * MIB);
+    let ticked = Instant::now() + REPLAN_EVERY;
     assert!(matches!(
-        step(&state, Instant::now() + REPLAN_EVERY),
+        step(&state, ticked),
         Step::Ran {
             replanned: true,
             ..
         }
     ));
-    assert!(row(&state, "metatile_cache").usage.capacity_bytes >= 2048 * MIB);
+    assert_eq!(governor().caps[&key].bytes, floor(), "a tick");
+    assert_eq!(row(&state, "metatile_cache").usage.capacity_bytes, floor());
+
+    // Under 90 % for 10 minutes, the restore steps up from the floor: the
+    // cache is back at its grant in the steps of 5 % that span the two,
+    // not those from the old ceiling.
+    let grant = grant_of(&row(&state, "metatile_cache").entry).bytes;
+    let step_bytes = (grant / 100 * RESTORE_PERCENT).div_ceil(MIB) * MIB;
+    let steps = (grant.saturating_sub(floor())).div_ceil(step_bytes).max(1);
+    let from_old_ceiling = (grant - 512 * MIB).div_ceil(step_bytes);
+    assert!(steps < from_old_ceiling, "{steps} vs {from_old_ceiling}");
+    governor().pressure.under_since = Some(ticked);
+    let mut at = ticked + UNDER_FOR;
+    let mut taken = 0;
+    while governor().caps.contains_key(&key) {
+        at += REPLAN_EVERY;
+        step(&state, at);
+        taken += 1;
+        assert!(taken <= steps, "{taken} restore steps, {steps} expected");
+    }
+    assert_eq!(
+        row(&state, "metatile_cache").usage.capacity_bytes,
+        grant_of(&row(&state, "metatile_cache").entry).bytes
+    );
 }
 
 /// #1315 review: a recovery pass, which refits the accepted config, does
@@ -831,7 +903,7 @@ async fn the_valve_at_its_floors_warns_purges_and_counts_sparingly() {
         assert!(reliefs < 3, "the valve keeps lowering");
     }
     assert_eq!(count("relieve"), reliefs);
-    assert_eq!(governor().floors_warned_at, Some(at), "the first WARN");
+    assert_eq!(governor().stuck_warned_at, Some(at), "the first WARN");
     let purged = governor().purged_at.unwrap();
     let purges = count("purge");
 
@@ -841,7 +913,7 @@ async fn the_valve_at_its_floors_warns_purges_and_counts_sparingly() {
         assert_eq!(count("relieve"), reliefs);
         assert_eq!(count("purge"), purges);
         assert_eq!(governor().purged_at, Some(purged));
-        assert_eq!(governor().floors_warned_at, Some(at));
+        assert_eq!(governor().stuck_warned_at, Some(at));
     }
     // 10 minutes on it purges once more, 30 on it WARNs again.
     assert!(!super::relieve(
@@ -852,14 +924,14 @@ async fn the_valve_at_its_floors_warns_purges_and_counts_sparingly() {
     ));
     assert_eq!(governor().purged_at, Some(purged + PURGE_EVERY));
     assert!(count("purge") <= purges + 1, "jemalloc may refuse");
-    assert_eq!(governor().floors_warned_at, Some(at));
+    assert_eq!(governor().stuck_warned_at, Some(at));
     assert!(!super::relieve(
         &state,
         resident,
         total,
         at + FLOORS_WARN_EVERY
     ));
-    assert_eq!(governor().floors_warned_at, Some(at + FLOORS_WARN_EVERY));
+    assert_eq!(governor().stuck_warned_at, Some(at + FLOORS_WARN_EVERY));
     assert_eq!(count("relieve"), reliefs);
 }
 
@@ -956,4 +1028,105 @@ async fn a_reloads_resizes_are_counted() {
 
     crate::admin::do_reload(&state).unwrap();
     assert_eq!(counted(), (metatile + 1, grid + 1), "nothing changed");
+}
+
+/// An in-memory sink for a `fmt` subscriber's lines.
+#[derive(Clone, Default)]
+struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturedLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self {
+        self.clone()
+    }
+}
+
+/// What `relieve` logs at `now`, and whether it lowered anything.
+fn relieve_logged(state: &AdminState, resident: u64, total: u64, now: Instant) -> (bool, String) {
+    let logs = CapturedLog::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    let lowered = tracing::subscriber::with_default(subscriber, || {
+        super::relieve(state, resident, total, now)
+    });
+    let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    (lowered, text)
+}
+
+/// #1315 review: a cache that refuses its shrink in place keeps no ceiling,
+/// and the valve's WARN names it and says what a restart does, never that
+/// every cache is at its floor. Before, the ceiling was kept and the WARN
+/// said the caches were at their floors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_refusing_its_shrink_keeps_no_ceiling_and_is_named() {
+    if !in_child("governor::tests::a_cache_refusing_its_shrink_keeps_no_ceiling_and_is_named") {
+        return;
+    }
+    // A cache holding 900 of its 1024 MiB whose resize never moves it. The
+    // fixture has no other cache of this id.
+    struct Stubborn;
+    let owner = std::sync::Arc::new(Stubborn);
+    let entry = Entry::cache("odim_composite_cache", Scope::Process, SizeSource::Default);
+    ds_cache::plan::register_resizable(
+        entry.clone(),
+        &owner,
+        |_| {
+            ds_cache::plan::Usage::cache(
+                ds_cache::CacheMetrics {
+                    bytes: 900 * MIB,
+                    capacity_bytes: 1024 * MIB,
+                    ..Default::default()
+                },
+                Some(9),
+            )
+        },
+        ds_cache::plan::Resize {
+            to: |_, _| 1024 * MIB,
+            least: |_| 0,
+            clear: |_| {},
+        },
+    );
+    let fixture = Fixture::new(AUTO);
+    let state = fixture.boot();
+    let relieves = || PRESSURE_ACTIONS.with_label_values(&["relieve"]).get();
+
+    let at = Instant::now();
+    let (lowered, logged) = relieve_logged(&state, 9 * GIB, 8 * GIB, at);
+    assert!(!lowered);
+    assert!(
+        !governor().caps.contains_key(&decide::key(&entry)),
+        "{logged}"
+    );
+    assert_eq!(relieves(), 0);
+    assert!(logged.contains("WARN"), "{logged}");
+    assert!(
+        logged.contains("1 cache refused its shrink in place and keeps its size, with no ceiling"),
+        "{logged}"
+    );
+    assert!(
+        logged.contains("odim_composite_cache kept at 1024 MiB"),
+        "{logged}"
+    );
+    assert!(logged.contains("a restart reaches the size"), "{logged}");
+    assert!(!logged.contains("at its floor"), "{logged}");
+
+    // A minute on, the same refusal: no WARN until 30 minutes have passed.
+    let (_, logged) = relieve_logged(&state, 9 * GIB, 8 * GIB, at + OVER_FOR);
+    assert!(!logged.contains("Memory pressure"), "{logged}");
+    let (_, logged) = relieve_logged(&state, 9 * GIB, 8 * GIB, at + FLOORS_WARN_EVERY);
+    assert!(logged.contains("refused its shrink"), "{logged}");
+    assert!(!governor().caps.contains_key(&decide::key(&entry)));
+    drop(owner);
 }

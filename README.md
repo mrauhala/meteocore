@@ -821,14 +821,18 @@ reload does: a step a reload holds the reload lock through is skipped.
   resident bytes every 15 seconds (`jemalloc_resident_bytes`):
   - above the total for a minute, every flexible cache is lowered to 90 %
     of what it holds, never below the plan's floor for it (a range's
-    `min` included) nor what it takes in place, and keeps that size as a
-    ceiling; every arena's dirty pages are purged, and a WARN names each
-    cache. While the process stays above the total it acts again each
-    minute: a relief that lowers other caches than the last WARNs, one
-    lowering the same again logs at INFO. With every flexible cache at its
-    floor it lowers nothing and counts nothing, purges at most every 10
-    minutes and WARNs at most every 30 that the process is still over
-    (resident against the total);
+    `min` included) nor what it takes in place, and keeps the size it
+    reached as a ceiling; every arena's dirty pages are purged, and a WARN
+    names each cache. A cache that refuses its shrink in place keeps its
+    size and no ceiling, and the WARN names it: a shrink in place stops
+    where each shard still holds its minimum of entries, and a restart
+    reaches the size. While the process stays above the total it acts
+    again each minute: a relief that lowers other caches than the last
+    WARNs, one lowering the same again logs at INFO. When it can lower
+    nothing, every flexible cache at its floor or refusing, it counts
+    nothing, purges at most every 10 minutes and WARNs at most every 30,
+    or when other caches refuse, that the process is still over (resident
+    against the total);
   - under 90 % of the total for 10 minutes, the ceilings are raised by 5 %
     of the cache's grant every 5 minutes, until each is back at the plan.
     The raises keep their own clock, so no reload or other fit puts them
@@ -843,8 +847,9 @@ reload does: a step a reload holds the reload lock through is skipped.
 - A reload fits and applies the plan itself and keeps the valve's
   ceilings and timers, which are about the process's memory, not its
   config; it restarts the 5 minutes to the next tick. A ceiling never
-  takes a cache below the plan's floor or its range's `min`, and a reload
-  that pins a lowered cache or gives it other bounds drops its ceiling.
+  takes a cache below the plan's floor or its range's `min`: one below
+  them is raised to them, so a restore steps up from there. A reload that
+  pins a lowered cache or gives it other bounds drops its ceiling.
   Report mode drops every ceiling; so does a config whose total no longer
   holds the valve (a total from the host), and the next tick then gives
   those caches their grant.
@@ -3176,7 +3181,7 @@ OpenAPI specs are generated dynamically from configured collections. A spec take
 
 ### Dynamic Collection Reload
 
-`POST /admin/collections/reload` re-reads `config.toml` (and `collections_dir` if configured), creates new engines, and atomically swaps them into the running server. If the reload produces zero working collections, the old state is preserved. A WIS2-fed CAP or BUFR collection whose config changed gets a new engine that takes over, in memory, every alert or report the replaced engine had received, with or without `state_dir`.
+`POST /admin/collections/reload` re-reads `config.toml` (and `collections_dir` if configured), creates new engines, and atomically swaps them into the running server. If the reload produces zero working collections, the old state is preserved. A request that arrives while another reload runs waits up to 2 seconds for it: if that reload ends in time, this request then runs a reload of its own; otherwise it answers 409. A WIS2-fed CAP or BUFR collection whose config changed gets a new engine that takes over, in memory, every alert or report the replaced engine had received, with or without `state_dir`.
 
 ### Memory and caches
 

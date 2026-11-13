@@ -78,7 +78,9 @@ disk, no TOML needed.
   task; the watcher and the recovery loop reload inline on a task nothing
   cancels. A new caller must hold the guard the same way. Until a reload ends
   later requests get 409 even if its client left, so a hung reload needs a
-  restart. A panic frees the lock (a Tokio mutex does not poison) and answers
+  restart. The handler waits up to 2 s (`RELOAD_LOCK_WAIT`) before that 409,
+  so a request arriving while a reload has under 2 s left runs a second
+  reload after it. A panic frees the lock (a Tokio mutex does not poison) and answers
   500.
 - **Reload is incremental (#574).** Validation stays all-or-nothing (any
   config error rejects the whole reload, live registry untouched), but the
@@ -362,7 +364,11 @@ need no reload pruning.
   dropped when the gate closes. The valve at its floors counts nothing,
   purges at most every 10 minutes and WARNs at most every 30.
   `serve_reload` waits up to 2 s (`RELOAD_LOCK_WAIT`) for the lock before
-  its 409, so a governor step never turns a reload request away. The tick logs the plan's
+  its 409, so a governor step never turns a reload request away. A stored
+  ceiling is never below the floor: `capped` and the tick
+  (`decide::floor_ceilings`) raise it, so a restore steps up from the
+  floor. A shrink the valve's relief finds refused keeps no ceiling, and
+  `stuck_block` names it. The tick logs the plan's
   WARN block through `memory_plan::log_new_warnings` (only when its cuts
   change), never `log_warnings`, which would WARN every 5 minutes. The
   valve reads `jemalloc::resident_bytes` and purges with

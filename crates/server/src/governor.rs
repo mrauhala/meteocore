@@ -14,11 +14,12 @@
 //! - **Pressure valve**, sampled every [`decide::SAMPLE_EVERY`]:
 //!   `jemalloc_resident_bytes` above the total for a minute lowers every
 //!   flexible cache to 90 % of what it holds, never below the plan's floor
-//!   for it nor what it takes in place, and keeps that as its ceiling;
-//!   every arena's dirty pages are purged, and a WARN says so (at INFO when
-//!   it lowers the same caches as the last relief). At the floors it
-//!   lowers and counts nothing, purges at most every 10 minutes and WARNs
-//!   at most every 30. Under 90 % of the total for 10 minutes, the ceilings
+//!   for it nor what it takes in place, and keeps what it reached as its
+//!   ceiling; every arena's dirty pages are purged, and a WARN says so (at
+//!   INFO when it lowers the same caches as the last relief). A cache that
+//!   refuses its shrink keeps no ceiling and is named. With nothing it can
+//!   lower it counts nothing, purges at most every 10 minutes and WARNs at
+//!   most every 30, or when other caches refuse. Under 90 % of the total for 10 minutes, the ceilings
 //!   rise by 5 % of the grant every 5 minutes, on their own clock, until
 //!   the plan has the caches again. A ceiling never takes a cache below
 //!   the plan's floor or its range's `min`. A cache its engines fill ahead
@@ -94,10 +95,12 @@ struct Governor {
     /// that lowers other caches WARNs, one that lowers the same again logs
     /// at INFO.
     lowered: Option<BTreeSet<Key>>,
-    /// When the valve, over the total with nothing left to lower, last
-    /// purged and last WARNed.
+    /// When the valve last purged.
     purged_at: Option<Instant>,
-    floors_warned_at: Option<Instant>,
+    /// When the valve, over the total with nothing it could lower, last
+    /// WARNed, and the caches that refused their shrink then.
+    stuck_warned_at: Option<Instant>,
+    stuck: BTreeSet<Key>,
     /// The last sample: resident bytes and the valve's total.
     sample: Option<(u64, u64)>,
     last_tick: Option<Record>,
@@ -121,21 +124,22 @@ fn floor_of(entry: &Entry, grant: &Grant) -> u64 {
 
 /// `grant` under the valve's ceiling on `entry`, if it holds one, never
 /// below the plan's floor nor a range's `min`: what a reload's plan gives
-/// a cache the valve lowered. A ceiling set under another source (a reload
-/// pinned the cache, or gave it other bounds) is dropped.
+/// a cache the valve lowered. A ceiling under that floor is raised to it,
+/// so a restore steps up from there; one set under another source (a
+/// reload pinned the cache, or gave it other bounds) is dropped.
 pub(crate) fn capped(entry: &Entry, grant: &Grant) -> u64 {
-    let mut governor = governor();
+    let floor = floor_of(entry, grant);
     let key = decide::key(entry);
-    match governor.caps.get(&key) {
-        Some(ceiling) if ceiling.holds(&entry.source) => {
-            decide::ceiled(grant.bytes, ceiling.bytes, floor_of(entry, grant))
-        }
-        Some(_) => {
-            governor.caps.remove(&key);
-            grant.bytes
-        }
-        None => grant.bytes,
+    let mut governor = governor();
+    let Some(ceiling) = governor.caps.get_mut(&key) else {
+        return grant.bytes;
+    };
+    if !ceiling.holds(&entry.source) {
+        governor.caps.remove(&key);
+        return grant.bytes;
     }
+    ceiling.bytes = ceiling.bytes.max(floor);
+    decide::ceiled(grant.bytes, ceiling.bytes, floor)
 }
 
 /// Drop the ceilings `rows` supersede: a cache whose size now comes from
@@ -261,7 +265,8 @@ pub(crate) fn step(state: &AdminState, now: Instant) -> Step {
                     // The spell of pressure is over: the next one's first
                     // relief WARNs, and so does its first stay at the floors.
                     governor.lowered = None;
-                    governor.floors_warned_at = None;
+                    governor.stuck_warned_at = None;
+                    governor.stuck.clear();
                 }
                 signal
             };
@@ -346,10 +351,21 @@ fn tick(state: &AdminState, now: Instant) {
         .map(|g| (decide::key(&g.entry), g.bytes))
         .collect();
     let grant_of = |key: &Key| grants.get(key).copied();
+    let floors: HashMap<Key, u64> = report
+        .plan
+        .iter()
+        .flat_map(|plan| {
+            rows.iter().filter_map(move |row| {
+                let grant = plan.grant(&row.entry)?;
+                Some((decide::key(&row.entry), floor_of(&row.entry, grant)))
+            })
+        })
+        .collect();
     supersede(&rows);
     // Copied out: applying calls back into `capped`.
     let (caps, refused, raised, restored, lifted) = {
         let mut governor = governor();
+        decide::floor_ceilings(&mut governor.caps, &|key| floors.get(key).copied());
         let (raised, restored) = if restore_due(&governor, now) {
             governor.restored_at = Some(now);
             decide::restore(&mut governor.caps, &grant_of)
@@ -438,12 +454,14 @@ fn tick(state: &AdminState, now: Instant) {
 
 /// The valve at `now`: the process holds `resident` bytes, above its
 /// `total` for a minute. Lower every flexible cache to 90 % of what it
-/// holds, keep that as its ceiling, and purge every arena's dirty pages.
-/// The first relief of a spell of pressure WARNs, and so does one that
-/// lowers other caches than the last; one lowering the same again logs at
-/// INFO. With nothing left to lower, it purges at most every 10 minutes
-/// and WARNs that the process is still over at most every 30. Only what it
-/// did is counted. Returns whether it lowered anything.
+/// holds, keep what each reached as its ceiling, and purge every arena's
+/// dirty pages. A cache that refuses its shrink in place keeps no ceiling,
+/// and the WARN names it. The first relief of a spell of pressure WARNs,
+/// and so does one that lowers other caches than the last; one lowering
+/// the same again logs at INFO. With nothing it could lower, it purges at
+/// most every 10 minutes and WARNs that the process is still over at most
+/// every 30, or when other caches refuse. Only what it did is counted.
+/// Returns whether it lowered anything.
 fn relieve(state: &AdminState, resident: u64, total: u64, now: Instant) -> bool {
     let rows = cache_plan::snapshot(state);
     let report = memory_plan::last();
@@ -465,48 +483,54 @@ fn relieve(state: &AdminState, resident: u64, total: u64, now: Instant) -> bool 
             }
         })
         .collect();
-    let mut changes = Vec::new();
+    let (mut changes, mut refused) = (Vec::new(), Vec::new());
     for (key, target) in decide::relieve(&slots) {
         let Some(slot) = slots.iter().find(|s| decide::key(&s.entry) == key) else {
             continue;
         };
-        governor().caps.insert(
-            key,
-            Ceiling {
-                bytes: target,
-                source: slot.entry.source.clone(),
-            },
-        );
-        let applied = ds_cache::plan::apply(&slot.entry, target);
-        let to = applied.unwrap_or(slot.capacity);
-        changes.push(Change {
+        // An owner gone first: nothing to lower, nothing to say.
+        let Some(to) = ds_cache::plan::apply(&slot.entry, target) else {
+            continue;
+        };
+        let change = Change {
             entry: slot.entry.clone(),
             from_bytes: slot.capacity,
             to_bytes: to,
             target_bytes: target,
             reason: "memory pressure: 90 % of what it holds".into(),
-            held: match applied {
-                None => Some(Held::Gone),
-                Some(to) if to != target => Some(Held::Refused),
-                Some(_) => None,
-            },
+            held: (to != target).then_some(Held::Refused),
             cleared: false,
-        });
+        };
+        if to < slot.capacity {
+            // Its ceiling is what it reached, where a shrink stopped short.
+            governor().caps.insert(
+                key,
+                Ceiling {
+                    bytes: to,
+                    source: slot.entry.source.clone(),
+                },
+            );
+            changes.push(change);
+        } else {
+            refused.push(change);
+        }
     }
-    changes.retain(|c| c.to_bytes != c.from_bytes);
     let due =
         |at: Option<Instant>, every| at.is_none_or(|at| now.saturating_duration_since(at) >= every);
     if changes.is_empty() {
-        // At the floors: purge and WARN, but not every minute.
+        // At the floors, or refused: purge and WARN, but not every minute.
+        let stuck: BTreeSet<Key> = refused.iter().map(|c| decide::key(&c.entry)).collect();
         let (purge_due, warn_due) = {
             let mut governor = governor();
             let purge_due = due(governor.purged_at, decide::PURGE_EVERY);
-            let warn_due = due(governor.floors_warned_at, decide::FLOORS_WARN_EVERY);
+            let warn_due =
+                governor.stuck != stuck || due(governor.stuck_warned_at, decide::FLOORS_WARN_EVERY);
             if purge_due {
                 governor.purged_at = Some(now);
             }
             if warn_due {
-                governor.floors_warned_at = Some(now);
+                governor.stuck_warned_at = Some(now);
+                governor.stuck = stuck;
             }
             (purge_due, warn_due)
         };
@@ -514,7 +538,7 @@ fn relieve(state: &AdminState, resident: u64, total: u64, now: Instant) -> bool 
             PRESSURE_ACTIONS.with_label_values(&["purge"]).inc();
         }
         if warn_due {
-            warn!("{}", floors_block(resident, total));
+            warn!("{}", stuck_block(resident, total, &refused));
         }
         return false;
     }
@@ -527,7 +551,7 @@ fn relieve(state: &AdminState, resident: u64, total: u64, now: Instant) -> bool 
     let mut governor = governor();
     governor.purged_at = Some(now);
     let lowered: BTreeSet<Key> = changes.iter().map(|c| decide::key(&c.entry)).collect();
-    let block = relief_block(resident, total, &changes, purged);
+    let block = relief_block(resident, total, &changes, &refused, purged);
     if governor.lowered.as_ref() == Some(&lowered) {
         info!("{block}");
     } else {
@@ -541,17 +565,52 @@ fn relieve(state: &AdminState, resident: u64, total: u64, now: Instant) -> bool 
     true
 }
 
-/// The valve's WARN while the process stays over its total with every
-/// flexible cache at its floor: at most every 30 minutes.
-pub(crate) fn floors_block(resident: u64, total: u64) -> String {
-    format!(
-        "Memory pressure: jemalloc still holds {} resident, above the total of {}, and every \
-         flexible cache is at its floor: what holds the memory is outside the caches the valve \
-         lowers. Dirty pages are purged at most every 10 minutes; this repeats at most every 30",
+/// The valve's WARN while the process stays over its total and it could
+/// lower nothing: every flexible cache at its floor, or the `refused`
+/// shrinks, each named. At most every 30 minutes, or when other caches
+/// refuse.
+pub(crate) fn stuck_block(resident: u64, total: u64, refused: &[Change]) -> String {
+    let mut out = format!(
+        "Memory pressure: jemalloc still holds {} resident, above the total of {}",
         mib(resident),
         mib(total)
+    );
+    if refused.is_empty() {
+        out.push_str(
+            ", and every flexible cache is at its floor: what holds the memory is outside the \
+             caches the valve lowers",
+        );
+    } else {
+        let _ = write!(
+            out,
+            ", and the valve could lower nothing: {}",
+            refused_line(refused.len())
+        );
+        memory_plan::write_changes(&mut out, refused);
+        out.push_str(RESTART);
+    }
+    out.push_str(
+        "\n  Dirty pages are purged at most every 10 minutes; this repeats at most every 30, or \
+         when other caches refuse",
+    );
+    out
+}
+
+/// What the valve says of the caches that refused their shrink in place.
+fn refused_line(count: usize) -> String {
+    format!(
+        "{count} cache{} refused {} shrink in place and keep{} {} size, with no ceiling",
+        if count == 1 { "" } else { "s" },
+        if count == 1 { "its" } else { "their" },
+        if count == 1 { "s" } else { "" },
+        if count == 1 { "its" } else { "their" },
     )
 }
+
+/// Where a refused shrink leaves the memory.
+const RESTART: &str = "\n  A shrink in place stops where each shard still holds its minimum of \
+                       entries: a restart reaches the size, building each cache empty at its \
+                       planned size";
 
 /// The INFO block of a re-plan tick that changed sizes: each change, old →
 /// new, and why; `restored` of them the valve had lowered, `lifted` back
@@ -579,8 +638,15 @@ pub(crate) fn tick_block(changed: &[Change], restored: usize, lifted: usize) -> 
 }
 
 /// The valve's WARN block: what the process holds against its total, each
-/// cache lowered, and whether the dirty pages were purged.
-pub(crate) fn relief_block(resident: u64, total: u64, changes: &[Change], purged: bool) -> String {
+/// cache lowered, whether the dirty pages were purged, and each cache that
+/// refused its shrink.
+pub(crate) fn relief_block(
+    resident: u64,
+    total: u64,
+    changes: &[Change],
+    refused: &[Change],
+    purged: bool,
+) -> String {
     let mut out = format!(
         "Memory pressure: jemalloc holds {} resident, above the total of {} for a minute: \
          {} cache{} lowered to 90 % of what {} hold{}{}",
@@ -601,6 +667,11 @@ pub(crate) fn relief_block(resident: u64, total: u64, changes: &[Change], purged
         "\n  They stay at most this large until the process is under 90 % of the total for 10 \
          minutes, then grow back by 5 % of their grant every 5 minutes",
     );
+    if !refused.is_empty() {
+        let _ = write!(out, "\n  {}:", refused_line(refused.len()));
+        memory_plan::write_changes(&mut out, refused);
+        out.push_str(RESTART);
+    }
     out
 }
 
