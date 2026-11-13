@@ -402,7 +402,18 @@ need no reload pruning.
   the staged resizes, before `cache_plan::log` (a built static is resized
   in place, with its registry source and configured size moved).
   `plans_sizes` (auto with a total) leaves a range or an unset key to the
-  plan; a pin, and everything in report mode, is applied there. The
+  plan, marking the capacity the plan's; a pin, and everything in report
+  mode, is applied there. A key-set entry stays key-managed (`keyed`), so
+  report mode gives it its size back whatever auto left it at.
+  `AcceptedLoad::plans_sizes` is the ONE gate for `PlanSized`,
+  `EngineReuse::plan_sized` and `memory_caches::apply`; `memory_plan::apply`
+  applies on the same condition. A reload `stage`s the keys before
+  `load_collections` (`keys::pending_bytes` answers an engine that checks
+  a process-wide size while built: the station grid) and `unstage`s them
+  on rejection: a rejected reload changes no size or value. A load that
+  lowers `station_grid`/`station_grid_compute` rebuilds live station
+  grids (`engine_station_grid::sizes_fall_on_load`). A new engine with a
+  build-time size check reads it through `pending_bytes` the same way. The
   render caches are not statics: `RenderCacheSizes::of` resolves
   `[memory.caches]` > `[server]` alias > `[wms]` > default (vector_tile:
   > constant), stored on `AcceptedLoad`, reused/resized as before.

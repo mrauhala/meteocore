@@ -1088,6 +1088,17 @@ fn point_index_sources_follow_the_config() {
             "point_index_cache_mb = 16\n",
             "collection:[grib] point_index_cache_mb",
         ),
+        // A range: derived from its configured size, the default clamped
+        // into it (#1313 review).
+        (
+            "message_cache_mb = { min = 1024, max = 4096 }\n",
+            "derived:[grib] message_cache_mb",
+        ),
+        ("message_cache_mb = { min = 64, max = 4096 }\n", "default"),
+        (
+            "message_cache_mb = { min = 64, max = 4096 }\npoint_index_cache_mb = { min = 8, max = 32 }\n",
+            "bounds:[grib] point_index_cache_mb",
+        ),
     ] {
         assert_eq!(source(body), expected, "{body}");
     }
@@ -1711,4 +1722,102 @@ async fn memory_caches_size_the_process_wide_caches_and_a_reload_resizes_them_in
         "{error}"
     );
     assert_eq!(sized("metatile_cache").0, 1536, "the live state kept");
+}
+
+/// #1313 review: a reload that raises `[memory.caches] station_grid`
+/// loads the station grid its old size failed, on that reload, checked
+/// against the size the reload gives the cache; one that lowers it below a
+/// grid fails the grid with the new size rather than shrinking the cache
+/// under it; and a rejected reload leaves the staged keys, the accepted
+/// ones and every live size as they were.
+///
+/// Runs in a child process: the grid cache is process-wide.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reload_raising_station_grid_loads_its_collection() {
+    const CHILD: &str = "MC_TEST_STATION_GRID_KEY_CHILD";
+    const NAME: &str = "cache_plan::tests::a_reload_raising_station_grid_loads_its_collection";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{NAME} failed in its child process");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    let write = |mb: u64, csv: &str| {
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+                 [memory.caches]\nstation_grid = {mb}\n\
+                 [[collections]]\nid = \"weather\"\ntitle = \"w\"\ndescription = \"d\"\n\
+                 engine_type = \"csv\"\ndata_path = {csv:?}\napis = [\"features\"]\n\
+                 [[collections]]\nid = \"grid\"\ntitle = \"g\"\ndescription = \"d\"\n\
+                 engine_type = \"station-grid\"\napis = [\"edr\", \"wms\"]\n\
+                 [collections.station_grid]\nsource = \"weather\"\n\
+                 parameters = [\"temperature\"]\n\
+                 grid = {{ bbox = [19.0, 59.0, 25.0, 63.0], resolution = 0.005 }}\n\
+                 search_radius_km = 60\ncadence = \"PT1H\"\nprecompute = 1\n"
+            ),
+        )
+        .unwrap();
+    };
+    let csv = testdata("weather.csv").to_str().unwrap().to_string();
+    let grid = |state: &crate::admin::AdminState| {
+        state
+            .health
+            .read()
+            .unwrap()
+            .iter()
+            .find(|h| h.id == "grid")
+            .map(|h| (h.status, h.error.clone().unwrap_or_default()))
+            .unwrap()
+    };
+    let capacity = || engine_station_grid::cache_metrics().capacity_bytes / MIB;
+    use crate::admin::CollectionStatus;
+
+    // 1200 × 800 cells, 3.7 MiB: more than 1 MiB holds.
+    write(1, &csv);
+    let state = crate::watcher::tests::build_state(&config_path);
+    let (status, error) = grid(&state);
+    assert_eq!(status, CollectionStatus::Failed);
+    assert!(error.contains("more than the 1 MiB grid cache"), "{error}");
+
+    write(64, &csv);
+    crate::admin::do_reload(&state).unwrap();
+    assert_eq!(
+        grid(&state).0,
+        CollectionStatus::Ready,
+        "on the reload that raises it"
+    );
+    assert_eq!(capacity(), 64);
+
+    // A rejected reload, every collection failing, with another key.
+    write(128, "/nonexistent/weather.csv");
+    assert!(matches!(
+        crate::admin::do_reload(&state),
+        Err(crate::admin::ReloadError::NoReadyCollections { .. })
+    ));
+    assert_eq!(capacity(), 64, "the live size kept");
+    assert_eq!(
+        plan::keys::pending_bytes("station_grid", 64 * MIB),
+        64 * MIB,
+        "nothing left staged"
+    );
+    assert_eq!(
+        plan::env_size("MC_STATION_GRID_CACHE_MB", 256),
+        (64, SizeSource::Config("[memory.caches] station_grid")),
+        "the accepted key kept"
+    );
+    assert_eq!(grid(&state).0, CollectionStatus::Ready);
+
+    // Lowered below the grid: built again and failed, the cache shrunk.
+    write(2, &csv);
+    crate::admin::do_reload(&state).unwrap();
+    let (status, error) = grid(&state);
+    assert_eq!(status, CollectionStatus::Failed);
+    assert!(error.contains("more than the 2 MiB grid cache"), "{error}");
 }

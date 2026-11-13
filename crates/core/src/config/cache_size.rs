@@ -14,9 +14,9 @@ use serde::Deserialize;
 pub enum CacheSize {
     /// Pinned: the memory plan leaves it alone. `0` disables a cache.
     Mib(u64),
-    /// Left to the memory plan, never below `min` nor above `max`. Until the
-    /// plan sizes it, and in `[memory] mode = "report"`, the size is the
-    /// built-in default clamped into the range.
+    /// Left to the memory plan, never below `min` nor above `max`, both at
+    /// least 1. Until the plan sizes it, and in `[memory] mode = "report"`,
+    /// the size is the built-in default clamped into the range.
     Range { min: u64, max: u64 },
 }
 
@@ -49,13 +49,19 @@ impl CacheSize {
         }
     }
 
-    /// A range whose `min` is above its `max`, or whose `max` is 0, is an
-    /// error naming `key`: write `0` to disable a cache.
+    /// A range whose `min` is above its `max`, or whose `min` or `max` is
+    /// 0, is an error naming `key`: write `0` to disable a cache. A range
+    /// from 0 would build a cache off by default (`[grib] message_cache_mb`)
+    /// off, and the plan never turns on a cache that is off.
     pub fn validate(self, key: &str) -> Result<(), String> {
         match self {
             CacheSize::Mib(_) => Ok(()),
             CacheSize::Range { max: 0, .. } => Err(format!(
                 "{key}: max must be at least 1 MiB; write {key} = 0 to disable the cache"
+            )),
+            CacheSize::Range { min: 0, .. } => Err(format!(
+                "{key}: min must be at least 1 MiB: a range from 0 can leave the cache off \
+                 for good; write {key} = 0 to disable it"
             )),
             CacheSize::Range { min, max } if min > max => {
                 Err(format!("{key}: min ({min}) must not be above max ({max})"))
@@ -191,6 +197,13 @@ mod tests {
             .validate("k")
             .unwrap_err()
             .contains("k = 0 to disable"));
+        assert_eq!(
+            CacheSize::Range { min: 0, max: 2048 }
+                .validate("[grib] message_cache_mb")
+                .unwrap_err(),
+            "[grib] message_cache_mb: min must be at least 1 MiB: a range from 0 can leave \
+             the cache off for good; write [grib] message_cache_mb = 0 to disable it"
+        );
         assert_eq!(range.to_string(), "{ min = 64, max = 512 }");
     }
 }

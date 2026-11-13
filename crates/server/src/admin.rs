@@ -651,9 +651,10 @@ static CACHE_SIZE_SOURCE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         Opts::new(
             "cache_size_source",
             "1 per cache and admission budget of /admin/cache-plan, labelled with where its size \
-             came from: default, env:<variable>, config:<key>, collection:<key>, \
-             derived:<key>, constant, or plan:auto while [memory] mode = \"auto\" gives it the \
-             memory plan's size. cache is the /metrics family, collection empty for a \
+             came from: default, env:<variable>, config:<key> ([memory.caches] or a [server] \
+             alias), collection:<key>, bounds:<key> for a { min, max } key the memory plan \
+             sizes within, derived:<key>, constant, or plan:auto while [memory] mode = \"auto\" \
+             gives it the memory plan's size. cache is the /metrics family, collection empty for a \
              process-wide one",
         ),
         &["cache", "collection", "source"],
@@ -3089,10 +3090,12 @@ pub struct ReusableCaches {
     pub plan_sized: PlanSized,
 }
 
-/// The render caches whose size the memory plan sets: in `[memory] mode =
-/// "auto"`, those no setting pins. A reload reuses each one as it is,
-/// stages no resize, and leaves its size to the plan fitted after the
-/// reload, which shrinks a warm cache by at most a quarter (#1312).
+/// The render caches whose size the memory plan sets: when it applies its
+/// sizes (`[memory] mode = "auto"` with a total,
+/// [`AcceptedLoad::plans_sizes`]), those no setting pins. A reload reuses
+/// each one as it is, stages no resize, and leaves its size to the plan
+/// fitted after the reload, which shrinks a warm cache by at most a quarter
+/// (#1312).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PlanSized {
     pub rendered: bool,
@@ -3103,10 +3106,16 @@ pub struct PlanSized {
 impl PlanSized {
     /// What `config` leaves to the plan.
     fn of(config: &AcceptedLoad) -> Self {
-        if config.memory_mode() != ds_core::config::MemoryMode::Auto {
+        Self::of_sizes(config.render_cache_sizes(), config.plans_sizes())
+    }
+
+    /// What `sizes` leave to the plan, when it applies its sizes
+    /// (`plans_sizes`): nothing when it does not, so a reload resizes
+    /// every render cache to its config's size itself.
+    fn of_sizes(sizes: &crate::memory_caches::RenderCacheSizes, plans_sizes: bool) -> Self {
+        if !plans_sizes {
             return Self::default();
         }
-        let sizes = config.render_cache_sizes();
         let unpinned = |source| !ds_cache::plan::grant::pinned(source);
         PlanSized {
             rendered: unpinned(&sizes.rendered.source),
@@ -7595,6 +7604,15 @@ impl AcceptedLoad {
     pub(crate) fn memory_mode(&self) -> ds_core::config::MemoryMode {
         self.memory_mode
     }
+
+    /// Whether the memory plan applies its sizes: `[memory] mode = "auto"`
+    /// with a total ([`crate::memory_plan::plans_sizes`]). The one gate of
+    /// every reload path that leaves a size to the plan (`PlanSized`,
+    /// `EngineReuse::plan_sized`, `[memory.caches]`), and of the plan's own
+    /// apply, so none leaves a size to a plan that does not apply.
+    pub(crate) fn plans_sizes(&self) -> bool {
+        crate::memory_plan::plans_sizes(self.memory_mode, self.memory_total_mb)
+    }
 }
 
 fn remote_radar(c: &CollectionConfig) -> bool {
@@ -7817,12 +7835,25 @@ fn apply_load(
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
+    // `[memory.caches]` (#1313): an engine that checks a process-wide size
+    // while it is built checks the size this load gives it. Staged, not
+    // applied: a rejected load leaves every size as it was (`unstage`
+    // below), an accepted one applies them (`memory_caches::apply`).
+    crate::memory_caches::stage(config.cache_settings(), config.plans_sizes());
     let reusable = if recovery {
         // Same accepted configuration: preserve static CSV/GeoJSON and their
         // nowcast dependents too. Explicit reload retains its rebuild semantics.
         live_handles.keys().cloned().collect()
     } else {
-        reusable_collections(&old_collections, &config.collections, &live_handles)
+        // A station grid checked its grid against the grid cache and the
+        // computation budget when it was built: a load that lowers either
+        // builds it again, checked against the new sizes, rather than
+        // shrinking them under it. Its dependents follow it.
+        let mut live = live_handles.clone();
+        if engine_station_grid::sizes_fall_on_load() {
+            live.retain(|_, engine| !matches!(engine, EngineHandle::StationGrid(_)));
+        }
+        reusable_collections(&old_collections, &config.collections, &live)
     };
     let engine_reuse = EngineReuse {
         engines: live_handles
@@ -7838,7 +7869,7 @@ fn apply_load(
             .filter(|(id, _)| reusable.contains(id.as_str()))
             .map(|(id, w)| (id.clone(), w.clone()))
             .collect(),
-        plan_sized: config.memory_mode() == ds_core::config::MemoryMode::Auto,
+        plan_sized: config.plans_sizes(),
     };
     info!(
         "Incremental reload: {} of {} configured collection(s) unchanged — reusing their live engines",
@@ -7884,6 +7915,7 @@ fn apply_load(
             "Reload produced 0 working collections from {} configured. Keeping old state.",
             config.collections.len()
         );
+        crate::memory_caches::unstage();
         return Err(ReloadError::NoReadyCollections {
             configured: config.collections.len(),
         });
@@ -8141,10 +8173,7 @@ fn apply_load(
     apply_cache_resizes(cache_resizes);
     // `[memory.caches]` (#1313): the process-wide caches and budgets take
     // the accepted config's sizes in place, before the plan is fitted.
-    crate::memory_caches::apply(
-        config.cache_settings(),
-        crate::memory_plan::plans_sizes(config.memory_mode(), config.memory_total_mb()),
-    );
+    crate::memory_caches::apply(config.cache_settings(), config.plans_sizes());
     // Metric-label hygiene (#446): only REMOVED collections lose their
     // render-latency series; a rebuilt one keeps its history. (A render in
     // flight on the old registry can re-create a series after this — the
@@ -12066,6 +12095,46 @@ prewarm_sweeps = 0
     /// #1028: the accepted load that reloads and recovery passes rebuild from
     /// carries the resolved size: `[server] rendered_cache_mb` over the
     /// deprecated `[wms]` key, else the largest `[wms]` value, else the default.
+    /// #1313 review: a reload leaves a render cache's size to the plan only
+    /// when the plan applies its sizes, `auto` with a total; in `auto`
+    /// without one, it resizes the caches itself, as in report mode.
+    #[test]
+    fn render_caches_are_left_to_the_plan_only_where_it_applies() {
+        let config: ds_core::config::ServerConfig = toml::from_str(
+            "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+             [memory]\nmode = \"auto\"\n\
+             [memory.caches]\nmetatile = { min = 512, max = 1536 }\nrendered = 300\n",
+        )
+        .unwrap();
+        let sizes = crate::memory_caches::RenderCacheSizes::of(
+            &config,
+            &crate::memory_caches::CacheSettings::known(&config),
+        );
+        assert_eq!(
+            super::PlanSized::of_sizes(&sizes, false),
+            super::PlanSized::default()
+        );
+        assert_eq!(
+            super::PlanSized::of_sizes(&sizes, true),
+            super::PlanSized {
+                rendered: false,
+                tile: true,
+                vector: true,
+            }
+        );
+        let accepted = super::AcceptedLoad::new(
+            &config,
+            ds_render::StyleContext::with_builtins(),
+            0,
+            Default::default(),
+        );
+        assert_eq!(
+            super::PlanSized::of(&accepted),
+            super::PlanSized::of_sizes(&sizes, accepted.plans_sizes()),
+            "one gate"
+        );
+    }
+
     #[test]
     fn accepted_load_resolves_the_rendered_cache_size() {
         let config = |server: &str, wms: &[u64]| -> ds_core::config::ServerConfig {

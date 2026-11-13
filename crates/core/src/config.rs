@@ -1367,6 +1367,13 @@ impl ServerConfig {
         warnings
     }
 
+    /// The collections whose deprecated `[wms] rendered_cache_mb`
+    /// [`select_rendered_cache_mb`] reads: those that serve WMS, Maps or
+    /// Tiles, by id, with the value.
+    pub fn deprecated_rendered_cache_mb(&self) -> impl Iterator<Item = (&str, u64)> + '_ {
+        rendered_cache_keyed(&self.collections)
+    }
+
     /// [`select_rendered_cache_mb`] over this config: `[server]
     /// rendered_cache_mb` and the collections.
     pub fn rendered_cache_mb(&self) -> (u64, Vec<String>) {
@@ -8675,6 +8682,38 @@ colormap = "radar_dbz"
             .unwrap_err()
             .to_string();
         assert!(unit.contains("a size in MiB"), "{unit}");
+    }
+
+    /// #1313 review: a range from 0 is a load error, on every key: on the
+    /// GRIB message cache, whose default is 0, it would build no cache,
+    /// which the plan never turns on.
+    #[test]
+    fn a_range_from_zero_is_a_load_error() {
+        let error = grib_collection(
+            "data_path = \"testdata/grib-local\"\nmessage_cache_mb = { min = 0, max = 2048 }\n",
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("Collection 'c': [grib] message_cache_mb: min must be at least 1 MiB"),
+            "{error}"
+        );
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+             [memory.caches]\npvol_pixel = { min = 0, max = 8 }\n",
+        )
+        .unwrap();
+        let error = ServerConfig::from_file(path.to_str().unwrap())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("[memory.caches] pvol_pixel: min must be at least 1 MiB"),
+            "{error}"
+        );
     }
 
     /// #1313: every per-collection size key takes the same two forms, and a

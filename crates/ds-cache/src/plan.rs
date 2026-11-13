@@ -565,6 +565,9 @@ struct Sizing {
     /// stopped setting it ([`configure`], #1313), when that is not the
     /// source it was registered with.
     source: Option<SizeSource>,
+    /// A `[memory.caches]` key has set it ([`configure`]): its size is the
+    /// key's to give it back in report mode, whatever its source is now.
+    keyed: bool,
 }
 
 struct Registered {
@@ -706,6 +709,7 @@ fn insert<T: Send + Sync + 'static>(
                 configured: configured.unwrap_or(capacity),
                 planned: None,
                 source: None,
+                keyed: false,
             })),
         ),
     };
@@ -778,11 +782,16 @@ pub fn restore(entry: &Entry) -> Option<u64> {
 
 /// [`keys::set`] for the newest live process-wide registration of `key`'s
 /// entry: give it `source` and `configured_bytes`, the size its settings
-/// now give it, and with `resize`, that capacity in place when the change
-/// moves it. `set`: the key is set; unset, an entry no key ever set is left
-/// as it was registered. Returns what changed; `None` when nothing is
-/// registered as the key's entry, or nothing changed. A pin takes away the
-/// plan's mark ([`Row::planned`]).
+/// now give it. `set`: the key is set; unset, an entry no key ever set is
+/// left as it was registered. Returns what changed; `None` when nothing is
+/// registered as the key's entry, or nothing changed.
+///
+/// With `resize`, the capacity becomes `configured_bytes` in place when
+/// the change moves it, or when it is the plan's ([`Row::planned`]): so
+/// report mode gives a key-set entry its documented size whatever auto left
+/// it at. Without, the size is the plan's to set: a capacity other than
+/// `configured_bytes` is marked the plan's, for the plan to move, or
+/// report mode to give back. A pin takes away the plan's mark.
 fn configure(
     key: &keys::Key,
     source: SizeSource,
@@ -803,31 +812,40 @@ fn configure(
             .max_by_key(|r| r.seq)
             .cloned()?
     };
-    let changed = {
+    // Read outside the lock: a cache's usage takes its own shard locks.
+    let capacity = (registered.read)()?.capacity_bytes;
+    let (changed, due) = {
         let mut sizing = registered.sizing.lock().unwrap_or_else(|e| e.into_inner());
         let current = sizing
             .source
             .clone()
             .unwrap_or_else(|| registered.entry.source.clone());
+        // Built while the key was set: its registration names the key.
         let from_key = matches!(
             &current,
             SizeSource::Config(label) | SizeSource::Bounds(label, _) if *label == key.label
         );
-        if !set && !from_key {
+        if !set && !from_key && !sizing.keyed {
             return None;
         }
+        sizing.keyed = true;
+        let planned = sizing.planned == Some(capacity);
         let changed = current != source || sizing.configured != configured_bytes;
         sizing.source = (source != registered.entry.source).then(|| source.clone());
         sizing.configured = configured_bytes;
         if grant::pinned(&source) {
             sizing.planned = None;
         }
-        changed
+        let moves = capacity != configured_bytes && (changed || planned);
+        if !resize && moves {
+            // Left to the plan: its capacity is the plan's to move, and
+            // report mode's to give back.
+            sizing.planned = Some(capacity);
+        }
+        (changed, resize && moves)
     };
-    // Read outside the lock: a cache's usage takes its own shard locks.
-    let capacity = (registered.read)()?.capacity_bytes;
-    let to = match &registered.resize {
-        Some(hook) if resize && changed && capacity != configured_bytes => {
+    let to = match (&registered.resize, due) {
+        (Some(hook), true) => {
             let applied = (hook.to)(configured_bytes).unwrap_or(capacity);
             let mut sizing = registered.sizing.lock().unwrap_or_else(|e| e.into_inner());
             sizing.planned = None;
@@ -835,7 +853,7 @@ fn configure(
         }
         _ => capacity,
     };
-    changed.then(|| keys::Configured {
+    (changed || due).then(|| keys::Configured {
         entry: Entry {
             source,
             ..registered.entry.clone()
@@ -843,6 +861,7 @@ fn configure(
         from_bytes: capacity,
         to_bytes: to,
         configured_bytes,
+        deferred: !resize && capacity != configured_bytes,
     })
 }
 

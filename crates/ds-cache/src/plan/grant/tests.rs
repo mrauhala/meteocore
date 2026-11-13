@@ -899,6 +899,7 @@ fn reasons_print_for_the_report() {
         Reason::Share(45),
         Reason::Today,
         Reason::Off,
+        Reason::RangeFloor,
         Reason::Held(Hold::Warm),
         Reason::Held(Hold::InPlace),
         Reason::Scaled,
@@ -920,6 +921,7 @@ fn reasons_print_for_the_report() {
             "share by weight 45",
             "size today",
             "off: its setting turns it on",
+            "the floor of its range",
             "held: a warm cache gives up at most 25 % of what it holds at once",
             "held: it shrinks no further in place",
             "scaled to the total",
@@ -1319,4 +1321,29 @@ fn a_bounded_size_never_falls_outside_its_bounds() {
     assert_eq!(mb(&small, "render_budget"), 256);
     // Not pinned: the plan sizes it.
     assert!(!pinned(&SizeSource::Bounds("k", Bounds::mib(1, 2))));
+}
+
+/// An off cache a range's floor turns on says so: its reason is the
+/// range's floor, not "off".
+#[test]
+fn an_off_cache_lifted_by_its_range_floor_says_so() {
+    let (mut caches, budgets) = process_wide(&[]);
+    caches.push(within(
+        cache(
+            "netcdf_chunk_cache",
+            Scope::Engine("probe"),
+            SizeSource::Default,
+            0,
+        ),
+        0,
+        64,
+        512,
+    ));
+    let plan = plan(&inputs(16.0, 10, Baseline::Estimated, caches, budgets));
+    let g = plan
+        .caches
+        .iter()
+        .find(|g| g.entry.scope == Scope::Engine("probe"))
+        .unwrap();
+    assert_eq!((g.bytes, &g.reason), (64 * MB, &Reason::RangeFloor));
 }

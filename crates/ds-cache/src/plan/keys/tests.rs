@@ -127,6 +127,7 @@ struct Reset;
 impl Drop for Reset {
     fn drop(&mut self) {
         *SETTINGS.lock().unwrap_or_else(|e| e.into_inner()) = Vec::new();
+        unstage();
     }
 }
 
@@ -189,18 +190,22 @@ fn a_built_cache_takes_its_key_in_place() {
     );
 
     // A range in auto: the source and configured size move, the capacity
-    // is the plan's to set.
+    // is marked the plan's to set.
     let bounds = Bounds::mib(8, 16);
     let changed = set(&[(key(), Size::Bounded(bounds))], true);
     assert_eq!(
-        (changed[0].to_bytes, changed[0].configured_bytes),
-        (64 * MIB, 16 * MIB)
+        (
+            changed[0].to_bytes,
+            changed[0].configured_bytes,
+            changed[0].deferred
+        ),
+        (64 * MIB, 16 * MIB, true)
     );
+    assert_eq!(sized(), (64, 16, "plan:auto".into()));
     assert_eq!(
-        sized(),
-        (64, 16, "bounds:[memory.caches] lightning_strike".into())
+        row().entry.source,
+        SizeSource::Bounds("[memory.caches] lightning_strike", bounds)
     );
-    assert_eq!(row().entry.source.bounds(), Some(bounds));
     // In report mode it takes the default clamped into the range.
     set(&[], true);
     set(&[(key(), Size::Bounded(bounds))], false);
@@ -234,5 +239,108 @@ fn an_unset_key_gives_its_variable_back() {
         (48, 48, format!("env:{VAR}")),
         "the variable pins it, applied in auto"
     );
+    drop(cache);
+}
+
+/// #1313 review: report mode gives a cache a key set its documented size,
+/// whatever auto left it at: a range auto left to the plan, at a size
+/// inside or outside the range, and a key removed in auto. Auto marks what
+/// it leaves to the plan as the plan's.
+#[test]
+fn report_mode_gives_a_keyed_cache_its_documented_size_after_auto() {
+    let _serial = serial();
+    let _reset = Reset;
+    let cache = build(); // default 32 MiB
+
+    // A pin, then a range in auto, kept at the pin's size for the plan.
+    set(&[(key(), Size::Pinned(16))], false);
+    let range = Bounds::mib(8, 64);
+    let changed = set(&[(key(), Size::Bounded(range))], true);
+    assert!(changed[0].deferred);
+    assert_eq!(cache.capacity_bytes(), 16 * MIB);
+    assert!(row().planned, "the plan's to move");
+    assert_eq!(row().source(), SizeSource::Planned);
+    // The same range in report: the default clamped into it.
+    set(&[(key(), Size::Bounded(range))], false);
+    assert_eq!(
+        sized(),
+        (32, 32, "bounds:[memory.caches] lightning_strike".into())
+    );
+    assert!(!row().planned);
+
+    // A pin above a range's ceiling, the range in auto, then report.
+    set(&[(key(), Size::Pinned(64))], false);
+    let low = Bounds::mib(8, 16);
+    set(&[(key(), Size::Bounded(low))], true);
+    assert_eq!(cache.capacity_bytes(), 64 * MIB);
+    set(&[(key(), Size::Bounded(low))], false);
+    assert_eq!(
+        sized(),
+        (16, 16, "bounds:[memory.caches] lightning_strike".into())
+    );
+
+    // A pin removed in auto, then report: back to the default.
+    set(&[(key(), Size::Pinned(48))], false);
+    set(&[], true);
+    assert_eq!(cache.capacity_bytes(), 48 * MIB);
+    assert_eq!(row().source(), SizeSource::Planned);
+    set(&[], false);
+    assert_eq!(sized(), (32, 32, "default".into()));
+    assert!(set(&[], false).is_empty(), "nothing left to give back");
+    drop(cache);
+}
+
+/// #1313 review: a load's staged keys answer `pending_bytes` and change
+/// nothing else: no size, no accepted value, no `env_size`. `set` takes a
+/// load's values and drops the staged ones; `unstage` drops them.
+#[test]
+fn staged_keys_answer_pending_bytes_and_change_nothing() {
+    let _serial = serial();
+    let _reset = Reset;
+    let cache = build(); // default 32 MiB
+    let live = cache.capacity_bytes();
+    assert_eq!(
+        pending_bytes("lightning_strike", live),
+        live,
+        "nothing staged"
+    );
+
+    stage(&[(key(), Size::Pinned(64))], false);
+    assert_eq!(pending_bytes("lightning_strike", live), 64 * MIB);
+    assert_eq!(cache.capacity_bytes(), live, "nothing resized");
+    assert_eq!(
+        plan::env_size(VAR, 32),
+        (32, SizeSource::Default),
+        "nothing accepted"
+    );
+    assert_eq!(
+        pending_bytes("pvol_pixel", 7),
+        7,
+        "a key the load leaves alone"
+    );
+    unstage();
+    assert_eq!(pending_bytes("lightning_strike", live), live);
+
+    // A range: its default clamped in report, the live size clamped where
+    // the plan sizes it.
+    let range = Bounds::mib(40, 50);
+    stage(&[(key(), Size::Bounded(range))], false);
+    assert_eq!(pending_bytes("lightning_strike", live), 40 * MIB);
+    stage(&[(key(), Size::Bounded(range))], true);
+    assert_eq!(pending_bytes("lightning_strike", 45 * MIB), 45 * MIB);
+
+    // Accepted, then dropped by the next load: back to the default, or in
+    // auto the plan's live size.
+    set(&[(key(), Size::Pinned(64))], false);
+    assert_eq!(
+        pending_bytes("lightning_strike", 64 * MIB),
+        64 * MIB,
+        "set unstaged"
+    );
+    stage(&[], false);
+    assert_eq!(pending_bytes("lightning_strike", 64 * MIB), 32 * MIB);
+    stage(&[], true);
+    assert_eq!(pending_bytes("lightning_strike", 64 * MIB), 64 * MIB);
+    unstage();
     drop(cache);
 }

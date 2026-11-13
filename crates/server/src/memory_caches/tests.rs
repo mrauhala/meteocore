@@ -117,43 +117,62 @@ fn the_rendered_cache_names_every_alias_it_wins_over() {
           rendered_cache_mb and the deprecated [wms] rendered_cache_mb are ignored, remove them"
         ]
     );
+    // A collection that serves none of WMS, Maps and Tiles is not read by
+    // the fallback, so its key is not a place that sizes the cache (#1313
+    // review): the same predicate as the resolver's.
+    let edr_only = config(
+        "[memory.caches]\nrendered = 256\n[[collections]]\nid = \"e\"\ntitle = \"t\"\n\
+         description = \"d\"\napis = [\"edr\"]\n[collections.wms]\nrendered_cache_mb = 512\n",
+    );
+    let settings = CacheSettings::of(&edr_only).unwrap();
+    assert!(conflict_warnings(&edr_only, &settings, &unset).is_empty());
+    assert_eq!(edr_only.deprecated_rendered_cache_mb().count(), 0);
 }
 
-/// The INFO block names each size [`apply`] changed and its source, with a
-/// range's floor and ceiling, and what stopped short.
+/// The INFO block names each size [`apply`] changed and its source, per
+/// case: resized, left to the plan (auto only), staying at a size a new
+/// source gives it too, or stopped short, which also WARNs that a restart
+/// reaches the size (#1313 review).
 #[test]
 fn the_changes_block_names_each_size_and_its_source() {
     use ds_cache::plan::{Entry, Scope};
-    let change = |source, from: u64, to: u64, configured: u64| Configured {
+    let change = |source, from: u64, to: u64, configured: u64, deferred: bool| Configured {
         entry: Entry::cache("pvol_pixel_cache", Scope::Engine("odim-volume"), source),
         from_bytes: from * MIB,
         to_bytes: to * MIB,
         configured_bytes: configured * MIB,
+        deferred,
     };
+    let pin = || SizeSource::Config("[memory.caches] pvol_pixel");
     assert_eq!(changes_block(&[]), None);
-    let block = changes_block(&[
-        change(
-            SizeSource::Config("[memory.caches] pvol_pixel"),
-            1024,
-            4096,
-            4096,
-        ),
+    let changes = [
+        change(pin(), 1024, 4096, 4096, false),
         change(
             SizeSource::Bounds("[memory.caches] pvol_pixel", Bounds::mib(64, 128)),
             4096,
             4096,
             128,
+            true,
         ),
-        change(SizeSource::Default, 4096, 1100, 1024),
-    ])
-    .unwrap();
+        change(pin(), 1024, 1024, 1024, false),
+        change(pin(), 4096, 1100, 1024, false),
+    ];
     assert_eq!(
-        block,
-        "[memory.caches] applied: 3 sizes changed\n  \
+        changes_block(&changes).unwrap(),
+        "[memory.caches] applied: 4 sizes changed\n  \
          pvol_pixel_cache 1024 MiB → 4096 MiB (config:[memory.caches] pvol_pixel)\n  \
          pvol_pixel_cache kept at 4096 MiB for the memory plan (bounds:[memory.caches] \
          pvol_pixel, floor 64 MiB, ceiling 128 MiB)\n  \
-         pvol_pixel_cache 4096 MiB → 1100 MiB (default; toward 1024 MiB: its resize stopped \
-         short)"
+         pvol_pixel_cache stays at 1024 MiB (config:[memory.caches] pvol_pixel)\n  \
+         pvol_pixel_cache 4096 MiB → 1100 MiB (config:[memory.caches] pvol_pixel; toward \
+         1024 MiB: its shrink stopped short)"
+    );
+    assert_eq!(
+        stopped_short_warnings(&changes),
+        [
+            "pvol_pixel_cache stays at 1100 MiB, above the 1024 MiB its key \
+          config:[memory.caches] pvol_pixel gives it: a shrink in place stops where its \
+          shards still hold 32 entries each. A restart builds it at 1024 MiB"
+        ]
     );
 }

@@ -222,12 +222,9 @@ pub(crate) fn conflict_warnings(
             places.push(alias.to_string());
         }
         if key.key == "rendered" && rendered_keyed {
-            let keyed = config.collections.iter().any(|c| {
-                c.wms
-                    .as_ref()
-                    .is_some_and(|w| w.rendered_cache_mb.is_some())
-            });
-            if keyed {
+            // The collections the deprecated fallback reads: those
+            // serving WMS, Maps or Tiles.
+            if config.deprecated_rendered_cache_mb().next().is_some() {
                 places.push("the deprecated [wms] rendered_cache_mb".into());
             }
         }
@@ -310,10 +307,27 @@ pub(crate) fn apply(settings: &CacheSettings, plan_sized: bool) {
     if let Some(block) = changes_block(&changed) {
         info!("{block}");
     }
+    for warning in stopped_short_warnings(&changed) {
+        warn!("{warning}");
+    }
 }
 
-/// The INFO block of what [`apply`] changed: each size, old → new, and its
-/// source; `None` when nothing changed.
+/// Stage `settings` for the load being built (`keys::stage`), before its
+/// engines are: one that checks a process-wide size while it is built
+/// checks the size the load gives it (`keys::pending_bytes`). [`apply`]
+/// takes them once the load is accepted; [`unstage`] drops them when it is
+/// rejected, which leaves every size and value as it was.
+pub(crate) fn stage(settings: &CacheSettings, plan_sized: bool) {
+    keys::stage(&settings.0, plan_sized);
+}
+
+/// Drop what [`stage`] staged: the load was rejected.
+pub(crate) fn unstage() {
+    keys::unstage();
+}
+
+/// The INFO block of what [`apply`] changed: each size, old → new, or what
+/// it stays at, and its source; `None` when nothing changed.
 pub(crate) fn changes_block(changed: &[Configured]) -> Option<String> {
     if changed.is_empty() {
         return None;
@@ -325,12 +339,14 @@ pub(crate) fn changes_block(changed: &[Configured]) -> Option<String> {
     );
     for change in changed {
         let _ = write!(out, "\n  {}", change.entry.id);
-        if change.to_bytes == change.from_bytes {
+        if change.deferred {
             let _ = write!(
                 out,
                 " kept at {} for the memory plan",
                 mib(change.from_bytes)
             );
+        } else if change.to_bytes == change.from_bytes {
+            let _ = write!(out, " stays at {}", mib(change.to_bytes));
         } else {
             let _ = write!(
                 out,
@@ -348,16 +364,37 @@ pub(crate) fn changes_block(changed: &[Configured]) -> Option<String> {
                 mib(bounds.max_bytes)
             );
         }
-        if change.to_bytes != change.configured_bytes && change.to_bytes != change.from_bytes {
+        if change.stopped_short() {
             let _ = write!(
                 out,
-                "; toward {}: its resize stopped short",
+                "; toward {}: its shrink stopped short",
                 mib(change.configured_bytes)
             );
         }
         out.push(')');
     }
     Some(out)
+}
+
+/// The WARN for each size [`apply`] could not shrink to in place: a shrink
+/// stops where the cache's shards still hold 32 entries each, and a
+/// restart builds it at its key's size.
+pub(crate) fn stopped_short_warnings(changed: &[Configured]) -> Vec<String> {
+    changed
+        .iter()
+        .filter(|change| change.stopped_short())
+        .map(|change| {
+            format!(
+                "{} stays at {}, above the {} its key {} gives it: a shrink in place stops \
+                 where its shards still hold 32 entries each. A restart builds it at {}",
+                change.entry.id,
+                mib(change.to_bytes),
+                mib(change.configured_bytes),
+                change.entry.source,
+                mib(change.configured_bytes)
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

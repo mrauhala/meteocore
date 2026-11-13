@@ -54,7 +54,17 @@ pub(crate) fn read_at_boot() -> &'static detect::Reading {
 /// a size the plan would set to it then, and applies it itself otherwise
 /// (#1313).
 pub(crate) fn plans_sizes(mode: MemoryMode, total_mb: Option<u64>) -> bool {
-    mode == MemoryMode::Auto && detect::total(total_mb, read_at_boot()).is_some()
+    plans_sizes_with(mode, total_mb, read_at_boot())
+}
+
+/// [`plans_sizes`] over `reading`: the condition [`apply`] applies a plan
+/// on, `auto` with the total [`report_for`] fits one to.
+pub(crate) fn plans_sizes_with(
+    mode: MemoryMode,
+    total_mb: Option<u64>,
+    reading: &detect::Reading,
+) -> bool {
+    mode == MemoryMode::Auto && detect::total(total_mb, reading).is_some()
 }
 
 /// A plan and the total it was fitted to.

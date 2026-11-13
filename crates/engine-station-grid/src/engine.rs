@@ -345,19 +345,22 @@ impl StationGridEngine {
         let grid_bytes = compute::grid_bytes(geom.cells());
         // The terrain and mask grids live as long as the engine: they count
         // with one grid against the cache.
+        // Against the sizes the load being built gives them (#1313): a
+        // reload that raises a key loads the collection at once.
         let resident = grid_bytes + corrections.resident_bytes();
-        if resident > compute::cache_capacity() {
+        let cache = compute::cache_capacity_for_load();
+        if resident > cache {
             return Err(bad(format!(
                 "one grid of {} cells is {} MiB with its terrain and mask, more than the {} MiB \
                  grid cache ([memory.caches] station_grid) holds, so every map tile would recompute \
                  it; raise the cache or coarsen the grid",
                 geom.cells(),
                 resident.div_ceil(ds_cache::MIB),
-                compute::cache_capacity() / ds_cache::MIB
+                cache / ds_cache::MIB
             )));
         }
         let job_bytes = grid_bytes + compute::COMPUTE_SLACK_BYTES;
-        let (_, budget, _) = compute::budget_metrics();
+        let budget = compute::budget_for_load();
         if job_bytes > budget / 2 {
             return Err(bad(format!(
                 "computing one grid of {} cells needs {} MiB, more than half the {} MiB \

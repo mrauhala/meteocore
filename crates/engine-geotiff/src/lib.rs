@@ -1004,7 +1004,9 @@ impl GeoTiffEngine {
         // cache, never the compressed tile cache.
         let cache_bytes = match store_mode {
             StoreMode::Local { .. } => 0,
-            _ => config.effective_tile_cache_mb() * 1024 * 1024,
+            _ => config
+                .effective_tile_cache_mb()
+                .saturating_mul(ds_cache::MIB),
         };
         let tile_cache = cache::TileCache::new(cache_bytes);
 

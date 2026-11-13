@@ -932,3 +932,24 @@ fn the_changes_block_says_why_a_size_was_not_set() {
          their configured sizes\n  grid_cache mp-block 456 MiB → 256 MiB (configured)"
     );
 }
+
+/// #1313 review: the plan applies its sizes in `auto` with a total, and
+/// only then: `auto` without one fits no plan, so nothing may leave a size
+/// to it (`plans_sizes`, the gate of `[memory.caches]`, the render caches
+/// and reused engines).
+#[test]
+fn the_plan_applies_its_sizes_only_in_auto_with_a_total() {
+    let none = Reading::default();
+    assert!(!plans_sizes_with(MemoryMode::Auto, None, &none));
+    assert!(plans_sizes_with(MemoryMode::Auto, Some(4096), &none));
+    assert!(!plans_sizes_with(MemoryMode::Report, Some(4096), &none));
+    let report = report_for(
+        MemoryMode::Auto,
+        None,
+        &none,
+        &[],
+        &HashMap::new(),
+        Baseline::Estimated,
+    );
+    assert!(report.plan.is_none(), "no total, no plan to apply");
+}

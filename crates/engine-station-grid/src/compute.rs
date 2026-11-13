@@ -129,6 +129,31 @@ pub(crate) fn cache_capacity() -> u64 {
     CACHE.capacity_bytes()
 }
 
+/// The grid cache's capacity once the load being built is accepted: the
+/// size its staged `[memory.caches] station_grid` gives it, else its
+/// capacity now (`ds_cache::plan::keys::pending_bytes`, #1313). What a
+/// collection built in that load checks its grid against, so a reload
+/// that raises the key loads the collection, and one that lowers it fails
+/// the collection rather than shrinking the cache under it.
+pub(crate) fn cache_capacity_for_load() -> u64 {
+    plan::keys::pending_bytes("station_grid", cache_capacity())
+}
+
+/// The computation budget's capacity once the load being built is
+/// accepted, as [`cache_capacity_for_load`]: `[memory.caches]
+/// station_grid_compute`.
+pub(crate) fn budget_for_load() -> u64 {
+    plan::keys::pending_bytes("station_grid_compute", BUDGET.capacity())
+}
+
+/// Whether the load being built gives the grid cache or the computation
+/// budget less than they have now: a live station grid, checked against
+/// the sizes it was built with, must be built again and checked against
+/// those (#1313).
+pub fn sizes_fall_on_load() -> bool {
+    cache_capacity_for_load() < cache_capacity() || budget_for_load() < BUDGET.capacity()
+}
+
 /// Drop one engine instance's grids (it was shut down).
 pub(crate) fn evict_epoch(epoch: u64) {
     CACHE.retain(|key, _| key.epoch != epoch);

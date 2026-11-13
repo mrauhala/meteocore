@@ -333,7 +333,7 @@ async fn payload_cache_obeys_budget_and_zero_disables_retention() {
             .all(|v| v == Some(10.0)));
         std::fs::remove_dir_all(dir.path().join("chunks")).unwrap();
         let second = render(&engine);
-        assert_eq!(second.is_ok(), enabled, "cache_mb={}", config.cache_mb);
+        assert_eq!(second.is_ok(), enabled, "cache_mb={:?}", config.cache_mb);
         if enabled {
             assert!(second
                 .unwrap()

@@ -456,6 +456,9 @@ pub enum Reason {
     Today,
     /// Off: its configured size is 0, and only its setting turns it on.
     Off,
+    /// The floor of its `{ min, max }` range, above the size its rule gives
+    /// it (rule 9): an off cache a range turns on.
+    RangeFloor,
     /// The least applying the plan can give it now ([`Least`]).
     Held(Hold),
     /// A budget scaled to the total.
@@ -477,6 +480,7 @@ impl fmt::Display for Reason {
             Reason::Share(weight) => write!(f, "share by weight {weight}"),
             Reason::Today => f.write_str("size today"),
             Reason::Off => f.write_str("off: its setting turns it on"),
+            Reason::RangeFloor => f.write_str("the floor of its range"),
             Reason::Held(Hold::Warm) => {
                 f.write_str("held: a warm cache gives up at most 25 % of what it holds at once")
             }
@@ -700,7 +704,11 @@ fn of_cache(input: &CacheInput, floors_only: bool, keep: Option<&Plan>) -> Plann
         // holds goes as it can.
         planned.grant.floor_bytes = bound(least);
         planned.want = bound(least);
-        planned.grant.reason = Reason::Off;
+        planned.grant.reason = if bound(least) > least {
+            Reason::RangeFloor
+        } else {
+            Reason::Off
+        };
         planned.set(bound(least));
         return planned;
     }

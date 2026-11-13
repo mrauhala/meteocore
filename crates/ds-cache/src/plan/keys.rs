@@ -153,8 +153,11 @@ impl Size {
     }
 }
 
+/// `[memory.caches]` values by key.
+type Values = Vec<(&'static str, Size)>;
+
 /// The values of the accepted config, as [`set`] last took them, by key.
-static SETTINGS: Mutex<Vec<(&'static str, Size)>> = Mutex::new(Vec::new());
+static SETTINGS: Mutex<Values> = Mutex::new(Vec::new());
 
 /// The default each variable was read with ([`super::env_size`]): what a
 /// range clamps, whatever the variable says, since the key wins over it.
@@ -197,6 +200,80 @@ pub struct Configured {
     pub to_bytes: u64,
     /// The size its settings now give it.
     pub configured_bytes: u64,
+    /// Left to the memory plan fitted next, at its capacity: a range or an
+    /// unset key in `[memory] mode = "auto"`.
+    pub deferred: bool,
+}
+
+impl Configured {
+    /// Resized toward its key's size, and its shrink stopped short of it:
+    /// a shrink in place stops where the cache's shards still hold 32
+    /// entries each, and only a restart builds it at that size.
+    pub fn stopped_short(&self) -> bool {
+        !self.deferred && self.to_bytes != self.configured_bytes
+    }
+}
+
+/// The values of a load being built, which [`set`] takes once it is
+/// accepted ([`stage`]), with whether the plan applies its sizes: what
+/// [`pending_bytes`] answers from.
+static STAGED: Mutex<Option<(Values, bool)>> = Mutex::new(None);
+
+/// Stage the `[memory.caches]` values of a load being built, before its
+/// engines are: one that checks a process-wide size while it is built
+/// reads it through [`pending_bytes`], so a reload that raises the size
+/// builds it against the size it will have, and one that lowers it against
+/// that too. Nothing is resized and [`super::env_size`] still reads the
+/// accepted values: a rejected load ([`unstage`]) leaves every size and
+/// value as it was. [`set`] takes the accepted load's values and drops
+/// these.
+pub fn stage(values: &[(&'static Key, Size)], plan_sized: bool) {
+    *STAGED.lock().unwrap_or_else(|e| e.into_inner()) = Some((
+        values.iter().map(|(key, size)| (key.key, *size)).collect(),
+        plan_sized,
+    ));
+}
+
+/// Drop what [`stage`] staged: the load was rejected.
+pub fn unstage() {
+    *STAGED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// The capacity the cache or budget of `key`, of `live_bytes` now, has
+/// once the load being built is accepted ([`stage`]): what [`set`] gives
+/// it. A pin is its size; a range, its default clamped into it, or in
+/// `auto`, where the plan sizes it, `live_bytes` clamped into it; a key
+/// the load drops, its variable's size, else its default, or in `auto`,
+/// for the plan, `live_bytes`. `live_bytes` when nothing is staged, or the
+/// load leaves the key as it is.
+pub fn pending_bytes(key: &str, live_bytes: u64) -> u64 {
+    let staged = STAGED.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let (Some((values, plan_sized)), Some(key)) = (staged, by_key(key)) else {
+        return live_bytes;
+    };
+    let staged = values.iter().find(|(k, _)| *k == key.key).map(|(_, s)| *s);
+    if staged == setting(key.key) {
+        return live_bytes;
+    }
+    let default_mb = key.env.and_then(default_of);
+    match staged {
+        Some(Size::Pinned(mb)) => mb.saturating_mul(MIB),
+        Some(Size::Bounded(bounds)) => match default_mb {
+            Some(mb) if !plan_sized => bounds.clamp(mb.saturating_mul(MIB)),
+            _ => bounds.clamp(live_bytes),
+        },
+        None => match (key.env, default_mb) {
+            (Some(var), Some(mb)) => {
+                let (mb, source) = super::from_env(var, mb);
+                if plan_sized && !super::grant::pinned(&source) {
+                    live_bytes
+                } else {
+                    mb.saturating_mul(MIB)
+                }
+            }
+            _ => live_bytes,
+        },
+    }
 }
 
 /// Take the accepted config's `[memory.caches]` values (#1313): every cache
@@ -208,9 +285,16 @@ pub struct Configured {
 /// no variable) is the plan's to apply, after this; otherwise every changed
 /// size is applied here. Keys without a variable are the server's to apply
 /// ([`Key::env`]). Returns what changed.
+///
+/// The server calls this under its reload lock, but a cache can be built on
+/// a request thread at any time: one whose initializer read its size before
+/// this and registers after it keeps the size it read, with its old key's
+/// source, until the next `set`, which finds its configured size differs
+/// and gives it the key's size then (the next reload, or restart).
 pub fn set(values: &[(&'static Key, Size)], plan_sized: bool) -> Vec<Configured> {
     *SETTINGS.lock().unwrap_or_else(|e| e.into_inner()) =
         values.iter().map(|(key, size)| (key.key, *size)).collect();
+    unstage();
     KEYS.iter()
         .filter_map(|key| {
             let size = values
