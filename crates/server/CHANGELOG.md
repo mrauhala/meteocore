@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.16.0](https://github.com/mrauhala/meteocore/compare/v0.15.0...v0.16.0) (2026-11-13)
+
+
+### Features
+
+* **memory:** [memory.caches] as the one home for cache and budget sizes ([#1463](https://github.com/mrauhala/meteocore/issues/1463)) ([39103c3](https://github.com/mrauhala/meteocore/commit/39103c30b2cdb3ff479342054021617d7dfaa9d8))
+* **memory:** re-plan tick and memory pressure valve ([#1465](https://github.com/mrauhala/meteocore/issues/1465)) ([151577a](https://github.com/mrauhala/meteocore/commit/151577a0403ce9dc3a77ea6ac9ef3bb5fc579932))
+
 ## [0.15.0](https://github.com/mrauhala/meteocore/compare/v0.14.0...v0.15.0) (2026-11-11)
 
 
