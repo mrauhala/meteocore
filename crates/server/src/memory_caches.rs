@@ -304,6 +304,9 @@ pub(crate) fn log_warnings(config: &ServerConfig, settings: &CacheSettings) {
 /// Logs one INFO block naming each size it changed.
 pub(crate) fn apply(settings: &CacheSettings, plan_sized: bool) {
     let changed = keys::set(&settings.0, plan_sized);
+    for change in changed.iter().filter(|c| c.to_bytes != c.from_bytes) {
+        crate::memory_plan::count_change(change.entry.id);
+    }
     if let Some(block) = changes_block(&changed) {
         info!("{block}");
     }

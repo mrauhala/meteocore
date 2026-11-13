@@ -78,7 +78,9 @@ disk, no TOML needed.
   task; the watcher and the recovery loop reload inline on a task nothing
   cancels. A new caller must hold the guard the same way. Until a reload ends
   later requests get 409 even if its client left, so a hung reload needs a
-  restart. A panic frees the lock (a Tokio mutex does not poison) and answers
+  restart. The handler waits up to 2 s (`RELOAD_LOCK_WAIT`) before that 409,
+  so a request arriving while a reload has under 2 s left runs a second
+  reload after it. A panic frees the lock (a Tokio mutex does not poison) and answers
   500.
 - **Reload is incremental (#574).** Validation stays all-or-nothing (any
   config error rejects the whole reload, live registry untouched), but the
@@ -343,6 +345,36 @@ need no reload pruning.
   every scrape; the ratio has none for a disabled cache.
 - The plan test runs in a child process: the `MC_*` statics read the
   environment once.
+- `governor.rs` (#1315), the memory governor: a step every 15 s on
+  `poll_runtime`, under `reload_lock.try_lock()` like
+  `radar_recovery_loop`, the gate read first without it. State is one
+  static `Governor`: the valve's timers and ceilings (`caps`, each with
+  the `SizeSource` it was set under), the refused resizes (keyed on
+  capacity, grant, in-place least and whether capped), the last records.
+  Never hold its mutex across `memory_plan::apply*` or a purge: `apply`
+  calls `governor::capped` (a reload keeps the valve's ceilings, never
+  below the floor or a range's `min`). `cache_plan::log` calls
+  `reconcile` before the plan is applied (drops superseded ceilings, and
+  every ceiling where the valve has no total, released for the next tick
+  to give the grant) and `fitted` after, except on a recovery pass, so a
+  reload restarts the tick's 5 minutes and forgets refused resizes while
+  a recovery pass, which `radar_recovery_loop` can run every 5 minutes,
+  never puts the tick off. Restores run on their own clock
+  (`restored_at`). Ceilings and timers carry over a reload and are
+  dropped when the gate closes. The valve at its floors counts nothing,
+  purges at most every 10 minutes and WARNs at most every 30.
+  `serve_reload` waits up to 2 s (`RELOAD_LOCK_WAIT`) for the lock before
+  its 409, so a governor step never turns a reload request away. A stored
+  ceiling is never below the floor: `capped` and the tick
+  (`decide::floor_ceilings`) raise it, so a restore steps up from the
+  floor. A shrink the valve's relief finds refused keeps no ceiling, and
+  `stuck_block` names it. The tick logs the plan's
+  WARN block through `memory_plan::log_new_warnings` (only when its cuts
+  change), never `log_warnings`, which would WARN every 5 minutes. The
+  valve reads `jemalloc::resident_bytes` and purges with
+  `jemalloc::purge` (`arena.4096.purge`, a void mallctl called through
+  tikv-jemalloc-sys: the ctl crate's typed write passes a value, which
+  jemalloc refuses with EPERM).
 - `memory_plan.rs` (#1312) fits every row to the memory total in
   `cache_plan::log`, so at boot, after every accepted reload and on a
   recovery reload: `ds_cache::plan::grant::plan` over the snapshot rows,

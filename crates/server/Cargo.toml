@@ -77,6 +77,9 @@ tower = { version = "0.5", features = ["util"] }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemalloc-ctl = { version = "0.7", features = ["stats"] }
+# `mallctl` itself: purging every arena's dirty pages (#1315) takes no old
+# or new value, which tikv-jemalloc-ctl's typed reads and writes always pass.
+tikv-jemalloc-sys = "0.7"
 tikv-jemallocator = { version = "0.7", features = ["stats"] }
 
 # The host's memory for the memory plan (#1312): `sysctlbyname`.

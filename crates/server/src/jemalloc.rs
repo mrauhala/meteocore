@@ -11,9 +11,45 @@
 //! it cannot silently depend on a build environment variable, and so a
 //! platform without background threads (macOS) gets an INFO line instead of
 //! a jemalloc that refuses to initialise.
+//!
+//! The memory pressure valve (#1315) reads [`resident_bytes`] every few
+//! seconds and, when the process stays above its total, [`purge`]s every
+//! arena's dirty pages at once.
 
-use tikv_jemalloc_ctl::{background_thread, opt, raw};
+use tikv_jemalloc_ctl::{background_thread, epoch, opt, raw, stats};
 use tracing::{info, warn};
+
+/// The bytes jemalloc keeps resident (`stats.resident`, the
+/// `jemalloc_resident_bytes` gauge), its stats refreshed first: one epoch
+/// advance, which merges each arena's counters, and one read. `None` when
+/// either fails.
+pub(crate) fn resident_bytes() -> Option<u64> {
+    epoch::advance().ok()?;
+    stats::resident::read().ok().map(|bytes| bytes as u64)
+}
+
+/// `arena.<MALLCTL_ARENAS_ALL>.purge` (jemalloc 5.3, `MALLCTL_ARENAS_ALL` =
+/// 4096): purge the unused dirty pages of every arena now, rather than as
+/// they decay. A void control: it takes no old or new value.
+const PURGE_ALL: &[u8] = b"arena.4096.purge\0";
+
+/// Purge every arena's unused dirty pages (#1315). `false` when jemalloc
+/// refuses.
+pub(crate) fn purge() -> bool {
+    // SAFETY: `PURGE_ALL` is NUL-terminated, and a void control is called
+    // with every pointer null and a length of 0, as jemalloc requires
+    // (`NEITHER_READ_NOR_WRITE` in its `ctl.c`).
+    let ret = unsafe {
+        tikv_jemalloc_sys::mallctl(
+            PURGE_ALL.as_ptr().cast(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ret == 0
+}
 
 /// The environment variable jemalloc reads its options from. Its symbols
 /// are prefixed `_rjem_`, so plain `MALLOC_CONF` is never read.
@@ -107,6 +143,18 @@ mod tests {
         assert!(is_enoent(enoent));
         let eperm = raw::write_str(b"opt.narenas\0", b"\0").unwrap_err();
         assert!(!is_enoent(eperm));
+    }
+
+    /// #1315: every arena's dirty pages purge through the void control,
+    /// and jemalloc's resident bytes read; neither depends on background
+    /// threads.
+    #[test]
+    fn arenas_purge_and_resident_bytes_read() {
+        assert!(purge(), "arena.4096.purge");
+        let resident = resident_bytes().unwrap();
+        assert!(resident > 0);
+        // The typed write would pass a value, which a void control refuses.
+        assert!(unsafe { raw::write(PURGE_ALL, ()) }.is_err());
     }
 
     /// The acceptance check of #1310: after startup, background threads
