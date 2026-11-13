@@ -3,6 +3,7 @@ mod auto;
 mod cache_plan;
 mod colormaps;
 mod delivery_delay;
+mod governor;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc;
 mod memory_caches;
@@ -844,6 +845,12 @@ async fn serve(cli: CliArgs) {
     let recovery_state = server_state.clone();
     poll_runtime().spawn(async move {
         admin::radar_recovery_loop(recovery_state).await;
+    });
+    // The memory governor (#1315): the re-plan tick and the pressure valve,
+    // serialized with reloads like the recovery loop.
+    let governor_state = server_state.clone();
+    poll_runtime().spawn(async move {
+        governor::run(governor_state).await;
     });
     // Each collection's delivery delay (#1389): its first observation, now
     // that every engine is loaded, is the baseline.

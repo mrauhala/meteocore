@@ -14,7 +14,10 @@
 //! `auto` resizes every cache and budget no setting pins to its grant,
 //! through the resize its registration hands the plan
 //! (`ds_cache::plan::apply`), right after the plan is fitted: so at boot
-//! and after every accepted reload. A warm cache, one holding more than its
+//! and after every accepted reload, and every re-plan tick of the memory
+//! governor between them (`crate::governor`, #1315), which applies only
+//! the grants that move far enough, and caps the caches the pressure valve
+//! lowered. Every size changed counts in `cache_plan_changes_total`. A warm cache, one holding more than its
 //! grant, shrinks by at most a quarter at once (`grant::bounded`); a cache
 //! no collection can reach keeps its size while it holds nothing, and a
 //! budget no collection can reach keeps its size. `report` resizes nothing,
@@ -65,6 +68,29 @@ pub(crate) fn plans_sizes_with(
     reading: &detect::Reading,
 ) -> bool {
     mode == MemoryMode::Auto && detect::total(total_mb, reading).is_some()
+}
+
+/// The total the memory pressure valve holds the process to (#1315): the
+/// plan's, where [`plans_sizes`] holds and the total is `[memory] total_mb`
+/// or a cgroup limit's share. `None` with a total taken from the host's
+/// memory, a share of what a shared host had free at boot, which the valve
+/// does not act on.
+pub(crate) fn valve_total(mode: MemoryMode, total_mb: Option<u64>) -> Option<u64> {
+    valve_total_with(mode, total_mb, read_at_boot())
+}
+
+/// [`valve_total`] over `reading`.
+pub(crate) fn valve_total_with(
+    mode: MemoryMode,
+    total_mb: Option<u64>,
+    reading: &detect::Reading,
+) -> Option<u64> {
+    let total = detect::total(total_mb, reading).filter(|_| mode == MemoryMode::Auto)?;
+    matches!(
+        total.source,
+        detect::Source::Configured | detect::Source::Cgroup(_)
+    )
+    .then_some(total.bytes)
 }
 
 /// A plan and the total it was fitted to.
@@ -155,6 +181,38 @@ const STORE_FAMILIES: &[&str] = &[
 /// `[memory] mode` says ([`apply`]), and keep the report. `memory` is what
 /// the `/metrics` refresh before it read.
 pub(crate) fn replan(state: &ServerState, rows: &[Row], memory: &MemoryReading) -> Arc<Report> {
+    let mut report = fit(state, rows, memory);
+    report.changes = apply(&report, rows);
+    keep(report, rows)
+}
+
+/// [`replan`]'s second half for the memory governor's re-plan tick
+/// (#1315): `report`, fitted by [`fit`], applied only where `wanted` gives
+/// a row a size ([`apply_with`]), counted and kept as the last report.
+pub(crate) fn apply_tick(
+    mut report: Report,
+    rows: &[Row],
+    wanted: &dyn Fn(&Row, &Grant) -> Option<u64>,
+) -> Arc<Report> {
+    report.changes = match (report.mode, &report.plan) {
+        (MemoryMode::Auto, Some(_)) => apply_with(&report, rows, wanted),
+        _ => Vec::new(),
+    };
+    keep(report, rows)
+}
+
+/// Count `report`'s changes, its unapplied capacity, and keep it as the
+/// last report.
+fn keep(mut report: Report, rows: &[Row]) -> Arc<Report> {
+    count_changes(&report.changes);
+    report.unapplied_bytes = unapplied(&report, rows);
+    let report = Arc::new(report);
+    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&report));
+    report
+}
+
+/// The plan of `rows` for the accepted config, applying nothing.
+pub(crate) fn fit(state: &ServerState, rows: &[Row], memory: &MemoryReading) -> Report {
     let baseline = baseline(memory);
     let (configured, mode) = state
         .accepted_load
@@ -164,25 +222,18 @@ pub(crate) fn replan(state: &ServerState, rows: &[Row], memory: &MemoryReading) 
         .map_or((None, MemoryMode::Report), |accepted| {
             (accepted.memory_total_mb(), accepted.memory_mode())
         });
-    let mut report = {
-        let collections = state
-            .last_collections
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        report_for(
-            mode,
-            configured,
-            read_at_boot(),
-            rows,
-            &collections,
-            baseline,
-        )
-    };
-    report.changes = apply(&report, rows);
-    report.unapplied_bytes = unapplied(&report, rows);
-    let report = Arc::new(report);
-    *LAST.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&report));
-    report
+    let collections = state
+        .last_collections
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    report_for(
+        mode,
+        configured,
+        read_at_boot(),
+        rows,
+        &collections,
+        baseline,
+    )
 }
 
 /// Apply `report` to the caches and budgets of `rows`, as its mode says,
@@ -192,14 +243,34 @@ pub(crate) fn replan(state: &ServerState, rows: &[Row], memory: &MemoryReading) 
 /// collection can reach that still holds entries drops them and keeps its
 /// capacity. In `report`, or `auto` without a total, each one the plan had
 /// resized gets its configured size back.
+///
+/// A cache the memory governor's pressure valve lowered keeps that ceiling
+/// across the reload (`crate::governor::capped`): the governor's restore
+/// lifts it.
 pub(crate) fn apply(report: &Report, rows: &[Row]) -> Vec<Change> {
-    let plan = match (report.mode, &report.plan) {
-        (MemoryMode::Auto, Some(plan)) => plan,
-        _ => return restore(rows),
+    match (report.mode, &report.plan) {
+        (MemoryMode::Auto, Some(_)) => apply_with(report, rows, &|row, grant| {
+            Some(crate::governor::capped(&row.entry, grant.bytes))
+        }),
+        _ => restore(rows),
+    }
+}
+
+/// [`apply`] in `auto`, each row no setting pins resized to the size
+/// `wanted` gives it for its grant, or left as it is for `None`. Shrinks
+/// go first; a cache no collection can reach is cleared as [`apply`]
+/// does, whatever `wanted` says.
+pub(crate) fn apply_with(
+    report: &Report,
+    rows: &[Row],
+    wanted: &dyn Fn(&Row, &Grant) -> Option<u64>,
+) -> Vec<Change> {
+    let Some(plan) = report.plan.as_ref() else {
+        return Vec::new();
     };
     let ideal = report.ideal.as_ref().unwrap_or(plan);
     let mut changes = Vec::new();
-    let mut wanted: Vec<(&Row, &Grant)> = Vec::new();
+    let mut moves: Vec<(&Row, &Grant, u64)> = Vec::new();
     for row in rows.iter().filter(|row| !grant::pinned(&row.entry.source)) {
         let Some(grant) = plan.grant(&row.entry) else {
             continue;
@@ -226,36 +297,89 @@ pub(crate) fn apply(report: &Report, rows: &[Row]) -> Vec<Change> {
             }
             continue;
         }
-        if grant.bytes != row.usage.capacity_bytes {
-            wanted.push((row, grant));
+        match wanted(row, grant) {
+            Some(bytes) if bytes != row.usage.capacity_bytes => moves.push((row, grant, bytes)),
+            _ => {}
         }
     }
     // Shrinks first: what they free is there before anything grows.
-    wanted.sort_by_key(|(row, grant)| grant.bytes > row.usage.capacity_bytes);
-    for (row, grant) in wanted {
+    moves.sort_by_key(|(row, _, bytes)| *bytes > row.usage.capacity_bytes);
+    for (row, grant, bytes) in moves {
         let from = row.usage.capacity_bytes;
-        let applied = ds_cache::plan::apply(&row.entry, grant.bytes);
+        let applied = ds_cache::plan::apply(&row.entry, bytes);
         let to = applied.unwrap_or(from);
         let target = ideal.grant(&row.entry).map_or(grant.bytes, |g| g.bytes);
         // Held above its ideal size; one held below it gave way to others.
         let held = match (applied, &grant.reason) {
             (None, _) => Some(Held::Gone),
-            (Some(to), _) if to != grant.bytes => Some(Held::Refused),
+            (Some(to), _) if to != bytes => Some(Held::Refused),
             (Some(to), Reason::Held(Hold::Warm)) if to > target => Some(Held::Warm),
             (Some(to), Reason::Held(Hold::InPlace)) if to > target => Some(Held::InPlace),
             _ => None,
+        };
+        let reason = if bytes == grant.bytes {
+            grant.reason.to_string()
+        } else {
+            // Below its grant: a ceiling the pressure valve set.
+            format!(
+                "held by the memory pressure valve, its grant {}",
+                mib(grant.bytes)
+            )
         };
         changes.push(Change {
             entry: row.entry.clone(),
             from_bytes: from,
             to_bytes: to,
             target_bytes: target,
-            reason: grant.reason.to_string(),
+            reason,
             held,
             cleared: false,
         });
     }
     changes
+}
+
+/// Every size changed: one in `cache_plan_changes_total` for each change
+/// that moved a capacity or dropped what a cache held (#1315).
+pub(crate) fn count_changes(changes: &[Change]) {
+    for change in changes {
+        if change.to_bytes != change.from_bytes || change.cleared {
+            CACHE_PLAN_CHANGES
+                .with_label_values(&[change.entry.id])
+                .inc();
+        }
+    }
+}
+
+/// Count one size change of the cache or budget `id` that is not a
+/// [`Change`]: a `[memory.caches]` key's.
+pub(crate) fn count_change(id: &str) {
+    CACHE_PLAN_CHANGES.with_label_values(&[id]).inc();
+}
+
+static CACHE_PLAN_CHANGES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
+    let counter = prometheus::IntCounterVec::new(
+        Opts::new(
+            "cache_plan_changes_total",
+            "Size changes of each cache and admission budget of /admin/cache-plan, cache its \
+             /metrics family: the memory plan's at boot and on reload in [memory] mode = \
+             \"auto\", its re-plan tick's every 5 minutes, the memory pressure valve's, a \
+             [memory.caches] key's, and report mode giving a size back (#1315). Each is logged \
+             with its reason",
+        ),
+        &["cache"],
+    )
+    .unwrap();
+    crate::admin::REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+});
+
+/// Register `cache_plan_changes_total`, so `/metrics` lists it before the
+/// first change.
+pub(crate) fn init_change_counter() {
+    LazyLock::force(&CACHE_PLAN_CHANGES);
 }
 
 /// The capacity above `report`'s ideal plan of the entries no setting pins
@@ -341,7 +465,13 @@ pub(crate) fn changes_block(report: &Report) -> Option<String> {
             mib(report.unapplied_bytes)
         );
     }
-    for change in &report.changes {
+    write_changes(&mut out, &report.changes);
+    Some(out)
+}
+
+/// One line per change: the entry, old → new or what it kept, and why.
+pub(crate) fn write_changes(out: &mut String, changes: &[Change]) {
+    for change in changes {
         let _ = write!(out, "\n  {}", change.entry.id);
         if let Some(collection) = change.entry.scope.collection() {
             let _ = write!(out, " {collection}");
@@ -382,7 +512,6 @@ pub(crate) fn changes_block(report: &Report) -> Option<String> {
         }
         out.push(')');
     }
-    Some(out)
 }
 
 /// The plan of `rows` for `collections`, its total from `configured_mb`
@@ -580,7 +709,7 @@ pub(crate) fn header_json(report: &Report) -> Value {
 }
 
 /// A size [`apply`] changed or meant to, for `/admin/cache-plan`.
-fn change_json(change: &Change) -> Value {
+pub(crate) fn change_json(change: &Change) -> Value {
     json!({
         "id": change.entry.id,
         "kind": change.entry.kind.as_str(),
@@ -759,6 +888,46 @@ pub(crate) fn log_warnings(report: &Report, rows: &[Row]) {
     if let Some(block) = warn_block(report, rows) {
         warn!("{block}");
     }
+    *CUT_LOGGED.lock().unwrap_or_else(|e| e.into_inner()) = Some(cut_of(report));
+}
+
+/// What a plan cuts or falls short by, coarsely: whether it falls short,
+/// and which caches and budgets it cuts. The re-plan tick logs the WARN
+/// block only when this changes, not every 5 minutes (#1315).
+type Cut = (bool, Vec<(&'static str, Option<String>)>);
+
+/// The cut [`log_warnings`] or [`log_new_warnings`] last logged.
+static CUT_LOGGED: Mutex<Option<Cut>> = Mutex::new(None);
+
+fn cut_of(report: &Report) -> Cut {
+    let Some(plan) = report.plan.as_ref() else {
+        return (false, Vec::new());
+    };
+    let cut = plan
+        .caches
+        .iter()
+        .chain(&plan.budgets)
+        .filter(|g| {
+            matches!(g.reason, Reason::Cut(_) | Reason::Floor) && g.bytes < g.capacity_bytes
+        })
+        .map(|g| (g.entry.id, g.entry.scope.collection().map(str::to_string)))
+        .collect();
+    (plan.shortfall_bytes > 0, cut)
+}
+
+/// [`log_warnings`]' cut block for the re-plan tick: logged only when the
+/// plan now cuts other caches, or starts or stops falling short, than the
+/// block last logged said.
+pub(crate) fn log_new_warnings(report: &Report, rows: &[Row]) {
+    let cut = cut_of(report);
+    let mut logged = CUT_LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+    if logged.as_ref() == Some(&cut) {
+        return;
+    }
+    if let Some(block) = warn_block(report, rows) {
+        warn!("{block}");
+    }
+    *logged = Some(cut);
 }
 
 static PLAN_TOTAL: LazyLock<IntGauge> = LazyLock::new(|| {

@@ -343,6 +343,21 @@ need no reload pruning.
   every scrape; the ratio has none for a disabled cache.
 - The plan test runs in a child process: the `MC_*` statics read the
   environment once.
+- `governor.rs` (#1315), the memory governor: a step every 15 s on
+  `poll_runtime`, under `reload_lock.try_lock()` like
+  `radar_recovery_loop`. State is one static `Governor`: the valve's
+  timers and ceilings (`caps`), the refused resizes, the last records.
+  Never hold its mutex across `memory_plan::apply*`: `apply` calls
+  `governor::capped` (a reload keeps the valve's ceilings). `fitted` is
+  called from `cache_plan::log`, so a reload restarts the tick's 5
+  minutes and forgets refused resizes; ceilings and timers carry over a
+  reload and are dropped when the gate closes. The tick logs the plan's
+  WARN block through `memory_plan::log_new_warnings` (only when its cuts
+  change), never `log_warnings`, which would WARN every 5 minutes. The
+  valve reads `jemalloc::resident_bytes` and purges with
+  `jemalloc::purge` (`arena.4096.purge`, a void mallctl called through
+  tikv-jemalloc-sys: the ctl crate's typed write passes a value, which
+  jemalloc refuses with EPERM).
 - `memory_plan.rs` (#1312) fits every row to the memory total in
   `cache_plan::log`, so at boot, after every accepted reload and on a
   recovery reload: `ds_cache::plan::grant::plan` over the snapshot rows,

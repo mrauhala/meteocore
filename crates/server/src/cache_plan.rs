@@ -400,7 +400,9 @@ impl Totals {
 }
 
 /// `GET /admin/cache-plan`, behind the `ADMIN_TOKEN` guard of
-/// `/admin/collections/reload`.
+/// `/admin/collections/reload`: [`to_json`]'s document, and the memory
+/// governor's last tick and pressure valve as `governor` (#1315,
+/// `crate::governor::json`).
 pub async fn handler(
     State(state): State<AdminState>,
     headers: HeaderMap,
@@ -408,7 +410,9 @@ pub async fn handler(
     crate::admin::require_admin_token(&state, &headers)?;
     let memory = crate::admin::refresh_metrics(&state);
     let report = memory_plan::last();
-    Ok(Json(to_json(&snapshot(&state), &memory, report.as_deref())))
+    let mut document = to_json(&snapshot(&state), &memory, report.as_deref());
+    document["governor"] = crate::governor::json();
+    Ok(Json(document))
 }
 
 /// The endpoint's document: `caches` and `budgets`, one object each, their
@@ -586,9 +590,12 @@ static LOGGED: Mutex<Option<Logged>> = Mutex::new(None);
 /// the sizes: a second INFO block names each size it changed, old → new,
 /// and the plan's WARNs follow. Returns the report.
 pub(crate) fn log(state: &AdminState, occasion: Occasion) -> Arc<Report> {
+    crate::governor::init_counters();
     let memory = crate::admin::refresh_metrics(state);
     let mut rows = snapshot(state);
     let report = memory_plan::replan(state, &rows, &memory);
+    // The governor's next re-plan tick is 5 minutes from this fit (#1315).
+    crate::governor::fitted(std::time::Instant::now());
     if report.changes.iter().any(|c| c.to_bytes != c.from_bytes) {
         rows = snapshot(state);
     }

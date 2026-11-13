@@ -341,6 +341,37 @@
             "titleFormat": "Reload failed"
           }
         }
+      },
+      {
+        "kind": "AnnotationQuery",
+        "spec": {
+          "name": "Memory pressure",
+          "enable": true,
+          "hide": false,
+          "iconColor": "purple",
+          "placement": "inControlsMenu",
+          "query": {
+            "kind": "DataQuery",
+            "group": "prometheus",
+            "version": "v0",
+            "datasource": {
+              "name": "${DS_PROMETHEUS}"
+            },
+            "spec": {
+              "expr": "sum(increase(memory_pressure_actions_total{job=~\"$job\",action=\"relieve\"}[5m])) > 0",
+              "interval": "1m",
+              "refId": "Anno"
+            }
+          },
+          "legacyOptions": {
+            "expr": "sum(increase(memory_pressure_actions_total{job=~\"$job\",action=\"relieve\"}[5m])) > 0",
+            "step": "1m",
+            "titleFormat": "Memory pressure",
+            "textFormat": "jemalloc resident above the [memory] total for a minute: the flexible caches were lowered to 90 % of what they hold.",
+            "useValueForTime": false,
+            "tagKeys": ""
+          }
+        }
       }
     ],
     "layout": {
@@ -1443,6 +1474,19 @@
                                   "element": {
                                     "kind": "ElementReference",
                                     "name": "panel-200"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 38,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-226"
                                   }
                                 }
                               }
@@ -22255,7 +22299,7 @@
         "spec": {
           "id": 181,
           "title": "Plan against memory",
-          "description": "Caches and budgets summed, as the memory plan sizes them (cache_planned_bytes) and as they are (memory_capacity_total_bytes: configured, or the plan's in auto mode), against the plan's total and cache pool, and RSS (Linux only). Sizes are ceilings: a cache allocates as it fills, so either sum can lie above the total while RSS stays below it. A step is a restart or reload that planned again.",
+          "description": "Caches and budgets summed, as the memory plan sizes them (cache_planned_bytes) and as they are (memory_capacity_total_bytes: configured, or the plan's in auto mode), against the plan's total and cache pool, and RSS (Linux only). Sizes are ceilings: a cache allocates as it fills, so either sum can lie above the total while RSS stays below it. A step is a restart, reload or 5-minute re-plan tick that planned again, or the memory pressure valve.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -25090,6 +25134,133 @@
                     "barAlignment": 0,
                     "stacking": {
                       "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-226": {
+        "kind": "Panel",
+        "spec": {
+          "id": 226,
+          "title": "Memory governor",
+          "description": "What the memory governor changed (#1315), only in [memory] mode = \"auto\" with a total. Size changes per cache (cache_plan_changes_total): the plan's at boot and on reload, its re-plan tick's every 5 minutes, which applies a grant only when it moves a capacity by more than 10 % and 64 MiB, [memory.caches] keys', and the pressure valve's. Pressure actions (memory_pressure_actions_total, with total_mb or a cgroup limit only): relieve, jemalloc resident above the total for a minute lowered the flexible caches to 90 % of what they hold; purge, every arena's dirty pages purged; restore, a tick raised the lowered caches by 5 % of their grant after 10 minutes under 90 % of the total. Bars that keep coming back mean the total is too small for the caches the plan keeps, or memory outside them grows: /admin/cache-plan has the governor's last tick and ceilings.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (increase(cache_plan_changes_total{job=~\"$job\"}[$__rate_interval])) > 0",
+                        "legendFormat": "{{cache}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "B",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (action) (increase(memory_pressure_actions_total{job=~\"$job\"}[$__rate_interval])) > 0",
+                        "legendFormat": "pressure: {{action}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "sum"
+                  ],
+                  "sortBy": "Total",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "bars",
+                    "lineWidth": 1,
+                    "fillOpacity": 80,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "normal",
                       "group": "A"
                     },
                     "thresholdsStyle": {

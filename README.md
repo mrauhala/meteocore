@@ -787,8 +787,8 @@ what it cannot take away yet:
   one shard at any size, so it has the layout of a cache built at its
   grant.
 - The plan sees the demands the engines have published when it is fitted.
-  One an engine publishes later, from a poll after boot, is applied at the
-  next reload: nothing re-plans between reloads yet.
+  One an engine publishes later, from a poll after boot, is applied by the
+  next [re-plan tick](#re-plan-tick-and-pressure-valve), within 5 minutes.
 - `/admin/cache-plan` gives each size the plan set the `source`
   `plan:auto`, with `configured_bytes` beside `capacity_bytes`, and
   `plan.changes` lists what the last boot or reload resized or cleared, and
@@ -796,6 +796,54 @@ what it cannot take away yet:
   old → new; `cache_size_source` on `/metrics` reads `plan:auto` too.
 - Back in `report` mode, a reload gives each size the plan set its
   configured size again.
+
+#### Re-plan tick and pressure valve
+
+In `auto` mode with a total, one background task, the memory governor,
+keeps the plan applied between reloads (#1315). It never runs while a
+reload does: a step a reload holds the reload lock through is skipped.
+
+- **Re-plan tick, every 5 minutes** after the last fit, a boot's or a
+  reload's included: the plan is fitted again with the demands the engines
+  publish now (PVOL sites found by polling, satellite windows filling over
+  the first hour). A grant is applied only when it moves a capacity by
+  more than 10 % and 64 MiB, so demand that jitters moves nothing; a warm
+  cache gives up at most a quarter of what it holds per tick, and no shrink
+  goes below what the cache takes in place. A resize that stops short is
+  not tried again until its capacity or grant moves. Every change is
+  logged at INFO with its reason; the plan's WARN block only when what it
+  cuts, or whether it falls short, changes.
+- **Pressure valve**, with `[memory] total_mb` or a cgroup limit only, not
+  on a total taken from a shared host's memory. It reads jemalloc's
+  resident bytes every 15 seconds (`jemalloc_resident_bytes`):
+  - above the total for a minute, every flexible cache is lowered to 90 %
+    of what it holds, never below the plan's floor for it (a range's
+    `min` included) nor what it takes in place, and keeps that size as a
+    ceiling; every arena's dirty pages are purged, and a WARN names each
+    cache. While the process stays above the total it acts again each
+    minute;
+  - under 90 % of the total for 10 minutes, each re-plan tick raises the
+    ceilings by 5 % of the cache's grant, until each is back at the plan.
+    Between 90 % and the total it holds still, so a restore does not push
+    the process straight back over;
+  - it never lowers a cache its engines fill ahead of requests (satellite
+    scans, PVOL pixels, station grids: below that they re-download in a
+    loop) nor an admission budget, which rejects or queues already.
+- A pin, by `[memory.caches]`, a variable or a collection key, is never
+  moved; a range moves only within its bounds. Every size the governor
+  sets is the plan's: back in `report` mode it is given back.
+- A reload fits and applies the plan itself and keeps the valve's
+  ceilings and timers, which are about the process's memory, not its
+  config; it restarts the 5 minutes to the next tick. Report mode, or no
+  total, drops them.
+- `cache_plan_changes_total{cache}` counts every size change, the
+  reload's, the tick's, the valve's and `[memory.caches]`'s;
+  `memory_pressure_actions_total{action}` counts the valve's `relieve`,
+  `purge` and `restore`. `/admin/cache-plan` has a `governor` object: the
+  last tick and its changes, and the valve's state (`resident_bytes`,
+  `total_bytes`, `state` over, under or normal, how long), its ceilings
+  and its last relief and restore. The dashboard's Memory governor panel
+  shows both counters, and a Memory pressure annotation marks each relief.
 
 A key set to exactly its default (`metatile = 1024`, `[grib]
 grid_cache_mb = 256`) pins it like any other value. An `MC_…` variable
@@ -3305,6 +3353,8 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `memory_plan_total_bytes` | gauge | — | The memory the plan fits every cache and budget into: `[memory] total_mb`, else 80 % of a cgroup limit, else the smaller of half of `MemTotal` and 80 % of `MemAvailable` at boot; 0 when unknown |
 | `memory_plan_pool_bytes` | gauge | — | What the caches share of the total after the reserves |
 | `memory_plan_shortfall_bytes` | gauge | — | How much more memory the plan needs with its pins kept and every other cache and budget at its floor; 0 when it fits |
+| `cache_plan_changes_total` | counter | cache | Size changes of each cache and admission budget: the memory plan's at boot and on reload in `auto` mode, its re-plan tick's, the pressure valve's, a `[memory.caches]` key's, report mode giving a size back. Each is logged with its reason |
+| `memory_pressure_actions_total` | counter | action | The memory pressure valve's actions: `relieve` (resident above the total for a minute lowered the flexible caches), `purge` (every arena's dirty pages purged), `restore` (a tick raised the lowered caches toward the plan). With `total_mb` or a cgroup limit only |
 | `memory_plan_unapplied_bytes` | gauge | — | In `[memory] mode = "auto"`, the capacity above the plan that applying it could not take away yet: warm caches giving up a quarter of what they hold per reload, shrinks that stop in place. The plan counts it, its shortfall what does not fit; 0 in `report` mode |
 
 **Render & storage:**
