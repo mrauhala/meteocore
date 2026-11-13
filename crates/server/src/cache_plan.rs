@@ -242,13 +242,15 @@ pub(crate) fn register_grib(collection: &CollectionConfig, engine: &Arc<engine_g
 }
 
 /// Where a GRIB source's point-index cache size came from: its key when
-/// set, whatever the value; unset, `message_cache_mb`, a size or a range,
-/// when its share of the message cache's configured size is above the
-/// default floor (#1333).
+/// set, whatever the value; unset, a pinned `message_cache_mb` when its
+/// share of it is above the default floor (#1333). A message cache the
+/// plan sizes within a range leaves the point-index cache to the plan too
+/// (`default`): a size derived from the range's floor, pinned, would never
+/// follow the plan.
 pub(crate) fn point_index_source(grib: &GribConfig) -> SizeSource {
     match grib.point_index_cache_mb {
         size @ Some(_) => key_source("[grib] point_index_cache_mb", size),
-        None if grib.message_cache_mb.is_some()
+        None if grib.message_cache_mb.is_some_and(CacheSize::is_pinned)
             && grib.derived_point_index_cache_mb() > DEFAULT_POINT_INDEX_CACHE_MB =>
         {
             SizeSource::Derived("[grib] message_cache_mb")

@@ -321,13 +321,15 @@ fn staged_keys_answer_pending_bytes_and_change_nothing() {
     unstage();
     assert_eq!(pending_bytes("lightning_strike", live), live);
 
-    // A range: its default clamped in report, the live size clamped where
-    // the plan sizes it.
+    // A range: its default clamped in report; where the plan sizes it, the
+    // capacity now, 32 MiB, clamped into it.
     let range = Bounds::mib(40, 50);
     stage(&[(key(), Size::Bounded(range))], false);
     assert_eq!(pending_bytes("lightning_strike", live), 40 * MIB);
+    stage(&[(key(), Size::Bounded(Bounds::mib(8, 50)))], true);
+    assert_eq!(pending_bytes("lightning_strike", live), 32 * MIB);
     stage(&[(key(), Size::Bounded(range))], true);
-    assert_eq!(pending_bytes("lightning_strike", 45 * MIB), 45 * MIB);
+    assert_eq!(pending_bytes("lightning_strike", live), 40 * MIB);
 
     // Accepted, then dropped by the next load: back to the default, or in
     // auto the plan's live size.
@@ -342,5 +344,131 @@ fn staged_keys_answer_pending_bytes_and_change_nothing() {
     stage(&[], true);
     assert_eq!(pending_bytes("lightning_strike", 64 * MIB), 64 * MIB);
     unstage();
+    drop(cache);
+}
+
+/// #1313 review round 2: `pending_bytes` answers what `set` then gives the
+/// cache, across a reload that keeps its values but switches auto → report
+/// (or loses its total) after the plan moved the cache: a range kept, and
+/// a key removed earlier from a keyed entry.
+#[test]
+fn pending_bytes_matches_set_across_a_mode_switch() {
+    let _serial = serial();
+    let _reset = Reset;
+    let cache = build(); // default 32 MiB
+    let range = Bounds::mib(8, 64);
+    for (label, values) in [
+        ("same range", vec![(key(), Size::Bounded(range))]),
+        ("same unset key, keyed entry", vec![]),
+    ] {
+        // Accepted in auto; the plan grows the cache to 48 MiB.
+        set(&[(key(), Size::Pinned(20))], false);
+        set(&values, true);
+        plan::apply(&row().entry, 48 * MIB);
+        assert_eq!(cache.capacity_bytes(), 48 * MIB);
+        // The next load: the same values, report mode.
+        stage(&values, false);
+        let pending = pending_bytes("lightning_strike", cache.capacity_bytes());
+        set(&values, false);
+        assert_eq!(
+            (pending, cache.capacity_bytes()),
+            (32 * MIB, 32 * MIB),
+            "{label}"
+        );
+    }
+    drop(cache);
+}
+
+/// #1313 review round 2: over many transitions, a keyed entry follows its
+/// rule after each `set` (where the size applies, the configured size; in
+/// auto otherwise, its capacity, marked the plan's when it is not the
+/// configured size), and `pending_bytes`, asked before each `set` with the
+/// same values and mode, answers the capacity `set` gives it, or where the
+/// plan sizes it, that capacity clamped into a range's bounds. The plan is
+/// simulated with `plan::apply`.
+#[test]
+fn a_keyed_entry_and_pending_bytes_follow_set_over_many_transitions() {
+    let _serial = serial();
+    let _reset = Reset;
+    let cache = build(); // default 32 MiB, one shard
+    type Values = Vec<(&'static Key, Size)>;
+    let pin = |mb| vec![(key(), Size::Pinned(mb))];
+    let range = |a, b| vec![(key(), Size::Bounded(Bounds::mib(a, b)))];
+    let none: Values = vec![];
+    // (step, values, plan_sized, the plan's grant afterwards in auto)
+    type Step = (&'static str, Values, bool, Option<u64>);
+    let steps: Vec<Step> = vec![
+        ("report pin 16", pin(16), false, None),
+        ("auto range 8..64", range(8, 64), true, Some(40)),
+        ("auto removed", none.clone(), true, Some(24)),
+        ("report removed", none.clone(), false, None),
+        ("report pin 48", pin(48), false, None),
+        ("auto pin 48", pin(48), true, None),
+        ("auto, no total, range 8..16", range(8, 16), false, None),
+        ("auto with total, range 8..16", range(8, 16), true, Some(12)),
+        ("auto, no total again", range(8, 16), false, None),
+        ("auto with total again", range(8, 16), true, Some(9)),
+        ("report pin 20", pin(20), false, None),
+        ("auto removed again", none.clone(), true, None),
+        ("report removed again", none.clone(), false, None),
+        ("auto pin 40", pin(40), true, None),
+        ("auto range 50..60, above", range(50, 60), true, None),
+        ("report range 50..60", range(50, 60), false, None),
+    ];
+    let mut bad = Vec::new();
+    for (label, values, plan_sized, grant) in steps {
+        let before = cache.capacity_bytes();
+        stage(&values, plan_sized);
+        let pending = pending_bytes("lightning_strike", before);
+        set(&values, plan_sized);
+        let r = row();
+        let pinned = matches!(values.first(), Some((_, Size::Pinned(_))));
+        let applies = !plan_sized || pinned;
+        let capacity = r.usage.capacity_bytes;
+        let follows = if applies {
+            capacity == r.configured_bytes
+        } else {
+            capacity == before && r.planned == (capacity != r.configured_bytes)
+        };
+        let expected = match r.entry.source.bounds() {
+            Some(bounds) if !applies => bounds.clamp(capacity),
+            _ => capacity,
+        };
+        if !follows || pending != expected {
+            bad.push(format!(
+                "{label}: {} -> {} MiB, configured {} MiB, source {}, planned {}, pending {} \
+                 MiB",
+                before / MIB,
+                capacity / MIB,
+                r.configured_bytes / MIB,
+                r.source(),
+                r.planned,
+                pending / MIB
+            ));
+        }
+        if let Some(grant) = grant {
+            plan::apply(&r.entry, grant * MIB);
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+    drop(cache);
+}
+
+/// `pending_bytes` of an entry no key ever set, whose capacity the plan
+/// sized in auto: in report mode, the configured size `plan::restore` gives
+/// it back; in auto, its capacity now, the plan's to move.
+#[test]
+fn pending_bytes_gives_an_unkeyed_plan_capacity_back_in_report() {
+    let _serial = serial();
+    let _reset = Reset;
+    let cache = build(); // default 32 MiB
+    plan::apply(&row().entry, 48 * MIB);
+    assert!(row().planned);
+    stage(&[], true);
+    assert_eq!(pending_bytes("lightning_strike", 48 * MIB), 48 * MIB);
+    stage(&[], false);
+    assert_eq!(pending_bytes("lightning_strike", 48 * MIB), 32 * MIB);
+    assert!(set(&[], false).is_empty(), "left to the plan's restore");
+    assert_eq!(plan::restore(&row().entry), Some(32 * MIB));
     drop(cache);
 }

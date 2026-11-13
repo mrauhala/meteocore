@@ -7837,22 +7837,25 @@ fn apply_load(
         .clone();
     // `[memory.caches]` (#1313): an engine that checks a process-wide size
     // while it is built checks the size this load gives it. Staged, not
-    // applied: a rejected load leaves every size as it was (`unstage`
-    // below), an accepted one applies them (`memory_caches::apply`).
-    crate::memory_caches::stage(config.cache_settings(), config.plans_sizes());
+    // applied: a rejected load leaves every size as it was (the guard
+    // unstages them, a panic included), an accepted one applies them
+    // (`memory_caches::apply`).
+    let _staged = crate::memory_caches::stage(config.cache_settings(), config.plans_sizes());
     let reusable = if recovery {
         // Same accepted configuration: preserve static CSV/GeoJSON and their
         // nowcast dependents too. Explicit reload retains its rebuild semantics.
         live_handles.keys().cloned().collect()
     } else {
         // A station grid checked its grid against the grid cache and the
-        // computation budget when it was built: a load that lowers either
-        // builds it again, checked against the new sizes, rather than
-        // shrinking them under it. Its dependents follow it.
+        // computation budget when it was built: one this load's sizes no
+        // longer fit is built again, failed with that check's error, rather
+        // than shrinking them under it. Its dependents follow it; the
+        // grids that still fit keep their engines.
         let mut live = live_handles.clone();
-        if engine_station_grid::sizes_fall_on_load() {
-            live.retain(|_, engine| !matches!(engine, EngineHandle::StationGrid(_)));
-        }
+        live.retain(|_, engine| match engine {
+            EngineHandle::StationGrid(grid) => grid.fits_the_load(),
+            _ => true,
+        });
         reusable_collections(&old_collections, &config.collections, &live)
     };
     let engine_reuse = EngineReuse {
@@ -7915,7 +7918,6 @@ fn apply_load(
             "Reload produced 0 working collections from {} configured. Keeping old state.",
             config.collections.len()
         );
-        crate::memory_caches::unstage();
         return Err(ReloadError::NoReadyCollections {
             configured: config.collections.len(),
         });

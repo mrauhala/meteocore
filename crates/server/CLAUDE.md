@@ -408,12 +408,20 @@ need no reload pruning.
   `AcceptedLoad::plans_sizes` is the ONE gate for `PlanSized`,
   `EngineReuse::plan_sized` and `memory_caches::apply`; `memory_plan::apply`
   applies on the same condition. A reload `stage`s the keys before
-  `load_collections` (`keys::pending_bytes` answers an engine that checks
-  a process-wide size while built: the station grid) and `unstage`s them
-  on rejection: a rejected reload changes no size or value. A load that
-  lowers `station_grid`/`station_grid_compute` rebuilds live station
-  grids (`engine_station_grid::sizes_fall_on_load`). A new engine with a
-  build-time size check reads it through `pending_bytes` the same way. The
+  `load_collections` (a guard, `memory_caches::Staged`, unstages them when
+  `apply_load` returns or unwinds: a rejected reload changes no size or
+  value). `keys::pending_bytes` answers an engine that checks a
+  process-wide size while built (the station grid) from `keys::decide`,
+  the same decision `keys::set` then applies, with the staged values and
+  mode and the entry's keyed/planned state: never a second rule. Its one
+  limit: where `set` leaves a size to the plan (`auto`), it answers the
+  capacity now clamped into a range, since the grant is known only once
+  the plan is fitted. A live station grid the staged sizes no longer hold
+  (`StationGridEngine::fits_the_load`, its constructor's check) is
+  dropped from the reuse pool and rebuilt; the others are reused. A new
+  engine with a build-time size check reads it through `pending_bytes`
+  the same way, and only for engines that exist: building a static to ask
+  enters it in the plan. The
   render caches are not statics: `RenderCacheSizes::of` resolves
   `[memory.caches]` > `[server]` alias > `[wms]` > default (vector_tile:
   > constant), stored on `AcceptedLoad`, reused/resized as before.

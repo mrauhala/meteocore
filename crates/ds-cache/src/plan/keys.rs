@@ -240,40 +240,118 @@ pub fn unstage() {
 }
 
 /// The capacity the cache or budget of `key`, of `live_bytes` now, has
-/// once the load being built is accepted ([`stage`]): what [`set`] gives
-/// it. A pin is its size; a range, its default clamped into it, or in
-/// `auto`, where the plan sizes it, `live_bytes` clamped into it; a key
-/// the load drops, its variable's size, else its default, or in `auto`,
-/// for the plan, `live_bytes`. `live_bytes` when nothing is staged, or the
-/// load leaves the key as it is.
+/// once the load being built is accepted ([`stage`]), from the very
+/// decision [`set`] makes for it ([`decide`]), with the staged values and
+/// mode, and the entry's own state: whether a key set it, and whether its
+/// capacity is the plan's. Where `set` resizes it, the size it resizes it
+/// to; where `set` leaves it to the plan fitted after the load (`auto`),
+/// its capacity now, clamped into a range's bounds, which no grant leaves;
+/// where `set` leaves it alone, its capacity now, but the plan's capacity
+/// of one no key ever set goes back to its configured size, as report mode
+/// gives it back (`plan::restore`). What `auto` then grants is the plan's,
+/// known only once it is fitted. `live_bytes` when nothing is staged, or
+/// nothing is built as the key's entry.
 pub fn pending_bytes(key: &str, live_bytes: u64) -> u64 {
     let staged = STAGED.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let (Some((values, plan_sized)), Some(key)) = (staged, by_key(key)) else {
         return live_bytes;
     };
-    let staged = values.iter().find(|(k, _)| *k == key.key).map(|(_, s)| *s);
-    if staged == setting(key.key) {
+    let Some(state) = super::key_state(key) else {
         return live_bytes;
+    };
+    let size = values.iter().find(|(k, _)| *k == key.key).map(|(_, s)| *s);
+    match decide(key, size, plan_sized, &state) {
+        Some(decision) if decision.resize => decision.configured,
+        Some(decision) if decision.deferred => decision
+            .source
+            .bounds()
+            .map_or(state.capacity, |bounds| bounds.clamp(state.capacity)),
+        Some(_) => state.capacity,
+        None if !plan_sized && state.planned => state.configured,
+        None => state.capacity,
     }
-    let default_mb = key.env.and_then(default_of);
-    match staged {
-        Some(Size::Pinned(mb)) => mb.saturating_mul(MIB),
-        Some(Size::Bounded(bounds)) => match default_mb {
-            Some(mb) if !plan_sized => bounds.clamp(mb.saturating_mul(MIB)),
-            _ => bounds.clamp(live_bytes),
-        },
-        None => match (key.env, default_mb) {
-            (Some(var), Some(mb)) => {
-                let (mb, source) = super::from_env(var, mb);
-                if plan_sized && !super::grant::pinned(&source) {
-                    live_bytes
-                } else {
-                    mb.saturating_mul(MIB)
-                }
-            }
-            _ => live_bytes,
-        },
+}
+
+/// What a built entry holds now, as [`decide`] reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct State {
+    /// Where its size comes from now.
+    pub current: SizeSource,
+    /// The size its settings give it now.
+    pub configured: u64,
+    /// A key has set it since it was built.
+    pub keyed: bool,
+    /// Its capacity is the plan's ([`super::Row::planned`]).
+    pub planned: bool,
+    pub capacity: u64,
+}
+
+/// What [`set`] does to one built entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Decision {
+    /// The source and size its settings give it from now on.
+    pub source: SizeSource,
+    pub configured: u64,
+    /// Either differs from what it had.
+    pub changed: bool,
+    /// Resize it to `configured` now: the size moves, or its capacity is
+    /// the plan's, where the size applies (report mode, auto without a
+    /// total, or a pin).
+    pub resize: bool,
+    /// Mark its capacity the plan's: the size moves where the plan sizes
+    /// it, `auto` with a range or an unset key.
+    pub defer: bool,
+    /// Its capacity is not `configured`, and the plan fitted next sizes it.
+    pub deferred: bool,
+}
+
+/// The one decision [`set`] applies and [`pending_bytes`] answers from
+/// (#1313): what `key`, set to `size` or unset, does to an entry in
+/// `state`, `plan_sized` saying whether the plan applies its sizes. `None`
+/// when `set` leaves the entry as it was registered: no key has set it,
+/// none sets it now.
+///
+/// A key's size, else its variable's, else the default is the entry's
+/// configured size. Where it applies (not `plan_sized`, or a pin), a size
+/// that moves, or a capacity that is the plan's, is resized to it: so
+/// report mode gives a keyed entry its documented size whatever `auto`
+/// left it at. Where the plan sizes it, a capacity other than the
+/// configured size is marked the plan's, for the plan to move, or report
+/// mode to give back.
+pub(super) fn decide(
+    key: &Key,
+    size: Option<Size>,
+    plan_sized: bool,
+    state: &State,
+) -> Option<Decision> {
+    let var = key.env?;
+    let default_mb = default_of(var)?;
+    let (configured, source) = match size {
+        Some(size) => size.sized(key.label, default_mb),
+        None => {
+            let (mb, source) = super::from_env(var, default_mb);
+            (mb.saturating_mul(MIB), source)
+        }
+    };
+    // Built while the key was set: its registration names the key.
+    let from_key = matches!(
+        &state.current,
+        SizeSource::Config(label) | SizeSource::Bounds(label, _) if *label == key.label
+    );
+    if size.is_none() && !from_key && !state.keyed {
+        return None;
     }
+    let applies = !plan_sized || super::grant::pinned(&source);
+    let changed = state.current != source || state.configured != configured;
+    let moves = state.capacity != configured && (changed || state.planned);
+    Some(Decision {
+        source,
+        configured,
+        changed,
+        resize: applies && moves,
+        defer: !applies && moves,
+        deferred: !applies && state.capacity != configured,
+    })
 }
 
 /// Take the accepted config's `[memory.caches]` values (#1313): every cache
@@ -308,16 +386,7 @@ pub fn set(values: &[(&'static Key, Size)], plan_sized: bool) -> Vec<Configured>
 
 /// [`set`] for one key whose cache or budget is built.
 fn configure_live(key: &Key, size: Option<Size>, plan_sized: bool) -> Option<Configured> {
-    let var = key.env?;
-    let (bytes, source) = match size {
-        Some(size) => size.sized(key.label, default_of(var)?),
-        None => {
-            let (mb, source) = super::from_env(var, default_of(var)?);
-            (mb.saturating_mul(MIB), source)
-        }
-    };
-    let resize = !plan_sized || super::grant::pinned(&source);
-    super::configure(key, source, bytes, size.is_some(), resize)
+    super::configure(key, size, plan_sized)
 }
 
 #[cfg(test)]

@@ -182,6 +182,45 @@ pub struct StationGridEngine {
 const GRID_DEMAND_RULE: &str = "parameters × precompute (at least 1) × grid bytes, summed over \
                                 collections; the terrain and mask are held beside the cache";
 
+/// Whether one grid of `cells` cells, with `corrections_bytes` of terrain
+/// and mask that live as long as the engine, fits the grid cache, and one
+/// computation of it half the budget: else every map tile would compute it
+/// again, or no request could. Against the sizes the load being built gives
+/// them (`compute::cache_capacity_for_load`, #1313), so the reload that
+/// raises a key loads the collection, and one that lowers it fails it.
+fn check_sizes(cells: usize, corrections_bytes: u64) -> Result<(), String> {
+    let grid_bytes = compute::grid_bytes(cells);
+    let resident = grid_bytes + corrections_bytes;
+    let cache = compute::cache_capacity_for_load();
+    if resident > cache {
+        return Err(format!(
+            "one grid of {cells} cells is {} MiB with its terrain and mask, more than the {} MiB \
+             grid cache ([memory.caches] station_grid) holds, so every map tile would recompute \
+             it; raise the cache or coarsen the grid",
+            resident.div_ceil(ds_cache::MIB),
+            cache / ds_cache::MIB
+        ));
+    }
+    let job_bytes = job_bytes(cells);
+    let budget = compute::budget_for_load();
+    if job_bytes > budget / 2 {
+        return Err(format!(
+            "computing one grid of {cells} cells needs {} MiB, more than half the {} MiB \
+             computation budget ([memory.caches] station_grid_compute); raise it or coarsen the \
+             grid",
+            job_bytes.div_ceil(ds_cache::MIB),
+            budget / ds_cache::MIB
+        ));
+    }
+    Ok(())
+}
+
+/// What computing one grid of `cells` cells reserves of the budget: the
+/// grid, and what the computation holds besides it.
+fn job_bytes(cells: usize) -> u64 {
+    compute::grid_bytes(cells) + compute::COMPUTE_SLACK_BYTES
+}
+
 impl StationGridEngine {
     /// Build the engine over the station collection `source`. Checks every
     /// setting; reads only the source's metadata snapshots, never its data.
@@ -342,34 +381,8 @@ impl StationGridEngine {
             settings.radius_m,
         )
         .map_err(bad)?;
-        let grid_bytes = compute::grid_bytes(geom.cells());
-        // The terrain and mask grids live as long as the engine: they count
-        // with one grid against the cache.
-        // Against the sizes the load being built gives them (#1313): a
-        // reload that raises a key loads the collection at once.
-        let resident = grid_bytes + corrections.resident_bytes();
-        let cache = compute::cache_capacity_for_load();
-        if resident > cache {
-            return Err(bad(format!(
-                "one grid of {} cells is {} MiB with its terrain and mask, more than the {} MiB \
-                 grid cache ([memory.caches] station_grid) holds, so every map tile would recompute \
-                 it; raise the cache or coarsen the grid",
-                geom.cells(),
-                resident.div_ceil(ds_cache::MIB),
-                cache / ds_cache::MIB
-            )));
-        }
-        let job_bytes = grid_bytes + compute::COMPUTE_SLACK_BYTES;
-        let budget = compute::budget_for_load();
-        if job_bytes > budget / 2 {
-            return Err(bad(format!(
-                "computing one grid of {} cells needs {} MiB, more than half the {} MiB \
-                 computation budget ([memory.caches] station_grid_compute); raise it or coarsen the grid",
-                geom.cells(),
-                job_bytes.div_ceil(ds_cache::MIB),
-                budget / ds_cache::MIB
-            )));
-        }
+        check_sizes(geom.cells(), corrections.resident_bytes()).map_err(bad)?;
+        let job_bytes = job_bytes(geom.cells());
 
         let duration = |name: &str, value: &str| -> Result<Duration, DataServerError> {
             let d = parse_iso8601_duration(value).map_err(|e| bad(format!("{name}: {e}")))?;
@@ -510,6 +523,19 @@ impl StationGridEngine {
 
     pub fn collection_id(&self) -> &str {
         &self.inner.collection_id
+    }
+
+    /// Whether this engine's grid still fits the grid cache and the
+    /// computation budget the load being built gives them, as its
+    /// constructor checked ([`check_sizes`]): a reload whose
+    /// `[memory.caches]` no longer fits it builds it again, failed with the
+    /// constructor's error, rather than shrinking them under it (#1313).
+    pub fn fits_the_load(&self) -> bool {
+        check_sizes(
+            self.inner.geom.cells(),
+            self.inner.corrections.resident_bytes(),
+        )
+        .is_ok()
     }
 
     pub fn source_id(&self) -> &str {

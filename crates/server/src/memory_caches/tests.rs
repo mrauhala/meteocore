@@ -171,8 +171,41 @@ fn the_changes_block_names_each_size_and_its_source() {
         stopped_short_warnings(&changes),
         [
             "pvol_pixel_cache stays at 1100 MiB, above the 1024 MiB its key \
-          config:[memory.caches] pvol_pixel gives it: a shrink in place stops where its \
-          shards still hold 32 entries each. A restart builds it at 1024 MiB"
+          [memory.caches] pvol_pixel gives it: a shrink in place stops where its shards \
+          still hold 32 entries each. A restart builds it at 1024 MiB"
+        ]
+    );
+    // A removed key's shrink back to the default or the variable names
+    // what sizes it now (#1313 review).
+    let back = [
+        change(SizeSource::Default, 4096, 1100, 1024, false),
+        change(
+            SizeSource::Env("MC_PVOL_PIXEL_CACHE_MB"),
+            4096,
+            1100,
+            1024,
+            false,
+        ),
+        change(
+            SizeSource::Bounds("[memory.caches] pvol_pixel", Bounds::mib(64, 128)),
+            4096,
+            1100,
+            128,
+            false,
+        ),
+    ];
+    let givers: Vec<String> = stopped_short_warnings(&back)
+        .iter()
+        .map(|w| w.split(" gives it").next().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        givers,
+        [
+            "pvol_pixel_cache stays at 1100 MiB, above the 1024 MiB its default",
+            "pvol_pixel_cache stays at 1100 MiB, above the 1024 MiB its variable \
+             MC_PVOL_PIXEL_CACHE_MB",
+            "pvol_pixel_cache stays at 1100 MiB, above the 128 MiB its range \
+             [memory.caches] pvol_pixel",
         ]
     );
 }

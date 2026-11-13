@@ -146,14 +146,6 @@ pub(crate) fn budget_for_load() -> u64 {
     plan::keys::pending_bytes("station_grid_compute", BUDGET.capacity())
 }
 
-/// Whether the load being built gives the grid cache or the computation
-/// budget less than they have now: a live station grid, checked against
-/// the sizes it was built with, must be built again and checked against
-/// those (#1313).
-pub fn sizes_fall_on_load() -> bool {
-    cache_capacity_for_load() < cache_capacity() || budget_for_load() < BUDGET.capacity()
-}
-
 /// Drop one engine instance's grids (it was shut down).
 pub(crate) fn evict_epoch(epoch: u64) {
     CACHE.retain(|key, _| key.epoch != epoch);

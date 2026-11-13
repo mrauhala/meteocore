@@ -315,15 +315,23 @@ pub(crate) fn apply(settings: &CacheSettings, plan_sized: bool) {
 /// Stage `settings` for the load being built (`keys::stage`), before its
 /// engines are: one that checks a process-wide size while it is built
 /// checks the size the load gives it (`keys::pending_bytes`). [`apply`]
-/// takes them once the load is accepted; [`unstage`] drops them when it is
-/// rejected, which leaves every size and value as it was.
-pub(crate) fn stage(settings: &CacheSettings, plan_sized: bool) {
+/// takes them once the load is accepted; dropping the guard drops them,
+/// so a load rejected, or one that panics, leaves every size and value as
+/// it was.
+#[must_use = "dropping the guard unstages the values"]
+pub(crate) fn stage(settings: &CacheSettings, plan_sized: bool) -> Staged {
     keys::stage(&settings.0, plan_sized);
+    Staged
 }
 
-/// Drop what [`stage`] staged: the load was rejected.
-pub(crate) fn unstage() {
-    keys::unstage();
+/// Unstages what [`stage`] staged when dropped: after an accepted load,
+/// whose `apply` took the values already, it does nothing.
+pub(crate) struct Staged;
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        keys::unstage();
+    }
 }
 
 /// The INFO block of what [`apply`] changed: each size, old → new, or what
@@ -376,6 +384,18 @@ pub(crate) fn changes_block(changed: &[Configured]) -> Option<String> {
     Some(out)
 }
 
+/// What sets a size, in a WARN's words: `its key [memory.caches] k`, `its
+/// range [memory.caches] k`, `its variable MC_X`, `its default`.
+fn giver(source: &SizeSource) -> String {
+    match source {
+        SizeSource::Config(key) => format!("its key {key}"),
+        SizeSource::Bounds(key, _) => format!("its range {key}"),
+        SizeSource::Env(var) => format!("its variable {var}"),
+        SizeSource::Default => "its default".into(),
+        other => other.to_string(),
+    }
+}
+
 /// The WARN for each size [`apply`] could not shrink to in place: a shrink
 /// stops where the cache's shards still hold 32 entries each, and a
 /// restart builds it at its key's size.
@@ -385,12 +405,12 @@ pub(crate) fn stopped_short_warnings(changed: &[Configured]) -> Vec<String> {
         .filter(|change| change.stopped_short())
         .map(|change| {
             format!(
-                "{} stays at {}, above the {} its key {} gives it: a shrink in place stops \
-                 where its shards still hold 32 entries each. A restart builds it at {}",
+                "{} stays at {}, above the {} {} gives it: a shrink in place stops where its \
+                 shards still hold 32 entries each. A restart builds it at {}",
                 change.entry.id,
                 mib(change.to_bytes),
                 mib(change.configured_bytes),
-                change.entry.source,
+                giver(&change.entry.source),
                 mib(change.configured_bytes)
             )
         })

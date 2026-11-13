@@ -1088,12 +1088,9 @@ fn point_index_sources_follow_the_config() {
             "point_index_cache_mb = 16\n",
             "collection:[grib] point_index_cache_mb",
         ),
-        // A range: derived from its configured size, the default clamped
-        // into it (#1313 review).
-        (
-            "message_cache_mb = { min = 1024, max = 4096 }\n",
-            "derived:[grib] message_cache_mb",
-        ),
+        // A range leaves the point-index cache to the plan, as the message
+        // cache: `default`, never a pin derived from the range's floor.
+        ("message_cache_mb = { min = 1024, max = 4096 }\n", "default"),
         ("message_cache_mb = { min = 64, max = 4096 }\n", "default"),
         (
             "message_cache_mb = { min = 64, max = 4096 }\npoint_index_cache_mb = { min = 8, max = 32 }\n",
@@ -1820,4 +1817,52 @@ async fn a_reload_raising_station_grid_loads_its_collection() {
     let (status, error) = grid(&state);
     assert_eq!(status, CollectionStatus::Failed);
     assert!(error.contains("more than the 2 MiB grid cache"), "{error}");
+}
+
+/// #1313 review round 2: a reload on a server without a station grid
+/// builds no station-grid cache or budget: they do not enter the plan as
+/// unreachable entries.
+///
+/// Runs in a child process: the station-grid statics must be this test's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reload_builds_no_station_grid_statics() {
+    const CHILD: &str = "MC_TEST_NO_STATION_GRID_CHILD";
+    const NAME: &str = "cache_plan::tests::a_reload_builds_no_station_grid_statics";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{NAME} failed in its child process");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[server]\nhost = \"127.0.0.1\"\nport = 8000\n\
+             [memory.caches]\nstation_grid = 64\n\
+             [[collections]]\nid = \"weather\"\ntitle = \"w\"\ndescription = \"d\"\n\
+             engine_type = \"csv\"\ndata_path = {:?}\napis = [\"features\"]\n",
+            testdata("weather.csv").to_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let state = crate::watcher::tests::build_state(&config_path);
+    let station_grid = |state: &crate::admin::AdminState| -> Vec<&'static str> {
+        snapshot(state)
+            .iter()
+            .map(|r| r.entry.id)
+            .filter(|id| id.starts_with("station_grid"))
+            .collect()
+    };
+    assert!(station_grid(&state).is_empty());
+    crate::admin::do_reload(&state).unwrap();
+    assert!(
+        station_grid(&state).is_empty(),
+        "{:?}",
+        station_grid(&state)
+    );
 }
