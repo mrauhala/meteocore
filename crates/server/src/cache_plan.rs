@@ -593,9 +593,16 @@ pub(crate) fn log(state: &AdminState, occasion: Occasion) -> Arc<Report> {
     crate::governor::init_counters();
     let memory = crate::admin::refresh_metrics(state);
     let mut rows = snapshot(state);
+    // The valve's ceilings this config supersedes go before the plan is
+    // applied: one set under another source than the cache's now, and all
+    // of them where the valve has no total (#1315).
+    crate::governor::reconcile(state, &rows);
     let report = memory_plan::replan(state, &rows, &memory);
-    // The governor's next re-plan tick is 5 minutes from this fit (#1315).
-    crate::governor::fitted(std::time::Instant::now());
+    // The governor's next re-plan tick is 5 minutes from this fit, a
+    // boot's or a reload's, never a recovery pass's (#1315).
+    if occasion != Occasion::Recovery {
+        crate::governor::fitted(std::time::Instant::now());
+    }
     if report.changes.iter().any(|c| c.to_bytes != c.from_bytes) {
         rows = snapshot(state);
     }

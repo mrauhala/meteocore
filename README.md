@@ -804,15 +804,18 @@ keeps the plan applied between reloads (#1315). It never runs while a
 reload does: a step a reload holds the reload lock through is skipped.
 
 - **Re-plan tick, every 5 minutes** after the last fit, a boot's or a
-  reload's included: the plan is fitted again with the demands the engines
-  publish now (PVOL sites found by polling, satellite windows filling over
-  the first hour). A grant is applied only when it moves a capacity by
-  more than 10 % and 64 MiB, so demand that jitters moves nothing; a warm
-  cache gives up at most a quarter of what it holds per tick, and no shrink
-  goes below what the cache takes in place. A resize that stops short is
-  not tried again until its capacity or grant moves. Every change is
-  logged at INFO with its reason; the plan's WARN block only when what it
-  cuts, or whether it falls short, changes.
+  reload's included (a radar recovery pass's is not): the plan is fitted
+  again with the demands the engines publish now (PVOL sites found by
+  polling, satellite windows filling over the first hour). A grant is
+  applied only when it moves a capacity by more than 10 % and 64 MiB, so
+  demand that jitters moves nothing; a warm cache gives up at most a
+  quarter of what it holds per tick, and no shrink goes below what the
+  cache takes in place. A cache under about 640 MiB therefore follows
+  only reloads: no grant moves it 10 % without also moving it 64 MiB. A
+  resize that stops short is not tried again until its capacity, grant,
+  in-place least or ceiling moves. Every change is logged at INFO with its
+  reason; the plan's WARN block only when what it cuts, or whether it
+  falls short, changes.
 - **Pressure valve**, with `[memory] total_mb` or a cgroup limit only, not
   on a total taken from a shared host's memory. It reads jemalloc's
   resident bytes every 15 seconds (`jemalloc_resident_bytes`):
@@ -821,11 +824,16 @@ reload does: a step a reload holds the reload lock through is skipped.
     `min` included) nor what it takes in place, and keeps that size as a
     ceiling; every arena's dirty pages are purged, and a WARN names each
     cache. While the process stays above the total it acts again each
-    minute;
-  - under 90 % of the total for 10 minutes, each re-plan tick raises the
-    ceilings by 5 % of the cache's grant, until each is back at the plan.
-    Between 90 % and the total it holds still, so a restore does not push
-    the process straight back over;
+    minute: a relief that lowers other caches than the last WARNs, one
+    lowering the same again logs at INFO. With every flexible cache at its
+    floor it lowers nothing and counts nothing, purges at most every 10
+    minutes and WARNs at most every 30 that the process is still over
+    (resident against the total);
+  - under 90 % of the total for 10 minutes, the ceilings are raised by 5 %
+    of the cache's grant every 5 minutes, until each is back at the plan.
+    The raises keep their own clock, so no reload or other fit puts them
+    off. Between 90 % and the total it holds still, so a restore does not
+    push the process straight back over;
   - it never lowers a cache its engines fill ahead of requests (satellite
     scans, PVOL pixels, station grids: below that they re-download in a
     loop) nor an admission budget, which rejects or queues already.
@@ -834,10 +842,18 @@ reload does: a step a reload holds the reload lock through is skipped.
   sets is the plan's: back in `report` mode it is given back.
 - A reload fits and applies the plan itself and keeps the valve's
   ceilings and timers, which are about the process's memory, not its
-  config; it restarts the 5 minutes to the next tick. Report mode, or no
-  total, drops them.
-- `cache_plan_changes_total{cache}` counts every size change, the
-  reload's, the tick's, the valve's and `[memory.caches]`'s;
+  config; it restarts the 5 minutes to the next tick. A ceiling never
+  takes a cache below the plan's floor or its range's `min`, and a reload
+  that pins a lowered cache or gives it other bounds drops its ceiling.
+  Report mode drops every ceiling; so does a config whose total no longer
+  holds the valve (a total from the host), and the next tick then gives
+  those caches their grant.
+- A reload request that finds the reload lock held waits up to 2 seconds
+  for it, past a governor step or a recovery pass, before answering 409.
+- `cache_plan_changes_total{cache}` counts every size change: the plan's
+  at boot and on reload, the tick's, the valve's, `[memory.caches]`'s and
+  a reload's resize of a cache by its setting (`[server]
+  metatile_cache_mb`, a GRIB or GeoTIFF collection's own);
   `memory_pressure_actions_total{action}` counts the valve's `relieve`,
   `purge` and `restore`. `/admin/cache-plan` has a `governor` object: the
   last tick and its changes, and the valve's state (`resident_bytes`,

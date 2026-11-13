@@ -3068,10 +3068,47 @@ impl LoadResult {
     }
 }
 
-/// Run staged [`CacheResize`]s, in the order the load staged them.
+/// Run staged [`CacheResize`]s, in the order the load staged them, and
+/// count each size they change in `cache_plan_changes_total` (#1315).
 fn apply_cache_resizes(resizes: Vec<CacheResize>) {
-    for resize in resizes {
-        resize();
+    if resizes.is_empty() {
+        return;
+    }
+    let changes = crate::memory_plan::counting_resizes(|| {
+        for resize in resizes {
+            resize();
+        }
+    });
+    // A GRIB or GeoTIFF engine logs its own; the render caches do not.
+    for ((_, id, scope), from, to) in changes {
+        if scope == ds_cache::plan::Scope::Process {
+            info!(
+                "{id}: resized from {} to {} by its setting, in place",
+                crate::cache_plan::mib(from),
+                crate::cache_plan::mib(to)
+            );
+        }
+    }
+}
+
+/// Stage the count of a render cache a reload builds anew at another size
+/// than the live one's (#1315): `counting_resizes` reads the plan
+/// registry, which does not list the new cache until the reload registers
+/// it.
+fn count_rebuilt(
+    cache_resizes: &mut Vec<CacheResize>,
+    id: &'static str,
+    live: Option<u64>,
+    mb: u64,
+) {
+    if let Some(from) = live.filter(|&bytes| bytes != mb.saturating_mul(ds_cache::MIB)) {
+        cache_resizes.push(Box::new(move || {
+            info!(
+                "{id}: rebuilt at {mb} MiB by its setting, from {}",
+                crate::cache_plan::mib(from)
+            );
+            crate::memory_plan::count_change(id);
+        }));
     }
 }
 
@@ -6502,7 +6539,16 @@ pub fn load_collections(
             cache_resizes.push(Box::new(move || cache.resize(rendered_cache_mb)));
             c
         }
-        _ => Arc::new(ds_render::RenderedCache::new(rendered_cache_mb)),
+        live => {
+            let live = live.map(|c| c.capacity());
+            count_rebuilt(
+                &mut cache_resizes,
+                "rendered_cache",
+                live,
+                rendered_cache_mb,
+            );
+            Arc::new(ds_render::RenderedCache::new(rendered_cache_mb))
+        }
     };
     let tile_cache = match reuse.tile {
         Some(c) if plan_sized_caches.tile => c,
@@ -6511,7 +6557,16 @@ pub fn load_collections(
             cache_resizes.push(Box::new(move || cache.resize(metatile_cache_mb)));
             c
         }
-        _ => Arc::new(ds_render::TilePixelCache::new(metatile_cache_mb)),
+        live => {
+            let live = live.map(|c| c.capacity());
+            count_rebuilt(
+                &mut cache_resizes,
+                "metatile_cache",
+                live,
+                metatile_cache_mb,
+            );
+            Arc::new(ds_render::TilePixelCache::new(metatile_cache_mb))
+        }
     };
     // Vector-tile (MVT) cache is independent of the raster cache because the
     // workloads differ (1–50 KB vs 30–200 KB per tile). Sized by
@@ -6524,7 +6579,16 @@ pub fn load_collections(
             cache_resizes.push(Box::new(move || cache.resize(vector_tile_cache_mb)));
             c
         }
-        _ => Arc::new(ds_mvt::VectorTileCache::new(vector_tile_cache_mb)),
+        live => {
+            let live = live.map(|c| c.capacity_bytes());
+            count_rebuilt(
+                &mut cache_resizes,
+                "vector_tile_cache",
+                live,
+                vector_tile_cache_mb,
+            );
+            Arc::new(ds_mvt::VectorTileCache::new(vector_tile_cache_mb))
+        }
     };
 
     // Set initial render semaphore total gauge
@@ -7348,18 +7412,27 @@ pub async fn reload_handler(
     serve_reload(&state, do_reload).await
 }
 
+/// How long a reload request waits for `reload_lock` before answering 409.
+const RELOAD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Run `reload` ([`do_reload`], outside tests) for one request and answer it.
 async fn serve_reload(
     state: &AdminState,
     reload: impl FnOnce(&AdminState) -> Result<ReloadOutcome, ReloadError> + Send + 'static,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    // Serialize reload requests — prevent concurrent reloads from racing
-    let reload_guard = state.reload_lock.clone().try_lock_owned().map_err(|_| {
-        (
-            StatusCode::CONFLICT,
-            Json(json!({ "error": "A reload is already in progress" })),
-        )
-    })?;
+    // Serialize reload requests — prevent concurrent reloads from racing.
+    // A short wait first: the memory governor's step and a recovery pass
+    // hold the lock briefly too, and a request that meets one should not
+    // hear that a reload is running (#1315).
+    let reload_guard =
+        tokio::time::timeout(RELOAD_LOCK_WAIT, state.reload_lock.clone().lock_owned())
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "error": "A reload is already in progress" })),
+                )
+            })?;
 
     // Run the (blocking) reload on the background runtime so it never parks a
     // request-serving worker — same as the collections_dir watcher. Use

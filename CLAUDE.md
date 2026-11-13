@@ -1754,7 +1754,8 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
 - **Memory governor** (`server/src/governor.rs`, #1315): ONE task on
   `poll_runtime`, a step every 15 s under `reload_lock.try_lock()` (a step
   a reload holds the lock through is skipped, so it never runs between a
-  reload's staged `[memory.caches]` and their `set`). Gated by
+  reload's staged `[memory.caches]` and their `set`); the gate is read
+  before the lock, so report mode never takes it. Gated by
   `AcceptedLoad::plans_sizes`; the pressure valve additionally needs
   `total_mb` or a cgroup limit (`memory_plan::valve_total`). The re-plan
   tick refits every 5 minutes through `memory_plan::fit` and
@@ -1763,7 +1764,11 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   `governor/decide.rs`, pure (inputs in, actions out, no clock): test
   them there. #1314's elastic sharing adds a step to this loop, never a
   second loop. Every size change counts in `cache_plan_changes_total`
-  (`memory_plan::count_changes`); a new resize path counts there too.
+  (`memory_plan::count_changes`; a reload's staged resizes through
+  `memory_plan::counting_resizes`); a new resize path counts there too.
+  A valve ceiling never takes a cache below the plan's floor or its
+  range's `min` (`decide::ceiled`), and a ceiling set under another
+  `SizeSource` than the cache's now is dropped (`governor::reconcile`).
 - **Grafana dashboards live in this repo:**
   `docker/grafana/dashboards/meteocore-overview.json`, provisioned via
   `docker/grafana/provisioning/`: a `dashboard.grafana.app/v2` resource

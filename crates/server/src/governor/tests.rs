@@ -64,7 +64,7 @@ fn a_doubled_demand_moves_the_grant_within_one_tick_and_jitter_moves_nothing() {
     let doubled = grid_grant(50);
     assert!(doubled > 2 * applied - 64 * MIB, "{}", doubled / MIB);
     assert_eq!(
-        tick_target(applied, doubled, None, false, None),
+        tick_target(applied, doubled, 0, None, false, false),
         Some(doubled),
         "the next tick applies it"
     );
@@ -72,7 +72,7 @@ fn a_doubled_demand_moves_the_grant_within_one_tick_and_jitter_moves_nothing() {
         let jittered = grid_grant(field_mb);
         assert_ne!(jittered, applied);
         assert_eq!(
-            tick_target(applied, jittered, None, false, None),
+            tick_target(applied, jittered, 0, None, false, false),
             None,
             "{field_mb} MiB fields: 4 % jitter"
         );
@@ -87,34 +87,69 @@ fn a_doubled_demand_moves_the_grant_within_one_tick_and_jitter_moves_nothing() {
     assert!(moves_enough(0, 65 * MIB), "a cache off grows");
 }
 
-/// A resize that stopped short is not tried again while its capacity and
-/// grant are what they were; the valve's ceiling caps a grant however
-/// little it moves; a lifted ceiling gives the grant at once.
+/// A resize that stopped short is not tried again while nothing it
+/// depends on moved; the valve's ceiling caps a grant however little it
+/// moves, but never below the floor; a lifted ceiling gives the grant at
+/// once.
 #[test]
 fn the_tick_skips_a_refused_resize_and_follows_the_valves_ceiling() {
-    let refused = Some((300 * MIB, 100 * MIB));
     assert_eq!(
-        tick_target(300 * MIB, 100 * MIB, None, false, refused),
+        tick_target(300 * MIB, 100 * MIB, 0, None, false, true),
         None
     );
     assert_eq!(
-        tick_target(400 * MIB, 100 * MIB, None, false, refused),
-        Some(100 * MIB),
-        "the capacity moved since"
+        tick_target(300 * MIB, 100 * MIB, 0, None, false, false),
+        Some(100 * MIB)
     );
     assert_eq!(
-        tick_target(1000 * MIB, 1010 * MIB, Some(900 * MIB), false, None),
+        tick_target(1000 * MIB, 1010 * MIB, 0, Some(900 * MIB), false, false),
         Some(900 * MIB)
     );
     assert_eq!(
-        tick_target(900 * MIB, 1000 * MIB, Some(950 * MIB), false, None),
+        tick_target(900 * MIB, 1000 * MIB, 0, Some(950 * MIB), false, false),
         Some(950 * MIB),
         "a restore step of 5 %"
     );
     assert_eq!(
-        tick_target(950 * MIB, 1000 * MIB, None, true, None),
+        tick_target(
+            512 * MIB,
+            3000 * MIB,
+            2048 * MIB,
+            Some(512 * MIB),
+            false,
+            false
+        ),
+        Some(2048 * MIB),
+        "a ceiling never takes it below its floor"
+    );
+    assert_eq!(ceiled(3000 * MIB, 512 * MIB, 2048 * MIB), 2048 * MIB);
+    assert_eq!(ceiled(1000 * MIB, 512 * MIB, 2048 * MIB), 1000 * MIB);
+    assert_eq!(
+        tick_target(950 * MIB, 1000 * MIB, 0, None, true, false),
         Some(1000 * MIB),
         "lifted"
+    );
+    // What a refused resize is not tried again with: any part moving
+    // tries it again, a changed least or a lifted ceiling included.
+    let refused = Refused {
+        capacity: 300 * MIB,
+        grant: 100 * MIB,
+        least: 250 * MIB,
+        capped: true,
+    };
+    assert_ne!(
+        refused,
+        Refused {
+            least: 90 * MIB,
+            ..refused
+        }
+    );
+    assert_ne!(
+        refused,
+        Refused {
+            capped: false,
+            ..refused
+        }
     );
 }
 
@@ -163,7 +198,7 @@ fn pressure_shrinks_the_flexible_caches_and_restores_them_slowly_without_oscilla
     ];
     let start = Instant::now();
     let mut pressure = Pressure::default();
-    let mut caps: HashMap<Key, u64> = HashMap::new();
+    let mut caps: HashMap<Key, Ceiling> = HashMap::new();
     let mut relief_at = Vec::new();
     let mut history: Vec<Vec<u64>> = Vec::new();
     let samples = REPLAN_EVERY.as_secs() / SAMPLE_EVERY.as_secs();
@@ -186,7 +221,13 @@ fn pressure_shrinks_the_flexible_caches_and_restores_them_slowly_without_oscilla
                     })
                     .collect();
                 for (key, target) in decide::relieve(&slots) {
-                    caps.insert(key.clone(), target);
+                    caps.insert(
+                        key.clone(),
+                        Ceiling {
+                            bytes: target,
+                            source: SizeSource::Default,
+                        },
+                    );
                     let cache = caches
                         .iter_mut()
                         .find(|c| decide::key(&c.entry) == key)
@@ -211,9 +252,10 @@ fn pressure_shrinks_the_flexible_caches_and_restores_them_slowly_without_oscilla
             if let Some(to) = tick_target(
                 cache.capacity,
                 cache.grant,
-                caps.get(&key).copied(),
+                64 * MIB,
+                caps.get(&key).map(|c| c.bytes),
                 lifted.contains(&key),
-                None,
+                false,
             ) {
                 cache.capacity = to;
             }
@@ -341,10 +383,14 @@ fn the_valve_lowers_flexible_caches_to_90_percent_above_their_floor() {
 fn a_restore_step_raises_each_ceiling_by_5_percent_of_its_grant() {
     let key =
         |id: &'static str| decide::key(&Entry::cache(id, Scope::Process, SizeSource::Default));
-    let mut caps: HashMap<Key, u64> = [
-        (key("metatile_cache"), 1000 * MIB),
-        (key("rendered_cache"), 250 * MIB),
-        (key("gone_cache"), 10 * MIB),
+    let ceiling = |bytes| Ceiling {
+        bytes,
+        source: SizeSource::Default,
+    };
+    let mut caps: HashMap<Key, Ceiling> = [
+        (key("metatile_cache"), ceiling(1000 * MIB)),
+        (key("rendered_cache"), ceiling(250 * MIB)),
+        (key("gone_cache"), ceiling(10 * MIB)),
     ]
     .into();
     let grants: HashMap<Key, u64> = [
@@ -354,7 +400,7 @@ fn a_restore_step_raises_each_ceiling_by_5_percent_of_its_grant() {
     .into();
     let (raised, lifted) = restore(&mut caps, &|k| grants.get(k).copied());
     assert_eq!(raised, vec![key("metatile_cache")]);
-    assert_eq!(caps[&key("metatile_cache")], 1100 * MIB);
+    assert_eq!(caps[&key("metatile_cache")].bytes, 1100 * MIB);
     assert!(lifted.contains(&key("rendered_cache")) && lifted.contains(&key("gone_cache")));
     assert_eq!(caps.len(), 1);
 }
@@ -471,51 +517,119 @@ fn the_valve_holds_only_a_configured_or_cgroup_total() {
     );
 }
 
-/// #1315: the governor's step on a running server. Gated in report mode;
-/// in auto with `total_mb`, it samples resident memory every step and fits
-/// the plan again 5 minutes after the last fit, a reload's included; it
-/// skips while a reload holds `reload_lock`; and `/admin/cache-plan`
-/// reports its last tick. Back in report mode it is gated again, its
-/// ceilings dropped.
-///
-/// Runs in a child process: it resizes the process-wide caches.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_governor_is_gated_ticks_and_skips_while_a_reload_holds_the_lock() {
+/// Run the test `name` in a child process of its own, since it resizes the
+/// process-wide caches and holds the governor's state: true in the child.
+fn in_child(name: &str) -> bool {
     const CHILD: &str = "MC_TEST_GOVERNOR_CHILD";
-    const NAME: &str =
-        "governor::tests::the_governor_is_gated_ticks_and_skips_while_a_reload_holds_the_lock";
-    if std::env::var_os(CHILD).is_none() {
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", NAME, "--nocapture"])
-            .env(CHILD, "1")
-            .status()
-            .unwrap();
-        assert!(status.success(), "{NAME} failed in its child process");
-        return;
+    if std::env::var_os(CHILD).is_some() {
+        return true;
     }
-    let dir = tempfile::tempdir().unwrap();
-    let config_path = dir.path().join("config.toml");
-    let radar = format!(
-        "[[collections]]\nid = \"radar\"\ntitle = \"t\"\ndescription = \"d\"\n\
-         engine_type = \"geotiff\"\ndata_path = {:?}\napis = [\"wms\", \"edr\"]\n\
-         [collections.geotiff]\nfilename_template = \"radar_%Y%m%dT%H%MZ.tif\"\n\
-         parameter = \"reflectivity\"\nunit = \"dBZ\"\n",
-        concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar")
-    );
-    let write = |memory: &str| {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "{name} failed in its child process");
+    false
+}
+
+/// `[memory]` in `auto` with a configured total: the valve's gate is open.
+const AUTO: &str = "[memory]\nmode = \"auto\"\ntotal_mb = 8192\n";
+
+/// A config over the radar GeoTIFF fixture, its `[memory]` rewritten by
+/// [`Fixture::write`].
+struct Fixture {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+}
+
+impl Fixture {
+    fn new(memory: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let fixture = Self { _dir: dir, path };
+        fixture.write(memory);
+        fixture
+    }
+
+    fn write(&self, memory: &str) {
+        let radar = format!(
+            "[[collections]]\nid = \"radar\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"geotiff\"\ndata_path = {:?}\napis = [\"wms\", \"edr\"]\n\
+             [collections.geotiff]\nfilename_template = \"radar_%Y%m%dT%H%MZ.tif\"\n\
+             parameter = \"reflectivity\"\nunit = \"dBZ\"\n",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar")
+        );
         std::fs::write(
-            &config_path,
+            &self.path,
             format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{memory}{radar}"),
         )
         .unwrap();
-    };
-    write("");
-    let state = crate::watcher::tests::build_state(&config_path);
-    cache_plan::log(&state, cache_plan::Occasion::Boot);
+    }
+
+    /// The server, booted.
+    fn boot(&self) -> AdminState {
+        let state = crate::watcher::tests::build_state(&self.path);
+        cache_plan::log(&state, cache_plan::Occasion::Boot);
+        state
+    }
+}
+
+/// The plan registry's row of the process-wide cache `id`.
+fn row(state: &AdminState, id: &str) -> Row {
+    cache_plan::snapshot(state)
+        .into_iter()
+        .find(|row| row.entry.id == id)
+        .unwrap()
+}
+
+/// The last plan's grant for `entry`.
+fn grant_of(entry: &Entry) -> Grant {
+    memory_plan::last()
+        .and_then(|report| report.plan.as_ref()?.grant(entry).cloned())
+        .unwrap()
+}
+
+/// The valve's ceiling of `bytes` on the cache of `row`, under its source.
+fn hold(row: &Row, bytes: u64) -> Key {
+    let key = decide::key(&row.entry);
+    governor().caps.insert(
+        key.clone(),
+        Ceiling {
+            bytes,
+            source: row.entry.source.clone(),
+        },
+    );
+    key
+}
+
+/// #1315: the governor's step on a running server. Gated in report mode,
+/// where it takes no lock; in auto with `total_mb`, it samples resident
+/// memory every step and fits the plan again 5 minutes after the last fit,
+/// a reload's included; it skips while a reload holds `reload_lock`; and
+/// `/admin/cache-plan` reports its last tick. Back in report mode it is
+/// gated again, its ceilings dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_governor_is_gated_ticks_and_skips_while_a_reload_holds_the_lock() {
+    if !in_child(
+        "governor::tests::the_governor_is_gated_ticks_and_skips_while_a_reload_holds_the_lock",
+    ) {
+        return;
+    }
+    let fixture = Fixture::new("");
+    let state = fixture.boot();
     let start = Instant::now();
     assert_eq!(step(&state, start), Step::Gated, "report mode");
+    {
+        let _reload = state.reload_lock.try_lock().unwrap();
+        assert_eq!(
+            step(&state, start),
+            Step::Gated,
+            "the gate is read before the lock"
+        );
+    }
 
-    write("[memory]\nmode = \"auto\"\ntotal_mb = 8192\n");
+    fixture.write(AUTO);
     crate::admin::do_reload(&state).unwrap();
     let now = Instant::now();
     assert_eq!(
@@ -561,16 +675,285 @@ async fn the_governor_is_gated_ticks_and_skips_while_a_reload_holds_the_lock() {
         }
     ));
 
-    governor().caps.insert(
-        decide::key(&Entry::cache(
-            "metatile_cache",
-            Scope::Process,
-            SizeSource::Default,
-        )),
-        512 * MIB,
-    );
-    write("");
+    hold(&row(&state, "metatile_cache"), 512 * MIB);
+    fixture.write("");
     crate::admin::do_reload(&state).unwrap();
-    assert_eq!(step(&state, later + 2 * REPLAN_EVERY), Step::Gated);
     assert!(governor().caps.is_empty(), "report mode drops the ceilings");
+    assert_eq!(step(&state, later + 2 * REPLAN_EVERY), Step::Gated);
+}
+
+/// #1315 review: a ceiling never holds a cache below the plan's floor nor
+/// its range's `min`, and a reload that pins or re-bounds the cache drops
+/// it. Before, a reload giving the meta-tile cache `{ min = 2048, max =
+/// 4096 }` left it at an old 512 MiB ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ceiling_never_holds_a_cache_below_its_floor_or_a_reloads_range() {
+    if !in_child(
+        "governor::tests::a_ceiling_never_holds_a_cache_below_its_floor_or_a_reloads_range",
+    ) {
+        return;
+    }
+    let fixture = Fixture::new(AUTO);
+    let state = fixture.boot();
+    let key = hold(&row(&state, "metatile_cache"), 512 * MIB);
+
+    // A reload of the same config keeps the ceiling, and the cache under it.
+    crate::admin::do_reload(&state).unwrap();
+    let metatile = row(&state, "metatile_cache");
+    let grant = grant_of(&metatile.entry);
+    assert!(governor().caps.contains_key(&key));
+    assert_eq!(
+        metatile.usage.capacity_bytes,
+        grant
+            .bytes
+            .min((512 * MIB).max(floor_of(&metatile.entry, &grant))),
+        "grant {} MiB, floor {} MiB",
+        grant.bytes / MIB,
+        grant.floor_bytes / MIB
+    );
+
+    // The reload gives the cache a range from 2048 MiB: the ceiling set
+    // under its old source goes.
+    fixture.write(&format!(
+        "{AUTO}[memory.caches]\nmetatile = {{ min = 2048, max = 4096 }}\n"
+    ));
+    crate::admin::do_reload(&state).unwrap();
+    let metatile = row(&state, "metatile_cache");
+    assert!(
+        metatile.usage.capacity_bytes >= 2048 * MIB,
+        "{} MiB from {}",
+        metatile.usage.capacity_bytes / MIB,
+        metatile.source()
+    );
+    assert!(!governor().caps.contains_key(&key), "superseded");
+
+    // A ceiling under the range itself stops at its min, in a reload's plan
+    // and in a tick.
+    hold(&metatile, 512 * MIB);
+    let grant = grant_of(&metatile.entry);
+    assert!(capped(&metatile.entry, &grant) >= 2048 * MIB);
+    crate::admin::do_reload(&state).unwrap();
+    assert!(governor().caps.contains_key(&key), "the same source");
+    assert!(row(&state, "metatile_cache").usage.capacity_bytes >= 2048 * MIB);
+    assert!(matches!(
+        step(&state, Instant::now() + REPLAN_EVERY),
+        Step::Ran {
+            replanned: true,
+            ..
+        }
+    ));
+    assert!(row(&state, "metatile_cache").usage.capacity_bytes >= 2048 * MIB);
+}
+
+/// #1315 review: a recovery pass, which refits the accepted config, does
+/// not put the tick off, and restores run on their own clock, which no fit
+/// puts off. Before, `radar_recovery_loop` backing off to the tick's own 5
+/// minutes kept the ceilings in place for as long as a source was down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restores_run_on_their_own_clock_and_recovery_passes_do_not_put_the_tick_off() {
+    if !in_child(
+        "governor::tests::restores_run_on_their_own_clock_and_recovery_passes_do_not_put_the_tick_off",
+    ) {
+        return;
+    }
+    let fixture = Fixture::new(AUTO);
+    let state = fixture.boot();
+    let booted = governor().fitted_at.unwrap();
+    cache_plan::log(&state, cache_plan::Occasion::Recovery);
+    assert_eq!(governor().fitted_at, Some(booted), "a recovery pass");
+    crate::admin::do_reload(&state).unwrap();
+    assert!(governor().fitted_at.unwrap() > booted, "a reload");
+
+    // The valve lowered the meta-tile cache; the process has been under 90 %
+    // of its total for 11 minutes, and a fit ran a second ago.
+    let key = hold(&row(&state, "metatile_cache"), 512 * MIB);
+    let at = Instant::now() + UNDER_FOR + Duration::from_secs(60);
+    {
+        let mut governor = governor();
+        governor.pressure.under_since = Some(Instant::now());
+        governor.fitted_at = Some(at - Duration::from_secs(1));
+    }
+    assert_eq!(
+        step(&state, at),
+        Step::Ran {
+            sampled: true,
+            relieved: false,
+            replanned: true,
+        },
+        "the restore is due"
+    );
+    assert_eq!(governor().restored_at, Some(at));
+    assert!(
+        governor()
+            .caps
+            .get(&key)
+            .is_none_or(|ceiling| ceiling.bytes > 512 * MIB),
+        "raised by 5 % of the grant"
+    );
+    // The next restore is 5 minutes on.
+    let soon = at + Duration::from_secs(60);
+    assert!(matches!(
+        step(&state, soon),
+        Step::Ran {
+            replanned: false,
+            ..
+        }
+    ));
+    assert!(matches!(
+        step(&state, at + REPLAN_EVERY),
+        Step::Ran {
+            replanned: true,
+            ..
+        }
+    ));
+}
+
+/// #1315 review: over the total with every flexible cache at its floor,
+/// the valve no longer WARNs, purges and counts every minute: it WARNs at
+/// most every 30 minutes, purges at most every 10, and counts only what it
+/// did.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_valve_at_its_floors_warns_purges_and_counts_sparingly() {
+    if !in_child("governor::tests::the_valve_at_its_floors_warns_purges_and_counts_sparingly") {
+        return;
+    }
+    let fixture = Fixture::new(AUTO);
+    let state = fixture.boot();
+    let count = |action: &str| PRESSURE_ACTIONS.with_label_values(&[action]).get();
+    let (resident, total) = (9 * GIB, 8 * GIB);
+
+    // The caches are empty: one relief takes them to their floors.
+    let mut at = Instant::now();
+    let mut reliefs = 0;
+    while super::relieve(&state, resident, total, at) {
+        reliefs += 1;
+        at += OVER_FOR;
+        assert!(reliefs < 3, "the valve keeps lowering");
+    }
+    assert_eq!(count("relieve"), reliefs);
+    assert_eq!(governor().floors_warned_at, Some(at), "the first WARN");
+    let purged = governor().purged_at.unwrap();
+    let purges = count("purge");
+
+    // Still over a minute on: nothing to lower, purge, WARN or count.
+    for later in [at + OVER_FOR, purged + PURGE_EVERY - Duration::from_secs(1)] {
+        assert!(!super::relieve(&state, resident, total, later));
+        assert_eq!(count("relieve"), reliefs);
+        assert_eq!(count("purge"), purges);
+        assert_eq!(governor().purged_at, Some(purged));
+        assert_eq!(governor().floors_warned_at, Some(at));
+    }
+    // 10 minutes on it purges once more, 30 on it WARNs again.
+    assert!(!super::relieve(
+        &state,
+        resident,
+        total,
+        purged + PURGE_EVERY
+    ));
+    assert_eq!(governor().purged_at, Some(purged + PURGE_EVERY));
+    assert!(count("purge") <= purges + 1, "jemalloc may refuse");
+    assert_eq!(governor().floors_warned_at, Some(at));
+    assert!(!super::relieve(
+        &state,
+        resident,
+        total,
+        at + FLOORS_WARN_EVERY
+    ));
+    assert_eq!(governor().floors_warned_at, Some(at + FLOORS_WARN_EVERY));
+    assert_eq!(count("relieve"), reliefs);
+}
+
+/// #1315 review: where the valve's total goes while the plan still applies
+/// its sizes, the ceilings go and the next tick gives those caches their
+/// grant, however little it moves; a reload in between applies none of
+/// them. Before, a reload into report mode and straight back brought an
+/// old ceiling back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn released_ceilings_give_the_grant_and_no_reload_brings_them_back() {
+    if !in_child("governor::tests::released_ceilings_give_the_grant_and_no_reload_brings_them_back")
+    {
+        return;
+    }
+    let fixture = Fixture::new(AUTO);
+    let state = fixture.boot();
+    let key = hold(&row(&state, "metatile_cache"), 512 * MIB);
+    crate::admin::do_reload(&state).unwrap();
+
+    // Report mode and straight back, with no step between.
+    fixture.write("");
+    crate::admin::do_reload(&state).unwrap();
+    assert!(governor().caps.is_empty());
+    fixture.write(AUTO);
+    crate::admin::do_reload(&state).unwrap();
+    let metatile = row(&state, "metatile_cache");
+    let grant = grant_of(&metatile.entry).bytes;
+    assert_eq!(metatile.usage.capacity_bytes, grant, "no stale ceiling");
+
+    // A released cache 32 MiB under its grant gets it at the next tick,
+    // which the thresholds alone would not give it.
+    ds_cache::plan::apply(&metatile.entry, grant - 32 * MIB).unwrap();
+    governor().released.insert(key);
+    let at = Instant::now() + REPLAN_EVERY;
+    assert!(matches!(
+        step(&state, at),
+        Step::Ran {
+            replanned: true,
+            ..
+        }
+    ));
+    let metatile = row(&state, "metatile_cache");
+    assert_eq!(
+        metatile.usage.capacity_bytes,
+        grant_of(&metatile.entry).bytes
+    );
+    assert!(governor().released.is_empty());
+    ds_cache::plan::apply(&metatile.entry, grant - 32 * MIB).unwrap();
+    step(&state, at + REPLAN_EVERY);
+    assert_eq!(
+        row(&state, "metatile_cache").usage.capacity_bytes,
+        grant - 32 * MIB,
+        "not released: the thresholds hold it"
+    );
+}
+
+/// #1315 review: every size change is counted, a reload's resize of the
+/// render caches by its `[server]` setting and of a GRIB engine's own by
+/// its collection's included; a reload that changes no size counts none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reloads_resizes_are_counted() {
+    if !in_child("governor::tests::a_reloads_resizes_are_counted") {
+        return;
+    }
+    let fixture = Fixture::new("");
+    let write = |metatile_mb: u64, grid_mb: u64| {
+        fixture.write(&format!("metatile_cache_mb = {metatile_mb}\n"));
+        let mut config = std::fs::read_to_string(&fixture.path).unwrap();
+        config.push_str(&format!(
+            "[[collections]]\nid = \"nwp\"\ntitle = \"t\"\ndescription = \"d\"\n\
+             engine_type = \"grib\"\napis = [\"edr\", \"wms\"]\n[collections.grib]\n\
+             data_path = {:?}\nindex_format = \"ecmwf-json\"\ngrid_cache_mb = {grid_mb}\n",
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/grib-local")
+        ));
+        std::fs::write(&fixture.path, config).unwrap();
+    };
+    write(1024, 256);
+    let state = fixture.boot();
+    let counted = || {
+        (
+            changes_counted("metatile_cache"),
+            changes_counted("grid_cache"),
+        )
+    };
+    let (metatile, grid) = counted();
+
+    write(512, 512);
+    crate::admin::do_reload(&state).unwrap();
+    assert_eq!(
+        row(&state, "metatile_cache").usage.capacity_bytes,
+        512 * MIB
+    );
+    assert_eq!(counted(), (metatile + 1, grid + 1));
+
+    crate::admin::do_reload(&state).unwrap();
+    assert_eq!(counted(), (metatile + 1, grid + 1), "nothing changed");
 }

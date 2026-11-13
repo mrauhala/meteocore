@@ -345,13 +345,24 @@ need no reload pruning.
   environment once.
 - `governor.rs` (#1315), the memory governor: a step every 15 s on
   `poll_runtime`, under `reload_lock.try_lock()` like
-  `radar_recovery_loop`. State is one static `Governor`: the valve's
-  timers and ceilings (`caps`), the refused resizes, the last records.
-  Never hold its mutex across `memory_plan::apply*`: `apply` calls
-  `governor::capped` (a reload keeps the valve's ceilings). `fitted` is
-  called from `cache_plan::log`, so a reload restarts the tick's 5
-  minutes and forgets refused resizes; ceilings and timers carry over a
-  reload and are dropped when the gate closes. The tick logs the plan's
+  `radar_recovery_loop`, the gate read first without it. State is one
+  static `Governor`: the valve's timers and ceilings (`caps`, each with
+  the `SizeSource` it was set under), the refused resizes (keyed on
+  capacity, grant, in-place least and whether capped), the last records.
+  Never hold its mutex across `memory_plan::apply*` or a purge: `apply`
+  calls `governor::capped` (a reload keeps the valve's ceilings, never
+  below the floor or a range's `min`). `cache_plan::log` calls
+  `reconcile` before the plan is applied (drops superseded ceilings, and
+  every ceiling where the valve has no total, released for the next tick
+  to give the grant) and `fitted` after, except on a recovery pass, so a
+  reload restarts the tick's 5 minutes and forgets refused resizes while
+  a recovery pass, which `radar_recovery_loop` can run every 5 minutes,
+  never puts the tick off. Restores run on their own clock
+  (`restored_at`). Ceilings and timers carry over a reload and are
+  dropped when the gate closes. The valve at its floors counts nothing,
+  purges at most every 10 minutes and WARNs at most every 30.
+  `serve_reload` waits up to 2 s (`RELOAD_LOCK_WAIT`) for the lock before
+  its 409, so a governor step never turns a reload request away. The tick logs the plan's
   WARN block through `memory_plan::log_new_warnings` (only when its cuts
   change), never `log_warnings`, which would WARN every 5 minutes. The
   valve reads `jemalloc::resident_bytes` and purges with

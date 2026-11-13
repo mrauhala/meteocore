@@ -133,3 +133,28 @@ async fn a_panicking_reload_answers_500_and_frees_the_lock() {
     let response = post_reload(&state).await.expect("the next reload runs");
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+/// A request that meets a brief hold of the lock, a memory governor step's
+/// or a recovery pass's, waits for it instead of hearing 409 (#1315). A
+/// hold longer than [`super::RELOAD_LOCK_WAIT`] is a running reload.
+#[tokio::test]
+async fn a_reload_waits_out_a_brief_hold_of_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_over_csv(dir.path());
+
+    let held = state.reload_lock.clone().lock_owned().await;
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+    });
+    let response = post_reload(&state).await.expect("it waited for the lock");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let _held = state.reload_lock.clone().lock_owned().await;
+    let started = std::time::Instant::now();
+    let (status, _) = post_reload(&state)
+        .await
+        .expect_err("the lock stays held past the wait");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(started.elapsed() >= super::RELOAD_LOCK_WAIT);
+}

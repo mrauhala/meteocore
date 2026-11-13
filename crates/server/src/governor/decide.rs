@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ds_cache::plan::grant::{class, Class};
-use ds_cache::plan::{Entry, Kind, Row, Scope};
+use ds_cache::plan::{Entry, Kind, Row, Scope, SizeSource};
 use ds_cache::MIB;
 
 /// A cache or budget, as the governor keeps state about it across ticks.
@@ -50,6 +50,49 @@ pub(crate) const RELIEVE_TO_PERCENT: u64 = 90;
 /// grant, in percent, at least 1 MiB.
 pub(crate) const RESTORE_PERCENT: u64 = 5;
 
+/// While over the total with nothing left to lower, the valve purges dirty
+/// pages at most this often ...
+pub(crate) const PURGE_EVERY: Duration = Duration::from_secs(600);
+
+/// ... and WARNs that it is still over at most this often.
+pub(crate) const FLOORS_WARN_EVERY: Duration = Duration::from_secs(1800);
+
+/// A ceiling the valve set on a cache, with the source the cache's size had
+/// then: a reload that pins the cache or gives it other bounds supersedes
+/// it ([`Ceiling::holds`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ceiling {
+    pub bytes: u64,
+    pub source: SizeSource,
+}
+
+impl Ceiling {
+    /// Whether the ceiling still holds for a cache whose size now comes
+    /// from `source`: the source it was set under.
+    pub(crate) fn holds(&self, source: &SizeSource) -> bool {
+        self.source == *source
+    }
+}
+
+/// `grant` under a valve's ceiling of `cap`, which never takes the cache
+/// below `floor`: the plan's floor for it, a range's `min` included.
+pub(crate) fn ceiled(grant: u64, cap: u64, floor: u64) -> u64 {
+    grant.min(cap.max(floor))
+}
+
+/// A resize that stopped short, as the tick tried it: what it is not tried
+/// again with. Any of them moving tries it again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Refused {
+    /// The capacity it stopped at.
+    pub capacity: u64,
+    pub grant: u64,
+    /// The least the cache took in place then.
+    pub least: u64,
+    /// Whether the valve held a ceiling on it.
+    pub capped: bool,
+}
+
 /// Whether the re-plan tick applies `grant` to a capacity of `capacity`:
 /// it moves it by more than [`MOVE_PERCENT`] of it and [`MOVE_BYTES`]. A
 /// demand that jitters a few percent moves nothing.
@@ -61,25 +104,27 @@ pub(crate) fn moves_enough(capacity: u64, grant: u64) -> bool {
 /// The size the re-plan tick gives a cache or budget of `capacity` whose
 /// grant is `grant`, or `None` to leave it:
 ///
-/// - one the valve lowered (`cap`): its grant up to that ceiling, however
-///   little it moves, since a restore lifts the ceiling by small steps;
-/// - one whose ceiling the tick just lifted (`lifted`): its grant;
+/// - one the valve lowered (`cap`): its grant up to that ceiling, never
+///   below `floor` ([`ceiled`]), however little it moves, since a restore
+///   lifts the ceiling by small steps;
+/// - one whose ceiling was just lifted or dropped (`lifted`): its grant;
 /// - else its grant, when it moves far enough ([`moves_enough`]);
-/// - never the move the tick tried last that stopped short (`refused`, the
-///   capacity it stopped at and the grant it was given), while capacity and
-///   grant are what they were then: it is logged once, not every tick.
+/// - never the move the tick tried last that stopped short, while
+///   `refused` says nothing it depends on moved since: it is logged once,
+///   not every tick.
 pub(crate) fn tick_target(
     capacity: u64,
     grant: u64,
+    floor: u64,
     cap: Option<u64>,
     lifted: bool,
-    refused: Option<(u64, u64)>,
+    refused: bool,
 ) -> Option<u64> {
-    if refused == Some((capacity, grant)) {
+    if refused {
         return None;
     }
     match cap {
-        Some(cap) => Some(grant.min(cap)),
+        Some(cap) => Some(ceiled(grant, cap, floor)),
         None if lifted || moves_enough(capacity, grant) => Some(grant),
         None => None,
     }
@@ -186,12 +231,12 @@ pub(crate) fn relieve(slots: &[Slot]) -> Vec<(Key, u64)> {
 /// and lift those that reach their grant, or whose cache the plan no longer
 /// grants. Returns the keys raised and the keys lifted.
 pub(crate) fn restore(
-    caps: &mut HashMap<Key, u64>,
+    caps: &mut HashMap<Key, Ceiling>,
     grant_of: &dyn Fn(&Key) -> Option<u64>,
 ) -> (Vec<Key>, HashSet<Key>) {
     let mut raised = Vec::new();
     let mut lifted = HashSet::new();
-    caps.retain(|key, cap| {
+    caps.retain(|key, Ceiling { bytes: cap, .. }| {
         let Some(grant) = grant_of(key) else {
             lifted.insert(key.clone());
             return false;

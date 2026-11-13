@@ -245,12 +245,13 @@ pub(crate) fn fit(state: &ServerState, rows: &[Row], memory: &MemoryReading) -> 
 /// resized gets its configured size back.
 ///
 /// A cache the memory governor's pressure valve lowered keeps that ceiling
-/// across the reload (`crate::governor::capped`): the governor's restore
-/// lifts it.
+/// across the reload (`crate::governor::capped`), never below the plan's
+/// floor or its range's `min`, until the governor's restore lifts it or a
+/// reload gives the cache another source.
 pub(crate) fn apply(report: &Report, rows: &[Row]) -> Vec<Change> {
     match (report.mode, &report.plan) {
         (MemoryMode::Auto, Some(_)) => apply_with(report, rows, &|row, grant| {
-            Some(crate::governor::capped(&row.entry, grant.bytes))
+            Some(crate::governor::capped(&row.entry, grant))
         }),
         _ => restore(rows),
     }
@@ -357,6 +358,40 @@ pub(crate) fn count_change(id: &str) {
     CACHE_PLAN_CHANGES.with_label_values(&[id]).inc();
 }
 
+/// Run `resize` and count each capacity it changes among the plan
+/// registry's entries: a reload's staged resizes of the caches it reuses,
+/// the render caches' and a GRIB or GeoTIFF engine's own (#1315). Returns
+/// each change: the entry's key, and its capacity before and after.
+pub(crate) fn counting_resizes(
+    resize: impl FnOnce(),
+) -> Vec<(crate::governor::decide::Key, u64, u64)> {
+    let capacities = || -> HashMap<crate::governor::decide::Key, u64> {
+        ds_cache::plan::snapshot()
+            .into_iter()
+            .map(|row| {
+                (
+                    crate::governor::decide::key(&row.entry),
+                    row.usage.capacity_bytes,
+                )
+            })
+            .collect()
+    };
+    let before = capacities();
+    resize();
+    let mut changes: Vec<_> = capacities()
+        .into_iter()
+        .filter_map(|(key, capacity)| {
+            let was = *before.get(&key)?;
+            (was != capacity).then_some((key, was, capacity))
+        })
+        .collect();
+    changes.sort_by(|a, b| a.0.cmp(&b.0));
+    for (key, _, _) in &changes {
+        count_change(key.1);
+    }
+    changes
+}
+
 static CACHE_PLAN_CHANGES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|| {
     let counter = prometheus::IntCounterVec::new(
         Opts::new(
@@ -364,8 +399,8 @@ static CACHE_PLAN_CHANGES: LazyLock<prometheus::IntCounterVec> = LazyLock::new(|
             "Size changes of each cache and admission budget of /admin/cache-plan, cache its \
              /metrics family: the memory plan's at boot and on reload in [memory] mode = \
              \"auto\", its re-plan tick's every 5 minutes, the memory pressure valve's, a \
-             [memory.caches] key's, and report mode giving a size back (#1315). Each is logged \
-             with its reason",
+             [memory.caches] key's, a reload's resize by a cache's own setting, and report \
+             mode giving a size back (#1315). Each is logged with its reason",
         ),
         &["cache"],
     )
