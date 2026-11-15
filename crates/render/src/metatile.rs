@@ -783,6 +783,8 @@ where
                 c.rgba
             } else {
                 misses += 1;
+                // The miss's cost (#1314): an error or a fallback drops it.
+                let fill = cache.cache.fill_timer();
                 let tx0 = origin_x + col as f64 * span;
                 let tx1 = tx0 + span;
                 let ty_top = origin_y - row as f64 * span;
@@ -848,6 +850,7 @@ where
                         rgba: entry.clone(),
                     },
                 );
+                fill.finish();
                 entry
             };
             tiles.tiles.push(rgba);

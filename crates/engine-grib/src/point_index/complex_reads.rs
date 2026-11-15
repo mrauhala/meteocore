@@ -213,7 +213,7 @@ impl GribEngine {
             }
             Err(error) => return unexpected(entry, error),
         };
-        index.cache.record_miss();
+        index.cache.record_miss_for(key);
         let (bytes, continued) = match header.start_index(&prefix) {
             Some(_) => (prefix, false),
             None => {

@@ -1085,6 +1085,9 @@ impl Inner {
         let inner = self.clone();
         compute::spawn(move || {
             let _permit = permit;
+            // The fill's time is the computation's, not its queue's (#1314).
+            let mut guard = guard;
+            guard.restart();
             let result = inner.compute(parameter, time, slice).map(Arc::new);
             match &result {
                 Ok(grid) => {
@@ -1118,7 +1121,7 @@ impl Inner {
                 Ok(Pending::Ready(grid))
             }
             CacheEntry::Vacant(guard) => {
-                CACHE.record_miss();
+                CACHE.record_miss_for(&key);
                 let permit = compute::reserve(self.job_bytes)?;
                 Ok(Pending::Job(
                     self.submit(parameter, time, None, key, guard, permit),
@@ -1149,7 +1152,7 @@ impl Inner {
                     CacheEntry::Timeout => Err(DataServerError::ResourceExhausted),
                     // The other computation failed: try once more ourselves.
                     CacheEntry::Vacant(guard) => {
-                        CACHE.record_miss();
+                        CACHE.record_miss_for(&key);
                         let permit = compute::reserve(self.job_bytes)?;
                         wait(self.submit(parameter, time, None, key, guard, permit))
                     }

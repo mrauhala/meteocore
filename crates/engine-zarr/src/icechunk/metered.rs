@@ -169,7 +169,8 @@ impl Meter {
         Self {
             requests: AtomicU64::new(0),
             read_bytes: AtomicU64::new(0),
-            payload: ByteBoundedCache::new(payload_bytes, ds_cache::MIB, weigh_payload),
+            payload: ByteBoundedCache::new(payload_bytes, ds_cache::MIB, weigh_payload)
+                .with_ghosts(),
             staging: Default::default(),
             prefetched: Default::default(),
             #[cfg(test)]
@@ -439,8 +440,12 @@ impl Storage for MeteredStorage {
             meter.payload.insert(key, bytes.clone());
             return Ok(cached(bytes));
         }
+        // The miss's cost, its read (#1314): a staged range cost nothing
+        // now, a failed read drops it.
+        let fill = meter.payload.fill_timer();
         let (bytes, version) = self.read_payload(ctx, path, range).await?;
         meter.payload.insert(key, bytes.clone());
+        fill.finish();
         Ok((Box::pin(Cursor::new(bytes)), version))
     }
 

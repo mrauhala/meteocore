@@ -57,6 +57,7 @@ pub(crate) static FRAMES: LazyLock<FrameCache> = LazyLock::new(|| {
     // resize below its scans would refuse every scan.
     FrameCache::new_single_shard(bytes, 30 << 20, |_, frame| frame.weight)
         .with_entry_floor()
+        .with_ghosts()
         .registered(
             "satellite_frame_cache",
             plan::Scope::Engine("satellite"),
@@ -67,11 +68,13 @@ pub(crate) static FRAMES: LazyLock<FrameCache> = LazyLock::new(|| {
 /// Decoded blocks, ~260 KB each for a 24-row 2 km full-disk strip.
 pub(crate) static STRIPS: LazyLock<StripCache> = LazyLock::new(|| {
     let (bytes, source) = plan::env_bytes("MC_SATELLITE_STRIP_CACHE_MB", 256);
-    StripCache::new(bytes, 256 << 10, |_, strip| strip.len() as u64 * 2).registered(
-        "satellite_strip_cache",
-        plan::Scope::Engine("satellite"),
-        source,
-    )
+    StripCache::new(bytes, 256 << 10, |_, strip| strip.len() as u64 * 2)
+        .with_ghosts()
+        .registered(
+            "satellite_strip_cache",
+            plan::Scope::Engine("satellite"),
+            source,
+        )
 });
 
 /// Snapshot of the scan cache for `/metrics`.

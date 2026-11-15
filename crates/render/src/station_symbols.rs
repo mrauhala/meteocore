@@ -229,11 +229,13 @@ pub fn frame_cache() -> &'static ByteBoundedCache<FrameKey, Arc<Vec<Marker>>> {
     static CACHE: OnceLock<ByteBoundedCache<FrameKey, Arc<Vec<Marker>>>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let (bytes, source) = ds_cache::plan::env_bytes("MC_STATION_FRAME_CACHE_MB", 32);
-        ByteBoundedCache::new(bytes, 1024 * 1024, frame_weight).registered(
-            "station_frame_cache",
-            ds_cache::plan::Scope::Process,
-            source,
-        )
+        ByteBoundedCache::new(bytes, 1024 * 1024, frame_weight)
+            .with_ghosts()
+            .registered(
+                "station_frame_cache",
+                ds_cache::plan::Scope::Process,
+                source,
+            )
     })
 }
 

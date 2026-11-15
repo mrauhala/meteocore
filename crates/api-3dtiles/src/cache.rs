@@ -129,11 +129,16 @@ impl Drop for FlightGuard {
 impl ContentCache {
     fn new(capacity_mb: u64) -> Self {
         ContentCache {
-            cache: Arc::new(ByteBoundedCache::new(
-                capacity_mb.saturating_mul(ds_cache::MIB),
-                2 * ds_cache::MIB,
-                weigh_content,
-            )),
+            // A ghost ring, as every cache the memory plan sizes keeps
+            // (#1314).
+            cache: Arc::new(
+                ByteBoundedCache::new(
+                    capacity_mb.saturating_mul(ds_cache::MIB),
+                    2 * ds_cache::MIB,
+                    weigh_content,
+                )
+                .with_ghosts(),
+            ),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -161,10 +166,13 @@ impl ContentCache {
                 self.cache.record_hit();
                 receiver.clone()
             } else {
-                self.cache.record_miss();
+                self.cache.record_miss_for(&key);
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 map.insert(key.clone(), receiver.clone());
                 let cache = self.cache.clone();
+                // The miss's cost, the computation (#1314): a failed one
+                // drops it.
+                let fill = cache.fill_timer();
                 let guard = FlightGuard {
                     key: key.clone(),
                     inflight: self.inflight.clone(),
@@ -180,6 +188,7 @@ impl ContentCache {
                             etag: Arc::from(etag),
                         };
                         cache.insert(key, content.clone());
+                        fill.finish();
                         content
                     });
                     sender.send_replace(Some(result));

@@ -399,6 +399,10 @@ pub struct Activity {
     pub churn: Churn,
 }
 
+/// [`crate::GHOST_DEPTHS`] as multiples of the capacity: the memory each
+/// depth adds.
+pub const GHOST_DEPTH_FACTORS: [f64; 3] = [0.5, 1.0, 2.0];
+
 /// Fewer lookups an hour than this: no demand yet, so fill and hit ratio
 /// say nothing ([`Label::Idle`]). Like the thresholds below, a starting
 /// point to be set from the first two weeks of production data (#1308).
@@ -494,6 +498,32 @@ impl Activity {
         let ghost_hits = self.churn.ghost_hits?;
         let lookups = self.lookups();
         (lookups > 0).then(|| ghost_hits.map(|ghosts| (self.hits + ghosts) as f64 / lookups as f64))
+    }
+
+    /// What a miss cost over the span: the mean time of its fills, in
+    /// seconds (#1314). `None` without a fill.
+    pub fn miss_cost_seconds(&self) -> Option<f64> {
+        self.churn.mean_fill_seconds()
+    }
+
+    /// The fill time the memory at each of [`crate::GHOST_DEPTHS`] would
+    /// have saved, per hour and per byte it adds: the ghost hits within that
+    /// depth times the miss cost, over the depth's bytes (0.5 ×, 1 × and 2 ×
+    /// the capacity), at the span's rate (#1314). Seconds an hour per byte;
+    /// what borrowing and lending memory between caches ranks on. `None`
+    /// without a ghost ring, a fill or a capacity.
+    pub fn value_per_byte(&self) -> Option<[f64; 3]> {
+        let ghost_hits = self.churn.ghost_hits?;
+        let cost = self.miss_cost_seconds()?;
+        let capacity = self.capacity_bytes as f64;
+        (capacity > 0.0).then(|| {
+            let mut value = [0.0; 3];
+            for (depth, (value, hits)) in value.iter_mut().zip(ghost_hits).enumerate() {
+                let bytes = capacity * GHOST_DEPTH_FACTORS[depth];
+                *value = self.per_hour(hits) * cost / bytes;
+            }
+            value
+        })
     }
 
     /// The cache's [`Label`]; `None` for a disabled cache that has demand.
@@ -1237,6 +1267,42 @@ mod tests {
                 ..Churn::default()
             },
         }
+    }
+
+    /// #1314: the value per byte is the ghost hits within each depth times
+    /// the mean fill time, an hour, over the bytes the depth adds.
+    #[test]
+    fn the_value_per_byte_is_ghost_hits_times_the_miss_cost_over_the_depths_bytes() {
+        let mut half_hour = hour(900, 100, 0, Some([10, 30, 60]));
+        half_hour.secs = 1800;
+        half_hour.capacity_bytes = 1000 * MIB;
+        half_hour.churn.fills = 100;
+        half_hour.churn.fill_nanos = 100 * 300_000_000;
+        assert_eq!(half_hour.miss_cost_seconds(), Some(0.3));
+        let [half, one, two] = half_hour.value_per_byte().unwrap();
+        // 10 ghost hits in half an hour are 20 an hour, at 0.3 s each, over
+        // the 500 MiB that 1.5 × the capacity adds.
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12 * b.abs();
+        assert!(close(half, 20.0 * 0.3 / (500.0 * MIB as f64)), "{half}");
+        assert!(close(one, 60.0 * 0.3 / (1000.0 * MIB as f64)), "{one}");
+        assert!(close(two, 120.0 * 0.3 / (2000.0 * MIB as f64)), "{two}");
+
+        let mut no_cost = half_hour;
+        no_cost.churn.fills = 0;
+        assert_eq!(no_cost.value_per_byte(), None, "no fill timed");
+        let no_ring = Activity {
+            churn: Churn {
+                ghost_hits: None,
+                ..half_hour.churn
+            },
+            ..half_hour
+        };
+        assert_eq!(no_ring.value_per_byte(), None);
+        let disabled = Activity {
+            capacity_bytes: 0,
+            ..half_hour
+        };
+        assert_eq!(disabled.value_per_byte(), None);
     }
 
     /// #1308 acceptance: a cache with no lookups in the hour is idle,

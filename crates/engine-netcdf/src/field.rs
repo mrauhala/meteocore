@@ -165,11 +165,13 @@ pub(crate) fn field_demand(
 /// every NetCDF collection.
 static FIELDS: LazyLock<ByteBoundedCache<FieldKey, Values>> = LazyLock::new(|| {
     let (bytes, source) = ds_cache::plan::env_bytes("MC_NETCDF_FIELD_CACHE_MB", 256);
-    ByteBoundedCache::new(bytes, TYPICAL_FIELD_BYTES, weigh).registered(
-        "netcdf_field_cache",
-        ds_cache::plan::Scope::Engine("netcdf"),
-        source,
-    )
+    ByteBoundedCache::new(bytes, TYPICAL_FIELD_BYTES, weigh)
+        .with_ghosts()
+        .registered(
+            "netcdf_field_cache",
+            ds_cache::plan::Scope::Engine("netcdf"),
+            source,
+        )
 });
 
 /// The field cache's counters and occupancy.
@@ -748,7 +750,7 @@ impl Fill<'_> {
                 return Ok(values);
             }
             CacheEntry::Vacant(guard) => {
-                FIELDS.record_miss();
+                FIELDS.record_miss_for(key);
                 let Some(slot) = RENDER_FILLS.claim() else {
                     let values = fill(
                         self.file,
@@ -797,7 +799,7 @@ impl Fill<'_> {
             CacheEntry::Vacant(guard) => {
                 deadline::check()?;
                 if !own {
-                    FIELDS.record_miss();
+                    FIELDS.record_miss_for(key);
                 }
                 let values = fill(
                     self.file,

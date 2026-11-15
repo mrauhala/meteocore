@@ -321,6 +321,30 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
         assert!(checked.contains(id), "{id} not on /metrics: {checked:?}");
     }
 
+    // #1314: every cache the plan sizes keeps a ghost ring, all but the
+    // solid-image memo, a constant; and every cache family counts its
+    // fills and their time, the miss cost.
+    for row in rows
+        .iter()
+        .filter(|row| row.entry.kind == Kind::Cache && row.usage.capacity_bytes > 0)
+    {
+        let (id, collection) = (row.entry.id, row.entry.scope.collection());
+        let ring = row
+            .usage
+            .churn
+            .is_some_and(|churn| churn.ghost_hits.is_some());
+        assert_eq!(ring, id != "solid_image_cache", "{id} {collection:?}");
+        for family in [
+            format!("{id}_fills_total"),
+            format!("{id}_fill_seconds_total"),
+        ] {
+            assert!(
+                metrics.lines().any(|line| line.starts_with(&family)),
+                "{family} not on /metrics"
+            );
+        }
+    }
+
     // Every budget has a high-water mark (#1307): its `*_reserved_peak_bytes`.
     for row in rows.iter().filter(|row| row.entry.kind == Kind::Budget) {
         let family = format!("{}_reserved_peak_bytes", row.entry.id);
@@ -419,11 +443,13 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
     }
 
     // Churn families (#1308): every cache's evictions; ghost hits for a
-    // cache with a ring only; GRIB reads around the grid cache by source.
+    // cache with a ring only, which since #1314 is every cache but the
+    // solid-image memo; GRIB reads around the grid cache by source.
     for series in [
         "metatile_cache_evictions_total{ring=\"cold\"} ",
         "metatile_cache_ghost_hits_total{depth=\"0.5\"} ",
         "station_frame_cache_inserted_bytes_total ",
+        "station_frame_cache_ghost_hits_total{depth=\"0.5\"} ",
         "grid_cache_ghost_hits_total{collection=\"grib-default\",depth=\"2\"} ",
         "grid_cache_bypass_total{collection=\"grib-default\"} ",
     ] {
@@ -432,7 +458,7 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
             "{series}"
         );
     }
-    assert!(!metrics.contains("station_frame_cache_ghost_hits_total{"));
+    assert!(!metrics.contains("solid_image_cache_ghost_hits_total{"));
     assert!(rows
         .iter()
         .filter(|row| row.entry.kind == Kind::Cache)
@@ -754,6 +780,8 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
                 "bypasses": 0,
                 "ghost_hits": null,
                 "prewarmed": false,
+                "fills": 0,
+                "fill_seconds": 0.0,
             },
             "last_hour": null,
             "demand_bytes": 400 * MIB,
@@ -933,6 +961,9 @@ fn the_last_hour_says_whether_a_cache_needs_memory() {
             "estimated_hit_ratio": {"1.5x": 0.7, "2x": 0.8, "3x": 0.9},
             "label": "thrashing",
             "caveat": PREWARMED,
+            "fills": 0,
+            "miss_cost_ms": null,
+            "value_ms_per_mib_hour": null,
         })
     );
     // A full cache nobody asked: idle, and without a ring no estimate.
@@ -951,6 +982,62 @@ fn the_last_hour_says_whether_a_cache_needs_memory() {
     assert_eq!(json["hit_ratio"], Value::Null);
     assert_eq!(json["estimated_hit_ratio"], Value::Null);
     assert_eq!(json["caveat"], Value::Null);
+}
+
+/// #1314: a cache's miss cost over its window, and at each depth the fill
+/// time a MiB of that much more memory would have saved an hour: the ghost
+/// hits within the depth × the miss cost ÷ the depth's MiB. In the
+/// document and at the end of the cache's log line.
+#[test]
+fn the_last_hour_values_a_mib_of_more_memory_by_ghost_hits_and_miss_cost() {
+    let window = plan::Activity {
+        secs: 1800,
+        capacity_bytes: 1000 * MIB,
+        hits: 900,
+        misses: 100,
+        churn: Churn {
+            ghost_hits: Some([10, 30, 60]),
+            fills: 100,
+            fill_nanos: 100 * 300_000_000,
+            ..Churn::default()
+        },
+    };
+    let json = last_hour_json(&window);
+    assert_eq!(json["fills"], 100);
+    assert_eq!(json["miss_cost_ms"], 300.0);
+    // 10 ghost hits in half an hour are 20 an hour, at 300 ms each, over
+    // the 500 MiB 0.5 × the capacity adds: 12 ms an hour per MiB.
+    assert_eq!(
+        json["value_ms_per_mib_hour"],
+        json!({"0.5": 12.0, "1": 18.0, "2": 18.0})
+    );
+    assert_eq!(
+        value_suffix(&window),
+        ", miss 300.000 ms, saves 12.000 / 18.000 / 18.000 ms an hour per MiB at 1.5 / 2 / 3 ×"
+    );
+    // No ring: a miss cost, no value; no fill timed: neither.
+    let no_ring = plan::Activity {
+        churn: Churn {
+            ghost_hits: None,
+            ..window.churn
+        },
+        ..window
+    };
+    assert_eq!(
+        last_hour_json(&no_ring)["value_ms_per_mib_hour"],
+        Value::Null
+    );
+    assert_eq!(value_suffix(&no_ring), ", miss 300.000 ms");
+    let untimed = plan::Activity {
+        churn: Churn {
+            fills: 0,
+            fill_nanos: 0,
+            ..window.churn
+        },
+        ..window
+    };
+    assert_eq!(last_hour_json(&untimed)["miss_cost_ms"], Value::Null);
+    assert_eq!(value_suffix(&untimed), "");
 }
 
 /// One line per entry, grouped by scope under a heading with the totals.

@@ -184,7 +184,10 @@ impl PointIndex {
     /// one per field, so one lock costs nothing.
     pub(crate) fn new(size_mb: u64) -> Option<Self> {
         (size_mb > 0).then(|| Self {
-            cache: ByteBoundedCache::new_single_shard(size_mb.saturating_mul(MIB), 4096, weight),
+            // A ghost ring, as every cache the memory plan sizes keeps
+            // (#1314).
+            cache: ByteBoundedCache::new_single_shard(size_mb.saturating_mul(MIB), 4096, weight)
+                .with_ghosts(),
             readable: RwLock::new(HashMap::new()),
             siblings: RwLock::new(HashMap::new()),
             stores: Mutex::new(()),
@@ -674,7 +677,7 @@ impl GribEngine {
                 }
                 match Header::parse_prefix(&bytes, len) {
                     Ok(Some(header)) => {
-                        index.cache.record_miss();
+                        index.cache.record_miss_for(key);
                         (header, None, bytes, 0)
                     }
                     Ok(None) => return Ok(None),

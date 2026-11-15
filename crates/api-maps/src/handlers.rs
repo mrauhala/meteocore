@@ -1647,6 +1647,9 @@ async fn render_map(
     let height = view.height;
     let output_crs = view.output_crs;
     let rendered_cache = state.rendered_cache.clone();
+    // The miss's cost, from admission to the insert (#1314): a failed or
+    // empty render drops it.
+    let fill = rendered_cache.fill_timer();
 
     let render_parameter = effective_parameter;
     let render_z = validated.z;
@@ -1809,6 +1812,7 @@ async fn render_map(
     let (cached, x_cache) = match render_result {
         Ok((Finished::Image(cached), _)) => {
             rendered_cache.insert(cache_key, cached.clone());
+            fill.finish();
             (cached, "MISS")
         }
         Ok((Finished::Empty(tile), _)) => {

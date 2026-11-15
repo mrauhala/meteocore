@@ -519,6 +519,8 @@ fn churn_json(churn: &Churn) -> Value {
         "bypasses": churn.bypasses,
         "ghost_hits": churn.ghost_hits.map(by_depth),
         "prewarmed": churn.prewarmed,
+        "fills": churn.fills,
+        "fill_seconds": rounded(churn.fill_nanos as f64 / 1e9),
     })
 }
 
@@ -529,7 +531,11 @@ const PREWARMED: &str = "pre-warmed: entries are inserted long before they are r
 /// What a cache did over its window, up to the last hour: lookups, hit
 /// ratio, turnover (capacities admitted per hour), the ghost hits at each
 /// depth as a share of misses, the hit ratio a cache 1.5, 2 or 3 times as
-/// large would have had, and its label (#1308).
+/// large would have had, and its label (#1308); its fills, their mean time
+/// (`miss_cost_ms`) and, at each depth, the fill time a MiB of that much
+/// more memory would have saved an hour (`value_ms_per_mib_hour`): ghost
+/// hits × miss cost ÷ the depth's bytes, what #1314's borrowing and
+/// lending rank caches on.
 pub(crate) fn last_hour_json(window: &Activity) -> Value {
     let evictions = window.churn.evictions();
     json!({
@@ -550,7 +556,18 @@ pub(crate) fn last_hour_json(window: &Activity) -> Value {
         }),
         "label": window.label().map(plan::Label::as_str),
         "caveat": window.churn.prewarmed.then_some(PREWARMED),
+        "fills": window.churn.fills,
+        "miss_cost_ms": window.miss_cost_seconds().map(|s| rounded(s * 1e3)),
+        "value_ms_per_mib_hour": window
+            .value_per_byte()
+            .map(|value| by_depth(value.map(|v| rounded(ms_per_mib(v))))),
     })
+}
+
+/// A value per byte in seconds an hour ([`Activity::value_per_byte`]) as
+/// milliseconds an hour per MiB.
+pub(crate) fn ms_per_mib(seconds_per_byte: f64) -> f64 {
+    seconds_per_byte * 1e3 * MIB as f64
 }
 
 /// Values at each of [`ds_cache::GHOST_DEPTHS`], keyed by depth.
@@ -726,6 +743,26 @@ pub(crate) fn render(
         if let Some(grant) = memory_plan::grant(report, row) {
             out.push_str(&memory_plan::line_suffix(grant));
         }
+        if let Some(window) = &row.window {
+            out.push_str(&value_suffix(window));
+        }
+    }
+    out
+}
+
+/// What a line says of a cache's miss cost and value per byte over its
+/// window (#1314): nothing without a fill timed.
+pub(crate) fn value_suffix(window: &Activity) -> String {
+    let Some(cost) = window.miss_cost_seconds() else {
+        return String::new();
+    };
+    let mut out = format!(", miss {:.3} ms", cost * 1e3);
+    if let Some(value) = window.value_per_byte() {
+        let [a, b, c] = value.map(ms_per_mib);
+        let _ = write!(
+            out,
+            ", saves {a:.3} / {b:.3} / {c:.3} ms an hour per MiB at 1.5 / 2 / 3 ×"
+        );
     }
     out
 }

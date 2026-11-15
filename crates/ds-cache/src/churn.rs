@@ -22,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use quick_cache::{DefaultHashBuilder, Lifecycle};
 
@@ -84,12 +85,28 @@ pub struct Churn {
     /// inserted long before it is read, and a recency signal undervalues it
     /// (#992). Set by [`crate::ByteBoundedCache::prewarmed`].
     pub prewarmed: bool,
+    /// Fills that produced a value (#1314): the computation of a
+    /// single-flight fill ([`crate::ByteBoundedCache::get_or_insert_with`]
+    /// and the other `get_or_insert_with*`), a claim's insert
+    /// ([`crate::CacheFillGuard`]), or a fill its caller timed
+    /// ([`crate::FillTimer`]). A fill that fails counts nothing, nor does a
+    /// caller waiting for another's fill.
+    pub fills: u64,
+    /// The time those fills took, in nanoseconds: over [`Self::fills`], what
+    /// a miss of this cache costs ([`Self::mean_fill_seconds`]).
+    pub fill_nanos: u64,
 }
 
 impl Churn {
     /// Every eviction, cold and hot.
     pub fn evictions(&self) -> u64 {
         self.evicted_cold.saturating_add(self.evicted_hot)
+    }
+
+    /// The mean time of a fill, in seconds: what a miss costs. `None`
+    /// without a fill.
+    pub fn mean_fill_seconds(&self) -> Option<f64> {
+        (self.fills > 0).then(|| self.fill_nanos as f64 / 1e9 / self.fills as f64)
     }
 
     /// The counters of `self` less those of `earlier`, the same cache read
@@ -113,6 +130,8 @@ impl Churn {
             bypasses: self.bypasses.checked_sub(earlier.bypasses)?,
             ghost_hits,
             prewarmed: self.prewarmed,
+            fills: self.fills.checked_sub(earlier.fills)?,
+            fill_nanos: self.fill_nanos.checked_sub(earlier.fill_nanos)?,
         })
     }
 }
@@ -144,6 +163,8 @@ pub(crate) struct Counters {
     evicted_bytes: AtomicU64,
     bypasses: AtomicU64,
     prewarmed: AtomicBool,
+    fills: AtomicU64,
+    fill_nanos: AtomicU64,
     /// [`crate::ByteBoundedCache::with_ghosts`] asked for a ring: one is
     /// kept whenever the cache is enabled, also by a resize from `0`.
     wants_ghosts: AtomicBool,
@@ -165,6 +186,8 @@ impl Counters {
             evicted_bytes: AtomicU64::new(0),
             bypasses: AtomicU64::new(0),
             prewarmed: AtomicBool::new(false),
+            fills: AtomicU64::new(0),
+            fill_nanos: AtomicU64::new(0),
             wants_ghosts: AtomicBool::new(false),
             ghosts: OnceLock::new(),
             hasher,
@@ -231,6 +254,18 @@ impl Counters {
         self.bypasses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count `entries` fills that took `elapsed` together (#1314): one
+    /// computation that filled several entries counts each at its share.
+    /// Nothing for a disabled cache, which counts nothing.
+    pub(crate) fn record_fills(&self, entries: u64, elapsed: Duration) {
+        if entries == 0 || !self.counting() {
+            return;
+        }
+        self.fills.fetch_add(entries, Ordering::Relaxed);
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.fill_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
     /// Look a missed `key` up in the ghost ring, if the cache keeps one and
     /// is enabled.
     pub(crate) fn record_ghost<Q: Hash + ?Sized>(&self, key: &Q) {
@@ -265,6 +300,8 @@ impl Counters {
                 .get()
                 .map(|ghosts| ghosts.hits.each_ref().map(load)),
             prewarmed: self.prewarmed.load(Ordering::Relaxed),
+            fills: load(&self.fills),
+            fill_nanos: load(&self.fill_nanos),
         }
     }
 }
@@ -321,6 +358,12 @@ impl<K, V> Counting<K, V> {
 
     pub(crate) fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// The counters, shared: for a [`crate::FillTimer`], which outlives
+    /// any borrow of the cache.
+    pub(crate) fn shared_counters(&self) -> Arc<Counters> {
+        Arc::clone(&self.counters)
     }
 
     pub(crate) fn weigh(&self, key: &K, value: &V) -> u64 {

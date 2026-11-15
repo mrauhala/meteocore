@@ -1161,6 +1161,19 @@
                                     "name": "panel-135"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 42,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-227"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -25280,6 +25293,115 @@
                   "links": [],
                   "min": 0,
                   "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-227": {
+        "kind": "Panel",
+        "spec": {
+          "id": 227,
+          "title": "Miss cost: mean fill time by cache",
+          "description": "The mean time a fill took over the trailing hour, by cache family (#1314): a missed entry computed, read or fetched until inserted, timed by ds-cache for single-flight fills and claims and at the call site for the meta-tile, rendered, vector-tile, 3D Tiles, GeoTIFF tile, PVOL pixel and Icechunk payload caches. Failed fills and callers waiting for another's fill are not counted. Ghost hits times this cost, over the memory a larger cache would take, is the value per byte /admin/cache-plan reports (value_ms_per_mib_hour). Log scale.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_fill_seconds_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_fill_seconds_total\")[1h:1m])) / (sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_fills_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_fills_total\")[1h:1m])) > 0)",
+                        "legendFormat": "{{cache}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "s",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false,
+                    "scaleDistribution": {
+                      "type": "log",
+                      "log": 10
+                    }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": []
                 },
                 "overrides": []
               }

@@ -76,10 +76,12 @@ RULE = ("Every /metrics family needs a dashboard panel, and every metric a "
 # by ChurnMetricSet::new, whose own callers outside these bodies pass literals.
 CHURN_PARTS = {"{prefix}_evictions_total", "{prefix}_evicted_bytes_total",
                "{prefix}_inserted_bytes_total", "{prefix}_refused_total",
-               "{prefix}_ghost_hits_total"}
+               "{prefix}_ghost_hits_total", "{prefix}_fills_total",
+               "{prefix}_fill_seconds_total"}
 CHURN_FAMILIES = {"evictions_total": None, "evicted_bytes_total": None,
                   "inserted_bytes_total": None, "refused_total": None,
-                  "ghost_hits_total": None}
+                  "ghost_hits_total": None, "fills_total": None,
+                  "fill_seconds_total": None}
 TEMPLATES: dict[str, dict] = {
     "CacheMetricSet::new": {
         "parts": {"{prefix}_hits_total", "{prefix}_misses_total", "{prefix}_bytes",

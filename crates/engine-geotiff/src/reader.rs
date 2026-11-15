@@ -1557,6 +1557,8 @@ fn read_encoded_chunk(
     let compressed = match cached {
         Some(cached) => cached,
         None => {
+            // The miss's cost (#1314): a failed fetch drops it.
+            let fill = cache.map(crate::cache::TileCache::fill_timer);
             let fetched = fetch_range(offset..end)?;
             // A short body is bytes that did not arrive: a fetch failure.
             if fetched.len() != byte_count {
@@ -1575,6 +1577,9 @@ fn read_encoded_chunk(
                     ifd_index,
                     fetched.clone(),
                 );
+            }
+            if let Some(fill) = fill {
+                fill.finish();
             }
             fetched
         }
@@ -2691,15 +2696,19 @@ fn read_bbox_tiles(
                         {
                             return Ok(bytes);
                         }
-                        let bytes = if let Some((whole, bytes)) = batch {
+                        // A single read's cost is timed here, a batch's
+                        // around its one read (#1314).
+                        let (bytes, fill) = if let Some((whole, bytes)) = batch {
                             // Copy ONLY this tile. A Bytes slice in the LRU would
                             // retain the whole batch while charging just the slice.
                             // The chunk's admission already covers this copy.
-                            Bytes::copy_from_slice(
+                            let tile = Bytes::copy_from_slice(
                                 &bytes[range.start - whole.start..range.end - whole.start],
-                            )
+                            );
+                            (tile, None)
                         } else {
-                            fetch(range.clone())?
+                            let fill = cache.map(crate::cache::TileCache::fill_timer);
+                            (fetch(range.clone())?, fill)
                         };
                         if bytes.len() != range.len() {
                             return Err(TileReadError::Fetch(DataServerError::Engine(
@@ -2714,6 +2723,9 @@ fn read_bbox_tiles(
                                 ifd_index,
                                 bytes.clone(),
                             );
+                        }
+                        if let Some(fill) = fill {
+                            fill.finish();
                         }
                         Ok(bytes)
                     },
@@ -2737,6 +2749,9 @@ fn read_bbox_tiles(
                         // compressed copy + decoder/output allocations. It lives
                         // until the whole batch is decoded; failures unwind it.
                         let permit = BUDGET.reserve(batch.range.len() as u64)?;
+                        // One read fills the batch's tiles: each counts its
+                        // share of it (#1314).
+                        let fill = cache.map(crate::cache::TileCache::fill_timer);
                         let bytes = match fetch(batch.range.clone()) {
                             Ok(bytes) if bytes.len() == batch.range.len() => Some(bytes),
                             Err(TileReadError::Fatal(e)) => return Err(e),
@@ -2752,11 +2767,15 @@ fn read_bbox_tiles(
                         // (`read_remote_chunk_with_retry`), sharing the same
                         // absolute deadline. After a refusal that showed the
                         // object gone, those reads make no I/O.
-                        batch
+                        let read: Result<Vec<_>, _> = batch
                             .tiles
                             .iter()
                             .map(|&i| read_one(i, bytes.as_ref().map(|b| (&batch.range, b))))
-                            .collect()
+                            .collect();
+                        if let (Some(fill), Some(_), Ok(tiles)) = (fill, &bytes, &read) {
+                            fill.finish_many(tiles.len() as u64);
+                        }
+                        read
                     }
                 }
             })

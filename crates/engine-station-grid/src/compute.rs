@@ -78,6 +78,7 @@ pub(crate) static CACHE: LazyLock<ByteBoundedCache<GridKey, Arc<AnalysisGrid>>> 
         // so a resize below its grids would refuse every grid.
         ByteBoundedCache::new_single_shard(bytes, 4 * MIB, weigh)
             .with_entry_floor()
+            .with_ghosts()
             .registered(
                 "station_grid_cache",
                 plan::Scope::Engine("station-grid"),

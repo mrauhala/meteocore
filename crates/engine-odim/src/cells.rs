@@ -132,11 +132,13 @@ static CELL_SET_CACHE: std::sync::LazyLock<ds_cache::ByteBoundedCache<CellSetKey
     std::sync::LazyLock::new(|| {
         let (bytes, source) =
             ds_cache::plan::env_bytes("MC_PVOL_CELL_SET_CACHE_MB", DEFAULT_CELL_SET_CACHE_MB);
-        ds_cache::ByteBoundedCache::new(bytes, 16 * 1024, cell_set_weight_bytes).registered(
-            "pvol_cell_set_cache",
-            ds_cache::plan::Scope::Engine("odim-volume"),
-            source,
-        )
+        ds_cache::ByteBoundedCache::new(bytes, 16 * 1024, cell_set_weight_bytes)
+            .with_ghosts()
+            .registered(
+                "pvol_cell_set_cache",
+                ds_cache::plan::Scope::Engine("odim-volume"),
+                source,
+            )
     });
 
 /// Snapshot of the process-global cell-set cache for `/metrics`.
@@ -369,7 +371,7 @@ impl PolarVolumeSiteView {
         query: &CellQuery,
         handle: Option<&tokio::runtime::Handle>,
     ) -> Result<Arc<CellSet>, DataServerError> {
-        CELL_SET_CACHE.record_miss();
+        CELL_SET_CACHE.record_claimed_miss(&fill);
         let (grid, valid) = self.voxel_grid_cached(entry, quantity, dims, handle)?;
         let set = Arc::new(segment(
             &grid,

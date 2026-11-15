@@ -123,7 +123,7 @@ impl DsStore {
             shared: Arc::new(Shared {
                 store,
                 root: root.into().trim_matches('/').to_string(),
-                cache: ByteBoundedCache::new(max_bytes, ds_cache::MIB, weigh_bytes),
+                cache: ByteBoundedCache::new(max_bytes, ds_cache::MIB, weigh_bytes).with_ghosts(),
             }),
             generation: Arc::new(Generation::new()),
         }
