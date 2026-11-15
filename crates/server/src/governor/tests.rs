@@ -704,6 +704,13 @@ async fn the_governor_is_gated_ticks_and_skips_while_a_reload_holds_the_lock() {
     assert_eq!(document["pressure"]["valve"], true, "total_mb");
     assert_eq!(document["pressure"]["total_bytes"], 8192 * MIB);
     assert!(document["pressure"]["resident_bytes"].as_u64().unwrap() > 0);
+    // #1314: the tick weighed elastic memory, report only. Nothing has a
+    // window yet, so nothing is weighed and nothing moves.
+    let elastic = &document["elastic"];
+    assert_eq!(elastic["mode"], "report", "{document}");
+    assert_eq!(elastic["held"], Value::Null);
+    assert_eq!(elastic["moves"], json!([]));
+    assert!(elastic["step_bytes"].as_u64().unwrap() >= ELASTIC_STEP_BYTES);
 
     {
         let _reload = state.reload_lock.try_lock().unwrap();
@@ -1129,4 +1136,600 @@ async fn a_cache_refusing_its_shrink_keeps_no_ceiling_and_is_named() {
     assert!(logged.contains("refused its shrink"), "{logged}");
     assert!(!governor().caps.contains_key(&decide::key(&entry)));
     drop(owner);
+}
+
+// --- Elastic memory (#1314), report only -------------------------------
+
+/// What reaches a simulated cache: `lookups` an hour spread evenly over a
+/// working set of `working_set` bytes, each miss costing `cost` seconds. A
+/// cache of capacity C hits min(1, C / W) of them, one 1.5 × as large
+/// min(1, 1.5 C / W): the difference are its ghost hits at the ring's first
+/// depth. A scan's keys are never asked for again: no ghost hits however
+/// much it misses.
+#[derive(Debug, Clone, Copy)]
+struct Load {
+    lookups: f64,
+    working_set: u64,
+    cost: f64,
+    scan: bool,
+}
+
+const IDLE: Load = Load {
+    lookups: 0.0,
+    working_set: GIB,
+    cost: 0.003,
+    scan: false,
+};
+
+/// 100 000 lookups an hour over `gib` GiB, 3 ms a miss.
+fn thrash(gib: u64) -> Load {
+    Load {
+        lookups: 100_000.0,
+        working_set: gib * GIB,
+        cost: 0.003,
+        scan: false,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SimCache {
+    key: Key,
+    capacity: u64,
+    floor: u64,
+    ceiling: u64,
+    load: Load,
+    lends: bool,
+}
+
+fn sim_cache(id: &'static str, capacity_mib: u64, floor_mib: u64, load: Load) -> SimCache {
+    SimCache {
+        key: (ds_cache::plan::Kind::Cache, id, Scope::Process),
+        capacity: capacity_mib * MIB,
+        floor: floor_mib * MIB,
+        ceiling: 8 * capacity_mib * MIB,
+        load,
+        lends: true,
+    }
+}
+
+/// `cache` as elastic memory weighs it over an hour, its ghost hits times
+/// `noise`.
+fn weigh(cache: &SimCache, noise: f64) -> Elastic {
+    let capacity = cache.capacity as f64;
+    let working_set = cache.load.working_set as f64;
+    let hit = |bytes: f64| (bytes / working_set).min(1.0);
+    let ghost_hits = if cache.load.scan {
+        0.0
+    } else {
+        cache.load.lookups * (hit(1.5 * capacity) - hit(capacity)) * noise
+    };
+    Elastic {
+        key: cache.key.clone(),
+        capacity: cache.capacity,
+        floor: cache.floor,
+        ceiling: cache.ceiling,
+        value: ghost_hits * cache.load.cost / (0.5 * capacity),
+        ghost_hits: ghost_hits as u64,
+        lends: cache.lends,
+    }
+}
+
+/// One tick of the simulation over a pool of `pool`: weigh, propose, and
+/// carry the proposed capacities forward as if they were applied, which
+/// production does not do yet. `noise(i)` scales cache `i`'s ghost hits.
+fn sim_tick(caches: &mut [SimCache], pool: u64, noise: &mut dyn FnMut(usize) -> f64) -> Vec<Move> {
+    let weighed: Vec<Elastic> = caches
+        .iter()
+        .enumerate()
+        .map(|(i, cache)| weigh(cache, noise(i)))
+        .collect();
+    let moves = elastic(&weighed, pool);
+    for m in &moves {
+        for cache in caches.iter_mut() {
+            if cache.key == m.borrower {
+                cache.capacity += m.bytes;
+            }
+            if cache.key == m.lender {
+                cache.capacity -= m.bytes;
+            }
+            assert!(cache.capacity >= cache.floor, "{cache:?} below its floor");
+            assert!(
+                cache.capacity <= cache.ceiling,
+                "{cache:?} above its ceiling"
+            );
+        }
+    }
+    moves
+}
+
+/// ±5 % noise, reproducible: a linear congruential generator.
+fn noise(seed: u64) -> impl FnMut(usize) -> f64 {
+    let mut state = seed;
+    move |_| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        0.95 + 0.1 * ((state >> 11) as f64 / (1u64 << 53) as f64)
+    }
+}
+
+/// #1314 acceptance: of two caches, one thrashing and one idle, capacity
+/// moves to the thrashing one within N ticks, and back when the load
+/// swaps; the idle one never goes below its floor, and once the thrashing
+/// one holds its working set nothing moves.
+#[test]
+fn memory_moves_to_the_thrashing_cache_and_back_when_the_load_swaps() {
+    let pool = 8 * GIB;
+    assert_eq!(elastic_step(pool), 81 * MIB, "1 % of the pool");
+    let mut caches = vec![
+        sim_cache("a_cache", 1024, 128, thrash(3)),
+        sim_cache("b_cache", 4096, 512, IDLE),
+    ];
+    let mut steady = &mut |_: usize| 1.0;
+    let mut ticks = 0;
+    while caches[0].capacity < 3 * GIB {
+        let moves = sim_tick(&mut caches, pool, &mut steady);
+        assert_eq!(moves.len(), 1, "tick {ticks}: {caches:?}");
+        assert_eq!(moves[0].borrower.1, "a_cache");
+        assert_eq!(moves[0].lender.1, "b_cache");
+        ticks += 1;
+        assert!(ticks <= 30, "{caches:?}");
+    }
+    // Its working set held, it borrows no more.
+    for _ in 0..50 {
+        assert_eq!(sim_tick(&mut caches, pool, &mut steady), []);
+    }
+    let held = caches[0].capacity;
+    assert!(caches[1].capacity >= caches[1].floor);
+
+    // The load swaps: the memory goes back.
+    caches[0].load = IDLE;
+    caches[1].load = thrash(3);
+    let mut ticks = 0;
+    while caches[1].capacity < 3 * GIB {
+        let moves = sim_tick(&mut caches, pool, &mut steady);
+        assert_eq!(moves.len(), 1, "tick {ticks}: {caches:?}");
+        assert_eq!(moves[0].borrower.1, "b_cache");
+        ticks += 1;
+        assert!(ticks <= 30, "{caches:?}");
+    }
+    assert!(caches[0].capacity < held);
+    assert!(caches[0].capacity >= caches[0].floor);
+}
+
+/// #1314 acceptance: a one-pass scan evicts plenty and misses every
+/// lookup, but no key comes back: no ghost hits, so no move.
+#[test]
+fn a_scan_with_evictions_but_no_ghost_hits_moves_nothing() {
+    let scan = Load {
+        working_set: 100 * GIB,
+        scan: true,
+        ..thrash(100)
+    };
+    let mut caches = vec![
+        sim_cache("scan_cache", 1024, 128, scan),
+        sim_cache("idle_cache", 4096, 512, IDLE),
+    ];
+    for _ in 0..50 {
+        assert_eq!(sim_tick(&mut caches, 8 * GIB, &mut |_| 1.0), []);
+    }
+}
+
+/// #1314 acceptance: ±5 % noise in ghost hits moves nothing over 50 ticks,
+/// between two caches under the same load, and once memory has moved.
+#[test]
+fn noise_of_5_percent_in_ghost_hits_moves_nothing_over_50_ticks() {
+    let pool = 8 * GIB;
+    let mut even = vec![
+        sim_cache("a_cache", 2048, 128, thrash(3)),
+        sim_cache("b_cache", 2048, 128, thrash(3)),
+    ];
+    let mut wobble = noise(1314);
+    for _ in 0..50 {
+        assert_eq!(sim_tick(&mut even, pool, &mut wobble), []);
+    }
+    // Moved until the busy cache holds most of its working set, then noise.
+    let mut moved = vec![
+        sim_cache("a_cache", 1024, 128, thrash(3)),
+        sim_cache(
+            "b_cache",
+            4096,
+            512,
+            Load {
+                lookups: 1_000.0,
+                ..thrash(1)
+            },
+        ),
+    ];
+    for _ in 0..40 {
+        sim_tick(&mut moved, pool, &mut |_| 1.0);
+    }
+    let settled: Vec<u64> = moved.iter().map(|c| c.capacity).collect();
+    for _ in 0..50 {
+        assert_eq!(sim_tick(&mut moved, pool, &mut wobble), [], "{moved:?}");
+    }
+    assert_eq!(
+        moved.iter().map(|c| c.capacity).collect::<Vec<_>>(),
+        settled
+    );
+
+    // Two busy caches of unlike loads settle where neither is worth twice
+    // the other a byte more. Noise near that edge may tip a move more the
+    // same way, never one back: back takes the other at twice the first.
+    let mut busy = vec![
+        sim_cache("a_cache", 1024, 128, thrash(3)),
+        sim_cache(
+            "b_cache",
+            4096,
+            512,
+            Load {
+                lookups: 50_000.0,
+                ..thrash(6)
+            },
+        ),
+    ];
+    let mut directions = BTreeSet::new();
+    for _ in 0..100 {
+        for m in sim_tick(&mut busy, pool, &mut wobble) {
+            directions.insert((m.borrower.1, m.lender.1));
+        }
+    }
+    assert_eq!(
+        directions.into_iter().collect::<Vec<_>>(),
+        [("a_cache", "b_cache")],
+        "{busy:?}"
+    );
+}
+
+fn elastic_cache(id: &'static str, capacity_mib: u64, value: f64, ghost_hits: u64) -> Elastic {
+    Elastic {
+        key: (ds_cache::plan::Kind::Cache, id, Scope::Process),
+        capacity: capacity_mib * MIB,
+        floor: 64 * MIB,
+        ceiling: 8 * capacity_mib * MIB,
+        value,
+        ghost_hits,
+        lends: true,
+    }
+}
+
+/// A move needs a borrower worth twice its lender a byte more, with enough
+/// ghost hits; it is the step, at most a tenth of either cache, within
+/// the lender's floor and the borrower's ceiling, in whole MiB; at most
+/// four a tick, each cache in one; a cache that does not lend never does.
+#[test]
+fn a_move_needs_twice_the_value_and_stays_within_its_bounds() {
+    let pool = 8 * GIB;
+    let busy = |value| elastic_cache("busy_cache", 2048, value, 100);
+    let quiet = elastic_cache("quiet_cache", 4096, 1.0, 100);
+    assert_eq!(
+        elastic(&[busy(1.99), quiet.clone()], pool),
+        [],
+        "under twice"
+    );
+    let moves = elastic(&[busy(2.0), quiet.clone()], pool);
+    assert_eq!(moves.len(), 1);
+    assert_eq!(
+        (moves[0].borrower.1, moves[0].lender.1),
+        ("busy_cache", "quiet_cache")
+    );
+    assert_eq!(moves[0].bytes, 81 * MIB, "the step");
+    assert_eq!((moves[0].borrower_value, moves[0].lender_value), (2.0, 1.0));
+
+    let few = Elastic {
+        ghost_hits: ELASTIC_MIN_GHOST_HITS - 1,
+        ..busy(100.0)
+    };
+    assert_eq!(
+        elastic(&[few, quiet.clone()], pool),
+        [],
+        "too few ghost hits"
+    );
+    let spared = Elastic {
+        lends: false,
+        value: 0.0,
+        ..quiet.clone()
+    };
+    assert_eq!(elastic(&[busy(10.0), spared], pool), [], "it never lends");
+
+    // A tenth of the smaller cache, its floor, its ceiling.
+    let small = elastic_cache("small_cache", 300, 0.0, 0);
+    assert_eq!(
+        elastic(&[busy(10.0), small.clone()], pool)[0].bytes,
+        30 * MIB
+    );
+    let at_floor = Elastic {
+        floor: 290 * MIB,
+        ..small.clone()
+    };
+    assert_eq!(elastic(&[busy(10.0), at_floor], pool)[0].bytes, 10 * MIB);
+    let near_ceiling = Elastic {
+        ceiling: 2048 * MIB + 5 * MIB + 1,
+        ..busy(10.0)
+    };
+    assert_eq!(
+        elastic(&[near_ceiling, quiet.clone()], pool)[0].bytes,
+        5 * MIB
+    );
+    let full = Elastic {
+        ceiling: 2048 * MIB,
+        ..busy(10.0)
+    };
+    assert_eq!(elastic(&[full, quiet.clone()], pool), [], "at its ceiling");
+    let tiny = elastic_cache("tiny_cache", 9, 10.0, 100);
+    assert_eq!(
+        elastic(&[tiny, quiet], pool),
+        [],
+        "a tenth of it is under 1 MiB"
+    );
+
+    // Six borrowers and six lenders: four moves, the best borrowers first,
+    // each from the cheapest lender left.
+    let ids = ["c1", "c2", "c3", "c4", "c5", "c6"];
+    let mut caches: Vec<Elastic> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| elastic_cache(id, 4096, 100.0 + i as f64, 100))
+        .collect();
+    let lenders = ["l1", "l2", "l3", "l4", "l5", "l6"];
+    caches.extend(
+        lenders
+            .iter()
+            .enumerate()
+            .map(|(i, id)| elastic_cache(id, 4096, i as f64, 0)),
+    );
+    let moves = elastic(&caches, pool);
+    let pairs: Vec<(&str, &str)> = moves.iter().map(|m| (m.borrower.1, m.lender.1)).collect();
+    assert_eq!(
+        pairs,
+        [("c6", "l1"), ("c5", "l2"), ("c4", "l3"), ("c3", "l4")]
+    );
+}
+
+/// The caches the tick weighs, from its rows and plan: those the plan
+/// sizes, with a ring and a timed fill; a value from the window's ghost
+/// hits and miss cost, or the cache's mean fill since it was built when
+/// the window timed none; no lending from a cache filled ahead of reads.
+#[test]
+fn the_tick_weighs_the_caches_the_plan_sizes_with_a_ring_and_a_timed_fill() {
+    use ds_cache::plan::{Activity, Kind, Row, Usage};
+    use ds_cache::Churn;
+    let hour = |ghost_hits: Option<[u64; 3]>, fills: u64| Activity {
+        secs: 3600,
+        capacity_bytes: GIB,
+        hits: 900,
+        misses: 100,
+        churn: Churn {
+            ghost_hits,
+            fills,
+            fill_nanos: fills * 2_000_000,
+            ..Churn::default()
+        },
+    };
+    let row = |id: &'static str, scope: Scope, source: SizeSource, window, ever: u64| Row {
+        entry: Entry::cache(id, scope, source),
+        usage: Usage {
+            capacity_bytes: GIB,
+            used_bytes: GIB / 2,
+            entries: Some(10),
+            hits: Some(900),
+            misses: Some(100),
+            churn: Some(Churn {
+                fills: ever,
+                fill_nanos: ever * 4_000_000,
+                ..Churn::default()
+            }),
+        },
+        window,
+        demand: None,
+        configured_bytes: GIB,
+        planned: false,
+        least_bytes: 32 * MIB,
+    };
+    let ring = Some([20, 30, 40]);
+    let mut rows = vec![
+        row(
+            "metatile_cache",
+            Scope::Process,
+            SizeSource::Default,
+            Some(hour(ring, 50)),
+            500,
+        ),
+        row(
+            "rendered_cache",
+            Scope::Process,
+            SizeSource::Config("[memory.caches] rendered"),
+            Some(hour(ring, 50)),
+            500,
+        ),
+        row(
+            "vector_tile_cache",
+            Scope::Process,
+            SizeSource::Default,
+            Some(hour(None, 50)),
+            500,
+        ),
+        row(
+            "tiles3d_content_cache",
+            Scope::Process,
+            SizeSource::Default,
+            Some(hour(ring, 50)),
+            500,
+        ),
+        row(
+            "geotiff_decoded_chunk_cache",
+            Scope::Engine("geotiff"),
+            SizeSource::Default,
+            Some(hour(ring, 0)),
+            500,
+        ),
+        row(
+            "odim_composite_cache",
+            Scope::Engine("odim"),
+            SizeSource::Default,
+            Some(hour(ring, 0)),
+            0,
+        ),
+        row(
+            "satellite_frame_cache",
+            Scope::Engine("satellite"),
+            SizeSource::Default,
+            Some(hour(ring, 50)),
+            500,
+        ),
+        row(
+            "pvol_voxel_grid_cache",
+            Scope::Engine("odim-volume"),
+            SizeSource::Default,
+            None,
+            500,
+        ),
+    ];
+    rows.push(Row {
+        usage: Usage {
+            capacity_bytes: 0,
+            ..rows[0].usage
+        },
+        ..row(
+            "lightning_strike_cache",
+            Scope::Engine("postgis"),
+            SizeSource::Default,
+            Some(hour(ring, 50)),
+            500,
+        )
+    });
+    let inputs = Inputs::of_rows(
+        32 * GIB,
+        4,
+        Baseline::Estimated,
+        &rows,
+        |row| (row.entry.id == "tiles3d_content_cache").then(|| "no 3dtiles collection".into()),
+        false,
+    );
+    let plan = plan(&inputs);
+    let weighed = elastic_inputs(&rows, &plan);
+    let ids: Vec<&str> = weighed.iter().map(|c| c.key.1).collect();
+    assert_eq!(
+        ids,
+        [
+            "metatile_cache",
+            "geotiff_decoded_chunk_cache",
+            "satellite_frame_cache"
+        ],
+        "pinned, without a ring, unreachable, never timed, unsampled and disabled ones drop"
+    );
+    let metatile = &weighed[0];
+    // 20 ghost hits an hour at 2 ms, over the 512 MiB half the capacity adds.
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b;
+    assert!(
+        close(metatile.value, 20.0 * 0.002 / (512.0 * MIB as f64)),
+        "{metatile:?}"
+    );
+    assert_eq!(metatile.ghost_hits, 20);
+    assert_eq!(metatile.capacity, GIB);
+    let grant = plan.grant(&rows[0].entry).unwrap();
+    assert_eq!(metatile.ceiling, grant.ceiling_bytes);
+    assert_eq!(metatile.floor, grant.floor_bytes.max(32 * MIB));
+    assert!(metatile.lends);
+    // No fill in the window: the mean since it was built, 4 ms.
+    assert!(close(weighed[1].value, 20.0 * 0.004 / (512.0 * MIB as f64)));
+    assert!(!weighed[2].lends, "a demand cache, filled ahead of reads");
+    assert!(rows.iter().all(|r| r.entry.kind == Kind::Cache));
+}
+
+/// While the pressure valve holds, elastic memory weighs nothing; else it
+/// proposes the moves the decision makes, logged once while they repeat,
+/// counted every tick, and listed with every cache it weighed in
+/// `/admin/cache-plan`.
+#[test]
+fn proposals_wait_for_the_valve_and_are_logged_counted_and_listed() {
+    let caches = vec![
+        elastic_cache("metatile_cache", 4096, 1e-9, 100),
+        Elastic {
+            key: (
+                ds_cache::plan::Kind::Cache,
+                "tile_cache",
+                Scope::Collection {
+                    engine: "geotiff",
+                    id: "radar".into(),
+                },
+            ),
+            ..elastic_cache("tile_cache", 1024, 0.0, 0)
+        },
+    ];
+    let moves = elastic(&caches, 8 * GIB);
+    let proposal = Proposal {
+        at: chrono::Utc::now(),
+        held: None,
+        step_bytes: elastic_step(8 * GIB),
+        caches: caches.clone(),
+        moves: moves.clone(),
+    };
+    let block = elastic_block(&proposal);
+    assert_eq!(
+        block,
+        format!(
+            "Elastic memory, report only, nothing resized (#1314): 2 caches weighed, 1 move a \
+             tick would make, in steps of at most 81 MiB\n  tile_cache radar → metatile_cache: \
+             81 MiB; a MiB more saves {:.3} ms of fills an hour there, 0.000 where it comes from",
+            crate::cache_plan::ms_per_mib(1e-9)
+        )
+    );
+    let none = Proposal {
+        moves: Vec::new(),
+        ..proposal.clone()
+    };
+    assert!(
+        elastic_block(&none).ends_with(", no move: no cache's MiB more is worth 2 times another's")
+    );
+
+    let document = elastic_json(&proposal);
+    assert_eq!(document["mode"], "report");
+    assert_eq!(document["held"], Value::Null);
+    assert_eq!(document["step_bytes"], 81 * MIB);
+    assert_eq!(
+        document["moves"][0]["lender"],
+        json!({"id": "tile_cache", "collection": "radar"})
+    );
+    assert_eq!(document["moves"][0]["bytes"], 81 * MIB);
+    assert_eq!(document["caches"][1]["floor_bytes"], 64 * MIB);
+    assert_eq!(document["caches"][1]["lends"], true);
+
+    let counted = |cache: &str, role: &str| {
+        ELASTIC_BYTES
+            .with_label_values(&[cache, role, "report"])
+            .get()
+    };
+    let before = (
+        counted("metatile_cache", "borrow"),
+        counted("tile_cache", "lend"),
+    );
+    record_elastic(proposal.clone());
+    record_elastic(proposal.clone());
+    assert_eq!(
+        (
+            counted("metatile_cache", "borrow"),
+            counted("tile_cache", "lend")
+        ),
+        (before.0 + 2 * 81 * MIB, before.1 + 2 * 81 * MIB),
+        "counted every tick"
+    );
+    assert_eq!(
+        governor().elastic_logged,
+        Some(vec![(moves[0].borrower.clone(), moves[0].lender.clone())])
+    );
+
+    // The valve holds: nothing weighed, nothing moved.
+    let rows: Vec<ds_cache::plan::Row> = Vec::new();
+    let empty = plan(&Inputs {
+        total_bytes: 8 * GIB,
+        collections: 1,
+        baseline: Baseline::Estimated,
+        caches: Vec::new(),
+        budgets: Vec::new(),
+    });
+    let held = propose(&rows, &empty, true);
+    assert_eq!(held.held, Some(VALVE_HOLDS));
+    assert!(held.moves.is_empty() && held.caches.is_empty());
+    assert_eq!(elastic_json(&held)["held"], VALVE_HOLDS);
 }

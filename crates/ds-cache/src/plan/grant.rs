@@ -504,6 +504,13 @@ pub struct Grant {
     pub expected_bytes: u64,
     /// The least a cut gives it; its grant when nothing cuts it.
     pub floor_bytes: u64,
+    /// The most its rule gives it (#1314): a traffic-driven cache
+    /// [`TRAFFIC_RANGE`] times its size today, a working-set cache
+    /// [`WORKING_SET_MAX`], a demand cache its demand plus 15 %, never above
+    /// a range's `max` (rule 9) nor below its grant. Its grant for a budget
+    /// and for a cache no rule sizes: a pinned, fixed, unreachable or
+    /// disabled one. What memory lent between caches never takes it past.
+    pub ceiling_bytes: u64,
     /// The size of one entry, for the shard layout of a cache built at
     /// the grant (rule 8); `None` for a budget or when unknown.
     pub entry_bytes: Option<u64>,
@@ -663,6 +670,7 @@ fn of_cache(input: &CacheInput, floors_only: bool, keep: Option<&Plan>) -> Plann
             bytes: today,
             expected_bytes: today,
             floor_bytes: today,
+            ceiling_bytes: today,
             entry_bytes,
             reason: Reason::Fixed,
         },
@@ -735,6 +743,7 @@ fn of_cache(input: &CacheInput, floors_only: bool, keep: Option<&Plan>) -> Plann
                 Some(rule) if rule >= today => Reason::Demand,
                 _ => Reason::Today,
             };
+            planned.ceiling = bound(want.max(least));
             (want, floor, reason)
         }
         Class::WorkingSet => {
@@ -751,6 +760,7 @@ fn of_cache(input: &CacheInput, floors_only: bool, keep: Option<&Plan>) -> Plann
             // off today.
             let entries = entry_bytes.unwrap_or(0).saturating_mul(FLOOR_ENTRIES);
             planned.useful = mib_up(entries).clamp(WORKING_SET_MIN, WORKING_SET_MAX);
+            planned.ceiling = bound(WORKING_SET_MAX.max(today).max(least));
             // Scaled with the others and raised to `today` later.
             (want, planned.useful.min(today), Reason::WorkingSet)
         }
@@ -805,6 +815,7 @@ fn of_budget(
             bytes: today,
             expected_bytes: today,
             floor_bytes: today,
+            ceiling_bytes: today,
             entry_bytes: None,
             reason: Reason::Pinned,
         },
@@ -1226,8 +1237,24 @@ fn fit(inputs: &Inputs, keep: Option<&Plan>, ideal: Option<&Plan>) -> Plan {
             0
         },
         cut,
-        caches: caches.into_iter().map(|c| c.grant).collect(),
-        budgets: budgets.into_iter().map(|b| b.grant).collect(),
+        caches: caches
+            .into_iter()
+            .map(|mut c| {
+                // A cache no rule sizes has no room above its grant.
+                c.grant.ceiling_bytes = match c.group {
+                    Group::Never => c.grant.bytes,
+                    _ => c.ceiling.max(c.grant.bytes),
+                };
+                c.grant
+            })
+            .collect(),
+        budgets: budgets
+            .into_iter()
+            .map(|mut b| {
+                b.grant.ceiling_bytes = b.grant.bytes;
+                b.grant
+            })
+            .collect(),
     }
 }
 

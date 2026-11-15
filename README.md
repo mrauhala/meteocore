@@ -865,6 +865,37 @@ reload does: a step a reload holds the reload lock through is skipped.
   `total_bytes`, `state` over, under or normal, how long), its ceilings
   and its last relief and restore. The dashboard's Memory governor panel
   shows both counters, and a Memory pressure annotation marks each relief.
+- **Elastic memory, report only** (#1314): each re-plan tick also weighs
+  what a MiB more is worth in each cache the plan sizes, from its last
+  hour: its ghost hits within half its capacity more, times its miss cost
+  (`value_ms_per_mib_hour` at 0.5 in `last_hour`). It proposes moving
+  memory from the caches where it is worth least to those where it is
+  worth most, and **applies nothing**: the moves are logged at INFO (again
+  only when they change), counted and listed. Its rules:
+  - a cache borrows with at least 10 ghost hits in its window and room
+    under its ceiling, the most its plan rule gives it (8 × its size today
+    for a traffic-driven cache, 2 GiB for a working set, a range's `max`);
+  - a cache lends down to its floor: the plan's floor for it, its range's
+    `min` and what it shrinks to in place. A cache its engines fill ahead
+    of requests never lends;
+  - a move only where the borrower's MiB more is worth at least twice the
+    lender's, so values between half and twice each other move nothing
+    either way; one with no ghost hits is worth nothing;
+  - a move is max(64 MiB, 1 % of the pool), at most a tenth of either
+    cache, at most four moves a tick, each cache in one;
+  - a cache without a ghost ring, or that never timed a fill, neither
+    borrows nor lends; nor a pinned one, nor one no collection reaches;
+  - nothing while the pressure valve holds: over the total, or a ceiling
+    of its still in force.
+
+  Since nothing applies them, a move repeats each tick while it holds.
+  `cache_elastic_moves_total{cache,role,mode}` and
+  `cache_elastic_bytes_total{cache,role,mode}` count them, `role` `borrow`
+  or `lend`, `mode` `report`; `/admin/cache-plan` has the last proposal as
+  `governor.elastic`: its `moves` (borrower, lender, bytes and the two
+  values) and every cache it weighed with its capacity, floor, ceiling,
+  ghost hits, value and whether it lends. The dashboard's Elastic memory
+  panels show both counters.
 
 A key set to exactly its default (`metatile = 1024`, `[grib]
 grid_cache_mb = 256`) pins it like any other value. An `MC_…` variable

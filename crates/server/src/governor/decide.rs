@@ -267,3 +267,137 @@ pub(crate) fn restore(
     });
     (raised, lifted)
 }
+
+/// Elastic memory (#1314): the step a move takes at most is this much, or
+/// [`ELASTIC_STEP_POOL_PERCENT`] of the caches' pool when that is more.
+pub(crate) const ELASTIC_STEP_BYTES: u64 = 64 * MIB;
+
+/// See [`ELASTIC_STEP_BYTES`].
+pub(crate) const ELASTIC_STEP_POOL_PERCENT: u64 = 1;
+
+/// At most this many moves a tick, each cache in one at most.
+pub(crate) const ELASTIC_MAX_MOVES: usize = 4;
+
+/// A move only where the borrower's value per byte is at least this many
+/// times the lender's: between half and twice the other's value no memory
+/// moves either way, so values that wobble move nothing.
+pub(crate) const ELASTIC_VALUE_RATIO: f64 = 2.0;
+
+/// A move takes at most this share of the lender's capacity, and adds at
+/// most this share of the borrower's, in percent.
+pub(crate) const ELASTIC_MAX_PERCENT: u64 = 10;
+
+/// A cache borrows only with at least this many ghost hits within the
+/// ring's first depth over its window: fewer are noise, whatever their
+/// value per byte.
+pub(crate) const ELASTIC_MIN_GHOST_HITS: u64 = 10;
+
+/// A cache as elastic memory weighs it (#1314): what a byte more of it is
+/// worth, and how far it may move.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Elastic {
+    pub key: Key,
+    pub capacity: u64,
+    /// The least it may lend down to: the plan's floor for it, its range's
+    /// `min`, and what it shrinks to in place.
+    pub floor: u64,
+    /// The most it may borrow up to: the plan's ceiling for it
+    /// (`Grant::ceiling_bytes`).
+    pub ceiling: u64,
+    /// The fill time a byte more would have saved an hour, at the ring's
+    /// first depth (half the capacity more): its ghost hits there times its
+    /// miss cost, over those bytes. Seconds an hour per byte.
+    pub value: f64,
+    /// The ghost hits within that depth, over the window the value is from.
+    pub ghost_hits: u64,
+    /// It may give memory up: not a cache its engines fill ahead of
+    /// requests ([`spared`]), which below that re-downloads in a loop.
+    pub lends: bool,
+}
+
+/// Memory elastic sharing would move: `bytes` from `lender` to `borrower`,
+/// with the value per byte of each.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Move {
+    pub borrower: Key,
+    pub lender: Key,
+    pub bytes: u64,
+    pub borrower_value: f64,
+    pub lender_value: f64,
+}
+
+/// The step of a move over a pool of `pool_bytes`: [`ELASTIC_STEP_BYTES`],
+/// or [`ELASTIC_STEP_POOL_PERCENT`] of the pool when that is more, in
+/// whole MiB.
+pub(crate) fn elastic_step(pool_bytes: u64) -> u64 {
+    let share = pool_bytes / 100 * ELASTIC_STEP_POOL_PERCENT;
+    ELASTIC_STEP_BYTES.max(share / MIB * MIB)
+}
+
+/// The moves one tick would make between `caches` over a pool of
+/// `pool_bytes` (#1314): the caches whose byte more is worth the most
+/// borrow, in that order, each from the cache whose byte more is worth the
+/// least, while the borrower's value is at least [`ELASTIC_VALUE_RATIO`]
+/// times the lender's:
+///
+/// - a borrower has [`ELASTIC_MIN_GHOST_HITS`] at least, and room under its
+///   ceiling;
+/// - a lender lends ([`Elastic::lends`]), with room above its floor; one
+///   with no ghost hits is worth nothing a byte more;
+/// - a move is the step ([`elastic_step`]), at most
+///   [`ELASTIC_MAX_PERCENT`] of either cache, the lender's room above its
+///   floor and the borrower's under its ceiling, in whole MiB, and at
+///   least one;
+/// - at most [`ELASTIC_MAX_MOVES`], each cache in one at most.
+pub(crate) fn elastic(caches: &[Elastic], pool_bytes: u64) -> Vec<Move> {
+    let step = elastic_step(pool_bytes);
+    let share = |c: &Elastic| c.capacity / 100 * ELASTIC_MAX_PERCENT;
+    let mut borrowers: Vec<&Elastic> = caches
+        .iter()
+        .filter(|c| c.ghost_hits >= ELASTIC_MIN_GHOST_HITS && c.value > 0.0)
+        .filter(|c| c.ceiling > c.capacity)
+        .collect();
+    borrowers.sort_by(|a, b| b.value.total_cmp(&a.value).then_with(|| a.key.cmp(&b.key)));
+    let mut lenders: Vec<&Elastic> = caches
+        .iter()
+        .filter(|c| c.lends && c.capacity > c.floor)
+        .collect();
+    lenders.sort_by(|a, b| a.value.total_cmp(&b.value).then_with(|| a.key.cmp(&b.key)));
+    let mut moved: HashSet<&Key> = HashSet::new();
+    let mut moves = Vec::new();
+    for borrower in borrowers {
+        if moves.len() == ELASTIC_MAX_MOVES {
+            break;
+        }
+        if moved.contains(&borrower.key) {
+            continue;
+        }
+        let room = step
+            .min(share(borrower))
+            .min(borrower.ceiling - borrower.capacity);
+        // Lowest value first: the first that is not worth enough ends it.
+        for lender in &lenders {
+            if moved.contains(&lender.key) || lender.key == borrower.key {
+                continue;
+            }
+            if borrower.value < ELASTIC_VALUE_RATIO * lender.value {
+                break;
+            }
+            let bytes = room.min(share(lender)).min(lender.capacity - lender.floor) / MIB * MIB;
+            if bytes == 0 {
+                continue;
+            }
+            moved.insert(&borrower.key);
+            moved.insert(&lender.key);
+            moves.push(Move {
+                borrower: borrower.key.clone(),
+                lender: lender.key.clone(),
+                bytes,
+                borrower_value: borrower.value,
+                lender_value: lender.value,
+            });
+            break;
+        }
+    }
+    moves
+}

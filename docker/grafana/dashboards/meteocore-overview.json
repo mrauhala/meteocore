@@ -1502,6 +1502,32 @@
                                     "name": "panel-226"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 46,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-228"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 46,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-229"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -25402,6 +25428,215 @@
                     ]
                   },
                   "links": []
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-228": {
+        "kind": "Panel",
+        "spec": {
+          "id": 228,
+          "title": "Elastic memory: moves proposed",
+          "description": "Elastic memory (#1314), report only: at each re-plan tick, every 5 minutes, the moves of memory between caches it would make, never applied. A cache whose MiB more saves the most fill time (its ghost hits within half its capacity more, times its miss cost) borrows from one whose MiB more is worth at most half as much, in steps of max(64 MiB, 1 % of the pool), at most a tenth of either cache and four moves a tick, never below a cache's floor nor above its ceiling, and never while the pressure valve holds. Since nothing applies them, a move repeats every tick while it holds. /admin/cache-plan lists the last proposal (governor.elastic) with every cache weighed. Moves by cache and role (cache_elastic_moves_total).",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache, role) (increase(cache_elastic_moves_total{job=~\"$job\"}[$__rate_interval])) > 0",
+                        "legendFormat": "{{cache}} {{role}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "sum"
+                  ],
+                  "sortBy": "Total",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "bars",
+                    "lineWidth": 1,
+                    "fillOpacity": 80,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "normal",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-229": {
+        "kind": "Panel",
+        "spec": {
+          "id": 229,
+          "title": "Elastic memory: bytes proposed",
+          "description": "Elastic memory (#1314), report only: at each re-plan tick, every 5 minutes, the moves of memory between caches it would make, never applied. A cache whose MiB more saves the most fill time (its ghost hits within half its capacity more, times its miss cost) borrows from one whose MiB more is worth at most half as much, in steps of max(64 MiB, 1 % of the pool), at most a tenth of either cache and four moves a tick, never below a cache's floor nor above its ceiling, and never while the pressure valve holds. Since nothing applies them, a move repeats every tick while it holds. /admin/cache-plan lists the last proposal (governor.elastic) with every cache weighed. Bytes by cache and role (cache_elastic_bytes_total).",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache, role) (increase(cache_elastic_bytes_total{job=~\"$job\"}[$__rate_interval])) > 0",
+                        "legendFormat": "{{cache}} {{role}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "sum"
+                  ],
+                  "sortBy": "Total",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "bars",
+                    "lineWidth": 1,
+                    "fillOpacity": 80,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "normal",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
                 },
                 "overrides": []
               }

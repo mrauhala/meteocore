@@ -1,6 +1,5 @@
 //! The memory governor (#1315): one task on `poll_runtime` that keeps the
 //! memory plan fitted between reloads and holds the process to its total.
-//! #1314's elastic sharing is meant to be one more step of the same loop.
 //!
 //! - **Re-plan tick**, every [`decide::REPLAN_EVERY`]: fit the plan again
 //!   with the engines' current demands (`memory_plan::fit`) and apply a
@@ -25,6 +24,13 @@
 //!   the plan's floor or its range's `min`. A cache its engines fill ahead
 //!   of requests (satellite scans, PVOL pixels, station grids) is never
 //!   lowered, nor a budget.
+//! - **Elastic memory**, report only (#1314), at each re-plan tick: weigh
+//!   what a byte more is worth in each cache the plan sizes
+//!   ([`elastic_inputs`]) and propose moving memory to the caches where it
+//!   is worth most from those where it is worth least
+//!   ([`decide::elastic`]). Nothing applies a move: it is logged when the
+//!   moves change, counted every tick and shown in `/admin/cache-plan`.
+//!   Nothing is proposed while the valve holds.
 //!
 //! Gates: everything runs where `AcceptedLoad::plans_sizes` holds, `auto`
 //! with a total; the valve only where that total is `[memory] total_mb` or
@@ -64,7 +70,7 @@ use tracing::{info, warn};
 use crate::admin::AdminState;
 use crate::cache_plan::{self, mib};
 use crate::memory_plan::{self, Change, Held};
-use decide::{Ceiling, Key, Pressure, Refused, Signal, Slot};
+use decide::{Ceiling, Elastic, Key, Move, Pressure, Refused, Signal, Slot};
 
 /// What the governor did at a time, for `/admin/cache-plan`.
 #[derive(Debug, Clone)]
@@ -72,6 +78,24 @@ struct Record {
     at: chrono::DateTime<chrono::Utc>,
     changes: Vec<Change>,
 }
+
+/// What elastic memory weighed at a tick and the moves it would make
+/// (#1314), for `/admin/cache-plan`. Report only: nothing applies them.
+#[derive(Debug, Clone)]
+struct Proposal {
+    at: chrono::DateTime<chrono::Utc>,
+    /// Why it weighed nothing: the pressure valve holds.
+    held: Option<&'static str>,
+    step_bytes: u64,
+    caches: Vec<Elastic>,
+    moves: Vec<Move>,
+}
+
+/// Why elastic memory proposes nothing while the pressure valve holds.
+const VALVE_HOLDS: &str = "the memory pressure valve holds";
+
+/// The mode of elastic memory's moves: proposed and logged, never applied.
+const ELASTIC_MODE: &str = "report";
 
 /// The governor's state between steps.
 #[derive(Debug, Default)]
@@ -106,6 +130,10 @@ struct Governor {
     last_tick: Option<Record>,
     last_relief: Option<Record>,
     last_restore: Option<Record>,
+    /// Elastic memory's last proposal (#1314), and the moves it last
+    /// logged: the same moves again log nothing.
+    elastic: Option<Proposal>,
+    elastic_logged: Option<Vec<(Key, Key)>>,
 }
 
 static GOVERNOR: LazyLock<Mutex<Governor>> = LazyLock::new(Default::default);
@@ -363,8 +391,10 @@ fn tick(state: &AdminState, now: Instant) {
         .collect();
     supersede(&rows);
     // Copied out: applying calls back into `capped`.
-    let (caps, refused, raised, restored, lifted) = {
+    let (caps, refused, raised, restored, lifted, valve_holds) = {
         let mut governor = governor();
+        // Before the restore: a ceiling it lifts now still held this tick.
+        let valve_holds = governor.pressure.over_since.is_some() || !governor.caps.is_empty();
         decide::floor_ceilings(&mut governor.caps, &|key| floors.get(key).copied());
         let (raised, restored) = if restore_due(&governor, now) {
             governor.restored_at = Some(now);
@@ -379,7 +409,14 @@ fn tick(state: &AdminState, now: Instant) {
             .iter()
             .map(|(key, ceiling)| (key.clone(), ceiling.bytes))
             .collect();
-        (caps, governor.refused.clone(), raised, restored, lifted)
+        (
+            caps,
+            governor.refused.clone(),
+            raised,
+            restored,
+            lifted,
+            valve_holds,
+        )
     };
     let attempt = |row: &Row, grant: &Grant, key: &Key| Refused {
         capacity: row.usage.capacity_bytes,
@@ -448,8 +485,153 @@ fn tick(state: &AdminState, now: Instant) {
     if let Some(block) = tick_block(&changed, raised.len() + restored.len(), restored.len()) {
         info!("{block}");
     }
+    if let Some(plan) = &report.plan {
+        record_elastic(propose(&rows, plan, valve_holds));
+    }
     let rows = cache_plan::snapshot(state);
     memory_plan::log_new_warnings(&report, &rows);
+}
+
+/// The caches elastic memory weighs (#1314), from the tick's `rows` and the
+/// plan it fitted: every cache the plan sizes (not pinned, a collection can
+/// reach it, enabled) with a ghost ring and a timed fill. Its value is a
+/// byte more at the ring's first depth, from the window's ghost hits and
+/// miss cost; without a fill in the window, from the cache's mean fill
+/// since it was built, so a cache nobody read lately weighs in at what its
+/// ghost hits say, nothing. A cache without a ring, or that never timed a
+/// fill, neither borrows nor lends.
+pub(crate) fn elastic_inputs(rows: &[Row], plan: &grant::Plan) -> Vec<Elastic> {
+    rows.iter()
+        .filter_map(|row| {
+            let entry = &row.entry;
+            let capacity = row.usage.capacity_bytes;
+            if entry.kind != ds_cache::plan::Kind::Cache || capacity == 0 {
+                return None;
+            }
+            if grant::pinned(&entry.source) {
+                return None;
+            }
+            let grant = plan
+                .grant(entry)
+                .filter(|g| !matches!(g.reason, Reason::Unreachable(_)))?;
+            let window = row.window.as_ref()?;
+            let ghost_hits = window.churn.ghost_hits?[0];
+            let cost = window
+                .miss_cost_seconds()
+                .or_else(|| row.usage.churn.as_ref()?.mean_fill_seconds())?;
+            let bytes = capacity as f64 * ds_cache::plan::GHOST_DEPTH_FACTORS[0];
+            Some(Elastic {
+                key: decide::key(entry),
+                capacity,
+                floor: floor_of(entry, grant).max(row.least_bytes),
+                ceiling: grant.ceiling_bytes,
+                value: window.per_hour(ghost_hits) * cost / bytes,
+                ghost_hits,
+                lends: !decide::spared(row),
+            })
+        })
+        .collect()
+}
+
+/// Elastic memory's proposal at a tick over `rows` and `plan`: nothing
+/// while the pressure valve holds (`valve_holds`: over the total, or a
+/// ceiling of its still in force), which comes first.
+fn propose(rows: &[Row], plan: &grant::Plan, valve_holds: bool) -> Proposal {
+    let step_bytes = decide::elastic_step(plan.pool_bytes);
+    let (held, caches, moves) = if valve_holds {
+        (Some(VALVE_HOLDS), Vec::new(), Vec::new())
+    } else {
+        let caches = elastic_inputs(rows, plan);
+        let moves = decide::elastic(&caches, plan.pool_bytes);
+        (None, caches, moves)
+    };
+    Proposal {
+        at: chrono::Utc::now(),
+        held,
+        step_bytes,
+        caches,
+        moves,
+    }
+}
+
+/// Keep `proposal` for `/admin/cache-plan`, count its moves and log them,
+/// when they differ from the moves last logged. Report only: nothing is
+/// resized.
+fn record_elastic(proposal: Proposal) {
+    for m in &proposal.moves {
+        for (key, role) in [(&m.borrower, "borrow"), (&m.lender, "lend")] {
+            ELASTIC_MOVES
+                .with_label_values(&[key.1, role, ELASTIC_MODE])
+                .inc();
+            ELASTIC_BYTES
+                .with_label_values(&[key.1, role, ELASTIC_MODE])
+                .inc_by(m.bytes);
+        }
+    }
+    let pairs: Vec<(Key, Key)> = proposal
+        .moves
+        .iter()
+        .map(|m| (m.borrower.clone(), m.lender.clone()))
+        .collect();
+    let block = {
+        let mut governor = governor();
+        let changed = proposal.held.is_none() && governor.elastic_logged.as_ref() != Some(&pairs);
+        if changed {
+            governor.elastic_logged = Some(pairs);
+        }
+        let block = changed.then(|| elastic_block(&proposal));
+        governor.elastic = Some(proposal);
+        block
+    };
+    if let Some(block) = block {
+        info!("{block}");
+    }
+}
+
+/// A cache's name in elastic memory's log lines: its id, and its
+/// collection or source.
+fn key_name((_, id, scope): &Key) -> String {
+    match scope.collection() {
+        Some(collection) => format!("{id} {collection}"),
+        None => id.to_string(),
+    }
+}
+
+/// Elastic memory's INFO block for `proposal`: each move it would make,
+/// from the lender to the borrower, with what a MiB more is worth in each.
+fn elastic_block(proposal: &Proposal) -> String {
+    let mut out = format!(
+        "Elastic memory, report only, nothing resized (#1314): {} cache{} weighed",
+        proposal.caches.len(),
+        if proposal.caches.len() == 1 { "" } else { "s" }
+    );
+    if proposal.moves.is_empty() {
+        out.push_str(&format!(
+            ", no move: no cache's MiB more is worth {} times another's",
+            decide::ELASTIC_VALUE_RATIO
+        ));
+        return out;
+    }
+    let _ = write!(
+        out,
+        ", {} move{} a tick would make, in steps of at most {}",
+        proposal.moves.len(),
+        if proposal.moves.len() == 1 { "" } else { "s" },
+        mib(proposal.step_bytes)
+    );
+    for m in &proposal.moves {
+        let _ = write!(
+            out,
+            "\n  {} → {}: {}; a MiB more saves {:.3} ms of fills an hour there, {:.3} where it \
+             comes from",
+            key_name(&m.lender),
+            key_name(&m.borrower),
+            mib(m.bytes),
+            cache_plan::ms_per_mib(m.borrower_value),
+            cache_plan::ms_per_mib(m.lender_value),
+        );
+    }
+    out
 }
 
 /// The valve at `now`: the process holds `resident` bytes, above its
@@ -697,10 +879,40 @@ static PRESSURE_ACTIONS: LazyLock<IntCounterVec> = LazyLock::new(|| {
     counter
 });
 
+/// One of elastic memory's counters (#1314), by cache, role (`borrow`,
+/// `lend`) and mode (`report`: proposed, never applied).
+fn elastic_counter(name: &str, help: &str) -> IntCounterVec {
+    let counter = IntCounterVec::new(Opts::new(name, help), &["cache", "role", "mode"]).unwrap();
+    crate::admin::REGISTRY
+        .register(Box::new(counter.clone()))
+        .unwrap();
+    counter
+}
+
+static ELASTIC_MOVES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    elastic_counter(
+        "cache_elastic_moves_total",
+        "Moves of memory between caches elastic memory proposed at a re-plan tick (#1314), \
+         by cache and role: borrow, the cache whose MiB more saves the most fill time; lend, \
+         one whose MiB more is worth at most half as much. mode = report: logged and shown in \
+         /admin/cache-plan, never applied, so a move repeats every tick while it holds. Only \
+         in [memory] mode = \"auto\" with a total, never while the pressure valve holds",
+    )
+});
+
+static ELASTIC_BYTES: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    elastic_counter(
+        "cache_elastic_bytes_total",
+        "Bytes of the moves cache_elastic_moves_total counts (#1314), by cache, role and mode",
+    )
+});
+
 /// Register the governor's counters, so `/metrics` lists them before the
 /// first change.
 pub(crate) fn init_counters() {
     LazyLock::force(&PRESSURE_ACTIONS);
+    LazyLock::force(&ELASTIC_MOVES);
+    LazyLock::force(&ELASTIC_BYTES);
     memory_plan::init_change_counter();
 }
 
@@ -746,6 +958,38 @@ pub(crate) fn json() -> Value {
             "last_relief": record(&governor.last_relief),
             "last_restore": record(&governor.last_restore),
         },
+        "elastic": governor.elastic.as_ref().map_or(Value::Null, elastic_json),
+    })
+}
+
+/// Elastic memory's last proposal for `/admin/cache-plan` (#1314): the
+/// moves it would make and every cache it weighed, values in milliseconds
+/// of fills an hour per MiB more.
+fn elastic_json(proposal: &Proposal) -> Value {
+    let name = |(_, id, scope): &Key| json!({"id": id, "collection": scope.collection()});
+    let value = |v: f64| (cache_plan::ms_per_mib(v) * 1e4).round() / 1e4;
+    json!({
+        "mode": ELASTIC_MODE,
+        "at": proposal.at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "held": proposal.held,
+        "step_bytes": proposal.step_bytes,
+        "moves": proposal.moves.iter().map(|m| json!({
+            "borrower": name(&m.borrower),
+            "lender": name(&m.lender),
+            "bytes": m.bytes,
+            "borrower_value_ms_per_mib_hour": value(m.borrower_value),
+            "lender_value_ms_per_mib_hour": value(m.lender_value),
+        })).collect::<Vec<_>>(),
+        "caches": proposal.caches.iter().map(|c| json!({
+            "id": c.key.1,
+            "collection": c.key.2.collection(),
+            "capacity_bytes": c.capacity,
+            "floor_bytes": c.floor,
+            "ceiling_bytes": c.ceiling,
+            "ghost_hits": c.ghost_hits,
+            "value_ms_per_mib_hour": value(c.value),
+            "lends": c.lends,
+        })).collect::<Vec<_>>(),
     })
 }
 
