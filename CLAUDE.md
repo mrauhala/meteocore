@@ -404,7 +404,10 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   it, or the fills after it push it out of the cold ring (#1340).
   The memory plan sizes a cache by its class (`ds_cache::plan::grant::class`,
   #1312: demand, working set, traffic-driven with a weight, else fixed):
-  a new cache gets one there.
+  a new cache gets one there. Each grant carries its rule's floor and
+  ceiling (`floor_bytes`, `ceiling_bytes`, #1314: 8 × today for a traffic
+  cache, `WORKING_SET_MAX`, demand + 15 %, never past a range; its grant
+  for a cache no rule sizes), which bound what elastic memory moves.
   Every cache and admission budget is entered in the memory plan,
   `ds_cache::plan` (#1306), under its `/metrics` family as id
   (`metatile_cache`, `geotiff_decode`), a scope and its size source. A
@@ -1782,8 +1785,14 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   `apply_tick`, the reload's own fit-and-apply code, with
   `governor::decide::tick_target` as the filter. Decisions live in
   `governor/decide.rs`, pure (inputs in, actions out, no clock): test
-  them there. #1314's elastic sharing adds a step to this loop, never a
-  second loop. Every size change counts in `cache_plan_changes_total`
+  them there. #1314's elastic sharing is a step of this loop, never a
+  second loop: report only for now (`decide::elastic` proposes moves by
+  value per byte, `Grant::ceiling_bytes` and the plan's floors bound them,
+  never past the pool's expected use; nothing applies them until a switch
+  sets `governor::ELASTIC_APPLIES`, when a ledger of per-cache offsets,
+  added to the grants by the tick and by a reload's plan, keeps the
+  re-plan from undoing them; `cache_elastic_proposed_bytes` shows them,
+  `cache_elastic_moves_total` counts them). Every size change counts in `cache_plan_changes_total`
   (`memory_plan::count_changes`; a reload's staged resizes through
   `memory_plan::counting_resizes`); a new resize path counts there too.
   A valve ceiling never takes a cache below the plan's floor or its

@@ -1502,6 +1502,32 @@
                                     "name": "panel-226"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 46,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-228"
+                                  }
+                                }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 12,
+                                  "y": 46,
+                                  "width": 12,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-229"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -25402,6 +25428,217 @@
                     ]
                   },
                   "links": []
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-228": {
+        "kind": "Panel",
+        "spec": {
+          "id": 228,
+          "title": "Elastic memory: new moves",
+          "description": "Elastic memory (#1314): at each re-plan tick, every 5 minutes, the moves of memory between caches it proposes; until its switch exists, it only reports them (mode = report) and resizes nothing. A cache whose MiB more saves the most fill time (its ghost hits within the best of 1.5, 2 or 3 × its size, times its miss cost, on average over those bytes) borrows from one whose MiB serves at most half as much (the higher of that and its hits times its miss cost over its capacity), in steps of max(64 MiB, 1 % of the pool), at most a tenth of either cache and four moves a tick, never below a cache's floor nor above its ceiling, never past the pool's expected use, and never while the pressure valve holds. Per-collection caches share their cache label; /admin/cache-plan (governor.elastic) has each collection's, with every cache weighed and the ledger of offsets. Moves by cache and role (cache_elastic_moves_total): in report mode a move counts once while it recurs tick after tick; applied moves count each time.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache, role) (increase(cache_elastic_moves_total{job=~\"$job\"}[$__rate_interval])) > 0",
+                        "legendFormat": "{{cache}} {{role}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "sum"
+                  ],
+                  "sortBy": "Total",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "short",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "bars",
+                    "lineWidth": 1,
+                    "fillOpacity": 80,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "normal",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0,
+                  "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-229": {
+        "kind": "Panel",
+        "spec": {
+          "id": 229,
+          "title": "Elastic memory: proposed now",
+          "description": "Elastic memory (#1314): at each re-plan tick, every 5 minutes, the moves of memory between caches it proposes; until its switch exists, it only reports them (mode = report) and resizes nothing. A cache whose MiB more saves the most fill time (its ghost hits within the best of 1.5, 2 or 3 × its size, times its miss cost, on average over those bytes) borrows from one whose MiB serves at most half as much (the higher of that and its hits times its miss cost over its capacity), in steps of max(64 MiB, 1 % of the pool), at most a tenth of either cache and four moves a tick, never below a cache's floor nor above its ceiling, never past the pool's expected use, and never while the pressure valve holds. Per-collection caches share their cache label; /admin/cache-plan (governor.elastic) has each collection's, with every cache weighed and the ledger of offsets. The bytes the last tick's moves take from (lend) or give to (borrow) each cache (cache_elastic_proposed_bytes).",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache, role) (cache_elastic_proposed_bytes{job=~\"$job\"}) > 0",
+                        "legendFormat": "{{cache}} {{role}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Max",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
                 },
                 "overrides": []
               }

@@ -865,6 +865,61 @@ reload does: a step a reload holds the reload lock through is skipped.
   `total_bytes`, `state` over, under or normal, how long), its ceilings
   and its last relief and restore. The dashboard's Memory governor panel
   shows both counters, and a Memory pressure annotation marks each relief.
+- **Elastic memory, report only** (#1314): each re-plan tick also weighs
+  each cache the plan sizes from its last hour, after the tick has set its
+  sizes, and proposes moving memory from the caches where it serves least
+  to those where more would save the most fill time. It **applies
+  nothing** yet: the moves are logged at INFO (again only when they
+  change), shown and listed. Its rules:
+  - a borrower's value is what a MiB more saves, on average, at the best
+    of the ring's depths (1.5, 2 or 3 × its size: the ghost hits within it
+    times its miss cost, over its MiB), so a cache past an LRU cliff, whose
+    misses come back only at 2 ×, counts. It borrows with at least 10
+    ghost hits in its window at that depth, fills timed in the window (one
+    with ghost hits and no fill is failing its refills, or not timing
+    them), and room under its ceiling, the most its plan rule gives it: 8 ×
+    its size today for a traffic-driven cache, `WORKING_SET_MAX` (2 GiB) or
+    its size today if larger for a working set, its demand + 15 % for a
+    demand cache, never past a range's `max`;
+  - a lender's value is the higher of that and what a MiB of it serves:
+    its hits times its miss cost over its capacity, from its mean fill
+    since it was built when the window timed none. A cache nobody reads
+    serves nothing and lends first; one that holds its working set serves
+    plenty, and keeps it. It lends down to its floor: the plan's floor for
+    it, its range's `min` and what it shrinks to in place. A cache its
+    engines fill ahead of requests never lends;
+  - a move only where the borrower's value is at least twice the
+    lender's, so values between half and twice each other move nothing
+    either way;
+  - a move is max(64 MiB, 1 % of the pool), at most a tenth of either
+    cache, at most four moves a tick, each cache in one, and never lifts
+    the plan's expected use past its pool: lending capacity a working-set
+    cache does not use to one that fills all it gets would put the process
+    over its total, and the pressure valve would take it back;
+  - a cache without a ghost ring, or that never timed a fill, neither
+    borrows nor lends; nor a pinned one, nor one no collection reaches;
+  - nothing while the pressure valve holds: over the total, or a ceiling
+    of its still in force.
+
+  The mechanism that would apply them is in place: a ledger of each
+  cache's offset, borrowed or lent, which the re-plan tick and a reload's
+  plan add to its grant, within its floor and ceiling, so the tick holds a
+  moved cache where it moved instead of pulling it back to its grant. A
+  reload that pins, re-bounds or resizes a cache drops its offset, and so
+  does one that rebuilds or removes its collection. Until the switch that
+  turns it on exists, the ledger stays empty.
+
+  `cache_elastic_proposed_bytes{cache,role}` shows what the last tick's
+  moves would take from (`lend`) or give to (`borrow`) each cache, and
+  `cache_elastic_moves_total{cache,role,mode}` counts the moves, a move
+  that recurs tick after tick once in `mode` `report`. Per-collection
+  caches share their `cache` label: `/admin/cache-plan` has the last
+  proposal as `governor.elastic`, with each collection's: its `moves`
+  (borrower, lender, bytes, the borrower's value and its depth, the
+  lender's value), every cache it weighed (capacity, floor, ceiling, ghost
+  hits, depth, both values, whether it borrows and lends), the headroom of
+  the pool and the `ledger`. The dashboard's Elastic memory panels show
+  both.
 
 A key set to exactly its default (`metatile = 1024`, `[grib]
 grid_cache_mb = 256`) pins it like any other value. An `MC_…` variable

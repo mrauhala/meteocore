@@ -1347,3 +1347,64 @@ fn an_off_cache_lifted_by_its_range_floor_says_so() {
         .unwrap();
     assert_eq!((g.bytes, &g.reason), (64 * MB, &Reason::RangeFloor));
 }
+
+/// #1314: each grant carries the most its rule gives the cache, what
+/// memory lent between caches never takes it past: a traffic-driven cache
+/// 8 × its size today, a working set `WORKING_SET_MAX`, a demand cache its
+/// demand plus 15 %, a range at most its `max`, and a cache no rule sizes
+/// (a pinned or fixed one, a budget) its grant.
+#[test]
+fn a_grant_carries_its_rules_ceiling() {
+    let mut ranged = default("rendered_cache", Scope::Process, 256);
+    ranged.entry.source = SizeSource::Bounds("[memory.caches] k", Bounds::mib(128, 1024));
+    let plan = plan(&inputs(
+        32.0,
+        2,
+        Baseline::Estimated,
+        vec![
+            default("metatile_cache", Scope::Process, 1024),
+            ranged,
+            with_demand(default("grid_cache", source("grib", "nwp"), 256), 400, 25),
+            with_demand(
+                default("satellite_frame_cache", engine("satellite"), 1024),
+                800,
+                30,
+            ),
+            cache(
+                "vector_tile_cache",
+                Scope::Process,
+                SizeSource::Config("[memory.caches] vector_tile"),
+                128,
+            ),
+            default("solid_image_cache", Scope::Process, 32),
+        ],
+        vec![budget(
+            "render_budget",
+            Scope::Process,
+            SizeSource::Default,
+            1024,
+        )],
+    ));
+    let ceiling = |id| grant(&plan, id, None).ceiling_bytes / MB;
+    assert_eq!(ceiling("metatile_cache"), 8 * 1024);
+    assert_eq!(ceiling("rendered_cache"), 1024, "the range's max");
+    assert_eq!(
+        grant(&plan, "grid_cache", Some("nwp")).ceiling_bytes,
+        WORKING_SET_MAX
+    );
+    assert_eq!(
+        ceiling("satellite_frame_cache"),
+        1024,
+        "demand + 15 %, today"
+    );
+    for id in ["vector_tile_cache", "solid_image_cache", "render_budget"] {
+        assert_eq!(
+            grant(&plan, id, None).ceiling_bytes,
+            grant(&plan, id, None).bytes,
+            "{id}"
+        );
+    }
+    for g in plan.caches.iter().chain(&plan.budgets) {
+        assert!(g.ceiling_bytes >= g.bytes, "{g:?}");
+    }
+}
