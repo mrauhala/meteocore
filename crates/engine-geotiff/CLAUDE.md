@@ -320,9 +320,11 @@ engine-zarr.
   absent from the previous catalog or holding another object there
   (`Catalog::fresh_since`, #1055), levels coarsest first while the frame
   stays within `prewarm::frame_cap` (`MC_COG_PREWARM_MB`, default 32 MiB,
-  0 off, at most 1/8 of the tile cache's capacity but never less than its
-  published keep floor, so a cache tier 2 shrank still warms the frame
-  its keep protects), coalesced by `range_batch::plan`,
+  0 off, at most 1/8 of the tile cache's capacity, raised to its
+  published keep floor up to 1/4 of the capacity, so a cache tier 2
+  shrank still warms the frame its keep protects and a cache shrunk
+  under pressure does not give one frame half its capacity), coalesced
+  by `range_batch::plan`,
   4 reads in flight on the poll runtime's blocking pool through the
   explicit-handle bridges, within `PREWARM_BUDGET`. `poll_loop` warms the
   startup catalog before its first sleep; on a STAC source its first poll

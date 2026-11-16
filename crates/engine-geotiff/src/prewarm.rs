@@ -68,13 +68,23 @@ const DEFAULT_FRAME_CAP_MB: usize = 32;
 /// cannot evict the rest, but never less than the cache's keep floor
 /// `keep` (#1475 review): when elastic memory took the cache below eight of
 /// its keeps, the newest frame the keep protects is still pre-warmed whole.
+/// The keep raises the cap only up to a quarter of the cache: a cache the
+/// plan or the pressure valve shrank, still read, would otherwise hand one
+/// frame half its capacity and evict the frames clients are looping over.
 /// Levels are taken coarsest first while the frame's running total stays
 /// within it, so a file too large for the cap still gets its overviews.
 pub(crate) fn frame_cap(tile_cache_capacity: u64, keep: u64) -> usize {
     static CAP: LazyLock<usize> =
         LazyLock::new(|| parse_frame_cap(std::env::var("MC_COG_PREWARM_MB").ok().as_deref()));
-    let share = (tile_cache_capacity / 8).max(keep);
-    (*CAP).min(usize::try_from(share).unwrap_or(usize::MAX))
+    (*CAP).min(frame_share(tile_cache_capacity, keep))
+}
+
+/// The share of a tile cache of `capacity` one frame pre-warms, before the
+/// `MC_COG_PREWARM_MB` cap: an eighth, raised to `keep` but never past a
+/// quarter of the cache.
+fn frame_share(capacity: u64, keep: u64) -> usize {
+    let share = (capacity / 8).max(keep.min(capacity / 4));
+    usize::try_from(share).unwrap_or(usize::MAX)
 }
 
 /// `MC_COG_PREWARM_MB` in bytes; unset or unparsable is the default.
@@ -508,6 +518,27 @@ mod tests {
         assert_eq!(
             parse_frame_cap(Some("lots")),
             DEFAULT_FRAME_CAP_MB * 1024 * 1024
+        );
+    }
+
+    /// #1475 review: a frame's share is an eighth of the cache, raised to the
+    /// keep floor but never past a quarter of the cache, so a cache shrunk
+    /// under pressure does not hand one frame half of what it holds.
+    #[test]
+    fn a_frames_share_is_raised_to_the_keep_up_to_a_quarter_of_the_cache() {
+        const MIB: u64 = 1024 * 1024;
+        let mib = |n: u64| usize::try_from(n * MIB).unwrap();
+        assert_eq!(frame_share(256 * MIB, 8 * MIB), mib(32), "an eighth");
+        assert_eq!(frame_share(48 * MIB, 8 * MIB), mib(8), "raised to the keep");
+        assert_eq!(
+            frame_share(64 * MIB, 32 * MIB),
+            mib(16),
+            "a quarter at most"
+        );
+        assert_eq!(
+            frame_share(6 * 32 * MIB, 32 * MIB),
+            mib(32),
+            "the keep whole"
         );
     }
 
