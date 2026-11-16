@@ -8285,6 +8285,9 @@ fn apply_load(
     rendered_cache.evict_collections(&stale);
     tile_cache.evict_collections(&stale);
     vector_cache.evict_collections(&stale);
+    // A rebuilt or removed collection's caches start from their grant, not
+    // the elastic offset the old ones had (#1314).
+    crate::governor::forget_elastic(&stale);
     if !stale.is_empty() {
         info!(
             "Evicted cached tiles for {} rebuilt, removed or restyled collection(s)",

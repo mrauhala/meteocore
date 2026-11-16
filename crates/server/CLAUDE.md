@@ -375,20 +375,33 @@ need no reload pruning.
   `jemalloc::purge` (`arena.4096.purge`, a void mallctl called through
   tikv-jemalloc-sys: the ctl crate's typed write passes a value, which
   jemalloc refuses with EPERM).
-  Elastic memory (#1314) is one more step of the tick, report only: after
-  `apply_tick`, `elastic_inputs` weighs the rows the tick read against the
-  plan it fitted (value a byte more = window ghost hits at depth 0.5 ×
-  miss cost ÷ half the capacity; ghost hits are cumulative by depth,
-  never summed; floor = `floor_of` and `least_bytes`, ceiling =
-  `Grant::ceiling_bytes`), and `decide::elastic` proposes the moves. Its
-  rules and parameters are `decide::ELASTIC_*`, pure and simulated in
-  `governor/tests.rs`, which carries proposed capacities forward as if
-  applied. Nothing calls `set_capacity` for a move: `record_elastic` keeps
-  the proposal for `/admin/cache-plan` (`governor.elastic`), counts it
-  (`cache_elastic_{moves,bytes}_total{cache,role,mode="report"}`) and
-  logs it only when the moves change. The valve comes first: no proposal
-  while it is over the total or holds a ceiling. Applying moves is the
-  next part of #1314, behind a switch it adds.
+  Elastic memory (#1314) is one more step of the tick: after
+  `apply_tick`, the tick snapshots the rows again and `run_elastic` weighs
+  them (`elastic_inputs`: a borrower's value at its best depth,
+  `decide::best_depth`, from window ghost hits × miss cost ÷ the depth's
+  bytes, ghost hits being cumulative by depth and never summed; a lender's
+  `decide::lend_value`, the higher of that and hits × cost ÷ capacity;
+  borrowing only with fills timed in the window; floor = `floor_of` and
+  `least_bytes`, ceiling = `Grant::ceiling_bytes`, need = the grant's
+  expected use when under its size) and `decide::elastic` decides the
+  moves, within the pool's headroom (`elastic_headroom`). Rules and
+  parameters are `decide::ELASTIC_*`. Applying is behind
+  `ELASTIC_APPLIES`, false: no config switch yet. Applied, a move resizes
+  the lender then the borrower through `ds_cache::plan::apply` and
+  `Governor::ledger` keeps each cache's offset (`decide::Lent`), which
+  the tick (`elastic_grant` in its `wanted`) and a reload's `capped` add to
+  the grant, so the 10 %/64 MiB re-plan never pulls a moved cache back.
+  `reconcile_ledger` drops an offset whose cache's source or configured
+  size changed, `forget_elastic` (from `do_reload`'s stale list) a rebuilt
+  or removed collection's, `bound_ledger` holds each to floor and
+  ceiling. The simulations in `governor/tests.rs` run the real tick over
+  planned rows (`real_tick`: `grant::plan`, `tick_target` with the
+  ledger, `run_elastic` applying). `record_elastic` keeps the proposal for
+  `/admin/cache-plan` (`governor.elastic`, with the ledger), sets
+  `cache_elastic_proposed_bytes{cache,role}` and counts
+  `cache_elastic_moves_total{cache,role,mode}` (report: a recurring move
+  once) and logs only when the moves change. The valve comes first: no
+  proposal while it is over the total or holds a ceiling.
 - `memory_plan.rs` (#1312) fits every row to the memory total in
   `cache_plan::log`, so at boot, after every accepted reload and on a
   recovery reload: `ds_cache::plan::grant::plan` over the snapshot rows,

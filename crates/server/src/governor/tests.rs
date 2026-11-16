@@ -1138,14 +1138,18 @@ async fn a_cache_refusing_its_shrink_keeps_no_ceiling_and_is_named() {
     drop(owner);
 }
 
-// --- Elastic memory (#1314), report only -------------------------------
+// --- Elastic memory (#1314) ----------------------------------------------
+
+use ds_cache::plan::{Activity, Kind, Usage};
+use ds_cache::Churn;
+use std::cell::RefCell;
 
 /// What reaches a simulated cache: `lookups` an hour spread evenly over a
 /// working set of `working_set` bytes, each miss costing `cost` seconds. A
-/// cache of capacity C hits min(1, C / W) of them, one 1.5 × as large
-/// min(1, 1.5 C / W): the difference are its ghost hits at the ring's first
-/// depth. A scan's keys are never asked for again: no ghost hits however
-/// much it misses.
+/// cache of capacity C hits min(1, C / W) of them, one d × larger
+/// min(1, (1 + d) C / W): the difference are its ghost hits at depth d,
+/// cumulative by construction. A scan's keys are never asked for again: no
+/// ghost hits however much it misses.
 #[derive(Debug, Clone, Copy)]
 struct Load {
     lookups: f64,
@@ -1175,55 +1179,80 @@ fn thrash(gib: u64) -> Load {
 struct SimCache {
     key: Key,
     capacity: u64,
+    /// The size its settings give it, what the plan fits it from.
+    configured: u64,
     floor: u64,
     ceiling: u64,
     load: Load,
     lends: bool,
+    need: Option<u64>,
 }
 
 fn sim_cache(id: &'static str, capacity_mib: u64, floor_mib: u64, load: Load) -> SimCache {
     SimCache {
-        key: (ds_cache::plan::Kind::Cache, id, Scope::Process),
+        key: (Kind::Cache, id, Scope::Process),
         capacity: capacity_mib * MIB,
+        configured: capacity_mib * MIB,
         floor: floor_mib * MIB,
         ceiling: 8 * capacity_mib * MIB,
         load,
         lends: true,
+        need: None,
     }
 }
 
-/// `cache` as elastic memory weighs it over an hour, its ghost hits times
-/// `noise`.
-fn weigh(cache: &SimCache, noise: f64) -> Elastic {
+/// An hour of `cache` at its capacity: hits, misses and cumulative ghost
+/// hits by depth, the latter times `noise`.
+fn hour_of(cache: &SimCache, noise: f64) -> (f64, f64, [f64; 3]) {
     let capacity = cache.capacity as f64;
     let working_set = cache.load.working_set as f64;
     let hit = |bytes: f64| (bytes / working_set).min(1.0);
-    let ghost_hits = if cache.load.scan {
-        0.0
+    let hits = cache.load.lookups * hit(capacity);
+    let ghost = if cache.load.scan {
+        [0.0; 3]
     } else {
-        cache.load.lookups * (hit(1.5 * capacity) - hit(capacity)) * noise
+        ds_cache::plan::GHOST_DEPTH_FACTORS.map(|depth| {
+            cache.load.lookups * (hit((1.0 + depth) * capacity) - hit(capacity)) * noise
+        })
     };
+    (hits, cache.load.lookups - hits, ghost)
+}
+
+/// `cache` as elastic memory weighs it over an hour, its ghost hits times
+/// `noise`, as `elastic_inputs` weighs a row.
+fn weigh(cache: &SimCache, noise: f64) -> Elastic {
+    let (hits, misses, ghost) = hour_of(cache, noise);
+    let (value, depth) = best_depth(
+        cache.capacity,
+        ghost,
+        cache.load.cost,
+        ds_cache::plan::GHOST_DEPTH_FACTORS,
+    );
     Elastic {
         key: cache.key.clone(),
         capacity: cache.capacity,
         floor: cache.floor,
         ceiling: cache.ceiling,
-        value: ghost_hits * cache.load.cost / (0.5 * capacity),
-        ghost_hits: ghost_hits as u64,
+        value,
+        ghost_hits: ghost[depth] as u64,
+        depth,
+        borrows: misses > 0.0,
+        lend_value: lend_value(value, hits, cache.load.cost, cache.capacity),
         lends: cache.lends,
+        need: cache.need,
     }
 }
 
-/// One tick of the simulation over a pool of `pool`: weigh, propose, and
-/// carry the proposed capacities forward as if they were applied, which
-/// production does not do yet. `noise(i)` scales cache `i`'s ghost hits.
+/// One decision over `caches`, its moves carried forward as if applied.
+/// `noise(i)` scales cache `i`'s ghost hits.
 fn sim_tick(caches: &mut [SimCache], pool: u64, noise: &mut dyn FnMut(usize) -> f64) -> Vec<Move> {
     let weighed: Vec<Elastic> = caches
         .iter()
         .enumerate()
         .map(|(i, cache)| weigh(cache, noise(i)))
         .collect();
-    let moves = elastic(&weighed, pool);
+    let expected: u64 = weighed.iter().map(|c| c.expected_at(c.capacity)).sum();
+    let moves = elastic(&weighed, pool, pool.saturating_sub(expected));
     for m in &moves {
         for cache in caches.iter_mut() {
             if cache.key == m.borrower {
@@ -1253,48 +1282,212 @@ fn noise(seed: u64) -> impl FnMut(usize) -> f64 {
     }
 }
 
-/// #1314 acceptance: of two caches, one thrashing and one idle, capacity
-/// moves to the thrashing one within N ticks, and back when the load
-/// swaps; the idle one never goes below its floor, and once the thrashing
-/// one holds its working set nothing moves.
+/// `cache`'s plan row after an hour at its capacity, as the snapshot gives
+/// it: its window, its lifetime counters, its configured size.
+fn sim_row(cache: &SimCache) -> Row {
+    let (hits, misses, ghost) = hour_of(cache, 1.0);
+    let ghost_hits = Some(ghost.map(|hits| hits as u64));
+    let nanos = |fills: f64| (fills * cache.load.cost * 1e9) as u64;
+    let window = Activity {
+        secs: 3600,
+        capacity_bytes: cache.capacity,
+        hits: hits as u64,
+        misses: misses as u64,
+        churn: Churn {
+            ghost_hits,
+            fills: misses as u64,
+            fill_nanos: nanos(misses),
+            ..Churn::default()
+        },
+    };
+    Row {
+        entry: Entry::cache(cache.key.1, Scope::Process, SizeSource::Default),
+        usage: Usage {
+            capacity_bytes: cache.capacity,
+            used_bytes: cache.capacity.min(cache.load.working_set),
+            entries: Some(1000),
+            hits: Some(hits as u64),
+            misses: Some(misses as u64),
+            churn: Some(Churn {
+                ghost_hits,
+                fills: 1,
+                fill_nanos: nanos(1.0),
+                ..Churn::default()
+            }),
+        },
+        window: Some(window),
+        demand: None,
+        configured_bytes: cache.configured,
+        planned: false,
+        least_bytes: 0,
+    }
+}
+
+/// The plan `rows` fit to `total`.
+fn sim_plan(rows: &[Row], total: u64) -> grant::Plan {
+    plan(&Inputs::of_rows(
+        total,
+        1,
+        Baseline::Estimated,
+        rows,
+        |_| None,
+        false,
+    ))
+}
+
+/// The least total in 64 MiB steps at which the plan grants every cache of
+/// `caches` its configured size: grants as the caches stand, nothing over.
+fn fitting_total(caches: &[SimCache]) -> u64 {
+    let rows: Vec<Row> = caches.iter().map(sim_row).collect();
+    let mut total = caches.iter().map(|c| c.configured).sum::<u64>();
+    loop {
+        let plan = sim_plan(&rows, total);
+        if rows
+            .iter()
+            .all(|row| plan.grant(&row.entry).unwrap().bytes >= row.configured_bytes)
+        {
+            return total;
+        }
+        total += 64 * MIB;
+    }
+}
+
+/// One re-plan tick as `tick` runs it, over simulated caches: fit the plan
+/// to their configured sizes, keep the ledger to what it supersedes and to
+/// the floors and ceilings, hold each cache to its grant plus its offset
+/// through `tick_target`, then weigh the capacities that left and apply the
+/// moves (`run_elastic`), the ledger keeping them.
+fn real_tick(caches: &RefCell<Vec<SimCache>>, total: u64, ledger: &mut Ledger) -> Proposal {
+    let set = |id: &str, bytes: u64| {
+        for cache in caches.borrow_mut().iter_mut() {
+            if cache.key.1 == id {
+                cache.capacity = bytes;
+            }
+        }
+    };
+    let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
+    let plan = sim_plan(&rows, total);
+    reconcile_ledger(ledger, &rows);
+    bound_ledger(ledger, &rows, &plan);
+    for row in &rows {
+        let grant = plan.grant(&row.entry).unwrap();
+        let target = elastic_grant(ledger, &decide::key(&row.entry), &row.entry, grant);
+        let floor = floor_of(&row.entry, grant);
+        if let Some(to) = tick_target(row.usage.capacity_bytes, target, floor, None, false, false) {
+            set(row.entry.id, to);
+        }
+    }
+    let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
+    let resize = |entry: &Entry, bytes: u64| {
+        set(entry.id, bytes);
+        Some(bytes)
+    };
+    run_elastic(&rows, &plan, ledger, false, true, &resize)
+}
+
+fn capacity_of(caches: &RefCell<Vec<SimCache>>, id: &str) -> u64 {
+    caches
+        .borrow()
+        .iter()
+        .find(|c| c.key.1 == id)
+        .unwrap()
+        .capacity
+}
+
+/// #1314 acceptance, through the real tick: of two caches, one thrashing
+/// and one idle, capacity moves to the thrashing one within N ticks and
+/// back when the load swaps; the idle one never goes below its floor. The
+/// re-plan tick fits the plan to their configured sizes every tick, and the
+/// ledger keeps it from moving them back (#1314 review: without it, two
+/// 81 MiB steps on a 1 GiB cache came undone at the next tick).
 #[test]
-fn memory_moves_to_the_thrashing_cache_and_back_when_the_load_swaps() {
-    let pool = 8 * GIB;
-    assert_eq!(elastic_step(pool), 81 * MIB, "1 % of the pool");
-    let mut caches = vec![
-        sim_cache("a_cache", 1024, 128, thrash(3)),
-        sim_cache("b_cache", 4096, 512, IDLE),
-    ];
-    let mut steady = &mut |_: usize| 1.0;
+fn through_the_real_tick_memory_moves_to_the_thrashing_cache_and_back() {
+    let caches = RefCell::new(vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        sim_cache("rendered_cache", 4096, 512, IDLE),
+    ]);
+    let total = fitting_total(&caches.borrow());
+    let floor = |id| {
+        let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
+        let plan = sim_plan(&rows, total);
+        let row = rows.iter().find(|r| r.entry.id == id).unwrap();
+        floor_of(&row.entry, plan.grant(&row.entry).unwrap())
+    };
+    let floors = (floor("metatile_cache"), floor("rendered_cache"));
+    let mut ledger = Ledger::new();
     let mut ticks = 0;
-    while caches[0].capacity < 3 * GIB {
-        let moves = sim_tick(&mut caches, pool, &mut steady);
-        assert_eq!(moves.len(), 1, "tick {ticks}: {caches:?}");
-        assert_eq!(moves[0].borrower.1, "a_cache");
-        assert_eq!(moves[0].lender.1, "b_cache");
+    while capacity_of(&caches, "metatile_cache") < 3 * GIB {
+        let proposal = real_tick(&caches, total, &mut ledger);
+        assert_eq!(proposal.moves.len(), 1, "tick {ticks}: {caches:?}");
+        assert_eq!(proposal.moves[0].borrower.1, "metatile_cache");
+        assert!(capacity_of(&caches, "rendered_cache") >= floors.1);
         ticks += 1;
-        assert!(ticks <= 30, "{caches:?}");
+        assert!(ticks <= 40, "{caches:?}");
     }
-    // Its working set held, it borrows no more.
-    for _ in 0..50 {
-        assert_eq!(sim_tick(&mut caches, pool, &mut steady), []);
+    let held = capacity_of(&caches, "metatile_cache");
+    // Its working set held, it borrows no more, and the re-plan keeps it.
+    for _ in 0..20 {
+        assert_eq!(real_tick(&caches, total, &mut ledger).moves, []);
+        assert_eq!(capacity_of(&caches, "metatile_cache"), held);
     }
-    let held = caches[0].capacity;
-    assert!(caches[1].capacity >= caches[1].floor);
+    let lent = ledger[&(Kind::Cache, "rendered_cache", Scope::Process)].offset;
+    assert_eq!(
+        lent,
+        -(held as i64 - GIB as i64),
+        "the ledger holds the moves"
+    );
 
     // The load swaps: the memory goes back.
-    caches[0].load = IDLE;
-    caches[1].load = thrash(3);
-    let mut ticks = 0;
-    while caches[1].capacity < 3 * GIB {
-        let moves = sim_tick(&mut caches, pool, &mut steady);
-        assert_eq!(moves.len(), 1, "tick {ticks}: {caches:?}");
-        assert_eq!(moves[0].borrower.1, "b_cache");
-        ticks += 1;
-        assert!(ticks <= 30, "{caches:?}");
+    for cache in caches.borrow_mut().iter_mut() {
+        cache.load = if cache.key.1 == "metatile_cache" {
+            IDLE
+        } else {
+            thrash(3)
+        };
     }
-    assert!(caches[0].capacity < held);
-    assert!(caches[0].capacity >= caches[0].floor);
+    let mut ticks = 0;
+    while capacity_of(&caches, "rendered_cache") < 3 * GIB {
+        let proposal = real_tick(&caches, total, &mut ledger);
+        assert_eq!(proposal.moves.len(), 1, "tick {ticks}: {caches:?}");
+        assert_eq!(proposal.moves[0].borrower.1, "rendered_cache");
+        assert!(capacity_of(&caches, "metatile_cache") >= floors.0);
+        ticks += 1;
+        assert!(ticks <= 40, "{caches:?}");
+    }
+    assert!(capacity_of(&caches, "metatile_cache") < held);
+}
+
+/// #1314 review: an elastic offset is what the re-plan tick holds a cache
+/// to, so the next tick leaves the moved capacity alone; without the
+/// offset it moves it back to the grant once 10 % and 64 MiB off.
+#[test]
+fn the_replan_tick_holds_a_cache_to_its_grant_plus_its_offset() {
+    let step = elastic_step(8 * GIB);
+    let grant = GIB;
+    for sign in [1i64, -1] {
+        let offset = sign * 3 * step as i64;
+        let capacity = (grant as i64 + offset) as u64;
+        assert_eq!(
+            tick_target(capacity, grant, 128 * MIB, None, false, false),
+            Some(grant),
+            "without the offset, the tick reverts it"
+        );
+        let target = elastic_target(grant, offset, 128 * MIB, 8 * GIB);
+        assert_eq!(target, capacity);
+        assert_eq!(
+            tick_target(capacity, target, 128 * MIB, None, false, false),
+            None
+        );
+    }
+    // Within the floor and the ceiling.
+    assert_eq!(
+        elastic_target(GIB, -(2 * GIB as i64), 128 * MIB, 8 * GIB),
+        128 * MIB
+    );
+    assert_eq!(
+        elastic_target(GIB, 9 * GIB as i64, 128 * MIB, 8 * GIB),
+        8 * GIB
+    );
 }
 
 /// #1314 acceptance: a one-pass scan evicts plenty and misses every
@@ -1317,6 +1510,8 @@ fn a_scan_with_evictions_but_no_ghost_hits_moves_nothing() {
 
 /// #1314 acceptance: ±5 % noise in ghost hits moves nothing over 50 ticks,
 /// between two caches under the same load, and once memory has moved.
+/// Between two busy caches of unlike loads, noise near the edge may tip a
+/// move more the same way, never one back.
 #[test]
 fn noise_of_5_percent_in_ghost_hits_moves_nothing_over_50_ticks() {
     let pool = 8 * GIB;
@@ -1328,18 +1523,9 @@ fn noise_of_5_percent_in_ghost_hits_moves_nothing_over_50_ticks() {
     for _ in 0..50 {
         assert_eq!(sim_tick(&mut even, pool, &mut wobble), []);
     }
-    // Moved until the busy cache holds most of its working set, then noise.
     let mut moved = vec![
         sim_cache("a_cache", 1024, 128, thrash(3)),
-        sim_cache(
-            "b_cache",
-            4096,
-            512,
-            Load {
-                lookups: 1_000.0,
-                ..thrash(1)
-            },
-        ),
+        sim_cache("b_cache", 4096, 512, IDLE),
     ];
     for _ in 0..40 {
         sim_tick(&mut moved, pool, &mut |_| 1.0);
@@ -1352,10 +1538,6 @@ fn noise_of_5_percent_in_ghost_hits_moves_nothing_over_50_ticks() {
         moved.iter().map(|c| c.capacity).collect::<Vec<_>>(),
         settled
     );
-
-    // Two busy caches of unlike loads settle where neither is worth twice
-    // the other a byte more. Noise near that edge may tip a move more the
-    // same way, never one back: back takes the other at twice the first.
     let mut busy = vec![
         sim_cache("a_cache", 1024, 128, thrash(3)),
         sim_cache(
@@ -1374,40 +1556,179 @@ fn noise_of_5_percent_in_ghost_hits_moves_nothing_over_50_ticks() {
             directions.insert((m.borrower.1, m.lender.1));
         }
     }
-    assert_eq!(
-        directions.into_iter().collect::<Vec<_>>(),
-        [("a_cache", "b_cache")],
-        "{busy:?}"
+    assert!(
+        !directions.contains(&("b_cache", "a_cache")),
+        "a move back: {directions:?}"
     );
+}
+
+/// #1314 review, through the real tick: a busy cache that holds its
+/// working set has no ghost hits, but what its bytes serve keeps it from
+/// lending while an idle cache has memory to give, and the busy cache short
+/// of memory borrows from the idle one. Before, the full cache weighed 0
+/// as a lender, as the idle one did, and the key decided: it lent and
+/// borrowed back in turn.
+#[test]
+fn a_full_busy_cache_does_not_lend_while_an_idle_one_can() {
+    let caches = RefCell::new(vec![
+        // Holds its 3 GiB working set; sorts before the idle cache.
+        sim_cache("metatile_cache", 3072, 128, thrash(3)),
+        // Short of its 3 GiB working set.
+        sim_cache("rendered_cache", 1024, 128, thrash(3)),
+        sim_cache("vector_tile_cache", 4096, 512, IDLE),
+    ]);
+    let total = fitting_total(&caches.borrow());
+    let mut ledger = Ledger::new();
+    let mut idle_lent = 0;
+    for _ in 0..40 {
+        for m in real_tick(&caches, total, &mut ledger).moves {
+            assert_ne!(m.lender.1, "metatile_cache", "{caches:?}");
+            assert_ne!(m.borrower.1, "metatile_cache", "{caches:?}");
+            idle_lent += usize::from(m.lender.1 == "vector_tile_cache");
+        }
+    }
+    assert!(idle_lent > 0);
+    assert!(
+        capacity_of(&caches, "rendered_cache") >= 3 * GIB,
+        "{caches:?}"
+    );
+    assert_eq!(capacity_of(&caches, "metatile_cache"), 3 * GIB);
+}
+
+/// #1314 review: a cache whose misses come back only past half its size
+/// more (an animation loop just over it: an LRU cliff) borrows, its value
+/// from the depth its ghost hits are at, gated there. Before, only the first
+/// depth was read, which had none.
+#[test]
+fn a_cache_past_an_lru_cliff_borrows_by_its_best_depth() {
+    // A loop over 1.8 × the cache: an LRU cache hits nothing, so every key
+    // misses; a cache 2 × larger holds the loop, 1.5 × does not.
+    let loop_cache = Elastic {
+        key: (Kind::Cache, "metatile_cache", Scope::Process),
+        capacity: 1024 * MIB,
+        floor: 128 * MIB,
+        ceiling: 8 * GIB,
+        value: 0.0,
+        ghost_hits: 0,
+        depth: 0,
+        borrows: true,
+        lend_value: 0.0,
+        lends: true,
+        need: None,
+    };
+    let (value, depth) = best_depth(
+        1024 * MIB,
+        [0.0, 100_000.0, 100_000.0],
+        0.003,
+        ds_cache::plan::GHOST_DEPTH_FACTORS,
+    );
+    assert_eq!(depth, 1, "the cliff at 2 ×");
+    assert!(value > 0.0);
+    let looping = Elastic {
+        value,
+        depth,
+        ghost_hits: 100_000,
+        ..loop_cache.clone()
+    };
+    let idle = Elastic {
+        key: (Kind::Cache, "rendered_cache", Scope::Process),
+        capacity: 4 * GIB,
+        floor: 512 * MIB,
+        ..loop_cache.clone()
+    };
+    let moves = elastic(&[looping.clone(), idle.clone()], 8 * GIB, 0);
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0].depth, 1);
+    // Gated at that depth: under 10 ghost hits there, no borrowing.
+    let rare = Elastic {
+        ghost_hits: ELASTIC_MIN_GHOST_HITS - 1,
+        ..looping
+    };
+    assert_eq!(elastic(&[rare, idle], 8 * GIB, 0), []);
+    // Equal values at two depths: the smaller step.
+    assert_eq!(
+        best_depth(GIB, [50.0, 100.0, 200.0], 1.0, [0.5, 1.0, 2.0]).1,
+        0
+    );
+}
+
+/// #1314 review: a move never lifts the expected use the plan fitted past
+/// its pool. Lending capacity a working-set cache does not use to a cache
+/// that fills all it gets would, and the pressure valve would take it back
+/// ten minutes later, again and again; it moves what the headroom holds.
+#[test]
+fn a_move_keeps_the_expected_use_within_the_pool() {
+    let pool = 3 * GIB;
+    // A working-set cache of 4 GiB that holds 1 GiB: lending its unused
+    // capacity lowers its expected use by nothing.
+    let unused = SimCache {
+        need: Some(GIB),
+        ..sim_cache("grid_cache", 4096, 512, IDLE)
+    };
+    let expected = |caches: &[SimCache]| -> u64 {
+        caches
+            .iter()
+            .map(|c| weigh(c, 1.0).expected_at(c.capacity))
+            .sum()
+    };
+    // 1 GiB + 1 GiB expected: 1 GiB of headroom, which the borrower fills
+    // and no more, though its working set is 3 GiB.
+    let mut caches = vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        unused.clone(),
+    ];
+    let mut moved = 0;
+    for _ in 0..200 {
+        moved += sim_tick(&mut caches, pool, &mut |_| 1.0).len();
+        assert!(expected(&caches) <= pool, "{caches:?}");
+    }
+    assert!(moved > 0);
+    assert_eq!(caches[0].capacity, 2 * GIB, "the headroom, filled");
+    // At the pool already: no move, though the lender is worth nothing.
+    let mut full = vec![sim_cache("metatile_cache", 2048, 128, thrash(8)), unused];
+    assert_eq!(expected(&full), pool);
+    assert_eq!(sim_tick(&mut full, pool, &mut |_| 1.0), []);
+    // A lender whose expected use drops with what it gives lends there.
+    let mut traffic = vec![
+        sim_cache("metatile_cache", 2048, 128, thrash(8)),
+        sim_cache("rendered_cache", 1024, 128, IDLE),
+    ];
+    assert_eq!(expected(&traffic), pool);
+    assert_eq!(sim_tick(&mut traffic, pool, &mut |_| 1.0).len(), 1);
 }
 
 fn elastic_cache(id: &'static str, capacity_mib: u64, value: f64, ghost_hits: u64) -> Elastic {
     Elastic {
-        key: (ds_cache::plan::Kind::Cache, id, Scope::Process),
+        key: (Kind::Cache, id, Scope::Process),
         capacity: capacity_mib * MIB,
         floor: 64 * MIB,
         ceiling: 8 * capacity_mib * MIB,
         value,
         ghost_hits,
+        depth: 0,
+        borrows: true,
+        lend_value: value,
         lends: true,
+        need: None,
     }
 }
 
-/// A move needs a borrower worth twice its lender a byte more, with enough
-/// ghost hits; it is the step, at most a tenth of either cache, within
-/// the lender's floor and the borrower's ceiling, in whole MiB; at most
-/// four a tick, each cache in one; a cache that does not lend never does.
+/// A move needs a borrower worth twice its lender, with enough ghost hits
+/// and fills in its window; it is the step, at most a tenth of either
+/// cache, within the lender's floor and the borrower's ceiling, in whole
+/// MiB; at most four a tick, each cache in one; a cache that does not lend
+/// never does.
 #[test]
 fn a_move_needs_twice_the_value_and_stays_within_its_bounds() {
     let pool = 8 * GIB;
     let busy = |value| elastic_cache("busy_cache", 2048, value, 100);
     let quiet = elastic_cache("quiet_cache", 4096, 1.0, 100);
     assert_eq!(
-        elastic(&[busy(1.99), quiet.clone()], pool),
+        elastic(&[busy(1.99), quiet.clone()], pool, GIB),
         [],
         "under twice"
     );
-    let moves = elastic(&[busy(2.0), quiet.clone()], pool);
+    let moves = elastic(&[busy(2.0), quiet.clone()], pool, GIB);
     assert_eq!(moves.len(), 1);
     assert_eq!(
         (moves[0].borrower.1, moves[0].lender.1),
@@ -1421,65 +1742,85 @@ fn a_move_needs_twice_the_value_and_stays_within_its_bounds() {
         ..busy(100.0)
     };
     assert_eq!(
-        elastic(&[few, quiet.clone()], pool),
+        elastic(&[few, quiet.clone()], pool, GIB),
         [],
         "too few ghost hits"
     );
+    let untimed = Elastic {
+        borrows: false,
+        ..busy(100.0)
+    };
+    assert_eq!(
+        elastic(&[untimed, quiet.clone()], pool, GIB),
+        [],
+        "no fill timed"
+    );
     let spared = Elastic {
         lends: false,
-        value: 0.0,
+        lend_value: 0.0,
         ..quiet.clone()
     };
-    assert_eq!(elastic(&[busy(10.0), spared], pool), [], "it never lends");
+    assert_eq!(
+        elastic(&[busy(10.0), spared], pool, GIB),
+        [],
+        "it never lends"
+    );
 
     // A tenth of the smaller cache, its floor, its ceiling.
     let small = elastic_cache("small_cache", 300, 0.0, 0);
     assert_eq!(
-        elastic(&[busy(10.0), small.clone()], pool)[0].bytes,
+        elastic(&[busy(10.0), small.clone()], pool, GIB)[0].bytes,
         30 * MIB
     );
     let at_floor = Elastic {
         floor: 290 * MIB,
         ..small.clone()
     };
-    assert_eq!(elastic(&[busy(10.0), at_floor], pool)[0].bytes, 10 * MIB);
+    assert_eq!(
+        elastic(&[busy(10.0), at_floor], pool, GIB)[0].bytes,
+        10 * MIB
+    );
     let near_ceiling = Elastic {
         ceiling: 2048 * MIB + 5 * MIB + 1,
         ..busy(10.0)
     };
     assert_eq!(
-        elastic(&[near_ceiling, quiet.clone()], pool)[0].bytes,
+        elastic(&[near_ceiling, quiet.clone()], pool, GIB)[0].bytes,
         5 * MIB
     );
     let full = Elastic {
         ceiling: 2048 * MIB,
         ..busy(10.0)
     };
-    assert_eq!(elastic(&[full, quiet.clone()], pool), [], "at its ceiling");
+    assert_eq!(
+        elastic(&[full, quiet.clone()], pool, GIB),
+        [],
+        "at its ceiling"
+    );
     let tiny = elastic_cache("tiny_cache", 9, 10.0, 100);
     assert_eq!(
-        elastic(&[tiny, quiet], pool),
+        elastic(&[tiny, quiet], pool, GIB),
         [],
         "a tenth of it is under 1 MiB"
     );
 
     // Six borrowers and six lenders: four moves, the best borrowers first,
     // each from the cheapest lender left.
-    let ids = ["c1", "c2", "c3", "c4", "c5", "c6"];
-    let mut caches: Vec<Elastic> = ids
+    let mut caches: Vec<Elastic> = ["c1", "c2", "c3", "c4", "c5", "c6"]
         .iter()
         .enumerate()
         .map(|(i, id)| elastic_cache(id, 4096, 100.0 + i as f64, 100))
         .collect();
-    let lenders = ["l1", "l2", "l3", "l4", "l5", "l6"];
     caches.extend(
-        lenders
+        ["l1", "l2", "l3", "l4", "l5", "l6"]
             .iter()
             .enumerate()
             .map(|(i, id)| elastic_cache(id, 4096, i as f64, 0)),
     );
-    let moves = elastic(&caches, pool);
-    let pairs: Vec<(&str, &str)> = moves.iter().map(|m| (m.borrower.1, m.lender.1)).collect();
+    let pairs: Vec<(&str, &str)> = elastic(&caches, pool, GIB)
+        .iter()
+        .map(|m| (m.borrower.1, m.lender.1))
+        .collect();
     assert_eq!(
         pairs,
         [("c6", "l1"), ("c5", "l2"), ("c4", "l3"), ("c3", "l4")]
@@ -1487,13 +1828,13 @@ fn a_move_needs_twice_the_value_and_stays_within_its_bounds() {
 }
 
 /// The caches the tick weighs, from its rows and plan: those the plan
-/// sizes, with a ring and a timed fill; a value from the window's ghost
-/// hits and miss cost, or the cache's mean fill since it was built when
-/// the window timed none; no lending from a cache filled ahead of reads.
+/// sizes, with a ring and a timed fill. A borrower's value is its best
+/// depth's, from the window's ghost hits and miss cost, and only a window
+/// that timed fills borrows; as a lender it is priced by what its bytes
+/// serve too, and without a fill in the window by its mean fill since it
+/// was built. No lending from a cache filled ahead of reads.
 #[test]
 fn the_tick_weighs_the_caches_the_plan_sizes_with_a_ring_and_a_timed_fill() {
-    use ds_cache::plan::{Activity, Kind, Row, Usage};
-    use ds_cache::Churn;
     let hour = |ghost_hits: Option<[u64; 3]>, fills: u64| Activity {
         secs: 3600,
         capacity_bytes: GIB,
@@ -1527,31 +1868,32 @@ fn the_tick_weighs_the_caches_the_plan_sizes_with_a_ring_and_a_timed_fill() {
         least_bytes: 32 * MIB,
     };
     let ring = Some([20, 30, 40]);
+    let process = Scope::Process;
     let mut rows = vec![
         row(
             "metatile_cache",
-            Scope::Process,
+            process.clone(),
             SizeSource::Default,
             Some(hour(ring, 50)),
             500,
         ),
         row(
             "rendered_cache",
-            Scope::Process,
+            process.clone(),
             SizeSource::Config("[memory.caches] rendered"),
             Some(hour(ring, 50)),
             500,
         ),
         row(
             "vector_tile_cache",
-            Scope::Process,
+            process.clone(),
             SizeSource::Default,
             Some(hour(None, 50)),
             500,
         ),
         row(
             "tiles3d_content_cache",
-            Scope::Process,
+            process.clone(),
             SizeSource::Default,
             Some(hour(ring, 50)),
             500,
@@ -1618,36 +1960,121 @@ fn the_tick_weighs_the_caches_the_plan_sizes_with_a_ring_and_a_timed_fill() {
         ],
         "pinned, without a ring, unreachable, never timed, unsampled and disabled ones drop"
     );
-    let metatile = &weighed[0];
-    // 20 ghost hits an hour at 2 ms, over the 512 MiB half the capacity adds.
     let close = |a: f64, b: f64| (a - b).abs() <= 1e-12 * b;
+    let metatile = &weighed[0];
+    // Its best depth: 20 ghost hits over the 512 MiB of 0.5 × against 30
+    // over 1 GiB and 40 over 2 GiB, at 2 ms.
+    assert_eq!((metatile.depth, metatile.ghost_hits), (0, 20));
     assert!(
         close(metatile.value, 20.0 * 0.002 / (512.0 * MIB as f64)),
         "{metatile:?}"
     );
-    assert_eq!(metatile.ghost_hits, 20);
-    assert_eq!(metatile.capacity, GIB);
+    // As a lender: 900 hits an hour at 2 ms over its 1 GiB is more.
+    assert!(close(metatile.lend_value, 900.0 * 0.002 / GIB as f64));
+    assert!(metatile.borrows && metatile.lends);
     let grant = plan.grant(&rows[0].entry).unwrap();
     assert_eq!(metatile.ceiling, grant.ceiling_bytes);
     assert_eq!(metatile.floor, grant.floor_bytes.max(32 * MIB));
-    assert!(metatile.lends);
-    // No fill in the window: the mean since it was built, 4 ms.
-    assert!(close(weighed[1].value, 20.0 * 0.004 / (512.0 * MIB as f64)));
+    // Ghost hits and no fill in the window: refills failing or untimed. It
+    // does not borrow; it lends at its mean fill since it was built, 4 ms.
+    let decoded = &weighed[1];
+    assert!(!decoded.borrows);
+    assert!(close(decoded.lend_value, 900.0 * 0.004 / GIB as f64));
     assert!(!weighed[2].lends, "a demand cache, filled ahead of reads");
-    assert!(rows.iter().all(|r| r.entry.kind == Kind::Cache));
+}
+
+/// The ledger (#1314): a reload that pins, re-bounds or resizes a cache
+/// drops its offset, and so does one that rebuilds or removes its
+/// collection; each offset stays within its cache's floor and ceiling.
+#[test]
+fn the_ledger_forgets_what_a_reload_supersedes_and_keeps_its_bounds() {
+    let tile = |id: &str| {
+        (
+            Kind::Cache,
+            "tile_cache",
+            Scope::Collection {
+                engine: "geotiff",
+                id: id.into(),
+            },
+        )
+    };
+    let lent = |offset| Lent {
+        offset,
+        source: SizeSource::Default,
+        configured: GIB,
+    };
+    let mut ledger: Ledger = [
+        (
+            (Kind::Cache, "metatile_cache", Scope::Process),
+            lent(512 * MIB as i64),
+        ),
+        (
+            (Kind::Cache, "rendered_cache", Scope::Process),
+            lent(-(100 * MIB as i64)),
+        ),
+        (
+            (Kind::Cache, "vector_tile_cache", Scope::Process),
+            lent(64 * MIB as i64),
+        ),
+        (tile("radar"), lent(64 * MIB as i64)),
+    ]
+    .into();
+    let caches = [
+        sim_cache("metatile_cache", 1024, 128, IDLE),
+        SimCache {
+            configured: 2 * GIB,
+            ..sim_cache("rendered_cache", 1024, 128, IDLE)
+        },
+    ];
+    let mut rows: Vec<Row> = caches.iter().map(sim_row).collect();
+    let mut pinned = sim_row(&sim_cache("vector_tile_cache", 1024, 128, IDLE));
+    pinned.entry.source = SizeSource::Config("[memory.caches] vector_tile");
+    rows.push(pinned);
+    reconcile_ledger(&mut ledger, &rows);
+    let kept: Vec<&str> = ledger.keys().map(|key| key.1).collect();
+    assert_eq!(
+        kept,
+        ["metatile_cache"],
+        "resized, pinned and gone ones drop"
+    );
+
+    ledger.insert(tile("radar"), lent(64 * MIB as i64));
+    ledger.insert(tile("opera"), lent(64 * MIB as i64));
+    forget_collections(&mut ledger, &["radar"]);
+    assert!(!ledger.contains_key(&tile("radar")), "rebuilt");
+    assert!(ledger.contains_key(&tile("opera")));
+    ledger.remove(&tile("opera"));
+
+    let caches = [sim_cache("metatile_cache", 1024, 128, IDLE)];
+    let rows: Vec<Row> = caches.iter().map(sim_row).collect();
+    let plan = sim_plan(&rows, fitting_total(&caches));
+    let grant = plan.grant(&rows[0].entry).unwrap();
+    assert!(grant.ceiling_bytes > grant.bytes, "{grant:?}");
+    ledger
+        .get_mut(&(Kind::Cache, "metatile_cache", Scope::Process))
+        .unwrap()
+        .offset = 16 * GIB as i64;
+    bound_ledger(&mut ledger, &rows, &plan);
+    let offset = ledger[&(Kind::Cache, "metatile_cache", Scope::Process)].offset;
+    assert_eq!(
+        offset,
+        grant.ceiling_bytes as i64 - grant.bytes as i64,
+        "its ceiling"
+    );
 }
 
 /// While the pressure valve holds, elastic memory weighs nothing; else it
-/// proposes the moves the decision makes, logged once while they repeat,
-/// counted every tick, and listed with every cache it weighed in
-/// `/admin/cache-plan`.
+/// proposes the moves the decision makes. In report mode they resize
+/// nothing and leave the ledger empty; the gauges show the current moves,
+/// and the counter and the log only new ones. Listed in `/admin/cache-plan`
+/// with every cache weighed and the ledger.
 #[test]
-fn proposals_wait_for_the_valve_and_are_logged_counted_and_listed() {
+fn proposals_wait_for_the_valve_and_report_mode_counts_only_new_moves() {
     let caches = vec![
         elastic_cache("metatile_cache", 4096, 1e-9, 100),
         Elastic {
             key: (
-                ds_cache::plan::Kind::Cache,
+                Kind::Cache,
                 "tile_cache",
                 Scope::Collection {
                     engine: "geotiff",
@@ -1657,11 +2084,13 @@ fn proposals_wait_for_the_valve_and_are_logged_counted_and_listed() {
             ..elastic_cache("tile_cache", 1024, 0.0, 0)
         },
     ];
-    let moves = elastic(&caches, 8 * GIB);
+    let moves = elastic(&caches, 8 * GIB, GIB);
     let proposal = Proposal {
         at: chrono::Utc::now(),
         held: None,
+        applied: false,
         step_bytes: elastic_step(8 * GIB),
+        headroom_bytes: GIB,
         caches: caches.clone(),
         moves: moves.clone(),
     };
@@ -1671,7 +2100,8 @@ fn proposals_wait_for_the_valve_and_are_logged_counted_and_listed() {
         format!(
             "Elastic memory, report only, nothing resized (#1314): 2 caches weighed, 1 move a \
              tick would make, in steps of at most 81 MiB\n  tile_cache radar → metatile_cache: \
-             81 MiB; a MiB more saves {:.3} ms of fills an hour there, 0.000 where it comes from",
+             81 MiB; a MiB more saves {:.3} ms of fills an hour there, on average up to 1.5 × \
+             its size more, against 0.000 a MiB serves where it comes from",
             crate::cache_plan::ms_per_mib(1e-9)
         )
     );
@@ -1683,20 +2113,35 @@ fn proposals_wait_for_the_valve_and_are_logged_counted_and_listed() {
         elastic_block(&none).ends_with(", no move: no cache's MiB more is worth 2 times another's")
     );
 
-    let document = elastic_json(&proposal);
+    let ledger: Ledger = [(
+        (Kind::Cache, "metatile_cache", Scope::Process),
+        Lent {
+            offset: 64 * MIB as i64,
+            source: SizeSource::Default,
+            configured: GIB,
+        },
+    )]
+    .into();
+    let document = elastic_json(&proposal, &ledger);
     assert_eq!(document["mode"], "report");
     assert_eq!(document["held"], Value::Null);
     assert_eq!(document["step_bytes"], 81 * MIB);
+    assert_eq!(document["headroom_bytes"], GIB);
     assert_eq!(
         document["moves"][0]["lender"],
         json!({"id": "tile_cache", "collection": "radar"})
     );
     assert_eq!(document["moves"][0]["bytes"], 81 * MIB);
+    assert_eq!(document["moves"][0]["borrower_depth"], "0.5");
     assert_eq!(document["caches"][1]["floor_bytes"], 64 * MIB);
     assert_eq!(document["caches"][1]["lends"], true);
+    assert_eq!(
+        document["ledger"],
+        json!([{"id": "metatile_cache", "collection": null, "offset_bytes": 64 * MIB}])
+    );
 
     let counted = |cache: &str, role: &str| {
-        ELASTIC_BYTES
+        ELASTIC_MOVES
             .with_label_values(&[cache, role, "report"])
             .get()
     };
@@ -1711,25 +2156,33 @@ fn proposals_wait_for_the_valve_and_are_logged_counted_and_listed() {
             counted("metatile_cache", "borrow"),
             counted("tile_cache", "lend")
         ),
-        (before.0 + 2 * 81 * MIB, before.1 + 2 * 81 * MIB),
-        "counted every tick"
+        (before.0 + 1, before.1 + 1),
+        "a move that recurs counts once"
     );
     assert_eq!(
-        governor().elastic_logged,
-        Some(vec![(moves[0].borrower.clone(), moves[0].lender.clone())])
+        ELASTIC_PROPOSED
+            .with_label_values(&["metatile_cache", "borrow"])
+            .get(),
+        81 * MIB as i64
     );
 
-    // The valve holds: nothing weighed, nothing moved.
-    let rows: Vec<ds_cache::plan::Row> = Vec::new();
-    let empty = plan(&Inputs {
-        total_bytes: 8 * GIB,
-        collections: 1,
-        baseline: Baseline::Estimated,
-        caches: Vec::new(),
-        budgets: Vec::new(),
-    });
-    let held = propose(&rows, &empty, true);
+    // The valve holds: nothing weighed, nothing moved; report mode resizes
+    // nothing and keeps no offset.
+    let rows: Vec<Row> = [
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        sim_cache("rendered_cache", 4096, 512, IDLE),
+    ]
+    .iter()
+    .map(sim_row)
+    .collect();
+    let plan = sim_plan(&rows, 32 * GIB);
+    let mut ledger = Ledger::new();
+    let resize = |_: &Entry, _: u64| -> Option<u64> { panic!("report mode resized") };
+    let held = run_elastic(&rows, &plan, &mut ledger, true, false, &resize);
     assert_eq!(held.held, Some(VALVE_HOLDS));
     assert!(held.moves.is_empty() && held.caches.is_empty());
-    assert_eq!(elastic_json(&held)["held"], VALVE_HOLDS);
+    let reported = run_elastic(&rows, &plan, &mut ledger, false, false, &resize);
+    assert_eq!(reported.moves.len(), 1, "{reported:?}");
+    assert!(ledger.is_empty());
+    assert_eq!(elastic_json(&held, &ledger)["held"], VALVE_HOLDS);
 }

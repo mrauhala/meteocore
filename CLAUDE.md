@@ -1778,8 +1778,12 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   `governor/decide.rs`, pure (inputs in, actions out, no clock): test
   them there. #1314's elastic sharing is a step of this loop, never a
   second loop: report only for now (`decide::elastic` proposes moves by
-  value per byte, `Grant::ceiling_bytes` and the plan's floors bound them;
-  nothing applies them, `cache_elastic_{moves,bytes}_total` count them). Every size change counts in `cache_plan_changes_total`
+  value per byte, `Grant::ceiling_bytes` and the plan's floors bound them,
+  never past the pool's expected use; nothing applies them until a switch
+  sets `governor::ELASTIC_APPLIES`, when a ledger of per-cache offsets,
+  added to the grants by the tick and by a reload's plan, keeps the
+  re-plan from undoing them; `cache_elastic_proposed_bytes` shows them,
+  `cache_elastic_moves_total` counts them). Every size change counts in `cache_plan_changes_total`
   (`memory_plan::count_changes`; a reload's staged resizes through
   `memory_plan::counting_resizes`); a new resize path counts there too.
   A valve ceiling never takes a cache below the plan's floor or its

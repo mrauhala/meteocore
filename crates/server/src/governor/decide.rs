@@ -287,13 +287,14 @@ pub(crate) const ELASTIC_VALUE_RATIO: f64 = 2.0;
 /// most this share of the borrower's, in percent.
 pub(crate) const ELASTIC_MAX_PERCENT: u64 = 10;
 
-/// A cache borrows only with at least this many ghost hits within the
-/// ring's first depth over its window: fewer are noise, whatever their
-/// value per byte.
+/// A cache borrows only with at least this many ghost hits over its
+/// window within the depth its value comes from: fewer are noise, whatever
+/// their value per byte. It also keeps a cache whose misses are rare but
+/// dear (a remote GRIB message at a few ghost hits an hour) from borrowing.
 pub(crate) const ELASTIC_MIN_GHOST_HITS: u64 = 10;
 
 /// A cache as elastic memory weighs it (#1314): what a byte more of it is
-/// worth, and how far it may move.
+/// worth, what a byte of it serves, and how far it may move.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Elastic {
     pub key: Key,
@@ -304,15 +305,42 @@ pub(crate) struct Elastic {
     /// The most it may borrow up to: the plan's ceiling for it
     /// (`Grant::ceiling_bytes`).
     pub ceiling: u64,
-    /// The fill time a byte more would have saved an hour, at the ring's
-    /// first depth (half the capacity more): its ghost hits there times its
-    /// miss cost, over those bytes. Seconds an hour per byte.
+    /// What a byte more is worth, as it borrows: the best of the ring's
+    /// depths of the fill time a byte of that much more memory would have
+    /// saved an hour on average (the ghost hits within the depth, which are
+    /// cumulative, times the miss cost, over all the depth's bytes). The
+    /// first slope of the curve's concave hull, so a cliff past half the
+    /// capacity counts. Seconds an hour per byte.
     pub value: f64,
-    /// The ghost hits within that depth, over the window the value is from.
+    /// The ghost hits within the depth `value` comes from, over the window.
     pub ghost_hits: u64,
+    /// That depth, an index of [`ds_cache::GHOST_DEPTHS`].
+    pub depth: usize,
+    /// It may borrow: its window timed fills, so its miss cost is now's. A
+    /// window with ghost hits and no fill is refills failing (an outage) or
+    /// fills untimed, not a cache that needs memory.
+    pub borrows: bool,
+    /// What a byte of it is worth, as it lends: the higher of `value` and
+    /// the fill time its hits saved an hour over its capacity, the average
+    /// its resident bytes serve. That overstates what its last bytes serve,
+    /// so it lends conservatively; a cache nobody reads serves nothing, and
+    /// lends first.
+    pub lend_value: f64,
     /// It may give memory up: not a cache its engines fill ahead of
     /// requests ([`spared`]), which below that re-downloads in a loop.
     pub lends: bool,
+    /// What its expected use is capped at, when the plan counts it at less
+    /// than its size (a working-set or demand cache holding less than its
+    /// grant): its expected use at a capacity of `c` is `min(c, need)`;
+    /// otherwise it is `c`.
+    pub need: Option<u64>,
+}
+
+impl Elastic {
+    /// Its expected use at a capacity of `bytes`, as the plan counts it.
+    pub(crate) fn expected_at(&self, bytes: u64) -> u64 {
+        self.need.map_or(bytes, |need| bytes.min(need))
+    }
 }
 
 /// Memory elastic sharing would move: `bytes` from `lender` to `borrower`,
@@ -322,7 +350,10 @@ pub(crate) struct Move {
     pub borrower: Key,
     pub lender: Key,
     pub bytes: u64,
+    /// The borrower's value, and the depth it comes from.
     pub borrower_value: f64,
+    pub depth: usize,
+    /// The lender's value as it lends ([`Elastic::lend_value`]).
     pub lender_value: f64,
 }
 
@@ -334,27 +365,58 @@ pub(crate) fn elastic_step(pool_bytes: u64) -> u64 {
     ELASTIC_STEP_BYTES.max(share / MIB * MIB)
 }
 
+/// The value a byte more of a cache of `capacity` is worth over a window,
+/// at the best of its ring's depths: `per_hour` of its cumulative `ghost`
+/// hits there, times `cost`, over the depth's bytes. Returns the value and
+/// its depth; the first of equal ones, the smaller step.
+pub(crate) fn best_depth(
+    capacity: u64,
+    ghost: [f64; 3],
+    cost: f64,
+    factors: [f64; 3],
+) -> (f64, usize) {
+    let mut best = (0.0, 0);
+    for depth in 0..3 {
+        let value = ghost[depth] * cost / (capacity as f64 * factors[depth]);
+        if value > best.0 {
+            best = (value, depth);
+        }
+    }
+    best
+}
+
+/// What a cache's byte serves as it lends ([`Elastic::lend_value`]): the
+/// higher of `value`, a byte more's, and the fill time its `hits_per_hour`
+/// saved at `cost` each, over its `capacity`.
+pub(crate) fn lend_value(value: f64, hits_per_hour: f64, cost: f64, capacity: u64) -> f64 {
+    value.max(hits_per_hour * cost / capacity.max(1) as f64)
+}
+
 /// The moves one tick would make between `caches` over a pool of
-/// `pool_bytes` (#1314): the caches whose byte more is worth the most
-/// borrow, in that order, each from the cache whose byte more is worth the
-/// least, while the borrower's value is at least [`ELASTIC_VALUE_RATIO`]
-/// times the lender's:
+/// `pool_bytes`, with `headroom` bytes of the pool the plan's expected use
+/// leaves (#1314). The caches whose byte more is worth the most borrow, in
+/// that order, each from the cache whose byte serves the least, while the
+/// borrower's value is at least [`ELASTIC_VALUE_RATIO`] times the lender's:
 ///
-/// - a borrower has [`ELASTIC_MIN_GHOST_HITS`] at least, and room under its
+/// - a borrower borrows ([`Elastic::borrows`]), with at least
+///   [`ELASTIC_MIN_GHOST_HITS`] at its value's depth and room under its
 ///   ceiling;
-/// - a lender lends ([`Elastic::lends`]), with room above its floor; one
-///   with no ghost hits is worth nothing a byte more;
+/// - a lender lends ([`Elastic::lends`]), with room above its floor, by its
+///   [`Elastic::lend_value`];
 /// - a move is the step ([`elastic_step`]), at most
 ///   [`ELASTIC_MAX_PERCENT`] of either cache, the lender's room above its
-///   floor and the borrower's under its ceiling, in whole MiB, and at
-///   least one;
+///   floor and the borrower's under its ceiling, in whole MiB, at least one;
+/// - a move raises the expected use the plan fitted to the pool by no more
+///   than the headroom left: lending capacity a cache does not use to one
+///   that fills all it gets would put the process over its total, and the
+///   pressure valve would take it back. It shrinks to what fits, or goes;
 /// - at most [`ELASTIC_MAX_MOVES`], each cache in one at most.
-pub(crate) fn elastic(caches: &[Elastic], pool_bytes: u64) -> Vec<Move> {
+pub(crate) fn elastic(caches: &[Elastic], pool_bytes: u64, headroom: u64) -> Vec<Move> {
     let step = elastic_step(pool_bytes);
     let share = |c: &Elastic| c.capacity / 100 * ELASTIC_MAX_PERCENT;
     let mut borrowers: Vec<&Elastic> = caches
         .iter()
-        .filter(|c| c.ghost_hits >= ELASTIC_MIN_GHOST_HITS && c.value > 0.0)
+        .filter(|c| c.borrows && c.ghost_hits >= ELASTIC_MIN_GHOST_HITS && c.value > 0.0)
         .filter(|c| c.ceiling > c.capacity)
         .collect();
     borrowers.sort_by(|a, b| b.value.total_cmp(&a.value).then_with(|| a.key.cmp(&b.key)));
@@ -362,7 +424,12 @@ pub(crate) fn elastic(caches: &[Elastic], pool_bytes: u64) -> Vec<Move> {
         .iter()
         .filter(|c| c.lends && c.capacity > c.floor)
         .collect();
-    lenders.sort_by(|a, b| a.value.total_cmp(&b.value).then_with(|| a.key.cmp(&b.key)));
+    lenders.sort_by(|a, b| {
+        a.lend_value
+            .total_cmp(&b.lend_value)
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    let mut headroom = headroom;
     let mut moved: HashSet<&Key> = HashSet::new();
     let mut moves = Vec::new();
     for borrower in borrowers {
@@ -375,18 +442,31 @@ pub(crate) fn elastic(caches: &[Elastic], pool_bytes: u64) -> Vec<Move> {
         let room = step
             .min(share(borrower))
             .min(borrower.ceiling - borrower.capacity);
-        // Lowest value first: the first that is not worth enough ends it.
+        // The lowest value first: the first that is not worth enough ends it.
         for lender in &lenders {
             if moved.contains(&lender.key) || lender.key == borrower.key {
                 continue;
             }
-            if borrower.value < ELASTIC_VALUE_RATIO * lender.value {
+            if borrower.value < ELASTIC_VALUE_RATIO * lender.lend_value {
                 break;
             }
-            let bytes = room.min(share(lender)).min(lender.capacity - lender.floor) / MIB * MIB;
-            if bytes == 0 {
+            let most = room.min(share(lender)).min(lender.capacity - lender.floor) / MIB;
+            // The most whole MiB whose move fits the headroom.
+            let raises = |bytes: u64| {
+                let up = borrower.expected_at(borrower.capacity + bytes)
+                    - borrower.expected_at(borrower.capacity);
+                let down = lender.expected_at(lender.capacity)
+                    - lender.expected_at(lender.capacity - bytes);
+                up.saturating_sub(down)
+            };
+            let Some(bytes) = (1..=most)
+                .rev()
+                .map(|mib| mib * MIB)
+                .find(|&bytes| raises(bytes) <= headroom)
+            else {
                 continue;
-            }
+            };
+            headroom -= raises(bytes);
             moved.insert(&borrower.key);
             moved.insert(&lender.key);
             moves.push(Move {
@@ -394,10 +474,33 @@ pub(crate) fn elastic(caches: &[Elastic], pool_bytes: u64) -> Vec<Move> {
                 lender: lender.key.clone(),
                 bytes,
                 borrower_value: borrower.value,
-                lender_value: lender.value,
+                depth: borrower.depth,
+                lender_value: lender.lend_value,
             });
             break;
         }
     }
     moves
+}
+
+/// A cache's elastic offset (#1314): the bytes it borrowed (positive) or
+/// lent (negative), which the re-plan tick and a reload's plan add to its
+/// grant, and what its size came from when it moved: a reload that pins it,
+/// re-bounds it or gives it another configured size drops the offset, as
+/// does one that rebuilds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Lent {
+    pub offset: i64,
+    pub source: SizeSource,
+    pub configured: u64,
+}
+
+/// The offsets of the caches elastic memory moved, by cache.
+pub(crate) type Ledger = HashMap<Key, Lent>;
+
+/// The size a cache whose grant is `grant` is held to with an elastic
+/// `offset`: the grant plus the offset, within `floor` and `ceiling`.
+pub(crate) fn elastic_target(grant: u64, offset: i64, floor: u64, ceiling: u64) -> u64 {
+    let target = (grant as i128 + offset as i128).clamp(0, u64::MAX as i128) as u64;
+    target.clamp(floor.min(ceiling), ceiling.max(floor))
 }
