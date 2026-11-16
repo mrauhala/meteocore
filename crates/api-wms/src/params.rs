@@ -31,8 +31,24 @@ pub const MAX_MAP_DIMENSION: u32 = 8000;
 /// time, each over the ones listed before it, under one render deadline, so
 /// every layer adds a whole render's time to it. The handler refuses more
 /// only after checking every named layer and style, so an undefined one is
-/// `LayerNotDefined` / `StyleNotDefined`.
+/// `LayerNotDefined` / `StyleNotDefined`, in a list of up to
+/// [`MAX_LISTED_LAYERS`] names.
 pub const LAYER_LIMIT: usize = 5;
+
+/// Most names a `LAYERS` list may hold, repeats included, for the handler to
+/// check them one by one. A longer list is refused before any name is
+/// resolved, with the answer a list over [`LAYER_LIMIT`] gets
+/// ([`too_many_layers`]). It is far above any list GetMap draws, so below it
+/// every name is still checked (#1065), each distinct one once.
+pub const MAX_LISTED_LAYERS: usize = 100;
+
+/// The `InvalidParameterValue` for a `LAYERS` list of `listed` names, more
+/// than [`LAYER_LIMIT`].
+pub(crate) fn too_many_layers(listed: usize) -> WmsError {
+    WmsError::invalid_parameter(&format!(
+        "LAYERS names {listed} layers; at most {LAYER_LIMIT} are drawn in one request"
+    ))
+}
 
 /// Supported CRS identifiers.
 const SUPPORTED_CRS: &[&str] = &["CRS:84", "EPSG:4326", "EPSG:3857", "EPSG:3067", "EPSG:3035"];
@@ -268,9 +284,9 @@ pub struct GetFeatureInfoParams {
     /// [`WmsQuery::validate_get_map`] so the two requests cannot read them
     /// differently.
     pub map: GetMapParams,
-    /// The `QUERY_LAYERS` names, in request order, each once. The handler
-    /// checks each is one of the map's `LAYERS`, and answers for each in
-    /// this order.
+    /// The `QUERY_LAYERS` names, in request order, each once, and at most
+    /// [`LAYER_LIMIT`] + 1 of them. The handler checks each is one of the
+    /// map's `LAYERS`, and answers for each in this order.
     pub query_layers: Vec<String>,
     /// The queried pixel's column, `0..map.width`.
     pub i: u32,
@@ -548,6 +564,12 @@ impl WmsQuery {
     pub fn validate_get_feature_info(&self) -> Result<GetFeatureInfoParams, WmsError> {
         let map = self.validate_get_map()?;
 
+        // QUERY_LAYERS names layers of LAYERS, of which the handler draws at
+        // most LAYER_LIMIT. Among any LAYER_LIMIT + 1 distinct names, then,
+        // one is not in LAYERS, and the handler answers LayerNotDefined for
+        // the first such name. The names after the first LAYER_LIMIT + 1
+        // distinct ones cannot change that answer, so they are not read: each
+        // name is compared with at most LAYER_LIMIT + 1 kept ones.
         let mut query_layers: Vec<String> = Vec::new();
         for name in self
             .query_layers
@@ -557,6 +579,9 @@ impl WmsQuery {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            if query_layers.len() > LAYER_LIMIT {
+                break;
+            }
             if !query_layers.iter().any(|q| q == name) {
                 query_layers.push(name.to_string());
             }
@@ -1139,6 +1164,25 @@ mod tests {
             ("J", "31"),
         ];
         WmsQuery::from_pairs(pairs.iter().chain(&base).copied()).validate_get_feature_info()
+    }
+
+    /// `QUERY_LAYERS` keeps its distinct names in request order, and stops
+    /// reading once it holds one more than `LAYERS` can: the handler answers
+    /// for the first name not in `LAYERS`, which is among those. Repeats
+    /// collapse onto their first listing, however many there are.
+    #[test]
+    fn query_layers_keep_their_first_distinct_names() {
+        let names = |query_layers: &str| {
+            get_feature_info(&[("QUERY_LAYERS", query_layers)])
+                .unwrap()
+                .query_layers
+        };
+        let many: Vec<String> = (0..1000).map(|i| format!("q{i}")).collect();
+        assert_eq!(names(&many.join(",")), many[..=LAYER_LIMIT]);
+        assert_eq!(names("a,b,a,c,b,c"), ["a", "b", "c"]);
+        let repeated = ["radar"; 1000].join(",");
+        assert_eq!(names(&format!("{repeated},other")), ["radar", "other"]);
+        assert_eq!(names(&format!("{repeated},,")), ["radar"]);
     }
 
     #[test]

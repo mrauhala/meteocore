@@ -1485,6 +1485,42 @@ async fn every_query_layer_is_shown_and_queryable() {
     assert!(nwp.calls().is_empty());
 }
 
+/// A long `QUERY_LAYERS` list is answered as before: `LayerNotDefined` for
+/// its first name that `LAYERS` does not list, here the sixth, after five
+/// that it does, whatever follows; and a layer listed any number of times
+/// is answered once. Nothing is read for the refused list.
+#[tokio::test]
+async fn a_long_query_layers_list_is_answered_for_its_first_name_not_shown() {
+    let nwp = Nwp::new(Answer::Value(1.0));
+    let app = router(nwp.clone());
+    let layers = "nwp/t2m,nwp/outline,nwp2/t2m,nwp2/outline,plain/t2m";
+    let later: Vec<String> = (0..1000).map(|i| format!("later{i}")).collect();
+    let query_layers = format!("{layers},missing,{}", later.join(","));
+    let reply = get(&app, &gfi_layers(layers, &query_layers, "")).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(
+        exception_code(&reply.body).as_deref(),
+        Some("LayerNotDefined")
+    );
+    assert!(
+        reply
+            .body
+            .contains("QUERY_LAYERS layer &apos;missing&apos; is not one of LAYERS"),
+        "{}",
+        reply.body
+    );
+    assert!(nwp.calls().is_empty());
+
+    let repeated = ["nwp/t2m"; 1000].join(",");
+    let reply = get(
+        &app,
+        &gfi_layers("nwp/t2m", &repeated, "&INFO_FORMAT=text/plain"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(reply.body.matches("layer: ").count(), 1, "{}", reply.body);
+}
+
 /// The request shapes of ets-wms13's `getfeatureinfo:two-query_layers`,
 /// `three-query_layers` and `less-query_layers`: one layer listed two or
 /// three times, all or some of them queried. A layer queried twice is

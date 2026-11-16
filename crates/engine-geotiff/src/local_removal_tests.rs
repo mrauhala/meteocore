@@ -109,6 +109,11 @@ fn a_local_file_deleted_after_the_scan_serves_its_mapping_until_the_next_scan() 
     let dir = TwoFrames::new();
     let engine = engine(&dir.0);
     assert_eq!(engine.raster_info().times, [older(), newer()]);
+    let shared = engine.raster_info_shared();
+    assert!(
+        std::sync::Arc::ptr_eq(&shared, &engine.raster_info_shared()),
+        "requests share one metadata snapshot until a scan changes it"
+    );
 
     std::fs::remove_file(dir.file(NEWER)).unwrap();
     assert_eq!(render(&engine, newer()), render(&reference, newer()));
@@ -117,6 +122,8 @@ fn a_local_file_deleted_after_the_scan_serves_its_mapping_until_the_next_scan() 
 
     engine.poll_once();
     assert_eq!(engine.raster_info().times, [older()]);
+    assert_eq!(engine.raster_info_shared().times, [older()]);
+    assert_eq!(shared.times, [older(), newer()], "a snapshot never changes");
     assert_eq!(engine.resolve_time(Some(newer()), None), Some(older()));
     assert_eq!(engine.resolve_time(None, None), Some(older()));
     assert_eq!(render(&engine, newer()), render(&reference, older()));

@@ -307,8 +307,9 @@ struct NowcastState {
     source_contract_changed: bool,
     /// Retained generations keyed by reference time (the instances contract).
     generations: BTreeMap<DateTime<Utc>, Arc<Generation>>,
-    /// Pre-built snapshot for the O(1) `raster_info()` contract.
-    info: RasterInfo,
+    /// Pre-built snapshot for the O(1) `raster_info()` contract, shared by
+    /// `raster_info_shared`.
+    info: Arc<RasterInfo>,
     /// Tracked-cell snapshots, oldest → newest (#544/#548). The last entry
     /// is the latest analysis frame's cells; earlier entries serve
     /// `?datetime=` history for animating clients.
@@ -477,7 +478,7 @@ impl NowcastEngine {
                 source_info: source_info.clone(),
                 source_contract_changed: false,
                 generations: BTreeMap::new(),
-                info: empty_info(&source_info),
+                info: Arc::new(empty_info(&source_info)),
                 cell_history: Vec::new(),
             }),
             shutdown: Shutdown::new(),
@@ -764,7 +765,7 @@ impl NowcastEngine {
                     let oldest = *generations.keys().next().unwrap();
                     generations.remove(&oldest);
                 }
-                let info = build_info(&source_info, &generations);
+                let info = Arc::new(build_info(&source_info, &generations));
                 let frame_bytes: u64 = generations
                     .values()
                     .flat_map(|g| &g.frames)
@@ -1763,6 +1764,10 @@ impl MapEngine for NowcastEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
+        (*self.raster_info_shared()).clone()
+    }
+
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
         self.state.load().info.clone()
     }
 

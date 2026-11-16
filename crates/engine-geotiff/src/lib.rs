@@ -3042,10 +3042,15 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
     }
 
     fn raster_info(&self) -> ds_core::map_engine::RasterInfo {
-        // O(1): clone the snapshot rebuilt at the last catalog swap
-        // (`refresh_raster_info`). No per-request CRS scan, timestamp Vec
-        // allocation, or STAC metadata fetch on the request path (#211).
-        (*self.raster_info.load_full()).clone()
+        (*self.raster_info_shared()).clone()
+    }
+
+    /// O(1): the snapshot rebuilt at the last catalog swap
+    /// (`refresh_raster_info`), shared rather than cloned. No per-request
+    /// CRS scan, timestamp `Vec` copy, or STAC metadata fetch on the request
+    /// path (#211).
+    fn raster_info_shared(&self) -> Arc<ds_core::map_engine::RasterInfo> {
+        self.raster_info.load_full()
     }
 
     fn resolve_time(

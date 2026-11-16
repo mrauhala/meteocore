@@ -58,9 +58,12 @@ injection risk.**
   GetMap refuses gets a legend or value (the style lookup falls back to
   the collection's styles for any `collection/…`).
 - A `LAYERS` list is checked name by name before `LAYER_LIMIT` (5)
-  refuses more: `resolve_map_layer` runs on every `(layer, style)` pair
-  (`GetMapParams::layers`), so an undefined one is `LayerNotDefined` /
-  `StyleNotDefined`. Several layers pair with `STYLES` values one to one
+  refuses more: `resolve_map_layer` runs on every distinct `(layer, style)`
+  pair (`GetMapParams::layers`), once, in list order, so an undefined one is
+  `LayerNotDefined` / `StyleNotDefined` and a repeat costs a lookup. A list
+  longer than `MAX_LISTED_LAYERS` (100) gets `LAYER_LIMIT`'s answer before
+  any name is resolved: the per-request work a list causes is bounded,
+  whatever its length. Several layers pair with `STYLES` values one to one
   (§7.3.3.4), an empty `STYLES` or one of commas only meaning every
   default; a single layer takes the whole `STYLES` value, as it always has.
 
@@ -501,7 +504,9 @@ compares them). Never unwrap it to `f64` on the way out.
   the frame GetMap draws and keys its caches on. `QUERY_LAYERS` must be
   layers of `LAYERS` (`LayerNotDefined`, Table E.1's "a layer not shown on
   the map"), each named once; a layer `LAYERS` lists twice is queried as
-  its first listing draws it. Every query layer is checked queryable before
+  its first listing draws it. `validate_get_feature_info` keeps at most
+  `LAYER_LIMIT` + 1 distinct names and reads no further: one of them is
+  not in `LAYERS`, and the first such is the answer, as for the whole list. Every query layer is checked queryable before
   any is read, and the answers come in `QUERY_LAYERS` order (#1181).
 - **Point.** `OutputCrs::position_on_earth` at `((I+0.5)/WIDTH,
   (J+0.5)/HEIGHT)`: `project_node`, the mapping every engine renders with

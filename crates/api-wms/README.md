@@ -151,7 +151,8 @@ lightning events, station symbols, radar volumes.
 
 - **Checks.** Every name and style is checked first, so an unknown one is
   `LayerNotDefined` / `StyleNotDefined`; a list of more than five served
-  layers is then `InvalidParameterValue`.
+  layers is then `InvalidParameterValue`. A list of more than 100 names is
+  `InvalidParameterValue` without its names being checked.
 - **Dimensions.** `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` apply to the
   listed layers that have that dimension; the others ignore it. A value a
   layer cannot take is an error, as for one layer. When no listed layer
