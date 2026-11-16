@@ -115,6 +115,15 @@ impl Ledger {
         Ok(())
     }
 
+    /// `key`'s largest loan to another cache: the borrower and the bytes.
+    pub(crate) fn largest_loan_to_a_cache(&self, key: &Key) -> Option<(Key, u64)> {
+        self.loans
+            .iter()
+            .filter(|loan| key_of(&loan.lender) == Some(key))
+            .filter_map(|loan| Some((key_of(&loan.borrower)?.clone(), loan.bytes)))
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+    }
+
     /// Every cache with a loan, once each.
     pub(crate) fn keys(&self) -> Vec<Key> {
         let mut keys: Vec<Key> = self

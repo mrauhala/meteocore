@@ -161,6 +161,40 @@ pub(crate) fn field_demand(
     )
 }
 
+/// How the chunk cache's keep floor is computed (#1314).
+const CHUNK_KEEP_RULE: &str = "the default variable's field at the default time of the newest \
+                               run as stored, uncompressed: at least its compressed chunks; none \
+                               after a day without a lookup";
+
+/// The chunk cache's keep floor in `catalog` (#1314): the field a map
+/// without a parameter or a time draws, its bottom level, as the cache
+/// weighs its chunks, from the file's metadata: its stored bytes, or the
+/// chunk holding it when that spans more, uncompressed, so at least what
+/// its compressed chunks or an OPeNDAP reply of it weigh; a quiet day drops
+/// it. `None` for a local collection, which the chunk cache never holds,
+/// and before a run.
+pub(crate) fn chunk_keep(catalog: &crate::catalog::Catalog) -> Option<ds_cache::plan::CacheDemand> {
+    let layout = catalog.layout.as_ref()?;
+    let selected = catalog.select(None, None).ok()?;
+    let file = &selected.step.file;
+    let url = file.reader.url()?;
+    // The first variable, as a map without a parameter draws
+    // (`NetcdfEngine::param`).
+    layout.variables.first()?;
+    let read = file.reads.first()?;
+    let chunk = read.chunk_bytes.max(1);
+    let chunks = read.field_bytes.div_ceil(chunk).max(1);
+    let stored = read.field_bytes.max(read.chunk_bytes);
+    let bytes = crate::remote::chunk_weight(stored, url)
+        + (chunks - 1) * crate::remote::chunk_weight(0, url);
+    Some(
+        ds_cache::plan::CacheDemand::keep(bytes, CHUNK_KEEP_RULE)
+            .when_quiet(0)
+            .input("field_bytes", read.field_bytes)
+            .input("chunks", chunks),
+    )
+}
+
 /// Decoded fields, `MC_NETCDF_FIELD_CACHE_MB` (default 256 MiB), shared by
 /// every NetCDF collection.
 static FIELDS: LazyLock<ByteBoundedCache<FieldKey, Values>> = LazyLock::new(|| {

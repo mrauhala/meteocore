@@ -1010,6 +1010,8 @@ fn rows_plan_at_their_configured_size() {
         configured_bytes: configured * MB,
         planned,
         least_bytes: 496 * MB,
+        keep: None,
+        quiet_for: None,
     };
     let input = |row: Row, applying: bool| {
         Inputs::of_rows(8 * GIB, 1, Baseline::Estimated, &[row], |_| None, applying).caches[0]

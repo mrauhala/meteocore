@@ -84,6 +84,15 @@ pub(crate) enum Reader {
 }
 
 impl Reader {
+    /// The URL a remote file's caches key on; `None` for a local file,
+    /// which the chunk cache never holds.
+    pub(crate) fn url(&self) -> Option<&str> {
+        match self {
+            Reader::Nc { remote, .. } => remote.as_deref().map(RemoteFile::url),
+            Reader::Dap(dap) => Some(dap.url()),
+        }
+    }
+
     /// Every variable's metadata.
     pub(crate) fn variables(&self) -> Result<&[NcVariable], String> {
         match self {

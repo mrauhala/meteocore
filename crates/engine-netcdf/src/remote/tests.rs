@@ -211,6 +211,34 @@ fn collections_on_one_host_share_its_limit_share_and_counter() {
     assert!(Arc::ptr_eq(&sfc.gets, &pl.gets));
 }
 
+/// #1314: a remote collection keeps its default field of the newest run
+/// in the chunk cache: what a map without a parameter or a time reads of
+/// it there, as the cache weighs it, is within the keep floor, which counts
+/// it as stored uncompressed; a quiet day drops it. A local collection,
+/// which the chunk cache never holds, keeps none.
+#[test]
+fn the_chunk_keep_holds_the_default_field_of_the_newest_run() {
+    let server = server();
+    let remote = engine(&server, "");
+    assert_eq!(local().chunk_cache_keep(), None);
+    let keep = remote.chunk_cache_keep().expect("published");
+    assert_eq!((keep.keep, keep.quiet_bytes), (true, 0));
+    let extent = remote.raster_info().spatial_extent.unwrap();
+    remote
+        .get_raster_tile(extent, 8, 8, None, &OutputCrs::Wgs84, None, None, None)
+        .unwrap();
+    let url = format!("{}/{}", server.url, key(slot(), 1));
+    let held = crate::remote::chunk_weight_of(&url);
+    assert!(held > 0, "the default field read into the cache");
+    assert!(held <= keep.bytes, "{held} > {keep:?}");
+    assert_eq!(keep.inputs[1], ("chunks", 1), "one chunk a field");
+    assert_eq!(
+        keep.bytes,
+        crate::remote::chunk_weight(keep.inputs[0].1, &url),
+        "the field as the cache weighs a chunk of it"
+    );
+}
+
 /// Every map drawn over HTTP ranges equals the same map read from the
 /// local files: every GET is ranged and answered 206, never the whole file.
 #[test]

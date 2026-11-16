@@ -207,7 +207,7 @@ static CHUNKS: LazyLock<ByteBoundedCache<ChunkKey, Bytes>> = LazyLock::new(|| {
             Part::Range { .. } => 0,
             Part::Dap(constraint) => constraint.len(),
         };
-        (bytes.len() + key.file.url.len() + constraint) as u64 + 96
+        chunk_weight(bytes.len() as u64, &key.file.url) + constraint as u64
     })
     .with_ghosts()
     .registered(
@@ -222,6 +222,20 @@ static CHUNKS: LazyLock<ByteBoundedCache<ChunkKey, Bytes>> = LazyLock::new(|| {
 /// neither lends nor decays in elastic memory. It stays marked.
 pub(crate) fn mark_chunks_prewarmed() {
     CHUNKS.mark_prewarmed();
+}
+
+/// The weight of a chunk of `bytes` of the file at `url` in the chunk
+/// cache, an OPeNDAP reply's constraint aside: what its keep floor counts
+/// (#1314).
+pub(crate) fn chunk_weight(bytes: u64, url: &str) -> u64 {
+    bytes + url.len() as u64 + 96
+}
+
+/// The weight of the byte ranges the chunk cache holds of the file at
+/// `url`.
+#[cfg(test)]
+pub(crate) fn chunk_weight_of(url: &str) -> u64 {
+    CHUNKS.weight_where(|key, _| key.file.url == url && matches!(key.part, Part::Range { .. }))
 }
 
 /// The block cache's counters and occupancy.
@@ -346,6 +360,11 @@ pub(crate) struct RemoteFile {
 }
 
 impl RemoteFile {
+    /// The file's URL, which every cache keys on.
+    pub(crate) fn url(&self) -> &str {
+        &self.id.url
+    }
+
     /// `key` under `host`, at `version`, for the ingest `ingest`. `origin`
     /// is the source URL's scheme and authority ([`origin`]).
     pub(crate) fn new(

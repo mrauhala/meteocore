@@ -90,6 +90,38 @@ pub(super) fn demand_slot(cache: &'static str, collection_id: &str) -> DemandSlo
     )
 }
 
+/// A slot for a source's keep floor on its cache `cache` (#1314), beside
+/// its demand slot.
+pub(super) fn keep_slot(cache: &'static str, collection_id: &str) -> DemandSlot {
+    DemandSlot::keep(
+        cache,
+        Scope::Source {
+            engine: "grib",
+            id: collection_id.to_string(),
+        },
+        collection_id,
+    )
+}
+
+/// How the compressed-message cache's keep floor is computed (#1314).
+const MESSAGE_KEEP_RULE: &str = "the default parameter's message at the default time of the \
+                                 newest run; none after a day without a lookup";
+
+/// The compressed-message cache's keep floor in `catalog` (#1314): the
+/// message a map without a parameter or a time draws, weighed as the cache
+/// weighs it, which a quiet day drops. `None` before a run, or for a
+/// message of unknown length.
+pub(super) fn message_keep(catalog: &Catalog) -> Option<CacheDemand> {
+    let (_, _, file) = super::select_run_step(catalog, &[], None, None).ok()?;
+    let entry = file.default_message()?;
+    let bytes = crate::message_cache::message_weight(file.message_url(entry), entry.length?);
+    Some(
+        CacheDemand::keep(bytes, MESSAGE_KEEP_RULE)
+            .when_quiet(0)
+            .input("message_bytes", bytes),
+    )
+}
+
 /// The decoded-grid cache's demand for fields of `nodes` values (#1309):
 /// [`DEMAND_FIELDS`] of them, each weighed as the cache weighs it.
 pub(super) fn grid_demand(nodes: u64) -> CacheDemand {
@@ -132,11 +164,30 @@ pub(super) fn message_demand(catalog: &Catalog) -> Option<CacheDemand> {
 }
 
 impl GribEngine {
+    /// Publish the message cache's keep floor (#1314) from the catalog,
+    /// with each catalog. The point-index cache keeps none: its size is
+    /// fixed, never one elastic memory moves.
+    pub(super) fn publish_keeps(&self) {
+        match message_keep(&self.source.catalog.load()) {
+            Some(keep) if self.source.message_cache.is_some() => {
+                self.source.message_keep.publish(keep);
+            }
+            _ => self.source.message_keep.clear(),
+        }
+    }
+
+    /// What the source last published as its message cache's keep floor
+    /// (#1314).
+    pub fn message_cache_keep(&self) -> Option<CacheDemand> {
+        self.source.message_keep.get()
+    }
+
     pub(super) fn publish_catalog(&self, catalog: Catalog) {
         if let Some(demand) = message_demand(&catalog) {
             self.publish_demand(&self.source.message_demand, demand);
         }
         self.source.catalog.store(Arc::new(catalog));
+        self.publish_keeps();
         // A new run may pack a parameter differently: let the CCSDS point
         // path try each parameter again (#1300).
         if let Some(index) = &self.source.point_index {
@@ -458,6 +509,54 @@ mod tests {
                 "prewarm {prewarm}, read_ahead {read_ahead}"
             );
         }
+    }
+
+    /// #1314: with a message cache, a source keeps the default message of
+    /// the newest run's default step, as the cache weighs it once a map has
+    /// read it, and none after a quiet day; without one, nothing.
+    #[test]
+    fn a_source_keeps_its_default_message() {
+        use ds_core::map_engine::{MapEngine, OutputCrs};
+        let source = TestSource::new();
+        for (name, step) in [("f000", 0), ("f003", 3)] {
+            source.write(
+                name,
+                &[
+                    ("TMP", "2 m above ground", message(0, 280.0, [0; 4], 103, 2)),
+                    ("TAIL", "surface", message(0, 0.0, [0; 4], 1, 0)),
+                ],
+                step,
+            );
+        }
+        let none = GribEngine::new("keep-none", &source.config()).unwrap();
+        assert_eq!(none.message_cache_keep(), None, "no message cache");
+        let mut config = source.config();
+        config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(16));
+        config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
+        let engine = GribEngine::new("keep", &config).unwrap();
+        let keep = engine.message_cache_keep().expect("published");
+        let length = message(0, 280.0, [0; 4], 103, 2).len() as u64;
+        assert!((length + 1..length + 512).contains(&keep.bytes), "{keep:?}");
+        assert_eq!(keep.inputs, [("message_bytes", keep.bytes)]);
+        assert_eq!((keep.keep, keep.quiet_bytes), (true, 0));
+        // A map at the default time reads that message into the cache.
+        engine
+            .get_raster_tile(
+                [-1.0, -1.0, 2.0, 2.0],
+                4,
+                4,
+                None,
+                &OutputCrs::Wgs84,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            engine.message_cache_metrics().bytes,
+            keep.bytes,
+            "the cache's weight"
+        );
     }
 
     #[test]

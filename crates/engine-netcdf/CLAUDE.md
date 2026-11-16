@@ -706,6 +706,21 @@ access = "opendap"` reads a remote family through DAP2.
 - `block_in_place` panics on a current-thread runtime: tests that render
   from async code use a multi-thread runtime.
 
+## Keep floor (#1314)
+
+- A remote collection publishes a keep floor on the process-wide chunk
+  cache with each catalog (`field::chunk_keep`): the first variable's
+  field (what a map without a parameter draws, `NetcdfEngine::param`) at
+  the step `Catalog::select(None, None)` draws, its bottom level, from
+  the file's metadata: `FieldRead::field_bytes`, or the chunk holding it
+  when that spans more, uncompressed, weighed as the cache weighs its
+  chunks (`remote::chunk_weight` with the file's URL, `Reader::url`).
+  An upper bound, deliberately: the compressed chunk sizes are not known
+  before a read, and the field as stored uncompressed is at least its
+  compressed chunks or an OPeNDAP reply of it.
+  None for a local collection; none after a quiet day. Pinned by
+  `the_chunk_keep_holds_the_default_field_of_the_newest_run`.
+
 ## Rendering
 
 `get_raster_tile` → `Catalog::select` → `field::read` →

@@ -218,6 +218,21 @@ pool: they do not use the Icechunk runtime bridge.
   arrays. Startup also logs outer/inner shapes, native bytes, and time steps
   per chunk to expose temporal decode amplification in map reads.
 
+## Keep floor (#1314)
+
+- `publish_demand` also publishes a keep floor on the cache of the
+  store's stored chunks (`Source::chunk_cache_id`: the plain object
+  cache, or the Icechunk payload cache): `Catalog::chunk_keep`, the first
+  variable's chunks over the grid at the time a map without one draws
+  (`nearest_time_idx(.., None)`) of the newest run, each at its decoded
+  size and its chunk key, weighed as the object cache weighs an object
+  (`store::object_weight`); for Icechunk the chunk key stands in for the
+  payload's path. An upper bound, deliberately: the stored chunk sizes
+  are not known before a read, and the decoded size is at least the
+  compressed one. None after a quiet day; the decoded cache keeps none.
+  Pinned by `keep_tests::a_plain_store_keeps_its_default_chunks` and the
+  Icechunk demand test.
+
 ## Wind components (#897)
 
 `catalog::wind_facts` reports each variable's CF `standard_name`, the frame

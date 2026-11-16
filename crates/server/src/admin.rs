@@ -727,6 +727,26 @@ static CACHE_DEMAND: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     per_collection(gauge)
 });
 
+// The least elastic memory leaves each cache (#1314): one series per cache
+// with a keep floor, labelled as `cache_size_source` is.
+static CACHE_KEEP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    let gauge = IntGaugeVec::new(
+        Opts::new(
+            "cache_keep_bytes",
+            "The keep floor of a cache of /admin/cache-plan: the least elastic memory leaves it \
+             (#1314), the largest of 64 MiB for the meta-tile, rendered-image and vector-tile \
+             caches, a demand cache's demand or a floor, and what its engines publish for a \
+             first view (the newest frame's pre-warmed tiles, a forecast's default field), \
+             smaller after a day without a lookup. cache is the /metrics family, collection \
+             empty for a process-wide one, whose keep sums its collections'. No series for a \
+             cache that keeps nothing",
+        ),
+        &["cache", "collection"],
+    )
+    .unwrap();
+    per_collection(gauge)
+});
+
 static CACHE_DEMAND_RATIO: LazyLock<GaugeVec> = LazyLock::new(|| {
     let gauge = GaugeVec::new(
         Opts::new(
@@ -771,11 +791,18 @@ fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
     CACHE_SIZE_SOURCE.reset();
     CACHE_DEMAND.reset();
     CACHE_DEMAND_RATIO.reset();
+    CACHE_KEEP.reset();
     for row in rows {
         let collection = row.entry.scope.collection().unwrap_or("");
         CACHE_SIZE_SOURCE
             .with_label_values(&[row.entry.id, collection, &row.source().to_string()])
             .set(1);
+        let keep = crate::governor::keep_of(row);
+        if row.entry.kind == ds_cache::plan::Kind::Cache && keep > 0 {
+            CACHE_KEEP
+                .with_label_values(&[row.entry.id, collection])
+                .set(keep.min(i64::MAX as u64) as i64);
+        }
         if let Some(demand) = &row.demand {
             let labels = [row.entry.id, collection];
             CACHE_DEMAND

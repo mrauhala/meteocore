@@ -864,6 +864,15 @@ async fn the_decoded_cache_demands_sixteen_inner_chunks() {
     let known = 8 + 4 + 3 * 8 + 160;
     assert!((known + 1..known + 64).contains(&chunk), "{chunk}");
     assert_eq!(demand.bytes, 16 * chunk);
+    // #1314: its keep floor, on the payload cache, the stored chunks' own.
+    let keep = engine.chunk_cache_keep().expect("published at load");
+    assert_eq!((keep.keep, keep.quiet_bytes), (true, 0));
+    assert_eq!(keep.inputs[0].0, "chunks");
+    assert!(keep.inputs[0].1 > 0 && keep.bytes > 0, "{keep:?}");
+    assert_eq!(
+        engine.source.chunk_cache_id(),
+        "zarr_icechunk_payload_cache"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

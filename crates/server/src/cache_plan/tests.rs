@@ -533,6 +533,23 @@ async fn every_cache_and_budget_on_metrics_is_in_the_plan() {
     );
     assert!(!metrics
         .contains("cache_demand_ratio{cache=\"grib_message_cache\",collection=\"grib-default\"}"));
+    // #1314: one `cache_keep_bytes` series per cache that keeps anything:
+    // the fixed one of the render caches, a demand cache's demand, what
+    // an engine publishes (the plain Zarr store its default chunks).
+    let keeps = || {
+        rows.iter()
+            .filter(|row| row.entry.kind == Kind::Cache && crate::governor::keep_of(row) > 0)
+    };
+    assert_eq!(count("cache_keep_bytes"), keeps().count());
+    assert!(metrics.contains(&format!(
+        "cache_keep_bytes{{cache=\"metatile_cache\",collection=\"\"}} {}",
+        64 * MIB
+    )));
+    let zarr = row("zarr_object_cache", Some("zarr")).expect("a plain store");
+    let zarr_keep = zarr.keep.as_ref().expect("published at load").bytes;
+    assert!(metrics.contains(&format!(
+        "cache_keep_bytes{{cache=\"zarr_object_cache\",collection=\"zarr\"}} {zarr_keep}"
+    )));
 
     // The log block and the endpoint list the same entries and sizes.
     assert_log_and_json_agree(&rows, Some(&report));
@@ -672,6 +689,8 @@ fn row(id: &'static str, scope: Scope, kind: Kind, source: SizeSource, capacity:
         configured_bytes: capacity,
         planned: false,
         least_bytes: 0,
+        keep: None,
+        quiet_for: None,
     }
 }
 
@@ -795,6 +814,9 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
                 "bytes": 400 * MIB,
                 "inputs": {"fields": 16, "nodes": 3601 * 1801, "field_bytes": 25 * MIB},
             }],
+            "keep_bytes": 0,
+            "keep": null,
+            "quiet_secs": null,
             "planned_bytes": 1536 * MIB,
             "planned_reason": "pinned",
             "expected_bytes": 768 * MIB,
@@ -827,10 +849,44 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
             "demand_kind": null,
             "suggested_bytes": null,
             "demand_inputs": null,
+            "keep_bytes": null,
+            "keep": null,
+            "quiet_secs": null,
             "planned_bytes": 4096 * MIB,
             "planned_reason": "pinned",
             "expected_bytes": 4096 * MIB,
         }])
+    );
+    // #1314: the meta-tile cache's fixed keep floor; a tile cache's
+    // published one, with its floor after a quiet day and each part.
+    assert_eq!(json["caches"][0]["keep_bytes"], 64 * MIB);
+    let mut keeping = rows[2].clone();
+    let part = ds_cache::plan::CacheDemand::keep(8 * MIB, "rule")
+        .when_quiet(MIB)
+        .input("frame_tile_bytes", 8 * MIB);
+    keeping.keep = Some(ds_cache::plan::Keep {
+        bytes: 8 * MIB,
+        quiet_bytes: MIB,
+        rule: "rule",
+        parts: vec![("opera".into(), part)],
+    });
+    keeping.quiet_for = Some(std::time::Duration::from_secs(90));
+    let kept = to_json(&[keeping], &memory, None);
+    assert_eq!(kept["caches"][0]["keep_bytes"], 8 * MIB);
+    assert_eq!(kept["caches"][0]["quiet_secs"], 90);
+    assert_eq!(
+        kept["caches"][0]["keep"],
+        json!({
+            "bytes": 8 * MIB,
+            "quiet_bytes": MIB,
+            "rule": "rule",
+            "parts": [{
+                "collection": "opera",
+                "bytes": 8 * MIB,
+                "quiet_bytes": MIB,
+                "inputs": {"frame_tile_bytes": 8 * MIB},
+            }],
+        })
     );
     let caches = (8192 + 4096 + 256 + 1536) * MIB;
     assert_eq!(

@@ -273,6 +273,9 @@ struct GribSource {
     /// (#1309), published as its grid geometry and catalog are.
     grid_demand: ds_cache::plan::DemandSlot,
     message_demand: ds_cache::plan::DemandSlot,
+    /// The least elastic memory leaves its message cache (#1314): the
+    /// default message of the newest run.
+    message_keep: ds_cache::plan::DemandSlot,
 }
 
 /// At most how many values a decoded field of a grid of `grid_size` cells
@@ -684,6 +687,7 @@ impl GribEngine {
                 discovery: RwLock::new(discovery::Discovery::default()),
                 grid_demand: discovery::demand_slot("grid_cache", collection_id),
                 message_demand: discovery::demand_slot("grib_message_cache", collection_id),
+                message_keep: discovery::keep_slot("grib_message_cache", collection_id),
             }),
         };
 

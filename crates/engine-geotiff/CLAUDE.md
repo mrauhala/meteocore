@@ -320,7 +320,11 @@ engine-zarr.
   absent from the previous catalog or holding another object there
   (`Catalog::fresh_since`, #1055), levels coarsest first while the frame
   stays within `prewarm::frame_cap` (`MC_COG_PREWARM_MB`, default 32 MiB,
-  0 off, at most 1/8 of the tile cache), coalesced by `range_batch::plan`,
+  0 off, at most 1/8 of the tile cache's capacity, raised to its
+  published keep floor up to 1/4 of the capacity, so a cache tier 2
+  shrank still warms the frame its keep protects and a cache shrunk
+  under pressure does not give one frame half its capacity), coalesced
+  by `range_batch::plan`,
   4 reads in flight on the poll runtime's blocking pool through the
   explicit-handle bridges, within `PREWARM_BUDGET`. `poll_loop` warms the
   startup catalog before its first sleep; on a STAC source its first poll
@@ -345,6 +349,23 @@ engine-zarr.
   each tile is cached as it lands and only in-flight reads are dropped, so
   the client's retry fetches the rest
   (`a_deadline_cut_read_keeps_fetched_tiles_for_the_retry`).
+
+## Keep floor (#1314)
+
+- A remote collection publishes its tile cache's keep floor beside its
+  demand, in `refresh_raster_info` under `demand_lock`, only when it
+  changes: `prewarm::frame_keep` over the newest frame's loaded header,
+  the levels `plan_frame` takes within `frame_cap` of the cache's
+  configured size (`TileCache::configured`, set at build and by
+  `apply_cache_sizes`, never the capacity elastic memory moved; one home,
+  `levels_within`), each tile weighed as the cache weighs it
+  (`cache::tile_weight`), at most `KEEP_MAX_BYTES` (32 MiB); after a day
+  without a lookup, its coarsest level (`when_quiet`). None for a local
+  collection, before the newest header loads, or with the pre-warm off.
+  `the_keep_floor_is_the_newest_frames_prewarmed_tiles` pins it against
+  what the cache holds after a pre-warm;
+  `a_cache_tier_2_shrank_still_prewarms_the_frame_its_keep_protects` the
+  keep and the cap on a cache below eight keeps.
 
 ## Remote tile read failures (#1051, #1074)
 

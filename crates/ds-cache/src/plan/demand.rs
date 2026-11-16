@@ -18,6 +18,15 @@
 //! [`check_rows`] over a snapshot, which sees a size a reload changed. A
 //! disabled cache (size 0) is never short: 0 is the way to turn one off.
 //!
+//! A third kind, a [`Keep`] (#1314), is no demand at all: the least of a
+//! cache elastic memory leaves it, so the first view of a quiet collection
+//! still finds its newest frame or its default field. The plan's sizes,
+//! suggestions and shortfalls ignore it. An engine publishes it through a
+//! slot of its own ([`DemandSlot::keep`]), computed as a demand is, where
+//! its facts change and weighed with the cache's own weight function, with
+//! the smaller floor that holds once the cache has gone a day without a
+//! lookup ([`CacheDemand::when_quiet`]).
+//!
 //! Nothing here changes a size.
 
 use std::collections::BTreeMap;
@@ -66,6 +75,12 @@ pub struct CacheDemand {
     /// is a size, and the first such is the size of one entry the cache
     /// holds ([`Self::entry_bytes`]).
     pub inputs: Vec<(&'static str, u64)>,
+    /// A keep floor (#1314, [`Self::keep`]): the least elastic memory
+    /// leaves the cache, never a demand.
+    pub keep: bool,
+    /// A keep's floor once the cache has gone [`QUIET_FOR`] without a
+    /// lookup ([`Self::when_quiet`]); `bytes` until then. 0 for a demand.
+    pub quiet_bytes: u64,
 }
 
 impl CacheDemand {
@@ -78,7 +93,28 @@ impl CacheDemand {
             ahead: false,
             setting,
             inputs: Vec::new(),
+            keep: false,
+            quiet_bytes: 0,
         }
+    }
+
+    /// A keep floor of `bytes` (#1314): what elastic memory never takes
+    /// from the cache, for `rule`; the same once the cache has gone quiet
+    /// unless [`Self::when_quiet`] says less. Published through a
+    /// [`DemandSlot::keep`]; the plan's sizes ignore it.
+    pub fn keep(bytes: u64, rule: &'static str) -> Self {
+        CacheDemand {
+            keep: true,
+            quiet_bytes: bytes,
+            ..Self::demand(bytes, rule, "")
+        }
+    }
+
+    /// A keep's floor once the cache has gone [`QUIET_FOR`] without a
+    /// lookup: one coarse overview of imagery, a forecast's point indexes.
+    pub fn when_quiet(mut self, bytes: u64) -> Self {
+        self.quiet_bytes = bytes.min(self.bytes);
+        self
     }
 
     /// A floor of `bytes`: [`Self::demand`], below which the cache cannot
@@ -195,11 +231,56 @@ impl Demand {
     }
 }
 
+/// How long a cache goes without a lookup before its keep floor drops to
+/// its quiet one ([`CacheDemand::when_quiet`], #1314): a day.
+pub const QUIET_FOR: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// A cache's keep floor (#1314): its collections' keeps summed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Keep {
+    pub bytes: u64,
+    /// The floor once the cache has gone [`QUIET_FOR`] without a lookup.
+    pub quiet_bytes: u64,
+    pub rule: &'static str,
+    /// Each collection's keep, by collection id.
+    pub parts: Vec<(String, CacheDemand)>,
+}
+
+impl Keep {
+    /// The sum of `parts`, sorted by collection; `None` without any.
+    fn of(mut parts: Vec<(String, CacheDemand)>) -> Option<Self> {
+        parts.sort_by(|a, b| a.0.cmp(&b.0));
+        let first = &parts.first()?.1;
+        let sum = |bytes: fn(&CacheDemand) -> u64| {
+            parts
+                .iter()
+                .fold(0u64, |sum, (_, part)| sum.saturating_add(bytes(part)))
+        };
+        Some(Keep {
+            bytes: sum(|part| part.bytes),
+            quiet_bytes: sum(|part| part.quiet_bytes),
+            rule: first.rule,
+            parts,
+        })
+    }
+
+    /// The floor of a cache that has gone `quiet_for` without a lookup.
+    pub fn floor(&self, quiet_for: Option<std::time::Duration>) -> u64 {
+        if quiet_for.is_some_and(|quiet| quiet >= QUIET_FOR) {
+            self.quiet_bytes
+        } else {
+            self.bytes
+        }
+    }
+}
+
 struct Slot {
     seq: u64,
     cache: &'static str,
     scope: Scope,
     collection: String,
+    /// A keep slot ([`DemandSlot::keep`]): counted apart from the demand.
+    keep: bool,
     demand: Mutex<Option<CacheDemand>>,
 }
 
@@ -224,13 +305,25 @@ impl DemandSlot {
     /// A slot for `collection`'s demand on the cache the plan lists as
     /// `cache` in `scope`, empty until the first [`Self::publish`].
     pub fn new(cache: &'static str, scope: Scope, collection: impl Into<String>) -> Self {
+        Self::with_kind(cache, scope, collection.into(), false)
+    }
+
+    /// A slot for `collection`'s keep floor on the cache `cache` in `scope`
+    /// (#1314), beside its demand slot: publish [`CacheDemand::keep`]s
+    /// there. A keep is never checked against the cache's size.
+    pub fn keep(cache: &'static str, scope: Scope, collection: impl Into<String>) -> Self {
+        Self::with_kind(cache, scope, collection.into(), true)
+    }
+
+    fn with_kind(cache: &'static str, scope: Scope, collection: String, keep: bool) -> Self {
         let slot = Arc::new(Slot {
             // The plan's own sequence: the entries registered after this
             // slot are its engine's ([`check`]).
             seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
             cache,
             scope,
-            collection: collection.into(),
+            collection,
+            keep,
             demand: Mutex::new(None),
         });
         let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -244,7 +337,11 @@ impl DemandSlot {
     /// engine's poll or refresh, never per request: it reads the cache's
     /// usage and every slot.
     pub fn publish(&self, demand: CacheDemand) -> Option<Shortfall> {
+        debug_assert_eq!(demand.keep, self.0.keep, "a keep goes in a keep slot");
         *self.0.demand.lock().unwrap_or_else(|e| e.into_inner()) = Some(demand);
+        if self.0.keep {
+            return None;
+        }
         check(&self.0)
     }
 
@@ -265,6 +362,7 @@ impl fmt::Debug for DemandSlot {
             .field("cache", &self.0.cache)
             .field("scope", &self.0.scope)
             .field("collection", &self.0.collection)
+            .field("keep", &self.0.keep)
             .field("demand", &self.0.demand())
             .finish()
     }
@@ -275,10 +373,32 @@ type Key = (&'static str, Scope);
 /// Every cache's demand from the live slots that have published, by cache
 /// id and scope.
 pub(super) fn demands() -> BTreeMap<Key, Demand> {
+    published(false)
+        .into_iter()
+        .filter_map(|(key, parts)| Some((key, Demand::of(parts)?)))
+        .collect()
+}
+
+/// Every cache's keep floor from the live keep slots that have published,
+/// by cache id and scope (#1314).
+pub(super) fn keeps() -> BTreeMap<Key, Keep> {
+    published(true)
+        .into_iter()
+        .filter_map(|(key, parts)| Some((key, Keep::of(parts)?)))
+        .collect()
+}
+
+/// What the newest live slot of each cache, scope and collection, of the
+/// kind `keep` says, published.
+fn published(keep: bool) -> BTreeMap<Key, Vec<(String, CacheDemand)>> {
     let slots: Vec<Arc<Slot>> = {
         let mut slots = SLOTS.lock().unwrap_or_else(|e| e.into_inner());
         slots.retain(|slot| slot.strong_count() > 0);
-        slots.iter().filter_map(Weak::upgrade).collect()
+        slots
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|slot| slot.keep == keep)
+            .collect()
     };
     // The newest slot of each cache, scope and collection.
     let mut newest: BTreeMap<(Key, &str), &Slot> = BTreeMap::new();
@@ -298,9 +418,6 @@ pub(super) fn demands() -> BTreeMap<Key, Demand> {
         }
     }
     parts
-        .into_iter()
-        .filter_map(|(key, parts)| Some((key, Demand::of(parts)?)))
-        .collect()
 }
 
 /// A cache configured below its demand.
@@ -594,6 +711,59 @@ mod tests {
         );
         drop((a, b_old, unpublished));
         assert_eq!(row("demand_test_sum").demand, None);
+    }
+
+    /// #1314: a keep slot beside a demand slot of the same collection
+    /// shadows neither: the row carries both, the keeps summed per cache,
+    /// each with its floor once quiet. A keep is never checked against the
+    /// size, and no demand counts it.
+    #[test]
+    fn a_keep_is_counted_apart_from_the_demand() {
+        let _serial = serial();
+        let owner = Arc::new(Sized(MIB));
+        let scope = Scope::Engine("demand-test-keep");
+        register(
+            Entry::cache("demand_test_keep", scope.clone(), SizeSource::Default),
+            &owner,
+            usage,
+        );
+        let demand_slot = DemandSlot::new("demand_test_keep", scope.clone(), "a");
+        demand_slot.publish(demand(512 * 1024));
+        let keep_a = DemandSlot::keep("demand_test_keep", scope.clone(), "a");
+        assert_eq!(
+            keep_a.publish(CacheDemand::keep(8 * MIB, "rule").when_quiet(2 * MIB)),
+            None,
+            "a keep above the size is no shortfall"
+        );
+        let keep_b = DemandSlot::keep("demand_test_keep", scope.clone(), "b");
+        keep_b.publish(CacheDemand::keep(4 * MIB, "rule"));
+        let listed = row("demand_test_keep");
+        assert_eq!(
+            listed.demand.as_ref().unwrap().bytes,
+            512 * 1024,
+            "unshadowed"
+        );
+        let keep = listed.keep.unwrap();
+        assert_eq!((keep.bytes, keep.quiet_bytes), (12 * MIB, 6 * MIB));
+        assert_eq!(keep.parts.len(), 2);
+        assert_eq!(keep.floor(None), 12 * MIB);
+        assert_eq!(
+            keep.floor(Some(QUIET_FOR - std::time::Duration::from_secs(1))),
+            12 * MIB
+        );
+        assert_eq!(keep.floor(Some(QUIET_FOR)), 6 * MIB);
+        assert_eq!(
+            CacheDemand::keep(MIB, "rule")
+                .when_quiet(2 * MIB)
+                .quiet_bytes,
+            MIB,
+            "never above the keep"
+        );
+        drop((keep_a, keep_b));
+        let listed = row("demand_test_keep");
+        assert_eq!(listed.keep, None);
+        assert!(listed.demand.is_some());
+        drop(demand_slot);
     }
 
     /// Note one cache of `capacity` MiB against a demand of `demand` MiB,

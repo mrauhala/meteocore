@@ -30,16 +30,20 @@
 //!   serves ([`elastic_inputs`]), and move memory to the caches where more
 //!   is worth most, from the pool's free headroom and the caches where it
 //!   serves least; a cache read again takes back what it lent the pool, a
-//!   cache below its grant what borrowers hold, and idle caches decay
-//!   ([`decide::elastic`]), within the pool's expected use. A cache filled
-//!   ahead of its reads neither lends nor decays. `report` only proposes:
-//!   logged when the moves change, shown on `/metrics` and in
+//!   cache below its grant what borrowers hold, then what idle caches its
+//!   engines fill ahead of reads hold above their keep floor, and idle
+//!   caches decay ([`decide::elastic`]), within the pool's expected use and
+//!   above every cache's keep floor ([`keep_of`]): what a first view of a
+//!   quiet collection needs, smaller after a day without a lookup. A cache
+//!   filled ahead of its reads neither lends nor decays. `report` only
+//!   proposes: logged when the moves change, shown on `/metrics` and in
 //!   `/admin/cache-plan`. `apply` makes them, each a loan in the
 //!   [`ledger`], whose offsets the tick and a reload's plan add to each
 //!   cache's grant, held exactly. Nothing moves while the valve holds, and
 //!   nothing borrows at or above 90 % of the total; the valve's relief takes
-//!   back what caches borrowed first, only the excess ([`relief`]), and
-//!   holds borrowing off for the restore's 10 minutes after.
+//!   back what caches borrowed first, only the excess and never below a
+//!   keep floor ([`relief`]), and holds borrowing off for the restore's 10
+//!   minutes after.
 //!
 //! Gates: everything runs where `AcceptedLoad::plans_sizes` holds, `auto`
 //! with a total; the valve only where that total is `[memory] total_mb` or
@@ -320,8 +324,9 @@ fn reconcile_ledger(ledger: &mut Ledger, rows: &[Row]) {
     });
 }
 
-/// Hold the ledger to `plan` (#1314): each cache's offset within its floor
-/// and ceiling, the lowest-valued counterparts shedding first, and the
+/// Hold the ledger to `plan` (#1314): each cache's offset within its floor,
+/// its keep floor included as far as its grant reaches, and ceiling, the
+/// lowest-valued counterparts shedding first, and the
 /// expected use it adds within the pool, the lowest-valued borrowers
 /// shedding first. A cache the plan no longer sizes loses its loans.
 fn bound_ledger(ledger: &mut Ledger, rows: &[Row], plan: &grant::Plan) {
@@ -332,11 +337,10 @@ fn bound_ledger(ledger: &mut Ledger, rows: &[Row], plan: &grant::Plan) {
         let grant = plan
             .grant(&row.entry)
             .filter(|g| !matches!(g.reason, Reason::Unreachable(_)))?;
-        Some((
-            grant.bytes,
-            floor_of(&row.entry, grant),
-            grant.ceiling_bytes,
-        ))
+        // Its keep floor too (#1314), as far as its grant reaches: what a
+        // cache lent comes back when its keep grows past what is left.
+        let floor = floor_of(&row.entry, grant).max(keep_of(row).min(grant.bytes));
+        Some((grant.bytes, floor, grant.ceiling_bytes))
     };
     ledger.bound(&bounds, &value);
     // The borrowers lowest-valued first, and from each its loans that add
@@ -814,10 +818,11 @@ pub(crate) fn elastic_inputs(rows: &[Row], plan: &grant::Plan, ledger: &Ledger) 
                 cost,
                 ds_cache::plan::GHOST_DEPTH_FACTORS,
             );
+            let keep = keep_of(row);
             Some(Elastic {
                 key: decide::key(entry),
                 capacity,
-                floor: floor_of(entry, grant).max(row.least_bytes),
+                floor: floor_of(entry, grant).max(row.least_bytes).max(keep),
                 ceiling: grant.ceiling_bytes,
                 value,
                 ghost_hits: ghost[depth],
@@ -832,9 +837,50 @@ pub(crate) fn elastic_inputs(rows: &[Row], plan: &grant::Plan, ledger: &Ledger) 
                 idle: window.label() == Some(ds_cache::plan::Label::Idle),
                 decays: !decide::spared(row) && !prewarmed(row),
                 pool_lent: ledger.lent_to_pool(&decide::key(entry)),
+                ahead: prewarmed(row) || row.demand.as_ref().is_some_and(|d| d.ahead),
+                keep,
+                recall: ledger.largest_loan_to_a_cache(&decide::key(entry)),
             })
         })
         .collect()
+}
+
+/// The keep floor a cache's whole size is fixed at (#1314): the meta-tile,
+/// rendered-image and vector-tile caches, process-wide, keep enough for a
+/// first view of any collection.
+pub(crate) const FIXED_KEEP_BYTES: u64 = 64 * MIB;
+
+/// The caches with a fixed keep floor ([`FIXED_KEEP_BYTES`]).
+const FIXED_KEEP: [&str; 3] = ["metatile_cache", "rendered_cache", "vector_tile_cache"];
+
+/// The least elastic memory leaves `row`'s cache (#1314): the larger of
+///
+/// - [`FIXED_KEEP_BYTES`] for the meta-tile, rendered-image and vector-tile
+///   caches;
+/// - its demand for a demand cache, or a floor its engines publish as its
+///   demand (the PVOL pixels' two pre-warms): what it must hold;
+/// - the keep floor its engines publish (`DemandSlot::keep`): the newest
+///   frame's pre-warmed tiles, the default field of the newest run, that
+///   run's point indexes; after a day without a lookup, the smaller floor
+///   they publish for that (`CacheDemand::when_quiet`).
+///
+/// 0 for any other cache: the QueryData caches and the stores keep none.
+pub(crate) fn keep_of(row: &Row) -> u64 {
+    let fixed = if FIXED_KEEP.contains(&row.entry.id) {
+        FIXED_KEEP_BYTES
+    } else {
+        0
+    };
+    let demand = row
+        .demand
+        .as_ref()
+        .filter(|d| d.floor || grant::class(row.entry.id) == grant::Class::Demand)
+        .map_or(0, |d| d.bytes);
+    let published = row
+        .keep
+        .as_ref()
+        .map_or(0, |keep| keep.floor(row.quiet_for));
+    fixed.max(demand).max(published)
 }
 
 /// Whether `row`'s engines fill its cache ahead of its reads
@@ -1044,7 +1090,16 @@ fn apply_move(
     if moved == 0 {
         return false;
     }
-    with_ledger(&mut |ledger| ledger.book(borrower.clone(), lender.clone(), moved));
+    with_ledger(&mut |ledger| {
+        // A borrower that decays gives the pool what it borrowed first, its
+        // lenders' share becoming their loans to the pool, which they take
+        // back when read again ([`MoveKind::Return`]); then it lends.
+        let released = match (&borrower, &lender) {
+            (None, Some(party)) => ledger.release_part(&party.key, moved, &|_| 0.0),
+            _ => 0,
+        };
+        ledger.book(borrower.clone(), lender.clone(), moved - released);
+    });
     m.bytes = moved;
     true
 }
@@ -1054,8 +1109,10 @@ fn roles(kind: MoveKind) -> (&'static str, &'static str) {
     match kind {
         MoveKind::Borrow => ("borrow", "lend"),
         MoveKind::Reclaim => ("reclaim", "repay"),
+        MoveKind::ReclaimPrewarmed => ("reclaim", "prewarmed"),
         MoveKind::Decay => ("borrow", "decay"),
         MoveKind::Return => ("return", "return"),
+        MoveKind::Recall => ("return", "repay"),
     }
 }
 
@@ -1178,9 +1235,19 @@ fn elastic_block(proposal: &Proposal) -> String {
                 cache_plan::ms_per_mib(m.borrower_value),
                 cache_plan::ms_per_mib(m.lender_value),
             ),
+            MoveKind::ReclaimPrewarmed => format!(
+                "back to its plan, below which a MiB more saves {:.3} ms of fills an hour, \
+                 from what an idle cache holds above its floor of what its engines fill ahead, \
+                 against {:.3} a MiB serves there",
+                cache_plan::ms_per_mib(m.borrower_value),
+                cache_plan::ms_per_mib(m.lender_value),
+            ),
             MoveKind::Decay => "idle: down toward what it holds plus 10 %".to_string(),
             MoveKind::Return => {
                 "read again: what it lent the pool, back at the restore's pace".to_string()
+            }
+            MoveKind::Recall => {
+                "read again: what tier 2 took from it, back at the restore's pace".to_string()
             }
         };
         let _ = write!(
@@ -1241,7 +1308,8 @@ fn take_back(
         };
         let floor = plan
             .grant(&row.entry)
-            .map_or(0, |g| floor_of(&row.entry, g));
+            .map_or(0, |g| floor_of(&row.entry, g))
+            .max(keep_of(row));
         let (from, used) = (row.usage.capacity_bytes, row.usage.used_bytes);
         let need = (excess - done.freed).saturating_add(from.saturating_sub(used));
         let release = need
@@ -1641,8 +1709,10 @@ static ELASTIC_MOVES: LazyLock<IntCounterVec> = LazyLock::new(|| {
              tick (#1314), by cache, role and mode. role: borrow, the cache whose MiB more \
              saves the most fill time, from the pool's free headroom or a cache; lend, a cache \
              whose MiB serves at most half as much; reclaim, a cache below its grant taking \
-             back what a borrower holds, at an even ratio; repay, that borrower; return, a \
-             cache read again taking back what it lent the pool, at the restore's pace; decay, \
+             back what a borrower holds, at an even ratio; repay, that borrower; prewarmed, an \
+             idle cache filled ahead of reads it then takes from, above its keep floor; return, \
+             a cache read again taking back what it lent the pool, or a cache filled ahead of \
+             reads what tier 2 took, at the restore's pace; decay, \
              an idle cache giving the pool what it does not hold; give_back, a borrower the \
              pressure valve made give back what it borrowed, as much as the excess. mode = report ([memory] elastic \
              = \"report\"): proposed, never applied, counted once while the same move recurs \
@@ -1665,8 +1735,9 @@ static ELASTIC_PROPOSED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         Opts::new(
             "cache_elastic_proposed_bytes",
             "Bytes the last re-plan tick's elastic memory moves took or would take from (role \
-             = lend, repay or decay) or give to (role = borrow or reclaim) each cache (#1314), \
-             summed over its collections; none with [memory] elastic = \"off\"",
+             = lend, repay, prewarmed or decay) or give to (role = borrow, reclaim or return) \
+             each cache (#1314), summed over its collections; none with [memory] elastic = \
+             \"off\"",
         ),
         &["cache", "role"],
     )
@@ -1696,10 +1767,10 @@ static ELASTIC_OFFSETS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
-/// Show `ledger`'s loans on `/metrics` (`cache_elastic_offset_bytes`),
-/// each cache's borrowed and lent bytes summed over its collections.
-fn show_offsets(ledger: &Ledger) {
-    let mut sums: HashMap<(&str, &str), u64> = HashMap::new();
+/// Each cache's `borrowed` and `lent` bytes in `ledger`, summed over its
+/// collections: what [`show_offsets`] sets, none for a cache without.
+fn offset_sums(ledger: &Ledger) -> HashMap<(&'static str, &'static str), u64> {
+    let mut sums = HashMap::new();
     for key in ledger.keys() {
         for (role, bytes) in [
             ("borrowed", ledger.borrowed(&key)),
@@ -1710,6 +1781,13 @@ fn show_offsets(ledger: &Ledger) {
             }
         }
     }
+    sums
+}
+
+/// Show `ledger`'s loans on `/metrics` (`cache_elastic_offset_bytes`),
+/// each cache's borrowed and lent bytes summed over its collections.
+fn show_offsets(ledger: &Ledger) {
+    let sums = offset_sums(ledger);
     ELASTIC_OFFSETS.reset();
     for ((cache, role), bytes) in sums {
         ELASTIC_OFFSETS
@@ -1838,7 +1916,9 @@ fn elastic_json(proposal: &Proposal, ledger: &Ledger) -> Value {
             "floor_bytes": c.floor,
             "ceiling_bytes": c.ceiling,
             "used_bytes": c.used,
+            "keep_bytes": c.keep,
             "idle": c.idle,
+            "ahead": c.ahead,
             "ghost_hits": c.ghost_hits,
             "depth": depth(c.depth),
             "value_ms_per_mib_hour": value(c.value),

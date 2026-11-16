@@ -469,6 +469,29 @@ cube) return `default_parameters` instead, every parameter of the view
 pressure/model view, else the products of the selected steps, near-surface
 ones only in the legacy layout.
 
+## Keep floors (#1314)
+
+- `publish_keeps` (after each catalog publish) publishes the message
+  cache's keep floor through `discovery::keep_slot`, `message_keep`: the
+  default message of the step `select_run_step(catalog, &[], None, None)`
+  draws, weighed by `message_weight`, none after a quiet day
+  (`when_quiet(0)`); only with a message cache. Pinned by
+  `a_source_keeps_its_default_message` (against the cache's own weight
+  after a map read).
+- No other keeps. The grid cache holds decoded grids, which a first view
+  can rebuild from messages. The point-index cache is `Class::Fixed` in
+  the plan: no rule sizes it and elastic memory never moves it, so a keep
+  would only cost a per-poll walk of its entries.
+- A trade, by intent: the poll's pre-warm and a map's read-ahead are a
+  share of the message cache's *current* capacity (`SHARE_PERCENT`, 25 %).
+  While tier 2 has taken an idle message cache down to its keep, the next
+  run's pre-warm is a quarter of that smaller cache. Sizing it from the
+  configured size instead would pre-warm into a cache too small to hold
+  it, evicting the newest run's messages it just fetched. The source is
+  idle when tier 2 takes from it, so a smaller pre-warm costs a first view
+  at most; once read again, the cache recalls what tier 2 took at 5 % of
+  its grant a tick (`MoveKind::Recall`), and the pre-warm grows with it.
+
 ## Per-parameter time axes (#1005)
 
 - Hour-window aggregates (`PRATE_avg_6h`) and maxima absent from the

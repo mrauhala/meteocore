@@ -335,6 +335,8 @@ fn row(id: &'static str, scope: Scope, source: SizeSource, capacity: u64) -> Row
         configured_bytes: capacity,
         planned: false,
         least_bytes: 0,
+        keep: None,
+        quiet_for: None,
     }
 }
 

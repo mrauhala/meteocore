@@ -65,13 +65,26 @@ const DEFAULT_FRAME_CAP_MB: usize = 32;
 /// The most encoded bytes one frame pre-warms: `MC_COG_PREWARM_MB` (default
 /// 32 MiB; 0 turns the pre-warm off), and at most an eighth of the engine's
 /// tile cache, so the newest frames fit side by side and one large file
-/// cannot evict the rest. Levels are taken coarsest first while the frame's
-/// running total stays within it, so a file too large for the cap still gets
-/// its overviews.
-pub(crate) fn frame_cap(tile_cache_capacity: u64) -> usize {
+/// cannot evict the rest, but never less than the cache's keep floor
+/// `keep` (#1475 review): when elastic memory took the cache below eight of
+/// its keeps, the newest frame the keep protects is still pre-warmed whole.
+/// The keep raises the cap only up to a quarter of the cache: a cache the
+/// plan or the pressure valve shrank, still read, would otherwise hand one
+/// frame half its capacity and evict the frames clients are looping over.
+/// Levels are taken coarsest first while the frame's running total stays
+/// within it, so a file too large for the cap still gets its overviews.
+pub(crate) fn frame_cap(tile_cache_capacity: u64, keep: u64) -> usize {
     static CAP: LazyLock<usize> =
         LazyLock::new(|| parse_frame_cap(std::env::var("MC_COG_PREWARM_MB").ok().as_deref()));
-    (*CAP).min(usize::try_from(tile_cache_capacity / 8).unwrap_or(usize::MAX))
+    (*CAP).min(frame_share(tile_cache_capacity, keep))
+}
+
+/// The share of a tile cache of `capacity` one frame pre-warms, before the
+/// `MC_COG_PREWARM_MB` cap: an eighth, raised to `keep` but never past a
+/// quarter of the cache.
+fn frame_share(capacity: u64, keep: u64) -> usize {
+    let share = (capacity / 8).max(keep.min(capacity / 4));
+    usize::try_from(share).unwrap_or(usize::MAX)
 }
 
 /// `MC_COG_PREWARM_MB` in bytes; unset or unparsable is the default.
@@ -185,18 +198,24 @@ impl FramePlan {
     }
 }
 
-/// Plan the pre-warm of one catalog entry: every level, coarsest first, whose
-/// encoded tiles keep the frame within `cap`, and of those the tiles `cache`
-/// does not hold. `None` for a source with nothing to fetch (local, in
+/// One level of a frame the pre-warm reads: its IFD, its tile layout, and
+/// its non-empty tiles with their absolute byte ranges.
+struct Level<'a> {
+    ifd: u16,
+    info: &'a RemoteTileInfo,
+    tiles: Vec<(u32, Range<usize>)>,
+}
+
+/// The levels of a frame the pre-warm reads, coarsest first: every level
+/// whose encoded tiles keep the frame within `cap`, and how many finer
+/// ones it leaves out. `None` for a source with nothing to fetch (local, in
 /// memory) or with a tile layout the request path would reject too.
-pub(crate) fn plan_frame(
-    path: &Path,
-    metadata: &TiffMetadata,
-    source: &Arc<DataSource>,
-    cache: &TileCache,
+fn levels_within<'a>(
+    metadata: &'a TiffMetadata,
+    source: &'a DataSource,
     cap: usize,
-) -> Option<FramePlan> {
-    let full = match source.as_ref() {
+) -> Option<(Vec<Level<'a>>, usize)> {
+    let full = match source {
         DataSource::Remote { tile_info, .. } | DataSource::HttpDirect { tile_info, .. } => {
             tile_info
         }
@@ -224,12 +243,7 @@ pub(crate) fn plan_frame(
         )))
         .collect();
 
-    let mut plan = FramePlan {
-        path: path.to_path_buf(),
-        source: Arc::clone(source),
-        reads: Vec::new(),
-        capped_levels: 0,
-    };
+    let mut within = Vec::new();
     let mut total = 0usize;
     for (level, &(ifd, info, across, down)) in levels.iter().enumerate() {
         // An overview without tile info (a header read too short to reach
@@ -251,10 +265,33 @@ pub(crate) fn plan_frame(
             tiles.push((u32::try_from(chunk).ok()?, offset..offset + count));
         }
         if total.saturating_add(bytes) > cap {
-            plan.capped_levels = levels.len() - level;
-            break;
+            return Some((within, levels.len() - level));
         }
         total += bytes;
+        within.push(Level { ifd, info, tiles });
+    }
+    Some((within, 0))
+}
+
+/// Plan the pre-warm of one catalog entry: every level, coarsest first, whose
+/// encoded tiles keep the frame within `cap`, and of those the tiles `cache`
+/// does not hold. `None` for a source with nothing to fetch (local, in
+/// memory) or with a tile layout the request path would reject too.
+pub(crate) fn plan_frame(
+    path: &Path,
+    metadata: &TiffMetadata,
+    source: &Arc<DataSource>,
+    cache: &TileCache,
+    cap: usize,
+) -> Option<FramePlan> {
+    let (levels, capped_levels) = levels_within(metadata, source, cap)?;
+    let mut plan = FramePlan {
+        path: path.to_path_buf(),
+        source: Arc::clone(source),
+        reads: Vec::new(),
+        capped_levels,
+    };
+    for Level { ifd, info, tiles } in levels {
         let misses: Vec<(usize, Range<usize>)> = tiles
             .iter()
             .enumerate()
@@ -271,6 +308,31 @@ pub(crate) fn plan_frame(
         }
     }
     Some(plan)
+}
+
+/// The most a frame's keep floor holds (#1314): the default per-frame
+/// pre-warm cap.
+pub(crate) const KEEP_MAX_BYTES: u64 = (DEFAULT_FRAME_CAP_MB * 1024 * 1024) as u64;
+
+/// What the tile cache holds of a frame the pre-warm warms within `cap`,
+/// weighed as the cache weighs its tiles (#1314): every tile of the levels
+/// [`plan_frame`] takes, and of its coarsest level alone. `None` where
+/// [`plan_frame`] fetches nothing.
+pub(crate) fn frame_keep(
+    metadata: &TiffMetadata,
+    source: &DataSource,
+    cap: usize,
+) -> Option<(u64, u64)> {
+    let (levels, _) = levels_within(metadata, source, cap)?;
+    let weight = |level: &Level| -> u64 {
+        level
+            .tiles
+            .iter()
+            .map(|(_, range)| crate::cache::tile_weight(range.len()))
+            .sum()
+    };
+    let coarsest = levels.first().map_or(0, weight);
+    Some((levels.iter().map(weight).sum(), coarsest))
 }
 
 /// What one pre-warm did, for its log line.
@@ -456,6 +518,27 @@ mod tests {
         assert_eq!(
             parse_frame_cap(Some("lots")),
             DEFAULT_FRAME_CAP_MB * 1024 * 1024
+        );
+    }
+
+    /// #1475 review: a frame's share is an eighth of the cache, raised to the
+    /// keep floor but never past a quarter of the cache, so a cache shrunk
+    /// under pressure does not hand one frame half of what it holds.
+    #[test]
+    fn a_frames_share_is_raised_to_the_keep_up_to_a_quarter_of_the_cache() {
+        const MIB: u64 = 1024 * 1024;
+        let mib = |n: u64| usize::try_from(n * MIB).unwrap();
+        assert_eq!(frame_share(256 * MIB, 8 * MIB), mib(32), "an eighth");
+        assert_eq!(frame_share(48 * MIB, 8 * MIB), mib(8), "raised to the keep");
+        assert_eq!(
+            frame_share(64 * MIB, 32 * MIB),
+            mib(16),
+            "a quarter at most"
+        );
+        assert_eq!(
+            frame_share(6 * 32 * MIB, 32 * MIB),
+            mib(32),
+            "the keep whole"
         );
     }
 

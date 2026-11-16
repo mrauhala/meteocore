@@ -205,6 +205,8 @@ type Placeholder<'a, K, V> = quick_cache::sync::PlaceholderGuard<
 
 struct Inner<K: Eq + Hash, V: Clone> {
     cache: Store<K, V>,
+    /// The weight function the store weighs with ([`ByteBoundedCache::weight_where`]).
+    weigh: fn(&K, &V) -> u64,
     /// The store's lifecycle, to count the requests the cache finishes.
     lifecycle: Counting<K, V>,
     shape: Shape,
@@ -628,6 +630,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         ByteBoundedCache {
             inner: Arc::new(Inner {
                 cache,
+                weigh,
                 lifecycle,
                 shape,
                 capacity_bytes: AtomicU64::new(capacity_bytes),
@@ -925,6 +928,22 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// reload-frequency paths, not per request.
     pub fn retain(&self, keep: impl Fn(&K, &V) -> bool) {
         self.inner.cache.retain(keep);
+    }
+
+    /// The weight of the resident entries `select` picks, as the cache
+    /// weighs them: what an engine's keep floor protects of what it holds
+    /// (#1314). Visits every entry, without touching its recency or a
+    /// counter: call it from a poll, never per request.
+    pub fn weight_where(&self, select: impl Fn(&K, &V) -> bool) -> u64
+    where
+        K: Clone,
+    {
+        self.inner
+            .cache
+            .iter()
+            .filter(|(key, value)| select(key, value))
+            .map(|(key, value)| (self.inner.weigh)(&key, &value))
+            .sum()
     }
 
     /// Fetch `key` from the cache, or run `with` and insert its result.
@@ -2372,6 +2391,21 @@ mod tests {
         let cache = ByteBoundedCache::new(MIB, 1000, weigh_declared).prewarmed();
         assert!(cache.metrics().churn.prewarmed);
         assert!(!ghost_cache(1).churn().prewarmed);
+    }
+
+    /// #1314: the weight of the entries a predicate picks, as the cache
+    /// weighs them, touching no recency or counter.
+    #[test]
+    fn the_weight_where_a_predicate_holds_is_the_caches_own() {
+        let cache = ByteBoundedCache::new(MIB, 1000, weigh_declared);
+        cache.insert("a/1".to_string(), 100);
+        cache.insert("a/2".to_string(), 50);
+        cache.insert("b/1".to_string(), 7);
+        let before = cache.stats();
+        assert_eq!(cache.weight_where(|key, _| key.starts_with("a/")), 150);
+        assert_eq!(cache.weight_where(|_, _| true), cache.weight());
+        assert_eq!(cache.weight_where(|_, &value| value > 1000), 0);
+        assert_eq!(cache.stats(), before);
     }
 
     // --- resize in place (#1311) ---

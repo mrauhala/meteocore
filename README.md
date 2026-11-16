@@ -232,7 +232,7 @@ not re-scan the auto roots.
 | `MC_NETCDF_EDR_QUERY_READS` | `200` | Most field reads one NetCDF EDR query may make, counted from the same plan before any read, whatever the access: a field of one level is one read, and through OPeNDAP one request is one, holding the window of every level a query asks of one variable at one step, and the windows of a step's variables up to 16 planes (variables × levels). Through OPeNDAP a six-variable surface meteogram over a 67-lead MEPS run is 67 reads, one variable at every pressure level over the run 67, a derived wind speed 134; at up to 0.55 s per request, four at a time, 200 reads take about 27 s, inside the 30 s EDR deadline. Three variables at every level over a whole run (201 reads, a 13-level variable filling a request alone) are just over it. Read whole (a local file, by range), `MC_NETCDF_EDR_QUERY_MB` binds first, at 140 MEPS fields. Over it the query is a 400 naming the reads and the limit. |
 | `MC_STATION_GRID_WORKERS` | half the CPUs, 1–4 | Station-grid analyses computed at once, on their own pool, never on the request runtime. Restart to change. |
 | `MC_COG_TILE_CONCURRENCY` | `16` | Max concurrent remote-COG tile (byte-range) fetches in the shared fetch pool, across all renders. A projected WMS view (EPSG:3857/3067/3035) renders one meta-tile at a time with only a few fetches in flight, so raising this does not shorten its first view; a whole-viewport render (WMS EPSG:4326, a Maps image) fetches all its missing tiles at once and does wait on the pool. Raise it (e.g. 32–64) when cold renders queue on a high-latency object store. Value must be ≥ 1. |
-| `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's `tile_cache_mb`. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. A collection no request has read for two poll intervals, and at least 30 minutes, warms only its newest frame and keeps only that frame in its tile cache; the poll after a read warms every new frame again. Start-up counts as a read, so the polls after a restart warm every new frame. `0` turns the pre-warm off. Restart to change. |
+| `MC_COG_PREWARM_MB` | `32` | Per-frame cap, in MiB of encoded tiles, on the poll-time pre-warm of newly discovered remote COG frames, which reads them into the collection's tile cache so their first view needs no storage round trips. Also at most 1/8 of the collection's tile cache, raised to its keep floor up to 1/4 of the cache, so a cache elastic memory has shrunk still warms the newest frame whole, and a cache shrunk under pressure does not give one frame half of what it holds. Levels are taken coarsest first while they fit, so a larger file still gets its overviews. A collection no request has read for two poll intervals, and at least 30 minutes, warms only its newest frame and keeps only that frame in its tile cache; the poll after a read warms every new frame again. Start-up counts as a read, so the polls after a restart warm every new frame. `0` turns the pre-warm off. Restart to change. |
 | `MC_ALLOW_INLINE_DB_URL` | _(unset)_ | Set to `1` to allow a literal `postgres://` URL in TOML instead of `dsn_env` (development only). |
 | `_RJEM_MALLOC_CONF` | _(unset)_ | jemalloc options, e.g. `background_thread:false` to turn off the background purging the server enables at startup. Plain `MALLOC_CONF` is not read: jemalloc's symbols are prefixed. Not on Windows. |
 
@@ -898,22 +898,38 @@ reload does: a step a reload holds the reload lock through is skipped.
     since it was built when the window timed none. A cache nobody reads
     serves nothing and lends first; one that holds its working set serves
     plenty, and keeps it. It lends down to its floor: the plan's floor for
-    it, its range's `min` and what it shrinks to in place;
+    it, its range's `min`, what it shrinks to in place and its keep floor
+    (below);
   - **a cache its engines fill ahead of its reads neither lends nor
     decays**: a demand cache (satellite scans, station grids), one with a
     floor or a demand filled ahead (the PVOL pixels), and one marked
     filled ahead of reads (`prewarmed` in `/admin/cache-plan`): the COG
     tiles, a GRIB message cache with the pre-warm or a map's read-ahead
     (`read_ahead`, on by default), and the NetCDF chunk cache once a
-    collection sets `prewarm_variables`;
-  - a cache read again (no longer idle) first takes back what it lent the
-    pool, its decays and its share of a valve take-back, 5 % of its grant
-    a tick, the restore's pace, with no ghost hits needed, while the
-    process holds under 90 % of its total;
+    collection sets `prewarm_variables`. Its keep floor covers a first
+    view, not what its engines fill (a GRIB source's pre-warm is a share
+    of its message cache's capacity, so a decay would cut the next run's):
+    only a tier-2 reclaim takes from it, above that floor;
+  - a cache filled ahead of reads that tier 2 took from (below), read
+    again, first takes that back from its borrower, 5 % of its grant a
+    tick, the restore's pace, with no ghost hits needed (a pre-warmed
+    cache rarely misses), the borrower shedding as much;
+  - a cache read again (no longer idle) then takes back what it lent the
+    pool, its decays and its share of a valve take-back, at the same pace
+    and never more than it is owed in all, while the process holds under
+    90 % of its total; both stop while a valve take-back holds borrowing
+    off;
   - then a cache below its grant, its fair share, that passes the
-    borrowing gate takes back what a borrower holds, the lowest-valued
+    borrowing gate takes back what it lent, never more: a cache below its
+    grant with nothing lent waits for the tick to grow it. It takes it
+    from what a borrower holds, the lowest-valued
     borrower first, at an even ratio: while its value is at least what the
-    borrower's bytes serve, up to its grant;
+    borrower's bytes serve, up to its grant. With no borrower left to take
+    from, it takes the pool's free headroom while caches may borrow, and
+    only then, at the same ratio, from an idle cache its engines fill ahead
+    of reads (pre-warmed COG tiles, GRIB messages, PVOL pixels, satellite
+    scans), what that cache holds above its floor: tier 2. Each cache makes
+    one move a tick, a return or recall included;
   - then borrowers borrow, the most valuable first: from the pool's free
     headroom (the pool less the plan's expected use), which is worth
     nothing where it is, and otherwise from a cache, only where the
@@ -923,7 +939,31 @@ reload does: a step a reload holds the reload lock through is skipped.
   - under `apply`, an idle cache (under 60 lookups an hour) that moved
     nothing gives the pool what it does not hold: down to what it holds
     plus 10 %, or its floor if higher, by at most half a step and 5 % of
-    its capacity a tick, slower than a busy cache grows;
+    its capacity a tick, slower than a busy cache grows. What it borrowed
+    goes first, its lenders' share becoming their loans to the pool, which
+    they take back once read again;
+  - no cache lends, decays or is taken from below its **keep floor**, the
+    least a first view of a quiet collection needs, the largest of:
+    - 64 MiB for the meta-tile, rendered-image and vector-tile caches;
+    - its demand for a demand cache (satellite scans, station grids), and
+      a floor its engines publish as its demand (the PVOL pixels: two
+      pre-warms);
+    - what its engines publish, where their facts change, weighed as the
+      cache weighs its entries: a remote GeoTIFF collection, the tiles
+      its pre-warm holds of the newest frame, sized from the tile cache's
+      configured size, at most 32 MiB; a GRIB source, the message of its
+      default parameter at the default time of the newest run (its
+      point-index cache keeps its size, so it needs no floor); a
+      remote NetCDF collection, its first variable's field at the default
+      time of the newest run, as stored uncompressed, at least its
+      compressed chunks or an OPeNDAP reply of it; a Zarr store, its first
+      variable's chunks at that time, at their decoded size, in its object
+      or Icechunk payload cache. The NetCDF and Zarr floors are an upper
+      bound on purpose: compressed sizes are not known before a read. No
+      decoded grids; the QueryData caches and the stores keep none;
+    - after a day without a lookup, the smaller floor the engines publish
+      for it: one coarse overview of imagery (the newest frame's coarsest
+      level), none for a forecast's field;
   - a move is max(64 MiB, 1 % of the pool), at most a tenth of either
     cache, at most four reclaims and borrows a tick, each cache in one,
     and never lifts the plan's expected use past its pool: lending
@@ -946,8 +986,10 @@ reload does: a step a reload holds the reload lock through is skipped.
   its collection: its counterparts shed exactly those bytes, so what
   caches borrowed always equals what caches and the pool lent. Each tick,
   and each reload's plan before it applies its grants, holds every offset
-  within its cache's floor and ceiling, and the loans' expected use within
-  the pool, the lowest-valued counterparts giving way first. A cache with
+  within its cache's floor, its keep floor included as far as its grant
+  reaches, and its ceiling, and the loans' expected use within the pool,
+  the lowest-valued counterparts giving way first: a cache whose keep
+  floor grows past what it has left gets back what it lent. A cache with
   loans is held to its grant plus its offset exactly, past the tick's
   10 % and 64 MiB dead band, so what a shed takes off reaches it. A move
   whose lender cannot grow back what the borrower did not take books that
@@ -957,13 +999,16 @@ reload does: a step a reload holds the reload lock through is skipped.
   Under pressure, the valve first takes back what caches borrowed, only
   as much as the excess: each borrower, the lowest-valued first, shrinks
   by the part of the excess still uncovered, in whole MiB, plus whatever
-  capacity it holds nothing in, at most what it borrowed, and gives that
+  capacity it holds nothing in, at most what it borrowed and never below
+  its keep floor, and gives that
   back, the part it borrowed from the pool first, its lenders' share
   becoming their loans to the pool, so they stay where they are. A
   borrower whose shrink in place is refused gives back nothing, keeps its
   loans and is named. Only when the take-back does not cover the excess
   does the valve lower the other caches to 90 % of what they hold, ending
-  their loans. After a take-back no cache borrows until the process has
+  their loans: that relief keeps the plan's own floors, not the keep
+  floors, the one deliberate exception to them, since the process's safety
+  comes first. After a take-back no cache borrows until the process has
   been under 90 % of its total for the restore's 10 minutes; the restore
   climbs to each lowered cache's planned size, and elastic memory borrows
   above it again only by its steps, once every ceiling is lifted.
@@ -972,21 +1017,27 @@ reload does: a step a reload holds the reload lock through is skipped.
   each cache its grant; a later `apply` starts from an empty ledger.
 
   `cache_elastic_proposed_bytes{cache,role}` shows what the last tick's
-  moves took or would take from (`lend`, `repay`, `decay`) or give to
-  (`borrow`, `reclaim`, `return`) each cache;
+  moves took or would take from (`lend`, `repay`, `prewarmed` for tier 2,
+  `decay`) or give to (`borrow`, `reclaim`, `return`) each cache;
   `cache_elastic_offset_bytes{cache,role}` what each cache's loans add up
-  to, `borrowed` and `lent`; and
+  to, `borrowed` and `lent`; `cache_keep_bytes{cache,collection}` each
+  cache's keep floor; and
   `cache_elastic_moves_total{cache,role,mode}` counts the moves: in `mode`
   `report` a move that recurs tick after tick once, `applied` each time,
   and the valve's `give_back`. Per-collection caches share their `cache`
   label: `/admin/cache-plan` has the setting as `governor.elastic_mode`
   and the last tick as `governor.elastic`, with each collection's: its
-  `moves` (kind, borrower, lender, bytes, the borrower's value and its
-  depth, the lender's value), every cache it weighed (capacity, grant,
-  offset, floor, ceiling, used, idle, ghost hits, depth, both values,
-  whether it borrows and lends, what it lent the pool), the headroom of the
-  pool, whether it may borrow and return, and the `ledger`'s `loans` and
-  `offsets`. The dashboard's Elastic memory panels show all three.
+  `moves` (kind, `reclaim_prewarmed` for tier 2, `recall` for a tier-2
+  lender taking it back, borrower, lender, bytes,
+  the borrower's value and its depth, the lender's value), every cache it
+  weighed (capacity, grant, offset, floor, keep floor, ceiling, used,
+  idle, filled ahead, ghost hits, depth, both values, whether it borrows
+  and lends, what it lent the pool), the headroom of the pool, whether it
+  may borrow and return, and the `ledger`'s `loans` and `offsets`. Every
+  cache there also has its `keep_bytes`, the keep its engines publish
+  (`keep`: `bytes`, `quiet_bytes`, `rule` and each collection's part with
+  its inputs), and `quiet_secs`, how long it has gone without a lookup.
+  The dashboard's Elastic memory panels show them.
 
 A key set to exactly its default (`metatile = 1024`, `[grib]
 grid_cache_mb = 256`) pins it like any other value. An `MC_…` variable
@@ -3501,8 +3552,8 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `memory_plan_pool_bytes` | gauge | — | What the caches share of the total after the reserves |
 | `memory_plan_shortfall_bytes` | gauge | — | How much more memory the plan needs with its pins kept and every other cache and budget at its floor; 0 when it fits |
 | `cache_plan_changes_total` | counter | cache | Size changes of each cache and admission budget: the memory plan's at boot and on reload in `auto` mode, its re-plan tick's, the pressure valve's, a `[memory.caches]` key's, report mode giving a size back. Each is logged with its reason |
-| `cache_elastic_moves_total` | counter | cache, role, mode | [Elastic memory](#memory-memory)'s moves (#1314): `role` `borrow`, `lend`, `reclaim`, `repay`, `return`, `decay` or the valve's `give_back`; `mode` `report` (proposed, a recurring move once) or `applied` (each). Only in `[memory] mode = "auto"` |
-| `cache_elastic_proposed_bytes` | gauge | cache, role | The bytes the last re-plan tick's elastic moves took or would take from (`lend`, `repay`, `decay`) or give to (`borrow`, `reclaim`, `return`) each cache; none with `[memory] elastic = "off"` |
+| `cache_elastic_moves_total` | counter | cache, role, mode | [Elastic memory](#memory-memory)'s moves (#1314): `role` `borrow`, `lend`, `reclaim`, `repay`, `prewarmed`, `return`, `decay` or the valve's `give_back`; `mode` `report` (proposed, a recurring move once) or `applied` (each). Only in `[memory] mode = "auto"` |
+| `cache_elastic_proposed_bytes` | gauge | cache, role | The bytes the last re-plan tick's elastic moves took or would take from (`lend`, `repay`, `prewarmed`, `decay`) or give to (`borrow`, `reclaim`, `return`) each cache; none with `[memory] elastic = "off"` |
 | `cache_elastic_offset_bytes` | gauge | cache, role | What each cache's loans in elastic memory's ledger add up to, summed over its collections: `borrowed` above its grant, `lent` below it; its offset is the one less the other. None outside `[memory] elastic = "apply"` |
 | `memory_pressure_actions_total` | counter | action | The memory pressure valve's actions: `relieve` (resident above the total for a minute took back what elastic memory lent and, unless that covered it, lowered the flexible caches), `purge` (every arena's dirty pages purged), `restore` (a tick raised the lowered caches toward the plan). With `total_mb` or a cgroup limit only |
 | `memory_plan_unapplied_bytes` | gauge | — | In `[memory] mode = "auto"`, the capacity above the plan that applying it could not take away yet: warm caches giving up a quarter of what they hold per reload, shrinks that stop in place. The plan counts it, its shortfall what does not fit; 0 in `report` mode |
