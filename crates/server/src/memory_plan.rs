@@ -184,6 +184,9 @@ const STORE_FAMILIES: &[&str] = &[
 /// the `/metrics` refresh before it read.
 pub(crate) fn replan(state: &ServerState, rows: &[Row], memory: &MemoryReading) -> Arc<Report> {
     let mut report = fit(state, rows, memory);
+    // Elastic memory's loans held to this plan before it applies them
+    // (#1314).
+    crate::governor::bound_to(state, rows, report.plan.as_ref());
     report.changes = apply(&report, rows);
     keep(report, rows)
 }

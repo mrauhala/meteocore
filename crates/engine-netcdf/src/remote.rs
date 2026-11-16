@@ -217,6 +217,13 @@ static CHUNKS: LazyLock<ByteBoundedCache<ChunkKey, Bytes>> = LazyLock::new(|| {
     )
 });
 
+/// Mark the chunk cache as filled ahead of its reads (#1314): a collection
+/// prewarms its newest run's fields into it (`prewarm_variables`), so it
+/// neither lends nor decays in elastic memory. It stays marked.
+pub(crate) fn mark_chunks_prewarmed() {
+    CHUNKS.mark_prewarmed();
+}
+
 /// The block cache's counters and occupancy.
 pub fn block_cache_metrics() -> ds_cache::CacheMetrics {
     BLOCKS.metrics()

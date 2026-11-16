@@ -477,6 +477,9 @@ impl NetcdfEngine {
                 }
             }
         };
+        if !config.prewarm_variables.is_empty() {
+            remote::mark_chunks_prewarmed();
+        }
         Ok(Remote {
             host,
             origin: remote::origin(data_path).to_string(),

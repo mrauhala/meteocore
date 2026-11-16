@@ -513,6 +513,9 @@ fn a_replacement_the_prober_finds_moves_the_content_version() {
 fn prewarm_fetches_the_newest_runs_chunks_before_requests() {
     let server = server();
     let engine = engine(&server, r#"prewarm_variables = ["wind_speed_of_gust"]"#);
+    // Filled ahead of its reads from now on (#1314): elastic memory
+    // neither lends nor decays it.
+    assert!(crate::remote::chunk_cache_metrics().churn.prewarmed);
     server.take();
     engine.poll_once();
     let prewarmed = server.take();

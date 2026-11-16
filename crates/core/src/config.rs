@@ -59,6 +59,11 @@ pub struct MemoryConfig {
     /// Whether the plan only reports its sizes or applies them.
     #[serde(default)]
     pub mode: MemoryMode,
+    /// `[memory] elastic` (#1314): what the memory governor does with the
+    /// moves of memory between caches it weighs at each re-plan tick. Only
+    /// with `mode = "auto"`; otherwise nothing moves.
+    #[serde(default)]
+    pub elastic: ElasticMode,
     /// `[memory.caches]` (#1313): the size of a process-wide cache or
     /// admission budget by its key, the `/metrics` family without its
     /// `_cache` suffix (`metatile`, `pvol_pixel`, `render_budget`, …). A
@@ -89,6 +94,42 @@ impl MemoryMode {
         match self {
             MemoryMode::Report => "report",
             MemoryMode::Auto => "auto",
+        }
+    }
+}
+
+/// `[memory] elastic` (#1314): elastic memory between caches. Any other
+/// value is a load error.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ElasticMode {
+    /// Weigh nothing, propose nothing.
+    Off,
+    /// Weigh the caches and propose moves at each re-plan tick; resize
+    /// nothing.
+    #[default]
+    Report,
+    /// Weigh, propose and apply the moves, through the ledger of what each
+    /// cache borrowed and lent.
+    Apply,
+}
+
+impl ElasticMode {
+    /// What it does under `[memory] mode`: as set in `auto`, else off,
+    /// since nothing moves while the plan only reports.
+    pub fn under(self, mode: MemoryMode) -> ElasticMode {
+        match mode {
+            MemoryMode::Auto => self,
+            MemoryMode::Report => ElasticMode::Off,
+        }
+    }
+
+    /// `off`, `report` or `apply`, as the config spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ElasticMode::Off => "off",
+            ElasticMode::Report => "report",
+            ElasticMode::Apply => "apply",
         }
     }
 }
@@ -8597,6 +8638,7 @@ colormap = "radar_dbz"
             Some(MemoryConfig {
                 total_mb: Some(4096),
                 mode: MemoryMode::Report,
+                elastic: ElasticMode::Report,
                 caches: BTreeMap::new(),
             })
         );
@@ -8627,6 +8669,34 @@ colormap = "radar_dbz"
         }
         let unknown = error("[memory]\napply = true\n", "");
         assert!(unknown.contains("unknown field `apply`"), "{unknown}");
+        // #1314: `[memory] elastic`, report by default.
+        assert_eq!(MemoryConfig::default().elastic, ElasticMode::Report);
+        for (elastic, expected) in [
+            ("off", ElasticMode::Off),
+            ("report", ElasticMode::Report),
+            ("apply", ElasticMode::Apply),
+        ] {
+            let config = load(&format!("[memory]\nelastic = \"{elastic}\"\n"), "").unwrap();
+            assert_eq!(config.memory.unwrap().elastic, expected, "{elastic}");
+            assert_eq!(expected.as_str(), elastic);
+        }
+        for elastic in ["Apply", "on", ""] {
+            let unknown = error(&format!("[memory]\nelastic = \"{elastic}\"\n"), "");
+            assert!(
+                unknown.contains(&format!("unknown variant `{elastic}`"))
+                    && unknown.contains("expected one of `off`, `report`, `apply`"),
+                "{unknown}"
+            );
+        }
+        for elastic in [ElasticMode::Off, ElasticMode::Report, ElasticMode::Apply] {
+            assert_eq!(elastic.under(MemoryMode::Auto), elastic);
+            assert_eq!(elastic.under(MemoryMode::Report), ElasticMode::Off);
+        }
+        let per_collection = error("", "[memory]\nelastic = \"apply\"\n");
+        assert!(
+            per_collection.contains("not allowed in per-collection files"),
+            "{per_collection}"
+        );
         let per_collection = error("", "[memory]\ntotal_mb = 4096\n");
         assert!(
             per_collection.contains(
