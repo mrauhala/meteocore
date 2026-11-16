@@ -1508,10 +1508,11 @@ fn real_tick_ruled(
     };
     let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
     let plan = sim_plan(&rows, total);
-    // As the tick: a cache with a loan before or after is held exactly.
-    let mut moved: HashSet<Key> = ledger.keys().into_iter().collect();
+    // As the tick: a cache whose offset keeping the ledger changed is held
+    // exactly; one whose offset stands keeps the dead band.
+    let before = offsets(ledger);
     keep_ledger(ledger, mode, &rows, Some(&plan));
-    moved.extend(ledger.keys());
+    let moved = changed_offsets(&before, &offsets(ledger));
     let valve_holds = !caps.is_empty();
     let grant_of = |key: &Key| {
         rows.iter()
@@ -1634,8 +1635,14 @@ fn through_the_real_tick_memory_moves_to_the_thrashing_cache_and_back() {
         grant_in(&caches, total, "metatile_cache"),
         grant_in(&caches, total, "rendered_cache"),
     );
-    // A cache with loans is held to its grant plus its offset exactly.
-    assert_eq!(ledger.offset(&metatile), held as i64 - grants.0 as i64);
+    // A cache with loans sits within the tick's dead band of its grant plus
+    // its offset: the grant may drift a little since its last move.
+    let target = grants.0 as i64 + ledger.offset(&metatile);
+    let band = MOVE_BYTES.max(held / 100 * MOVE_PERCENT);
+    assert!(
+        (held as i64 - target).unsigned_abs() <= band,
+        "held {held}, target {target}"
+    );
     // Its working set held, it borrows no more, and the re-plan keeps it.
     // The idle cache decays to what it holds plus 10 %, by at most half a
     // step and 5 % of its size a tick, and stays there.
@@ -1653,9 +1660,10 @@ fn through_the_real_tick_memory_moves_to_the_thrashing_cache_and_back() {
     assert_eq!(capacity_of(&caches, "rendered_cache"), decayed);
     assert_eq!(real_tick(&caches, total, &mut ledger).moves, []);
     assert_eq!(ledger.offset(&rendered), decayed as i64 - grants.1 as i64);
+    // What the pool lent and borrowed is what the caches borrowed and lent.
     assert_eq!(
         ledger.pool_net(),
-        held as i64 + decayed as i64 - (grants.0 + grants.1) as i64
+        ledger.offset(&metatile) + ledger.offset(&rendered)
     );
 
     // The load swaps: read again, the cache takes back what it lent the
@@ -3151,10 +3159,12 @@ fn leaving_apply_ends_every_loan_and_off_weighs_nothing() {
 
 // --- #1473 review --------------------------------------------------------
 
-/// What the capacities of the caches with loans sit above their ledger
-/// targets, the most of any, over the plan at `total`; and that the
-/// headroom elastic memory weighs leaves room for every cache where it is.
-fn worst_gap(caches: &RefCell<Vec<SimCache>>, total: u64, ledger: &Ledger) -> i64 {
+/// How far past the tick's dead band (more than [`MOVE_BYTES`] and
+/// [`MOVE_PERCENT`] of its capacity) a cache with loans sits from its
+/// ledger target, the most of any, over the plan at `total`: at most 0 when
+/// every one is within it. And that the headroom elastic memory weighs
+/// leaves room for every cache where it is.
+fn worst_past_dead_band(caches: &RefCell<Vec<SimCache>>, total: u64, ledger: &Ledger) -> i64 {
     let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
     let plan = sim_plan(&rows, total);
     let held: u64 = rows
@@ -3175,7 +3185,9 @@ fn worst_gap(caches: &RefCell<Vec<SimCache>>, total: u64, ledger: &Ledger) -> i6
         .map(|row| {
             let grant = plan.grant(&row.entry).unwrap();
             let target = elastic_grant(ledger, &decide::key(&row.entry), &row.entry, grant);
-            row.usage.capacity_bytes as i64 - target as i64
+            let capacity = row.usage.capacity_bytes;
+            let band = MOVE_BYTES.max(capacity / 100 * MOVE_PERCENT);
+            capacity.abs_diff(target) as i64 - band as i64
         })
         .max()
         .unwrap_or(0)
@@ -3357,11 +3369,12 @@ fn a_cache_read_again_takes_back_what_it_lent_the_pool() {
     assert_eq!(moves[0].bytes, 10 * MIB);
 }
 
-/// #1473 review, through the real tick: what the ledger sheds as a total
-/// shrinks reaches the caches: a cache with loans is held to its grant
-/// plus its offset exactly, never left in the tick's dead band above it,
-/// and the headroom counts every cache where it is, the dead band's
-/// slack included; with or without a cache filled ahead of its reads.
+/// #1473 review, through the real tick: as a total shrinks, a cache with
+/// loans stays within the tick's dead band of its grant plus its offset:
+/// a shed changes its offset and is applied exactly, and a grant that only
+/// drifts is the plan's own dead band, as for any cache. The headroom
+/// counts every cache where it is, the dead band's slack included; with or
+/// without a cache filled ahead of its reads.
 #[test]
 fn the_ledgers_sheds_reach_the_caches() {
     for prewarmed in [false, true] {
@@ -3376,13 +3389,13 @@ fn the_ledgers_sheds_reach_the_caches() {
         let mut ledger = Ledger::default();
         for _ in 0..30 {
             real_tick(&caches, total, &mut ledger);
-            assert!(worst_gap(&caches, total, &ledger) < 64 * MIB as i64);
+            assert!(worst_past_dead_band(&caches, total, &ledger) <= 0);
         }
         for _ in 0..24 {
             total -= 48 * MIB;
             real_tick(&caches, total, &mut ledger);
-            let worst = worst_gap(&caches, total, &ledger);
-            assert!(worst < 64 * MIB as i64, "{} MiB over", worst / MIB as i64);
+            let past = worst_past_dead_band(&caches, total, &ledger);
+            assert!(past <= 0, "{} MiB past the dead band", past / MIB as i64);
         }
     }
 }
