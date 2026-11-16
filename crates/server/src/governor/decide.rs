@@ -445,8 +445,9 @@ pub(crate) struct Rules {
     /// total, or the valve has no total to hold it to, and no take-back of
     /// the valve's is waiting out the restore's [`UNDER_FOR`].
     pub may_borrow: bool,
-    /// Caches may take back what they lent the pool: the process is under
-    /// [`UNDER_PERCENT`] of its total, or the valve has no total.
+    /// Caches may take back what they lent the pool: as [`Self::may_borrow`],
+    /// under [`UNDER_PERCENT`] of the total, or no total, and no take-back
+    /// waiting out the restore.
     pub may_return: bool,
     /// Idle caches decay toward what they hold: only when moves apply.
     pub decays: bool,
@@ -454,12 +455,14 @@ pub(crate) struct Rules {
 
 /// What [`Rules`] a tick gets from the valve's last `sample` (resident
 /// bytes and the total) and whether a take-back of the valve's still holds
-/// borrowing off (`held`): `(may_borrow, may_return)`.
+/// borrowing off (`held`): `(may_borrow, may_return)`. A take-back's hold
+/// stops returns too: a lender whose share it moved to the pool would
+/// otherwise take it back within a few ticks, while borrowing is still held.
 pub(crate) fn borrowing(sample: Option<(u64, u64)>, held: bool) -> (bool, bool) {
     let under = sample.is_none_or(|(resident, total)| {
         resident.saturating_mul(100) < total.saturating_mul(UNDER_PERCENT)
     });
-    (under && !held, under)
+    (under && !held, under && !held)
 }
 
 /// An idle cache decays by at most this share of the step a tick...

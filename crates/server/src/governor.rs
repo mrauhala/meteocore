@@ -515,14 +515,7 @@ pub(crate) fn step(state: &AdminState, now: Instant) -> Step {
                 relieved = relieve(state, resident, total, now);
             }
         }
-        _ => {
-            // No valve: its ceilings go, and the next tick gives those
-            // caches their grant at once rather than by the thresholds.
-            let mut governor = governor();
-            release(&mut governor);
-            governor.sample = None;
-            governor.pressure = Pressure::default();
-        }
+        _ => without_valve(&mut governor()),
     }
     let due = {
         let governor = governor();
@@ -539,6 +532,40 @@ pub(crate) fn step(state: &AdminState, now: Instant) -> Step {
         relieved,
         replanned: due,
     }
+}
+
+/// Each cache's offset in `ledger` (#1314).
+fn offsets(ledger: &Ledger) -> HashMap<Key, i64> {
+    ledger
+        .keys()
+        .into_iter()
+        .map(|key| {
+            let offset = ledger.offset(&key);
+            (key, offset)
+        })
+        .collect()
+}
+
+/// The caches whose offset differs between `before` and `after`, one
+/// absent from either counting as 0: a loan booked, shed or ended.
+fn changed_offsets(before: &HashMap<Key, i64>, after: &HashMap<Key, i64>) -> HashSet<Key> {
+    before
+        .keys()
+        .chain(after.keys())
+        .filter(|key| before.get(*key).unwrap_or(&0) != after.get(*key).unwrap_or(&0))
+        .cloned()
+        .collect()
+}
+
+/// No valve, with no total and no cgroup limit: its ceilings go, and the
+/// next tick gives those caches their grant at once rather than by the
+/// thresholds. A take-back's hold on borrowing goes with them: with no
+/// total, nothing would ever end it (#1314).
+fn without_valve(governor: &mut Governor) {
+    release(governor);
+    governor.sample = None;
+    governor.pressure = Pressure::default();
+    governor.borrow_held = false;
 }
 
 /// What a tick at `now` lets elastic memory do ([`decide::borrowing`]): a
@@ -617,12 +644,14 @@ fn tick(state: &AdminState, now: Instant) {
     let mode = elastic_mode(state);
     let (caps, refused, raised, restored, lifted, valve_holds, rules, ledger) = {
         let mut governor = governor();
-        // A cache with a loan before or after the ledger is kept is held to
-        // its grant plus its offset exactly, past the tick's dead band: what
-        // a shed takes off reaches the cache (#1314).
-        let mut moved: HashSet<Key> = governor.ledger.keys().into_iter().collect();
+        // A cache whose offset keeping the ledger changed or ended is held
+        // to its grant plus its offset exactly, past the tick's dead band:
+        // what a shed takes off reaches the cache (#1314). One whose offset
+        // stands keeps the dead band, so a grant that wobbles with measured
+        // memory resizes nothing; the headroom counts what it holds.
+        let before = offsets(&governor.ledger);
         keep_ledger(&mut governor.ledger, mode, &rows, report.plan.as_ref());
-        moved.extend(governor.ledger.keys());
+        let moved = changed_offsets(&before, &offsets(&governor.ledger));
         // No borrowing at or above 90 % of the total, nor after a take-back
         // until the restore's 10 minutes under 90 % have passed: elastic
         // memory never grows into pressure. Returns only under 90 %.
@@ -843,13 +872,21 @@ fn expected_use(rows: &[Row], plan: &grant::Plan, ledger: &Ledger) -> u64 {
 /// The plan's expected use with each cache at the larger of its capacity
 /// and its grant plus its offset (#1314): what the caches can hold now,
 /// a cache the tick's dead band or a refused shrink left above its target
-/// counted where it is.
+/// counted where it is. Only the caches the plan's pool holds: a budget
+/// sits outside it, and an unreachable cache, cleared but keeping its
+/// capacity, holds nothing the pool counts.
 fn held_use(rows: &[Row], plan: &grant::Plan, ledger: &Ledger) -> u64 {
     let mut expected = plan.expected_bytes;
     for row in rows {
+        if row.entry.kind != ds_cache::plan::Kind::Cache {
+            continue;
+        }
         let Some(grant) = plan.grant(&row.entry) else {
             continue;
         };
+        if matches!(grant.reason, Reason::Unreachable(_)) {
+            continue;
+        }
         let at = |bytes: u64| {
             if grant.expected_bytes < grant.bytes {
                 bytes.min(grant.expected_bytes)

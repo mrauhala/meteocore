@@ -3253,9 +3253,10 @@ fn the_take_back_gives_back_the_excess_and_holds_borrowing_off() {
     assert!(grown > 0 && grown <= proposal.step_bytes, "{grown}");
 }
 
-/// #1473 review: a take-back holds borrowing off until the process has
-/// been under 90 % of its total for 10 minutes; returns need only under
-/// 90 %; at 90 % or more neither.
+/// #1473 review: a take-back holds borrowing and returns off until the
+/// process has been under 90 % of its total for 10 minutes, so a lender
+/// whose share it moved to the pool does not take it back meanwhile; at
+/// 90 % or more neither.
 #[test]
 fn a_take_back_holds_borrowing_off_for_the_restores_ten_minutes() {
     let start = Instant::now();
@@ -3265,10 +3266,10 @@ fn a_take_back_holds_borrowing_off_for_the_restores_ten_minutes() {
         ..Governor::default()
     };
     governor.pressure.observe(start, 80, 100);
-    assert_eq!(tick_rules(&mut governor, start), (false, true));
+    assert_eq!(tick_rules(&mut governor, start), (false, false));
     let almost = start + decide::UNDER_FOR - Duration::from_secs(1);
     governor.pressure.observe(almost, 80, 100);
-    assert_eq!(tick_rules(&mut governor, almost), (false, true));
+    assert_eq!(tick_rules(&mut governor, almost), (false, false));
     let after = start + decide::UNDER_FOR;
     governor.pressure.observe(after, 80, 100);
     assert_eq!(tick_rules(&mut governor, after), (true, true));
@@ -3635,4 +3636,144 @@ fn the_headroom_counts_a_cache_above_its_target_where_it_is() {
         elastic_headroom(&rows, &plan, &ledger),
         at_grants - 300 * MIB
     );
+}
+
+/// #1473 verify review: the headroom counts only the caches the pool
+/// holds. A cache no collection reaches is cleared but keeps its
+/// capacity, and the plan grants it nothing: counted where it is, it ate
+/// the headroom, and no pool borrow or return could run.
+#[test]
+fn an_unreachable_cache_takes_no_headroom() {
+    let caches = vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        sim_cache("rendered_cache", 1024, 128, IDLE),
+        sim_cache("tiles3d_content_cache", 2048, 64, IDLE),
+    ];
+    let mut rows: Vec<Row> = caches.iter().map(sim_row).collect();
+    rows[2].usage.used_bytes = 0;
+    let total = fitting_total(&caches) + GIB;
+    let plan = plan(&Inputs::of_rows(
+        total,
+        1,
+        Baseline::Estimated,
+        &rows,
+        |row| (row.entry.id == "tiles3d_content_cache").then(|| "no collection".to_string()),
+        false,
+    ));
+    let ledger = Ledger::default();
+    assert_eq!(
+        held_use(&rows, &plan, &ledger),
+        expected_use(&rows, &plan, &ledger)
+    );
+    assert_eq!(
+        elastic_headroom(&rows, &plan, &ledger),
+        plan.pool_bytes
+            .saturating_sub(expected_use(&rows, &plan, &ledger))
+    );
+}
+
+/// #1473 verify review: while a take-back holds borrowing off, a lender
+/// whose share it moved to the pool does not take it back either.
+#[test]
+fn a_lender_does_not_return_during_the_borrow_hold() {
+    let light = Load {
+        lookups: 100.0,
+        working_set: 256 * MIB,
+        cost: 0.003,
+        scan: false,
+    };
+    let caches = RefCell::new(vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        sim_cache("rendered_cache", 4096, 512, light),
+    ]);
+    let total = fitting_total(&caches.borrow());
+    let mut ledger = Ledger::default();
+    for _ in 0..10 {
+        real_tick(&caches, total, &mut ledger);
+    }
+    let rendered = (Kind::Cache, "rendered_cache", Scope::Process);
+    assert!(ledger.lent(&rendered) > 0, "it lent before the take-back");
+    let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
+    let plan = sim_plan(&rows, total);
+    let resize = |entry: &Entry, bytes: u64| {
+        let mut caches = caches.borrow_mut();
+        let cache = caches.iter_mut().find(|c| c.key.1 == entry.id).unwrap();
+        cache.capacity = bytes;
+        Some(bytes)
+    };
+    let cell = RefCell::new(ledger);
+    let with_ledger = |book: &mut dyn FnMut(&mut Ledger)| book(&mut cell.borrow_mut());
+    relief(
+        &rows,
+        Some(&plan),
+        &with_ledger,
+        ElasticMode::Apply,
+        256 * MIB,
+        &resize,
+    );
+    let mut ledger = cell.into_inner();
+    assert!(
+        ledger.lent_to_pool(&rendered) > 0,
+        "its share went to the pool"
+    );
+    let at = capacity_of(&caches, "rendered_cache");
+    for _ in 0..6 {
+        let proposal = real_tick_ruled(
+            &caches,
+            total,
+            &mut ledger,
+            ElasticMode::Apply,
+            &mut HashMap::new(),
+            false,
+            decide::borrowing(None, true),
+        );
+        assert!(proposal.moves.iter().all(|m| m.kind != MoveKind::Return));
+        assert_eq!(capacity_of(&caches, "rendered_cache"), at);
+    }
+}
+
+/// #1473 verify review: losing the valve, as a reload that leaves no total
+/// and no cgroup limit does, ends a take-back's hold on borrowing, which
+/// nothing would end otherwise.
+#[test]
+fn losing_the_valve_ends_the_borrow_hold() {
+    let now = Instant::now();
+    let mut governor = Governor {
+        borrow_held: true,
+        sample: Some((80, 100)),
+        ..Governor::default()
+    };
+    without_valve(&mut governor);
+    assert!(!governor.borrow_held);
+    assert_eq!(tick_rules(&mut governor, now), (true, true));
+}
+
+/// #1473 verify review: the tick holds to its target exactly only the
+/// caches whose offset keeping the ledger booked, shed or ended. One whose
+/// offset stands keeps the dead band, so a grant that wobbles with measured
+/// memory does not resize it every tick.
+#[test]
+fn only_a_changed_offset_lifts_a_cache_past_the_dead_band() {
+    let key = |id: &'static str| (Kind::Cache, id, Scope::Process);
+    let before: HashMap<Key, i64> = [
+        (key("metatile_cache"), 512 * MIB as i64),
+        (key("rendered_cache"), -(512 * MIB as i64)),
+        (key("tile_cache"), 64 * MIB as i64),
+    ]
+    .into();
+    let after: HashMap<Key, i64> = [
+        (key("metatile_cache"), 512 * MIB as i64),
+        (key("rendered_cache"), -(448 * MIB as i64)),
+        (key("vector_tile_cache"), -(64 * MIB as i64)),
+    ]
+    .into();
+    let changed = changed_offsets(&before, &after);
+    assert!(
+        !changed.contains(&key("metatile_cache")),
+        "its offset stands"
+    );
+    assert!(changed.contains(&key("rendered_cache")), "shed");
+    assert!(changed.contains(&key("tile_cache")), "ended");
+    assert!(changed.contains(&key("vector_tile_cache")), "booked");
+    assert_eq!(changed.len(), 3);
 }
