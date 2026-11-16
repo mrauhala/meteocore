@@ -22,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use quick_cache::{DefaultHashBuilder, Lifecycle};
 
@@ -33,10 +34,12 @@ use crate::WeighFn;
 /// the depths estimate the hit ratio at 1.5 ×, 2 × and 3 × the size.
 pub const GHOST_DEPTHS: [&str; 3] = ["0.5", "1", "2"];
 
-/// The most evictions a ghost ring remembers, whatever its reach: about
-/// 32 MiB at the ring's ~32 bytes per eviction. A ring of a cache whose
-/// entries are so small that twice its capacity is more evictions than this
-/// sees less than 2 × back, and undercounts its deepest ghost hits.
+/// The most evictions a ghost ring remembers, whatever its reach: 50 MiB of
+/// heap at the cap, measured (`tests/ghost_ring_heap.rs`), about 50 bytes
+/// an eviction there and up to 70 below it, as its tables double. A ring of
+/// a cache whose entries are so small that twice its capacity is more
+/// evictions than this sees less than 2 × back, and undercounts its deepest
+/// ghost hits.
 const MAX_GHOSTS: usize = 1 << 20;
 
 /// A ghost ring's stripes: keys spread over them by hash, each behind its
@@ -84,12 +87,32 @@ pub struct Churn {
     /// inserted long before it is read, and a recency signal undervalues it
     /// (#992). Set by [`crate::ByteBoundedCache::prewarmed`].
     pub prewarmed: bool,
+    /// Fills that produced a value (#1314): the computation of a
+    /// single-flight fill ([`crate::ByteBoundedCache::get_or_insert_with`]
+    /// and the other `get_or_insert_with*`), a claim's insert
+    /// ([`crate::CacheFillGuard`]), or a fill its caller timed
+    /// ([`crate::FillTimer`]). A fill that fails counts nothing, nor does a
+    /// caller waiting for another's fill.
+    pub fills: u64,
+    /// The time those fills took, in nanoseconds: over [`Self::fills`], what
+    /// a miss of this cache costs ([`Self::mean_fill_seconds`]).
+    pub fill_nanos: u64,
+    /// The heap its ghost ring holds now, estimated from its tables'
+    /// capacities (#1314): memory outside the cache's own weight. Not a
+    /// counter: [`Self::since`] keeps the later value. `0` without a ring.
+    pub ghost_ring_bytes: u64,
 }
 
 impl Churn {
     /// Every eviction, cold and hot.
     pub fn evictions(&self) -> u64 {
         self.evicted_cold.saturating_add(self.evicted_hot)
+    }
+
+    /// The mean time of a fill, in seconds: what a miss costs. `None`
+    /// without a fill.
+    pub fn mean_fill_seconds(&self) -> Option<f64> {
+        (self.fills > 0).then(|| self.fill_nanos as f64 / 1e9 / self.fills as f64)
     }
 
     /// The counters of `self` less those of `earlier`, the same cache read
@@ -113,6 +136,9 @@ impl Churn {
             bypasses: self.bypasses.checked_sub(earlier.bypasses)?,
             ghost_hits,
             prewarmed: self.prewarmed,
+            ghost_ring_bytes: self.ghost_ring_bytes,
+            fills: self.fills.checked_sub(earlier.fills)?,
+            fill_nanos: self.fill_nanos.checked_sub(earlier.fill_nanos)?,
         })
     }
 }
@@ -144,6 +170,8 @@ pub(crate) struct Counters {
     evicted_bytes: AtomicU64,
     bypasses: AtomicU64,
     prewarmed: AtomicBool,
+    fills: AtomicU64,
+    fill_nanos: AtomicU64,
     /// [`crate::ByteBoundedCache::with_ghosts`] asked for a ring: one is
     /// kept whenever the cache is enabled, also by a resize from `0`.
     wants_ghosts: AtomicBool,
@@ -165,6 +193,8 @@ impl Counters {
             evicted_bytes: AtomicU64::new(0),
             bypasses: AtomicU64::new(0),
             prewarmed: AtomicBool::new(false),
+            fills: AtomicU64::new(0),
+            fill_nanos: AtomicU64::new(0),
             wants_ghosts: AtomicBool::new(false),
             ghosts: OnceLock::new(),
             hasher,
@@ -231,6 +261,18 @@ impl Counters {
         self.bypasses.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count `entries` fills that took `elapsed` together (#1314): one
+    /// computation that filled several entries counts each at its share.
+    /// Nothing for a disabled cache, which counts nothing.
+    pub(crate) fn record_fills(&self, entries: u64, elapsed: Duration) {
+        if entries == 0 || !self.counting() {
+            return;
+        }
+        self.fills.fetch_add(entries, Ordering::Relaxed);
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.fill_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
     /// Look a missed `key` up in the ghost ring, if the cache keeps one and
     /// is enabled.
     pub(crate) fn record_ghost<Q: Hash + ?Sized>(&self, key: &Q) {
@@ -265,6 +307,9 @@ impl Counters {
                 .get()
                 .map(|ghosts| ghosts.hits.each_ref().map(load)),
             prewarmed: self.prewarmed.load(Ordering::Relaxed),
+            ghost_ring_bytes: self.ghosts.get().map_or(0, Ghosts::heap_bytes),
+            fills: load(&self.fills),
+            fill_nanos: load(&self.fill_nanos),
         }
     }
 }
@@ -321,6 +366,12 @@ impl<K, V> Counting<K, V> {
 
     pub(crate) fn counters(&self) -> &Counters {
         &self.counters
+    }
+
+    /// The counters, shared: for a [`crate::FillTimer`], which outlives
+    /// any borrow of the cache.
+    pub(crate) fn shared_counters(&self) -> Arc<Counters> {
+        Arc::clone(&self.counters)
     }
 
     pub(crate) fn weigh(&self, key: &K, value: &V) -> u64 {
@@ -597,15 +648,16 @@ impl Ghosts {
     /// Remember that `hash`'s key was evicted when the clock read `before`,
     /// and forget what the clock, now at `after`, has left behind: more than
     /// twice the capacity ago, or past the stripe's share of
-    /// [`MAX_GHOSTS`].
+    /// [`MAX_GHOSTS`]. Forgotten first, so a stripe at its share makes room
+    /// before it remembers and its tables never grow past the share: pushed
+    /// first, one more eviction than fits would double a full stripe's
+    /// `VecDeque`.
     fn remember(&self, hash: u64, before: u64, after: u64) {
         let reach = self.depth(2);
         let mut stripe = self.stripe(hash);
-        stripe.index.insert(hash, before);
-        stripe.order.push_back((hash, before));
         while let Some(&(oldest, at)) = stripe.order.front() {
             let reached = after.saturating_sub(at) <= reach;
-            if reached && stripe.order.len() <= MAX_GHOSTS / STRIPES {
+            if reached && stripe.order.len() < MAX_GHOSTS / STRIPES {
                 break;
             }
             stripe.order.pop_front();
@@ -615,6 +667,23 @@ impl Ghosts {
                 stripe.index.remove(&oldest);
             }
         }
+        stripe.index.insert(hash, before);
+        stripe.order.push_back((hash, before));
+    }
+
+    /// The heap the ring holds: each stripe's eviction order and index,
+    /// from their capacities, which grow and never shrink (#1314).
+    fn heap_bytes(&self) -> u64 {
+        let bytes: usize = self
+            .stripes
+            .iter()
+            .map(|stripe| {
+                let stripe = stripe.0.lock().unwrap_or_else(|e| e.into_inner());
+                stripe.order.capacity() * std::mem::size_of::<(u64, u64)>()
+                    + hash_table::<(u64, u64)>(stripe.index.capacity())
+            })
+            .sum();
+        bytes as u64
     }
 
     /// Bytes evicted since `hash`'s key was evicted, its own included, the
@@ -636,6 +705,23 @@ impl Ghosts {
             }
         }
     }
+}
+
+/// The heap of a hash map of `capacity` (its `capacity()`) holding `T`
+/// entries: one slot and one control byte per bucket and a group of control
+/// bytes more, hashbrown keeping 7 of 8 buckets usable, all of them below
+/// 8. `ds_core::heap::hash_table`, which this crate cannot depend on.
+fn hash_table<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = if capacity < 8 {
+        (capacity + 1).next_power_of_two()
+    } else {
+        (capacity / 7 * 8).next_power_of_two()
+    };
+    const GROUP: usize = 16;
+    (buckets * std::mem::size_of::<T>()).next_multiple_of(GROUP) + buckets + GROUP
 }
 
 /// A hasher for keys that are hashes already.
@@ -709,6 +795,43 @@ mod tests {
             "its later eviction stays"
         );
         assert_eq!(ghosts.stripe(0).order.len(), 3);
+    }
+
+    /// #1314 review: a ring at its cap of evictions never grows its tables
+    /// past their share of it, and its estimate is what they hold. Before,
+    /// a stripe pushed before it made room, so one eviction past its share
+    /// doubled its `VecDeque`: about 66 MiB at the cap of 2^20.
+    #[test]
+    fn a_full_ring_stays_within_its_cap() {
+        let ghosts = Ghosts::new(u64::MAX / 4);
+        // Hashes spread over the stripes (bits 32..) and the maps' bits.
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for clock in 0..(MAX_GHOSTS + MAX_GHOSTS / 4) as u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ghosts.remember(x, clock, clock + 1);
+        }
+        let (mut entries, mut estimate) = (0usize, 0usize);
+        for stripe in &ghosts.stripes {
+            let s = stripe.0.lock().unwrap();
+            assert!(s.order.len() <= MAX_GHOSTS / STRIPES);
+            assert!(
+                s.order.capacity() <= MAX_GHOSTS / STRIPES,
+                "{}",
+                s.order.capacity()
+            );
+            entries += s.order.len();
+            estimate += s.order.capacity() * 16 + hash_table::<(u64, u64)>(s.index.capacity());
+        }
+        assert!(entries > MAX_GHOSTS * 99 / 100, "{entries}");
+        assert_eq!(ghosts.heap_bytes(), estimate as u64);
+        let per_eviction = estimate as f64 / entries as f64;
+        eprintln!(
+            "{entries} evictions remembered, {:.1} MiB, {per_eviction:.1} bytes each",
+            estimate as f64 / (1 << 20) as f64
+        );
+        assert!(per_eviction < 52.0, "{per_eviction:.1} bytes an eviction");
     }
 
     #[test]

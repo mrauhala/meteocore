@@ -442,11 +442,17 @@ impl PixelCache {
             rechecked();
             let mut failures = 0;
             if !missing.is_empty() {
-                for (path, raw) in load(&missing, held)? {
+                // One read and decode fills every moment it loads: each
+                // counts its share of the time (#1314).
+                let fill = self.fill_timer();
+                let loaded = load(&missing, held)?;
+                let filled = loaded.len() as u64;
+                for (path, raw) in loaded {
                     let raw = Arc::new(raw);
                     self.insert(file_id, &path, raw.clone());
                     pixels.insert(path, raw);
                 }
+                fill.finish_many(filled);
                 for (path, _, _) in missing {
                     if !pixels.contains_key(path) && self.mark_bad(file_id, path) {
                         failures += 1;
@@ -510,6 +516,12 @@ impl PixelCache {
         }
         let key: PixelKey = (Arc::from(file_id), Arc::from(dataset_path));
         self.inner.contains_key(&key)
+    }
+
+    /// Time the load of a missed moment, from the miss to its insert: the
+    /// cache's miss cost (#1314). Dropped unfinished, it counts nothing.
+    pub fn fill_timer(&self) -> ds_cache::FillTimer {
+        self.inner.fill_timer()
     }
 
     /// Insert a freshly-decoded array. No-op when disabled.

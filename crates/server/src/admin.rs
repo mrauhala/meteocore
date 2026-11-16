@@ -10,8 +10,8 @@ use axum::response::IntoResponse;
 use axum::Json;
 use prometheus::core::{Collector, MetricVec, MetricVecBuilder};
 use prometheus::{
-    Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge,
-    IntGaugeVec, Opts, Registry, TextEncoder,
+    CounterVec, Encoder, Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -206,6 +206,8 @@ impl CacheMetricSet {
                 &format!("{prefix}_inserted_bytes_total"),
                 &format!("{prefix}_refused_total"),
                 &format!("{prefix}_ghost_hits_total"),
+                &format!("{prefix}_fills_total"),
+                &format!("{prefix}_fill_seconds_total"),
                 &capitalized,
                 false,
             ),
@@ -230,8 +232,10 @@ impl CacheMetricSet {
 
 /// One cache family's churn (#1308): `{prefix}_evictions_total{ring}`,
 /// `{prefix}_evicted_bytes_total`, `{prefix}_inserted_bytes_total`,
-/// `{prefix}_refused_total` and, for a cache with a ghost ring,
-/// `{prefix}_ghost_hits_total{depth}`. A per-collection family leads with a
+/// `{prefix}_refused_total`, for a cache with a ghost ring,
+/// `{prefix}_ghost_hits_total{depth}`, and its fills with their time
+/// (#1314), `{prefix}_fills_total` and `{prefix}_fill_seconds_total`: over
+/// each other, the cache's miss cost. A per-collection family leads with a
 /// `collection` label and registers [`per_collection`], so a reload that
 /// removes a collection drops its series. Fed from cumulative
 /// [`ds_cache::Churn`] snapshots against the caller's last-seen one: a
@@ -244,20 +248,45 @@ struct ChurnMetricSet {
     inserted_bytes: IntCounterVec,
     refused: IntCounterVec,
     ghost_hits: IntCounterVec,
+    fills: IntCounterVec,
+    fill_seconds: CounterVec,
 }
 
 impl ChurnMetricSet {
     /// `display` names the cache in the help texts; the families carry a
-    /// `collection` label when `by_collection`.
+    /// `collection` label when `by_collection`. Every name is passed as a
+    /// literal from its builder's body, which the dashboard check reads.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         evictions: &str,
         evicted_bytes: &str,
         inserted_bytes: &str,
         refused: &str,
         ghost_hits: &str,
+        fills: &str,
+        fill_seconds: &str,
         display: &str,
         by_collection: bool,
     ) -> Self {
+        let collection: &[&str] = if by_collection { &["collection"] } else { &[] };
+        let fill_seconds = CounterVec::new(
+            Opts::new(
+                fill_seconds,
+                format!(
+                    "{display}: time its fills took, a missed entry computed, read or fetched \
+                     until inserted; failed fills not counted. Over the fills, the cache's miss \
+                     cost (#1314)"
+                ),
+            ),
+            collection,
+        )
+        .unwrap();
+        let fill_seconds = if by_collection {
+            per_collection(fill_seconds)
+        } else {
+            REGISTRY.register(Box::new(fill_seconds.clone())).unwrap();
+            fill_seconds
+        };
         ChurnMetricSet {
             evictions: churn_family(
                 evictions,
@@ -300,6 +329,17 @@ impl ChurnMetricSet {
                 &["depth"],
                 by_collection,
             ),
+            fills: churn_family(
+                fills,
+                &format!(
+                    "{display}: fills that produced a value, each a missed entry computed, read \
+                     or fetched; failed fills and callers waiting for another's are not \
+                     counted (#1314)"
+                ),
+                &[],
+                by_collection,
+            ),
+            fill_seconds,
         }
     }
 
@@ -331,6 +371,10 @@ impl ChurnMetricSet {
                 inc(&self.ghost_hits, &[depth], hits);
             }
         }
+        inc(&self.fills, &[], delta.fills);
+        self.fill_seconds
+            .with_label_values(labels)
+            .inc_by(delta.fill_nanos as f64 / 1e9);
         delta
     }
 }
@@ -711,6 +755,16 @@ static MEMORY_CAPACITY_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+static CACHE_GHOST_RING: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "cache_ghost_ring_bytes",
+        "Heap the caches' ghost rings hold, summed (#1314): the hashes of evicted keys a \
+         cache remembers back over twice its capacity of evictions, about 35 to 70 bytes \
+         each and at most 50 MiB a cache, outside every *_cache_bytes. Counted in the memory plan's heap as the stores \
+         are; /admin/cache-plan has each cache's ghost_ring_bytes",
+    )
+});
+
 /// Set the plan gauges from `rows`, dropping series of entries gone since
 /// the last scrape.
 fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
@@ -740,6 +794,9 @@ fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
         MEMORY_CAPACITY_TOTAL
             .with_label_values(&[kind.as_str()])
             .set(total.capacity_bytes.min(i64::MAX as u64) as i64);
+        if kind == ds_cache::plan::Kind::Cache {
+            CACHE_GHOST_RING.set(total.ghost_ring_bytes.min(i64::MAX as u64) as i64);
+        }
     }
     crate::memory_plan::update_gauges();
 }
@@ -1815,6 +1872,8 @@ impl CollectionCacheMetricSet {
             &format!("{prefix}_inserted_bytes_total"),
             &format!("{prefix}_refused_total"),
             &format!("{prefix}_ghost_hits_total"),
+            &format!("{prefix}_fills_total"),
+            &format!("{prefix}_fill_seconds_total"),
             display,
             true,
         );

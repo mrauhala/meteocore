@@ -97,11 +97,14 @@ impl VectorTileCache {
         // ~8 KB per encoded tile for initial hash map sizing; eviction is
         // driven by the weight budget.
         Self {
+            // A ghost ring, as every cache the memory plan sizes keeps
+            // (#1314).
             cache: ByteBoundedCache::new(
                 capacity_mb.saturating_mul(ds_cache::MIB),
                 8192,
                 weigh_tile,
-            ),
+            )
+            .with_ghosts(),
         }
     }
 
@@ -111,6 +114,12 @@ impl VectorTileCache {
 
     pub fn insert(&self, key: VectorTileKey, val: CachedTile) {
         self.cache.insert(key, val);
+    }
+
+    /// Time the encode of a missed tile, from the miss to its insert: the
+    /// cache's miss cost (#1314). Dropped unfinished, it counts nothing.
+    pub fn fill_timer(&self) -> ds_cache::FillTimer {
+        self.cache.fill_timer()
     }
 
     pub fn capacity_bytes(&self) -> u64 {
@@ -201,6 +210,30 @@ mod tests {
             data_version: 0,
             time: None,
         }
+    }
+
+    /// #1314: the vector-tile cache keeps a ghost ring, so a miss of a tile
+    /// it evicted counts as a ghost hit; and a fill timed from the miss to
+    /// its insert counts its time.
+    #[test]
+    fn a_miss_of_an_evicted_tile_is_a_ghost_hit_and_its_fill_is_timed() {
+        let cache = VectorTileCache::new(1);
+        let tile = || CachedTile::new(Bytes::from(vec![0u8; 64 * 1024]));
+        // 24 tiles of 64 KiB through a 1 MiB cache evict some, well within
+        // the ring's reach of twice the capacity.
+        for x in 0..24 {
+            let fill = cache.fill_timer();
+            cache.insert(key(10, x, 0), tile());
+            fill.finish();
+        }
+        let missed = (0..24)
+            .filter(|x| cache.get(&key(10, *x, 0)).is_none())
+            .count() as u64;
+        assert!(missed > 0, "nothing evicted");
+        let churn = cache.metrics().churn;
+        let ghost_hits = churn.ghost_hits.expect("a ghost ring");
+        assert_eq!(ghost_hits[2], missed, "{ghost_hits:?}");
+        assert_eq!(churn.fills, 24);
     }
 
     #[test]

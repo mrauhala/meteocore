@@ -185,6 +185,7 @@ static BLOCKS: LazyLock<ByteBoundedCache<BlockKey, Bytes>> = LazyLock::new(|| {
     )
     // The memory plan's resizes too (#1312).
     .with_min_capacity(MIN_BLOCK_CACHE_MB.saturating_mul(ds_cache::MIB))
+    .with_ghosts()
     .registered(
         "netcdf_block_cache",
         ds_cache::plan::Scope::Engine("netcdf"),
@@ -208,6 +209,7 @@ static CHUNKS: LazyLock<ByteBoundedCache<ChunkKey, Bytes>> = LazyLock::new(|| {
         };
         (bytes.len() + key.file.url.len() + constraint) as u64 + 96
     })
+    .with_ghosts()
     .registered(
         "netcdf_chunk_cache",
         ds_cache::plan::Scope::Engine("netcdf"),
@@ -407,14 +409,16 @@ impl RemoteFile {
             let span = block_range(low).start..block_range(high).end;
             // An error drops the claims: a waiting reader fetches its own.
             let bytes = self.fetch(span.clone())?;
+            let batch = u32::try_from(claimed.len()).unwrap_or(u32::MAX);
             for (index, guard) in claimed {
                 let range = block_range(index);
                 let at = (range.start - span.start) as usize;
                 // A copy, so no block keeps the whole span allocated.
                 let block =
                     Bytes::copy_from_slice(&bytes[at..at + (range.end - range.start) as usize]);
-                BLOCKS.record_miss();
-                let _ = guard.insert(block.clone());
+                BLOCKS.record_claimed_miss(&guard);
+                // One GET filled the batch: each block counts its share.
+                let _ = guard.insert_batched(block.clone(), batch);
                 found[(index - first) as usize] = Some(block);
             }
         }

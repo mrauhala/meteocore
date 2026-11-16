@@ -77,13 +77,15 @@ impl TileCache {
     pub fn new(max_bytes: u64) -> Self {
         TileCache {
             // Filled ahead of reads by the COG pre-warm (#1318): its
-            // eviction and ghost numbers undervalue it.
+            // eviction and ghost numbers undervalue it. A ghost ring, as
+            // every cache the memory plan sizes keeps (#1314).
             inner: ByteBoundedCache::new_with_hot_allocation(
                 max_bytes,
                 APPROX_TILE_BYTES,
                 weigh_tile,
                 HOT_ALLOCATION,
             )
+            .with_ghosts()
             .prewarmed(),
             namespace: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
         }
@@ -114,6 +116,18 @@ impl TileCache {
             ifd_index,
         };
         self.inner.get(&key)
+    }
+
+    /// Time the fetch of a missed tile, from the miss to its insert: the
+    /// cache's miss cost (#1314). Dropped unfinished, it counts nothing.
+    pub(crate) fn fill_timer(&self) -> ds_cache::FillTimer {
+        self.inner.fill_timer()
+    }
+
+    /// Count `tiles` fills one coalesced read of `elapsed` filled (#1314):
+    /// the tiles of the read it inserted.
+    pub(crate) fn record_fills(&self, tiles: u64, elapsed: std::time::Duration) {
+        self.inner.record_fills(tiles, elapsed);
     }
 
     /// Speculative planning lookup: counters belong to the later worker read.

@@ -39,7 +39,7 @@ mod churn;
 mod entry;
 pub mod plan;
 pub use churn::{Churn, GHOST_DEPTHS};
-pub use entry::{CacheEntry, CacheFillGuard, Joined};
+pub use entry::{CacheEntry, CacheFillGuard, FillTimer, Joined};
 
 use churn::{Counters, Counting, Evicted, Insert};
 
@@ -321,18 +321,29 @@ impl<K: Eq + Hash, V: Clone> Inner<K, V> {
         self.counters().record_ghost(key);
     }
 
-    /// Publish `value` to a single-flight claim on `key` and count the
-    /// insert. The weight function takes the owned key, so `key` is cloned:
-    /// only on a fill, which follows a computation.
-    fn fill<Q>(&self, key: &Q, claim: Placeholder<'_, K, V>, value: V)
+    /// Compute a single-flight claim's value with `with` and publish it to
+    /// the claim on `key`, counting the insert and the fill with the time
+    /// `with` took (#1314). An error publishes and counts nothing. The
+    /// weight function takes the owned key, so `key` is cloned: only on a
+    /// fill, which follows a computation.
+    fn fill<Q, E>(
+        &self,
+        key: &Q,
+        claim: Placeholder<'_, K, V>,
+        with: impl FnOnce() -> Result<V, E>,
+    ) -> Result<V, E>
     where
         Q: ToOwned<Owned = K> + ?Sized,
     {
+        let started = std::time::Instant::now();
+        let value = with()?;
+        self.counters().record_fills(1, started.elapsed());
         let weight = self
             .counters()
             .counting()
             .then(|| self.lifecycle.weigh(&key.to_owned(), &value));
-        let _ = publish(&self.lifecycle, claim, value, weight);
+        let _ = publish(&self.lifecycle, claim, value.clone(), weight);
+        Ok(value)
     }
 
     /// One step of a resize: set the store to `store_bytes` (`0` only on the
@@ -756,7 +767,8 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// Keep a ghost ring: the hashes of recently evicted keys, back over
     /// twice the capacity of evicted weight, so [`Churn::ghost_hits`] counts
     /// the misses that a cache 1.5 ×, 2 × or 3 × as large would have hit
-    /// (#1308). About 32 bytes per remembered eviction, up to 32 MiB. A
+    /// (#1308). About 35 to 70 bytes of heap per remembered eviction, 50 MiB
+    /// at its cap of 2^20 ([`Churn::ghost_ring_bytes`] says how much). A
     /// miss takes one more hash of its key and the lock of one of the ring's
     /// stripes, and an eviction the same; a hit costs nothing (the
     /// `churn_bench` example measures it). Misses counted by
@@ -930,9 +942,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             }
             quick_cache::sync::GuardResult::Guard(claim) => {
                 self.inner.miss(key);
-                let value = with()?;
-                self.inner.fill(key, claim, value.clone());
-                Ok(value)
+                self.inner.fill(key, claim, with)
             }
             quick_cache::sync::GuardResult::Timeout => {
                 unreachable!("a lookup without a timeout waits for the fill")
@@ -960,9 +970,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
             }
             quick_cache::sync::GuardResult::Guard(claim) => {
                 self.inner.miss(key);
-                let value = with()?;
-                self.inner.fill(key, claim, value.clone());
-                Ok(value)
+                self.inner.fill(key, claim, with)
             }
             quick_cache::sync::GuardResult::Timeout => Err(timed_out()),
         }
@@ -1004,9 +1012,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
                     return Err(expired());
                 }
                 self.inner.miss(key);
-                let value = with()?;
-                self.inner.fill(key, claim, value.clone());
-                Ok(value)
+                self.inner.fill(key, claim, with)
             }
             quick_cache::sync::GuardResult::Timeout => Err(expired()),
         }
@@ -1034,6 +1040,7 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
                 claim,
                 key: self.inner.counters().counting().then(|| key.to_owned()),
                 lifecycle: &self.inner.lifecycle,
+                started: std::time::Instant::now(),
             }),
             quick_cache::sync::GuardResult::Timeout => CacheEntry::Timeout,
         }
@@ -1073,6 +1080,26 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         }
     }
 
+    /// Start timing the fill of a missed entry, for a caller that looks a
+    /// key up and inserts it apart (#1314): take it at the miss, before
+    /// computing, and [`FillTimer::finish`] it once the value is inserted.
+    /// The `get_or_insert_with*` fills and the claims
+    /// ([`Self::get_value_or_guard_untracked`]) time themselves.
+    pub fn fill_timer(&self) -> FillTimer {
+        FillTimer {
+            counters: self.inner.lifecycle.shared_counters(),
+            started: std::time::Instant::now(),
+        }
+    }
+
+    /// Count `entries` fills that took `elapsed` together, timed by the
+    /// caller (#1314): one GET of a batch, counting only the entries it
+    /// inserted, or a pre-warm's download and the computation after it.
+    /// `0` counts nothing, as does a disabled cache.
+    pub fn record_fills(&self, entries: u64, elapsed: std::time::Duration) {
+        self.inner.counters().record_fills(entries, elapsed);
+    }
+
     /// Count one hit (for wrappers using [`Self::get_untracked`]).
     pub fn record_hit(&self) {
         self.inner.hits.fetch_add(1, Ordering::Relaxed);
@@ -1099,6 +1126,16 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         Q: Hash + Equivalent<K> + ?Sized,
     {
         self.inner.miss(key);
+    }
+
+    /// Count the miss a claim ([`Self::get_value_or_guard_untracked`]) is
+    /// about to fill, and look its key up among recent evictions as
+    /// [`Self::get`] does: for a caller that holds the claim but not the key.
+    pub fn record_claimed_miss(&self, claim: &CacheFillGuard<'_, K, V>) {
+        self.inner.misses.fetch_add(1, Ordering::Relaxed);
+        if let Some(key) = &claim.key {
+            self.inner.counters().record_ghost(key);
+        }
     }
 
     /// Cumulative `(hits, misses)`.
@@ -1225,11 +1262,141 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // The signature must match `fn(&K, &V)` with `K = String`, `V = Vec<u8>`.
     #[allow(clippy::ptr_arg)]
     fn weigh_str(key: &String, val: &Vec<u8>) -> u64 {
         key.len() as u64 + val.len() as u64 + 64
+    }
+
+    /// The fills a cache counted, and their time.
+    fn fills<K: Eq + Hash, V: Clone>(cache: &ByteBoundedCache<K, V>) -> (u64, Duration) {
+        let churn = cache.churn();
+        (churn.fills, Duration::from_nanos(churn.fill_nanos))
+    }
+
+    /// #1314: a single-flight fill counts its computation's time, once: not
+    /// for the callers that waited for it, nor for a hit, nor for a fill
+    /// that failed.
+    #[test]
+    fn a_single_flight_fill_is_timed_once_and_a_failed_one_not_at_all() {
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        let key = "a".to_string();
+        let started = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                cache
+                    .get_or_insert_with(&key, || {
+                        started.wait();
+                        std::thread::sleep(Duration::from_millis(30));
+                        Ok::<_, ()>(vec![1])
+                    })
+                    .unwrap()
+            });
+            started.wait();
+            // Waits for the fill in flight, then finds it.
+            let waited = cache.get_or_insert_with(&key, || Ok::<_, ()>(vec![2]));
+            assert_eq!(waited, Ok(vec![1]));
+        });
+        let (count, time) = fills(&cache);
+        assert_eq!(count, 1, "the waiter did not fill");
+        assert!(time >= Duration::from_millis(30), "{time:?}");
+        cache
+            .get_or_insert_with(&key, || Ok::<_, ()>(vec![3]))
+            .unwrap();
+        let failed = cache.get_or_insert_with(&"b".to_string(), || Err::<Vec<u8>, _>("offline"));
+        assert_eq!(failed, Err("offline"));
+        let until = cache.get_or_insert_with_until(
+            &"c".to_string(),
+            Some(std::time::Instant::now() + Duration::from_secs(60)),
+            || Ok::<_, ()>(vec![4]),
+            || (),
+        );
+        assert!(until.is_ok());
+        assert_eq!(fills(&cache).0, 2, "a hit and a failure count nothing");
+        assert_eq!(
+            cache.churn().mean_fill_seconds().map(|s| s > 0.0),
+            Some(true)
+        );
+    }
+
+    /// #1314: a claim's fill counts from the claim, or from a restart, to
+    /// its insert; a dropped claim counts nothing; a claim one of a batch
+    /// filled counts its share.
+    #[test]
+    fn a_claims_fill_is_timed_from_the_claim_to_its_insert() {
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        let claim = |key: &str| match cache.get_value_or_guard_untracked(key, Duration::ZERO) {
+            CacheEntry::Vacant(guard) => guard,
+            _ => panic!("expected a vacant entry"),
+        };
+        let guard = claim("a");
+        std::thread::sleep(Duration::from_millis(20));
+        guard.insert(vec![1]).unwrap();
+        let (count, time) = fills(&cache);
+        assert_eq!(count, 1);
+        assert!(time >= Duration::from_millis(20), "{time:?}");
+
+        drop(claim("b"));
+        assert_eq!(fills(&cache).0, 1, "dropped unfilled");
+
+        // 600 ms before the restart: a fill timed from the claim counts all
+        // of it, a restarted one none, with 400 ms to spare for a stall.
+        let mut guard = claim("c");
+        std::thread::sleep(Duration::from_millis(600));
+        guard.restart();
+        guard.insert(vec![3]).unwrap();
+        let (count, after) = fills(&cache);
+        assert_eq!(count, 2);
+        let restarted = after - time;
+        assert!(restarted < Duration::from_millis(400), "{restarted:?}");
+
+        let batch: Vec<_> = ["d", "e", "f", "g"].map(claim).into_iter().collect();
+        std::thread::sleep(Duration::from_millis(400));
+        let before = fills(&cache).1;
+        for guard in batch {
+            guard.insert_batched(vec![4], 4).unwrap();
+        }
+        let (count, time) = fills(&cache);
+        assert_eq!(count, 6);
+        // Four quarters of at least 400 ms each: the batch's time once, not
+        // four times (1.6 s), with 600 ms to spare for a stall.
+        let batched = time - before;
+        assert!(batched >= Duration::from_millis(400), "{batched:?}");
+        assert!(batched < Duration::from_millis(1000), "{batched:?}");
+    }
+
+    /// #1314: a fill a caller times around its own lookup and insert counts
+    /// when finished, its share each when it filled several, and nothing
+    /// when dropped; a disabled cache counts nothing.
+    #[test]
+    fn a_fill_timer_counts_what_its_caller_finishes() {
+        let cache = ByteBoundedCache::new(MIB, 1024, weigh_str);
+        assert!(cache.get(&"a".to_string()).is_none());
+        let timer = cache.fill_timer();
+        std::thread::sleep(Duration::from_millis(10));
+        cache.insert("a".to_string(), vec![1]);
+        timer.finish();
+        let (count, time) = fills(&cache);
+        assert_eq!(count, 1);
+        assert!(time >= Duration::from_millis(10));
+
+        drop(cache.fill_timer());
+        cache.fill_timer().finish_many(3);
+        cache.fill_timer().finish_many(0);
+        assert_eq!(fills(&cache).0, 4);
+        // A timer moves to the thread or task that computes.
+        let timer = cache.fill_timer();
+        std::thread::spawn(move || timer.finish()).join().unwrap();
+        assert_eq!(fills(&cache).0, 5);
+
+        let disabled = ByteBoundedCache::new(0, 1024, weigh_str);
+        disabled.fill_timer().finish();
+        disabled
+            .get_or_insert_with(&"a".to_string(), || Ok::<_, ()>(vec![1]))
+            .unwrap();
+        assert_eq!(fills(&disabled), (0, Duration::ZERO));
     }
 
     #[test]
@@ -2275,7 +2442,13 @@ mod tests {
         before.inner.counters().resize(90 * 1000, 100 * 1000, shard);
         let (now, then) = (resized.churn(), before.churn());
         assert!(now.evictions() > 0);
-        assert_eq!(now, then);
+        // The ring's tables grow with the order it learns keys in, which
+        // the two take differently: the same keys, not the same capacities.
+        let learned = |churn: Churn| Churn {
+            ghost_ring_bytes: 0,
+            ..churn
+        };
+        assert_eq!(learned(now), learned(then));
         let resident = |cache: &ByteBoundedCache<String, u64>| {
             (0..150)
                 .filter(|i| cache.contains_key(&format!("k{i}")))
@@ -2288,7 +2461,7 @@ mod tests {
                 let _ = cache.get(&format!("k{i}"));
             }
         }
-        assert_eq!(resized.churn(), before.churn());
+        assert_eq!(learned(resized.churn()), learned(before.churn()));
         assert!(resized.churn().ghost_hits.unwrap()[0] > 0);
     }
 

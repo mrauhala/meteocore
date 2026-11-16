@@ -93,11 +93,13 @@ static COMPOSITE_CACHE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| {
     let (bytes, source) =
         ds_cache::plan::env_bytes("MC_ODIM_COMPOSITE_CACHE_MB", DEFAULT_COMPOSITE_CACHE_MB);
-    ds_cache::ByteBoundedCache::new(bytes, 67 * 1024 * 1024, weigh_composite).registered(
-        "odim_composite_cache",
-        ds_cache::plan::Scope::Engine("odim"),
-        source,
-    )
+    ds_cache::ByteBoundedCache::new(bytes, 67 * 1024 * 1024, weigh_composite)
+        .with_ghosts()
+        .registered(
+            "odim_composite_cache",
+            ds_cache::plan::Scope::Engine("odim"),
+            source,
+        )
 });
 
 /// Snapshot of the process-global composite cache for `/metrics`. Mirrors

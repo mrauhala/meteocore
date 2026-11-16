@@ -727,7 +727,7 @@ pub async fn get_content(
     let engine = engine.clone();
     let semaphore = state.content_semaphore.clone();
     let content = CONTENT_CACHE
-        .get_or_compute(key, move || async move {
+        .get_or_compute(key, move |admitted| async move {
             // Sample + encode off the request worker: `read_point_cloud` does
             // blocking HDF5 I/O and a long CPU loop (CLAUDE.md concurrency
             // rules), so bound it with the 3D content pool (never a raster
@@ -737,6 +737,7 @@ pub async fn get_content(
             let job = ds_executor::RenderJob::acquire_volume(semaphore)
                 .await
                 .map_err(Tiles3dError::from)?;
+            admitted.mark();
 
             // Sample, encode, and hash all on the blocking thread (the ETag
             // hash over a multi-MB tile is real CPU — keep it off the async
@@ -879,7 +880,7 @@ pub async fn get_content_glb(
     let semaphore = state.content_semaphore.clone();
     let id_for_err = key.collection.clone();
     let content = CONTENT_CACHE
-        .get_or_compute(key, move || async move {
+        .get_or_compute(key, move |admitted| async move {
             // read_voxel_grid + meshing do blocking HDF5 I/O + a long CPU
             // loop, so bound them with the 3D content pool and run on a
             // blocking thread (same rule as the `.pnts` path). Only the
@@ -887,6 +888,7 @@ pub async fn get_content_glb(
             let job = ds_executor::RenderJob::acquire_volume(semaphore)
                 .await
                 .map_err(Tiles3dError::from)?;
+            admitted.mark();
 
             job.run(move || -> Result<(Vec<u8>, String), Tiles3dError> {
                 let result = match representation {
@@ -1158,7 +1160,7 @@ pub async fn get_voxel_content(
     let semaphore = state.content_semaphore.clone();
     let id_for_err = key.collection.clone();
     let content = CONTENT_CACHE
-        .get_or_compute(key, move || async move {
+        .get_or_compute(key, move |admitted| async move {
             // The 3D content pool (NOT the raster render slots) so a slow
             // `high`-res encode can't hold a WMS/Maps/Tiles render slot — see
             // `CONTENT_SLOTS`. Only the computing request pays.
@@ -1166,6 +1168,7 @@ pub async fn get_voxel_content(
                 .acquire_owned()
                 .await
                 .map_err(|_| Tiles3dError::Internal("content semaphore closed".into()))?;
+            admitted.mark();
             tokio::task::spawn_blocking(move || -> Result<(Vec<u8>, String), Tiles3dError> {
                 let _permit = _permit;
                 let grid = engine.read_voxel_grid(quantity.as_deref(), time, Some(dims), None)?;

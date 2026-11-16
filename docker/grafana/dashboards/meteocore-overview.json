@@ -1161,6 +1161,19 @@
                                     "name": "panel-135"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 42,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-227"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -18844,7 +18857,7 @@
         "spec": {
           "id": 122,
           "title": "Memory outside caches",
-          "description": "RSS less every *_cache_bytes, stacked by where it is: stores = the in-memory stores that report their size (BUFR reports and snapshot, the WIS2 dedup and BUFR deletion indexes, CAP alerts, nowcast frames, PVOL catalogs, NetCDF open files, Icechunk ranges fetched ahead; see Store memory), heap without a gauge = jemalloc allocated less the caches and the stores, allocator slack = active less allocated (fragmentation), dirty pages = resident less active (freed pages awaiting purge), outside jemalloc = RSS less jemalloc resident (thread stacks, mapped files). A growing heap without a gauge is memory no gauge explains yet. RSS is read on Linux only, so the top band is empty elsewhere.",
+          "description": "RSS less every *_cache_bytes, stacked by where it is: stores = the in-memory stores that report their size (BUFR reports and snapshot, the WIS2 dedup and BUFR deletion indexes, CAP alerts, nowcast frames, PVOL catalogs, NetCDF open files, Icechunk ranges fetched ahead, and the caches' ghost rings, cache_ghost_ring_bytes; see Store memory), heap without a gauge = jemalloc allocated less the caches and the stores, allocator slack = active less allocated (fragmentation), dirty pages = resident less active (freed pages awaiting purge), outside jemalloc = RSS less jemalloc resident (thread stacks, mapped files). A growing heap without a gauge is memory no gauge explains yet. RSS is read on Linux only, so the top band is empty elsewhere.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -18863,7 +18876,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)",
+                        "expr": "sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes|cache_ghost_ring_bytes\"}) or vector(0)",
                         "legendFormat": "stores",
                         "range": true,
                         "instant": false,
@@ -18885,7 +18898,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)), 0)",
+                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes|cache_ghost_ring_bytes\"}) or vector(0)), 0)",
                         "legendFormat": "heap without a gauge",
                         "range": true,
                         "instant": false,
@@ -19384,7 +19397,7 @@
         "spec": {
           "id": 127,
           "title": "Heap without a gauge",
-          "description": "jemalloc allocated less every cache and every store that reports its size: heap no gauge explains. Should stay flat; a steady climb is a store or leak to meter next.",
+          "description": "jemalloc allocated less every cache, every store that reports its size and the caches' ghost rings (cache_ghost_ring_bytes, #1314): heap no gauge explains. Should stay flat; a steady climb is a store or leak to meter next.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -19403,7 +19416,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes\"}) or vector(0)), 0)",
+                        "expr": "clamp_min(sum(jemalloc_allocated_bytes{job=~\"$job\"}) - sum({job=~\"$job\", __name__=~\".+_cache_bytes\"}) - (sum({job=~\"$job\", __name__=~\"bufr_store_bytes|bufr_snapshot_bytes|bufr_deletion_index_bytes|wis2_dedup_bytes|cap_alert_bytes|nowcast_frame_bytes|period_grid_bytes|pvol_catalog_bytes|netcdf_open_file_bytes|zarr_icechunk_staged_bytes|cache_ghost_ring_bytes\"}) or vector(0)), 0)",
                         "legendFormat": "heap without a gauge",
                         "range": true,
                         "instant": false,
@@ -25280,6 +25293,115 @@
                   "links": [],
                   "min": 0,
                   "decimals": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-227": {
+        "kind": "Panel",
+        "spec": {
+          "id": 227,
+          "title": "Miss cost: mean fill time by cache",
+          "description": "The mean time a fill took over the trailing hour, by cache family (#1314): a missed entry computed, read or fetched until inserted, timed by ds-cache for single-flight fills and claims and at the call site for the meta-tile, rendered, vector-tile, 3D Tiles, GeoTIFF tile, PVOL pixel and Icechunk payload caches. Failed fills and callers waiting for another's fill are not counted. Ghost hits times this cost, over the memory a larger cache would take, is the value per byte /admin/cache-plan reports (value_ms_per_mib_hour). Log scale.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_fill_seconds_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_fill_seconds_total\")[1h:1m])) / (sum by (cache) (increase(label_replace({job=~\"$job\", __name__=~\"(${cache})_fills_total\", collection=~\"$collection|\"}, \"cache\", \"$1\", \"__name__\", \"(.+)_fills_total\")[1h:1m])) > 0)",
+                        "legendFormat": "{{cache}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Mean",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "s",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false,
+                    "scaleDistribution": {
+                      "type": "log",
+                      "log": 10
+                    }
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": []
                 },
                 "overrides": []
               }

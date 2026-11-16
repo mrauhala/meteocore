@@ -251,11 +251,13 @@ static VOXEL_GRID_CACHE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| {
     let (bytes, source) =
         ds_cache::plan::env_bytes("MC_PVOL_VOXEL_GRID_CACHE_MB", DEFAULT_VOXEL_GRID_CACHE_MB);
-    ds_cache::ByteBoundedCache::new(bytes, 21 * 1024 * 1024, weigh_voxel_grid).registered(
-        "pvol_voxel_grid_cache",
-        ds_cache::plan::Scope::Engine("odim-volume"),
-        source,
-    )
+    ds_cache::ByteBoundedCache::new(bytes, 21 * 1024 * 1024, weigh_voxel_grid)
+        .with_ghosts()
+        .registered(
+            "pvol_voxel_grid_cache",
+            ds_cache::plan::Scope::Engine("odim-volume"),
+            source,
+        )
 });
 
 /// Snapshot of the process-global voxel-grid cache for `/metrics`.
@@ -2108,6 +2110,8 @@ impl<'a> Pixels<'a> {
                 return Ok(None);
             }
             PIXEL_CACHE.record_miss(&cache_id, &moment.dataset_path);
+            // The miss's cost (#1314): a failed read drops it.
+            let fill = PIXEL_CACHE.fill_timer();
             let path = moment.dataset_path.as_str();
             // A read the deadline cuts off is finished in the background,
             // for this moment (#1046).
@@ -2126,6 +2130,7 @@ impl<'a> Pixels<'a> {
                 if let Some(raw) = raw {
                     let pixels = Arc::new(raw);
                     PIXEL_CACHE.insert(&cache_id, path, pixels.clone());
+                    fill.finish();
                     return Ok(pixels);
                 }
                 // Held until the moment is decoded and cached (#1127).
@@ -2148,6 +2153,7 @@ impl<'a> Pixels<'a> {
                     );
                     let pixels = Arc::new(single_moment(path, opened, result)?);
                     PIXEL_CACHE.insert(&cache_id, path, pixels.clone());
+                    fill.finish();
                     let siblings = sibling_requests(volume, moment, nrays, nbins, &cache_id);
                     spawn_sibling_decode(background, &cache_id, &bytes, siblings);
                     Ok(pixels)

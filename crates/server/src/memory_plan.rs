@@ -175,6 +175,8 @@ const STORE_FAMILIES: &[&str] = &[
     "pvol_catalog_bytes",
     "netcdf_open_file_bytes",
     "zarr_icechunk_staged_bytes",
+    // Not a store, but heap outside the caches' weight all the same (#1314).
+    "cache_ghost_ring_bytes",
 ];
 
 /// Fit `rows` to the accepted config's total, apply the plan as its

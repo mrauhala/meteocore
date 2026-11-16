@@ -243,11 +243,13 @@ pub fn strike_window_cache() -> &'static ByteBoundedCache<WindowKey, Arc<Vec<Str
     static CACHE: OnceLock<ByteBoundedCache<WindowKey, Arc<Vec<Strike>>>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let (bytes, source) = ds_cache::plan::env_bytes("MC_LIGHTNING_STRIKE_CACHE_MB", 32);
-        ByteBoundedCache::new(bytes, 64 * 1024, strike_window_weight).registered(
-            "lightning_strike_cache",
-            ds_cache::plan::Scope::Engine("postgis"),
-            source,
-        )
+        ByteBoundedCache::new(bytes, 64 * 1024, strike_window_weight)
+            .with_ghosts()
+            .registered(
+                "lightning_strike_cache",
+                ds_cache::plan::Scope::Engine("postgis"),
+                source,
+            )
     })
 }
 

@@ -1100,6 +1100,9 @@ pub async fn wms_handler(
                 })
                 .collect();
             let rendered_cache = state.rendered_cache.clone();
+            // The miss's cost, from admission to the insert (#1314): a
+            // failed or empty render drops it.
+            let fill = rendered_cache.fill_timer();
             let tile_cache = state.tile_cache.clone();
 
             // Spans spawn_blocking *dispatch* + execution, so `render_ms`
@@ -1170,6 +1173,7 @@ pub async fn wms_handler(
                 Ok(Finished::Image(cached, _)) => {
                     if let Some(cache_key) = cache_key {
                         rendered_cache.insert(cache_key, cached.clone());
+                        fill.finish();
                     }
                     (cached, "MISS", None)
                 }

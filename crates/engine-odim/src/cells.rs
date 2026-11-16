@@ -132,11 +132,13 @@ static CELL_SET_CACHE: std::sync::LazyLock<ds_cache::ByteBoundedCache<CellSetKey
     std::sync::LazyLock::new(|| {
         let (bytes, source) =
             ds_cache::plan::env_bytes("MC_PVOL_CELL_SET_CACHE_MB", DEFAULT_CELL_SET_CACHE_MB);
-        ds_cache::ByteBoundedCache::new(bytes, 16 * 1024, cell_set_weight_bytes).registered(
-            "pvol_cell_set_cache",
-            ds_cache::plan::Scope::Engine("odim-volume"),
-            source,
-        )
+        ds_cache::ByteBoundedCache::new(bytes, 16 * 1024, cell_set_weight_bytes)
+            .with_ghosts()
+            .registered(
+                "pvol_cell_set_cache",
+                ds_cache::plan::Scope::Engine("odim-volume"),
+                source,
+            )
     });
 
 /// Snapshot of the process-global cell-set cache for `/metrics`.
@@ -369,7 +371,7 @@ impl PolarVolumeSiteView {
         query: &CellQuery,
         handle: Option<&tokio::runtime::Handle>,
     ) -> Result<Arc<CellSet>, DataServerError> {
-        CELL_SET_CACHE.record_miss();
+        CELL_SET_CACHE.record_claimed_miss(&fill);
         let (grid, valid) = self.voxel_grid_cached(entry, quantity, dims, handle)?;
         let set = Arc::new(segment(
             &grid,
@@ -550,7 +552,9 @@ fn picked_cell(
 /// publish the cell set to `fill`, off the request path (#1155). The
 /// quantity's sweeps are decoded into memory of the build's own, not the
 /// pixel cache, and the grid is not kept: only the cell set, a few KB, is.
-/// Best-effort: a volume that does not decode is left to the tiles.
+/// Best-effort: a volume that does not decode is left to the tiles. The
+/// fill counts at its full cost (#1314): `download`, what reading the file
+/// took, if this warm-up read it, and the segmentation.
 fn warm_one(
     fill: CacheFillGuard<'_, CellSetKey, Arc<CellSet>>,
     source: &Source,
@@ -558,13 +562,16 @@ fn warm_one(
     volume: &PolarVolume,
     quantity: &str,
     bytes: &Bytes,
+    download: Duration,
 ) -> bool {
+    let started = std::time::Instant::now();
     let query = layer_query(quantity, None);
     let dims = query.dims.unwrap_or(DEFAULT_VOXEL_DIMS);
     match voxel_grid_from_bytes(source, file_id, volume, quantity, dims, bytes) {
         Ok((grid, valid)) => {
             let set = segment(&grid, valid, volume.time, quantity, &query.extraction);
-            let _ = fill.insert(Arc::new(set));
+            let _ = fill.insert_untimed(Arc::new(set));
+            CELL_SET_CACHE.record_fills(1, download + started.elapsed());
             true
         }
         Err(e) => {
@@ -603,7 +610,16 @@ pub(crate) fn warm_from_bytes(
     };
     let key = layer_key(source, file_id, quantity);
     match CELL_SET_CACHE.get_value_or_guard_untracked(&key, Duration::ZERO) {
-        CacheEntry::Vacant(fill) => warm_one(fill, source, file_id, volume, quantity, bytes),
+        // The poll read the file for its own scan: only the segmentation.
+        CacheEntry::Vacant(fill) => warm_one(
+            fill,
+            source,
+            file_id,
+            volume,
+            quantity,
+            bytes,
+            Duration::ZERO,
+        ),
         CacheEntry::Value(_) | CacheEntry::Timeout => false,
     }
 }
@@ -652,7 +668,14 @@ pub(crate) fn warm_windows(source: &Source, catalog: &Catalog) -> usize {
             .iter()
             .map(|(_, entry, _)| entry.id.as_str())
             .collect();
+        // A file's share of the batch's read: remote files are read at
+        // once, each taking the batch's time; local ones one by one.
+        let started = std::time::Instant::now();
         let files = read_volume_files(source, &ids);
+        let download = match source {
+            Source::Local { .. } => started.elapsed() / ids.len().max(1) as u32,
+            Source::Remote { .. } => started.elapsed(),
+        };
         for ((quantity, entry, key), bytes) in batch.iter().zip(files) {
             let bytes = match bytes {
                 Ok(bytes) => bytes,
@@ -671,6 +694,7 @@ pub(crate) fn warm_windows(source: &Source, catalog: &Catalog) -> usize {
                     &entry.volume,
                     quantity,
                     &bytes,
+                    download,
                 ));
             }
         }
@@ -1238,6 +1262,26 @@ mod tests {
         let product = view.cell_product(&layer_query("DBZH", None), None).unwrap();
         assert_eq!(product.cell_sets.len(), LAYER_WINDOW);
         assert_eq!(store.bytes_read(), read, "a warm window reads no file");
+    }
+
+    /// #1314 review: the warm-up claims a volume's cell set only once its
+    /// file is downloaded, yet counts the fill at its full cost, the
+    /// download included. Before, each counted only its segmentation.
+    #[test]
+    fn a_warm_up_counts_each_cell_set_with_its_download() {
+        let delay = Duration::from_millis(300);
+        let (engine, _, _, _) = remote_engine_with_delay(&["sd01"], LAYER_WINDOW, delay);
+        // Other tests fill the shared cache too: they only add.
+        let before = CELL_SET_CACHE.churn();
+        let built = warm_windows(&engine.source, &engine.catalog.load());
+        assert_eq!(built, LAYER_WINDOW);
+        let after = CELL_SET_CACHE.churn();
+        assert!(after.fills - before.fills >= built as u64);
+        let time = Duration::from_nanos(after.fill_nanos - before.fill_nanos);
+        assert!(
+            time >= delay * built as u32,
+            "{built} cell sets in {time:?}"
+        );
     }
 
     /// #1155: a poll that downloads a site's new newest volume segments it

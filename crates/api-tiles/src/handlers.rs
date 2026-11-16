@@ -2116,6 +2116,9 @@ async fn render_vector_tile(
         cursor: None,
     };
 
+    // The miss's cost, the feature query and the encode (#1314): a failed
+    // or refused tile drops it.
+    let fill = state.vector_tile_cache.fill_timer();
     let page = engine
         .get_features(&query)
         .map_err(|e| TilesError::from_engine(e, "vector tile", id))?;
@@ -2159,6 +2162,7 @@ async fn render_vector_tile(
 
     let cached = CachedTile::new(bytes::Bytes::from(bytes));
     state.vector_tile_cache.insert(cache_key, cached.clone());
+    fill.finish();
 
     if let Some(ref inm) = if_none_match {
         if ds_render::etag_matches(inm, cached.etag()) {
@@ -2794,6 +2798,9 @@ async fn render_tile(
     // Render on a blocking thread
     let engine = engine.clone();
     let rendered_cache = state.rendered_cache.clone();
+    // The miss's cost, from admission to the insert (#1314): a failed or
+    // empty render drops it.
+    let fill = rendered_cache.fill_timer();
 
     // The blocking closure returns Ok(None) for empty (all-nodata) tiles,
     // or Ok(Some(bytes)) for tiles with data.
@@ -2964,6 +2971,7 @@ async fn render_tile(
         }
         Finished::Image(cached) => {
             rendered_cache.insert(cache_key, cached.clone());
+            fill.finish();
             (cached, "MISS")
         }
     };

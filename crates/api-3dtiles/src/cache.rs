@@ -126,14 +126,41 @@ impl Drop for FlightGuard {
     }
 }
 
+/// A content computation's clock (#1314): when it started computing, which
+/// [`ContentCache::get_or_compute`] counts its fill from. It starts at the
+/// miss; a computation that queues for the content pool first calls
+/// [`Self::mark`] once admitted.
+#[derive(Clone)]
+pub struct Admitted(Arc<Mutex<std::time::Instant>>);
+
+impl Admitted {
+    fn now() -> Self {
+        Admitted(Arc::new(Mutex::new(std::time::Instant::now())))
+    }
+
+    /// The computation was admitted, and computes from now.
+    pub fn mark(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = std::time::Instant::now();
+    }
+
+    fn elapsed(&self) -> std::time::Duration {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).elapsed()
+    }
+}
+
 impl ContentCache {
     fn new(capacity_mb: u64) -> Self {
         ContentCache {
-            cache: Arc::new(ByteBoundedCache::new(
-                capacity_mb.saturating_mul(ds_cache::MIB),
-                2 * ds_cache::MIB,
-                weigh_content,
-            )),
+            // A ghost ring, as every cache the memory plan sizes keeps
+            // (#1314).
+            cache: Arc::new(
+                ByteBoundedCache::new(
+                    capacity_mb.saturating_mul(ds_cache::MIB),
+                    2 * ds_cache::MIB,
+                    weigh_content,
+                )
+                .with_ghosts(),
+            ),
             inflight: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -141,9 +168,13 @@ impl ContentCache {
     /// Return cached content or join a shared computation. All callers in a
     /// flight receive its result, even for errors or entries too large to cache.
     /// Errors are not retained after the flight, so subsequent requests retry.
+    ///
+    /// `compute` is handed the fill's clock ([`Admitted`]): a computation
+    /// that queues for the content pool first marks it once admitted, so
+    /// the cache's miss cost is the computation's, not the queue's (#1314).
     pub async fn get_or_compute<F, Fut>(&self, key: ContentKey, compute: F) -> ContentResult
     where
-        F: FnOnce() -> Fut + Send + 'static,
+        F: FnOnce(Admitted) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(Vec<u8>, String), Tiles3dError>> + Send + 'static,
     {
         if let Some(hit) = self.cache.get_untracked(&key) {
@@ -161,10 +192,13 @@ impl ContentCache {
                 self.cache.record_hit();
                 receiver.clone()
             } else {
-                self.cache.record_miss();
+                self.cache.record_miss_for(&key);
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 map.insert(key.clone(), receiver.clone());
                 let cache = self.cache.clone();
+                // The miss's cost, from admission to the insert (#1314): a
+                // failed computation counts nothing.
+                let admitted = Admitted::now();
                 let guard = FlightGuard {
                     key: key.clone(),
                     inflight: self.inflight.clone(),
@@ -174,12 +208,13 @@ impl ContentCache {
                 // cache even if every HTTP waiter disconnects.
                 tokio::spawn(async move {
                     let _guard = guard;
-                    let result = compute().await.map(|(bytes, etag)| {
+                    let result = compute(admitted.clone()).await.map(|(bytes, etag)| {
                         let content = CachedContent {
                             bytes: Bytes::from(bytes),
                             etag: Arc::from(etag),
                         };
                         cache.insert(key, content.clone());
+                        cache.record_fills(1, admitted.elapsed());
                         content
                     });
                     sender.send_replace(Some(result));
@@ -259,7 +294,7 @@ mod tests {
         for _ in 0..3 {
             let c = computes.clone();
             let got = cache
-                .get_or_compute(key(1), move || async move {
+                .get_or_compute(key(1), move |_| async move {
                     c.fetch_add(1, Ordering::Relaxed);
                     Ok((vec![1, 2, 3], "\"abc\"".to_string()))
                 })
@@ -279,7 +314,7 @@ mod tests {
         let cache = ContentCache::new(64);
         for v in [1u64, 2] {
             let got = cache
-                .get_or_compute(key(v), move || async move {
+                .get_or_compute(key(v), move |_| async move {
                     Ok((vec![v as u8], format!("\"{v}\"")))
                 })
                 .await
@@ -300,7 +335,7 @@ mod tests {
             let computes = computes.clone();
             handles.push(tokio::spawn(async move {
                 cache
-                    .get_or_compute(key(7), move || async move {
+                    .get_or_compute(key(7), move |_| async move {
                         computes.fetch_add(1, Ordering::Relaxed);
                         // Linger so the other tasks pile onto the gate.
                         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -322,7 +357,7 @@ mod tests {
     async fn error_is_not_cached_and_gate_is_released() {
         let cache = ContentCache::new(64);
         let err = cache
-            .get_or_compute(key(3), || async {
+            .get_or_compute(key(3), |_| async {
                 Err(Tiles3dError::Internal("boom".into()))
             })
             .await;
@@ -330,7 +365,7 @@ mod tests {
         assert!(cache.inflight.lock().unwrap().is_empty());
         // A later request recomputes and succeeds.
         let got = cache
-            .get_or_compute(key(3), || async { Ok((vec![4], "\"y\"".to_string())) })
+            .get_or_compute(key(3), |_| async { Ok((vec![4], "\"y\"".to_string())) })
             .await
             .unwrap();
         assert_eq!(&got.bytes[..], &[4]);
@@ -341,7 +376,7 @@ mod tests {
         let cache = ContentCache::new(0);
         for _ in 0..2 {
             let got = cache
-                .get_or_compute(key(5), || async { Ok((vec![1], "\"z\"".to_string())) })
+                .get_or_compute(key(5), |_| async { Ok((vec![1], "\"z\"".to_string())) })
                 .await
                 .unwrap();
             assert_eq!(&got.bytes[..], &[1]);
@@ -358,7 +393,7 @@ mod tests {
         let s = started.clone();
         let r = release.clone();
         let request = tokio::spawn(async move {
-            c.get_or_compute(key(99), move || async move {
+            c.get_or_compute(key(99), move |_| async move {
                 s.notify_one();
                 r.notified().await;
                 Ok((vec![42], "etag".into()))
@@ -376,7 +411,7 @@ mod tests {
         release.notify_one();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            cache.get_or_compute(key(99), || async {
+            cache.get_or_compute(key(99), |_| async {
                 panic!("must join the original compute")
             }),
         )
@@ -399,7 +434,7 @@ mod tests {
             let n = computes.clone();
             let r = release.clone();
             requests.push(tokio::spawn(async move {
-                c.get_or_compute(key(100), move || async move {
+                c.get_or_compute(key(100), move |_| async move {
                     n.fetch_add(1, Ordering::Relaxed);
                     r.notified().await;
                     Err(Tiles3dError::NotFound("no echo".into()))
@@ -424,7 +459,7 @@ mod tests {
         assert_eq!(computes.load(Ordering::Relaxed), 1);
         assert!(cache.inflight.lock().unwrap().is_empty());
         assert!(cache
-            .get_or_compute(key(100), || async { Ok((vec![1], "retry".into())) })
+            .get_or_compute(key(100), |_| async { Ok((vec![1], "retry".into())) })
             .await
             .is_ok());
         assert_eq!(cache.metrics().misses, 2);
@@ -435,7 +470,7 @@ mod tests {
         let cache = ContentCache::new(1);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            cache.get_or_compute(key(101), || async { panic!("injected compute panic") }),
+            cache.get_or_compute(key(101), |_| async { panic!("injected compute panic") }),
         )
         .await
         .unwrap();
@@ -455,5 +490,50 @@ mod tests {
         );
         resize_content_cache(before);
         assert_eq!(content_cache_metrics().capacity_bytes, before);
+    }
+
+    /// A content computation that waits `wait` for a one-slot pool, marks
+    /// its clock once admitted if `mark`, and then computes at once.
+    async fn queued(cache: &ContentCache, k: u64, mark: bool, wait: std::time::Duration) {
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = pool.clone().try_acquire_owned().unwrap();
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            drop(held);
+        });
+        cache
+            .get_or_compute(key(k), move |admitted| async move {
+                let _permit = pool.acquire_owned().await.unwrap();
+                if mark {
+                    admitted.mark();
+                }
+                Ok((vec![1], "\"q\"".to_string()))
+            })
+            .await
+            .unwrap();
+    }
+
+    /// #1314 review: a content computation that queues on the content pool
+    /// first marks its clock once admitted, so the cache's miss cost is the
+    /// computation's, not the queue's; unmarked, it counts from the miss.
+    /// Before, a 150 ms wait for the pool and an instant computation counted
+    /// 160 ms.
+    #[tokio::test]
+    async fn a_contents_miss_cost_counts_from_its_admission() {
+        let wait = std::time::Duration::from_millis(400);
+        let fill_time = |cache: &ContentCache| {
+            std::time::Duration::from_nanos(cache.metrics().churn.fill_nanos)
+        };
+        let marked = ContentCache::new(64);
+        queued(&marked, 42, true, wait).await;
+        assert_eq!(marked.metrics().churn.fills, 1);
+        assert!(
+            fill_time(&marked) < wait / 2,
+            "the queue: {:?}",
+            fill_time(&marked)
+        );
+        let unmarked = ContentCache::new(64);
+        queued(&unmarked, 43, false, wait).await;
+        assert!(fill_time(&unmarked) >= wait, "{:?}", fill_time(&unmarked));
     }
 }

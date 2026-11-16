@@ -723,6 +723,12 @@ impl RenderedCache {
         self.cache.insert(key, value);
     }
 
+    /// Time the render of a missed image, from the miss to its insert: the
+    /// cache's miss cost (#1314). Dropped unfinished, it counts nothing.
+    pub fn fill_timer(&self) -> ds_cache::FillTimer {
+        self.cache.fill_timer()
+    }
+
     /// Return (hits, misses) counters.
     pub fn stats(&self) -> (u64, u64) {
         self.cache.stats()

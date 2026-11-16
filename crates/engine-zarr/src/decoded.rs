@@ -53,9 +53,12 @@ pub(crate) struct ColdRange {
 
 impl DecodedCache {
     pub(crate) fn new(capacity: u64) -> Self {
-        Self(ByteBoundedCache::new(capacity, 16 * MIB, |key, value| {
-            overhead(key).saturating_add(value.capacity() as u64)
-        }))
+        Self(
+            ByteBoundedCache::new(capacity, 16 * MIB, |key: &Key, value: &Arc<Vec<u8>>| {
+                overhead(key).saturating_add(value.capacity() as u64)
+            })
+            .with_ghosts(),
+        )
     }
 
     pub(crate) fn metrics(&self) -> CacheMetrics {
@@ -464,8 +467,10 @@ impl DecodedArray {
             self.cache.0.record_hit();
             bytes
         } else {
-            if chunk.fill.is_some() {
-                self.cache.0.record_miss();
+            if let Some(fill) = chunk.fill.as_mut() {
+                self.cache.0.record_claimed_miss(fill);
+                // Claimed before admission: the fill's time starts here.
+                fill.restart();
             }
             let result = {
                 let _encoded =

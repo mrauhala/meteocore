@@ -1,6 +1,8 @@
 use std::hash::Hash;
+use std::sync::Arc;
+use std::time::Instant;
 
-use crate::churn::Counting;
+use crate::churn::{Counters, Counting};
 use crate::Placeholder;
 
 /// An uncounted lookup that separates single-flight ownership from computing.
@@ -29,25 +31,83 @@ pub enum Joined<V> {
 
 /// A single-flight fill claim. Drop without inserting to permit a retry.
 /// This holds no cache lock while the caller admits or computes a value.
+///
+/// The fill is timed from the claim to its insert, the cache's miss cost
+/// ([`crate::Churn::fills`], #1314): a caller that waits for an admission
+/// budget after claiming restarts the clock when it starts computing
+/// ([`Self::restart`]). A claim dropped without an insert counts nothing.
 pub struct CacheFillGuard<'a, K, V> {
     pub(crate) claim: Placeholder<'a, K, V>,
     /// The claimed key, to weigh the value it is filled with (`None` for a
     /// disabled cache, which counts nothing).
     pub(crate) key: Option<K>,
     pub(crate) lifecycle: &'a Counting<K, V>,
+    pub(crate) started: Instant,
 }
 
 impl<K: Eq + Hash, V: Clone> CacheFillGuard<'_, K, V> {
     /// Publish the value to waiters and attempt cache retention. Returns the
     /// value if an explicit cache insertion/invalidation displaced this claim.
     /// Neither claiming nor publishing updates the cache's hit/miss counters;
-    /// a retained value counts as inserted ([`crate::Churn`]).
+    /// a retained value counts as inserted ([`crate::Churn`]). The fill
+    /// counts with the time since the claim, or since [`Self::restart`].
     pub fn insert(self, value: V) -> Result<(), V> {
+        self.insert_batched(value, 1)
+    }
+
+    /// [`Self::insert`] for one of `batch` claims a single computation
+    /// filled (one GET of several blocks): it counts a fill of a
+    /// `batch`th of the time since the claim.
+    pub fn insert_batched(self, value: V, batch: u32) -> Result<(), V> {
+        let elapsed = self.started.elapsed() / batch.max(1);
+        self.lifecycle.counters().record_fills(1, elapsed);
+        self.insert_untimed(value)
+    }
+
+    /// [`Self::insert`] counting no fill: for a caller that times the fill
+    /// itself, from before it claimed (a pre-warm that fetches, then claims),
+    /// with [`crate::FillTimer`] or [`crate::ByteBoundedCache::record_fills`].
+    pub fn insert_untimed(self, value: V) -> Result<(), V> {
         let weight = self
             .key
             .as_ref()
             .map(|key| self.lifecycle.weigh(key, &value));
         crate::publish(self.lifecycle, self.claim, value, weight)
+    }
+
+    /// Time the fill from now: for a caller that claims, then waits for an
+    /// admission budget or other claims before it computes.
+    pub fn restart(&mut self) {
+        self.started = Instant::now();
+    }
+}
+
+/// Times the fill of a missed entry for a cache whose caller looks a key up
+/// and inserts it apart ([`crate::ByteBoundedCache::get`], then
+/// [`crate::ByteBoundedCache::insert`]): take one at the miss, before
+/// computing ([`crate::ByteBoundedCache::fill_timer`]), and finish it once
+/// the value is inserted. Its time over the fills is the cache's miss cost
+/// ([`crate::Churn::fills`], #1314). A fill that fails is dropped unfinished
+/// and counts nothing: its time is not the cost of an entry the cache could
+/// hold. One `Instant` and two atomic adds a fill; owned, so it can travel
+/// with the computation to another task or thread.
+#[must_use = "finish the timer once the value is inserted"]
+pub struct FillTimer {
+    pub(crate) counters: Arc<Counters>,
+    pub(crate) started: Instant,
+}
+
+impl FillTimer {
+    /// Count one fill, timed from the timer's start.
+    pub fn finish(self) {
+        self.finish_many(1);
+    }
+
+    /// Count `entries` fills that one computation since the timer's start
+    /// filled together (a volume read decoding several moments), each at
+    /// an equal share of the time. `0` counts nothing.
+    pub fn finish_many(self, entries: u64) {
+        self.counters.record_fills(entries, self.started.elapsed());
     }
 }
 
