@@ -385,6 +385,9 @@ pub(crate) struct Totals {
     pub count: usize,
     pub capacity_bytes: u64,
     pub used_bytes: u64,
+    /// The heap the caches' ghost rings hold, outside their capacities
+    /// (#1314); 0 for budgets.
+    pub ghost_ring_bytes: u64,
 }
 
 impl Totals {
@@ -395,8 +398,14 @@ impl Totals {
                 count: t.count + 1,
                 capacity_bytes: t.capacity_bytes.saturating_add(row.usage.capacity_bytes),
                 used_bytes: t.used_bytes.saturating_add(row.usage.used_bytes),
+                ghost_ring_bytes: t.ghost_ring_bytes.saturating_add(ghost_ring_bytes(row)),
             })
     }
+}
+
+/// The heap `row`'s ghost ring holds (#1314): 0 without a ring.
+pub(crate) fn ghost_ring_bytes(row: &Row) -> u64 {
+    row.usage.churn.map_or(0, |churn| churn.ghost_ring_bytes)
 }
 
 /// `GET /admin/cache-plan`, behind the `ADMIN_TOKEN` guard of
@@ -454,6 +463,7 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Repo
                     "hits": usage.hits,
                     "misses": usage.misses,
                     "churn": usage.churn.as_ref().map(churn_json),
+                    "ghost_ring_bytes": (kind == Kind::Cache).then(|| ghost_ring_bytes(row)),
                     "last_hour": row.window.as_ref().map(last_hour_json),
                     "demand_bytes": demand.map(|d| d.bytes),
                     "demand_rule": demand.map(|d| d.rule),
@@ -473,6 +483,7 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Repo
             "count": t.count,
             "capacity_bytes": t.capacity_bytes,
             "used_bytes": t.used_bytes,
+            "ghost_ring_bytes": t.ghost_ring_bytes,
         })
     };
     let memory: serde_json::Map<String, Value> = memory
@@ -533,9 +544,9 @@ const PREWARMED: &str = "pre-warmed: entries are inserted long before they are r
 /// depth as a share of misses, the hit ratio a cache 1.5, 2 or 3 times as
 /// large would have had, and its label (#1308); its fills, their mean time
 /// (`miss_cost_ms`) and, at each depth, the fill time a MiB of that much
-/// more memory would have saved an hour (`value_ms_per_mib_hour`): ghost
-/// hits × miss cost ÷ the depth's bytes, what #1314's borrowing and
-/// lending rank caches on.
+/// more memory would have saved an hour on average (`value_ms_per_mib_hour`):
+/// the ghost hits within the depth, cumulative, × miss cost ÷ the depth's
+/// bytes (#1314).
 pub(crate) fn last_hour_json(window: &Activity) -> Value {
     let evictions = window.churn.evictions();
     json!({
@@ -750,8 +761,8 @@ pub(crate) fn render(
     out
 }
 
-/// What a line says of a cache's miss cost and value per byte over its
-/// window (#1314): nothing without a fill timed.
+/// What a line says of a cache's miss cost and average value per byte over
+/// its window (#1314): nothing without a fill timed.
 pub(crate) fn value_suffix(window: &Activity) -> String {
     let Some(cost) = window.miss_cost_seconds() else {
         return String::new();
@@ -761,7 +772,7 @@ pub(crate) fn value_suffix(window: &Activity) -> String {
         let [a, b, c] = value.map(ms_per_mib);
         let _ = write!(
             out,
-            ", saves {a:.3} / {b:.3} / {c:.3} ms an hour per MiB at 1.5 / 2 / 3 ×"
+            ", saves {a:.3} / {b:.3} / {c:.3} ms an hour per MiB on average at 1.5 / 2 / 3 ×"
         );
     }
     out

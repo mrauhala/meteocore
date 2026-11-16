@@ -507,11 +507,14 @@ impl Activity {
     }
 
     /// The fill time the memory at each of [`crate::GHOST_DEPTHS`] would
-    /// have saved, per hour and per byte it adds: the ghost hits within that
-    /// depth times the miss cost, over the depth's bytes (0.5 ×, 1 × and 2 ×
-    /// the capacity), at the span's rate (#1314). Seconds an hour per byte;
-    /// what borrowing and lending memory between caches ranks on. `None`
-    /// without a ghost ring, a fill or a capacity.
+    /// have saved, per hour and per byte it adds, on average over that
+    /// depth's bytes: the ghost hits within that depth (cumulative over the
+    /// shallower depths) times the miss cost, over all the depth's bytes
+    /// (0.5 ×, 1 × and 2 × the capacity), at the span's rate (#1314).
+    /// Seconds an hour per byte. The average from the capacity up to each
+    /// depth, not the marginal value of the step to it: that is the ghost
+    /// hits between two depths over the bytes between them. `None` without
+    /// a ghost ring, a fill or a capacity.
     pub fn value_per_byte(&self) -> Option<[f64; 3]> {
         let ghost_hits = self.churn.ghost_hits?;
         let cost = self.miss_cost_seconds()?;

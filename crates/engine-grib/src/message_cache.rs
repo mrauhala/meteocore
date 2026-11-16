@@ -775,6 +775,8 @@ impl MessageCache {
             CacheEntry::Vacant(claim) => drop(claim),
             CacheEntry::Value(_) | CacheEntry::Timeout => return Ok(None),
         }
+        // Its fill at its full cost, the GET included (#1314).
+        let timer = self.cache.fill_timer();
         let bytes = fetch()?;
         let fetched = bytes.len();
         let weight = weight(key, &bytes);
@@ -798,6 +800,7 @@ impl MessageCache {
         let admitted = self.admit();
         self.cache.insert(key.clone(), bytes);
         drop(admitted);
+        timer.finish();
         if !self.cache.contains_key(key) {
             self.read_ahead.forget(key);
         }
@@ -825,6 +828,10 @@ impl MessageCache {
         if self.cache.contains_key(key) {
             return Ok(None);
         }
+        // Its fill at its full cost, the GET included, though it claims only
+        // once fetched (#1314): a cache pre-warmed well rarely misses, and
+        // its miss cost is then mostly its pre-warm's.
+        let timer = self.cache.fill_timer();
         let bytes = fetch()?;
         validate(&bytes)?;
         let fetched = bytes.len();
@@ -836,9 +843,10 @@ impl MessageCache {
         // pre-warmed message far below the cache's capacity.
         let bytes = Bytes::copy_from_slice(&bytes);
         let admitted = self.admit();
-        let _ = fill.insert(bytes.clone());
+        let _ = fill.insert_untimed(bytes.clone());
         self.cache.keep(key.clone(), bytes);
         drop(admitted);
+        timer.finish();
         if self.cache.contains_key(key) {
             self.prewarmed.insert(key, &self.cache);
         }

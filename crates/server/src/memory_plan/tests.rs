@@ -861,6 +861,8 @@ fn an_unreachable_cache_keeps_its_size_while_it_holds_nothing() {
 #[test]
 fn staged_icechunk_bytes_are_reserved_with_the_stores() {
     assert!(STORE_FAMILIES.contains(&"zarr_icechunk_staged_bytes"));
+    // So are the caches' ghost rings (#1314), heap outside their weight.
+    assert!(STORE_FAMILIES.contains(&"cache_ghost_ring_bytes"));
     let staged = 1u64 << 50;
     crate::admin::ZARR_ICECHUNK_STAGED_BYTES
         .with_label_values(&["mp-staged"])

@@ -663,6 +663,7 @@ fn row(id: &'static str, scope: Scope, kind: Kind, source: SizeSource, capacity:
                 evicted_cold: 2,
                 evicted_hot: 1,
                 evicted_bytes: capacity / 2,
+                ghost_ring_bytes: capacity / 1024,
                 ..Churn::default()
             }),
         },
@@ -783,6 +784,7 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
                 "fills": 0,
                 "fill_seconds": 0.0,
             },
+            "ghost_ring_bytes": 1536 * MIB / 1024,
             "last_hour": null,
             "demand_bytes": 400 * MIB,
             "demand_rule": "16 × decoded field bytes",
@@ -818,6 +820,7 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
             "hits": null,
             "misses": null,
             "churn": null,
+            "ghost_ring_bytes": null,
             "last_hour": null,
             "demand_bytes": null,
             "demand_rule": null,
@@ -833,8 +836,18 @@ fn the_endpoint_document_lists_caches_budgets_totals_and_memory() {
     assert_eq!(
         json["totals"],
         json!({
-            "caches": {"count": 4, "capacity_bytes": caches, "used_bytes": caches / 2},
-            "budgets": {"count": 1, "capacity_bytes": 4096 * MIB, "used_bytes": 2048 * MIB},
+            "caches": {
+                "count": 4,
+                "capacity_bytes": caches,
+                "used_bytes": caches / 2,
+                "ghost_ring_bytes": caches / 1024,
+            },
+            "budgets": {
+                "count": 1,
+                "capacity_bytes": 4096 * MIB,
+                "used_bytes": 2048 * MIB,
+                "ghost_ring_bytes": 0,
+            },
         })
     );
     assert_eq!(
@@ -1013,7 +1026,8 @@ fn the_last_hour_values_a_mib_of_more_memory_by_ghost_hits_and_miss_cost() {
     );
     assert_eq!(
         value_suffix(&window),
-        ", miss 300.000 ms, saves 12.000 / 18.000 / 18.000 ms an hour per MiB at 1.5 / 2 / 3 ×"
+        ", miss 300.000 ms, saves 12.000 / 18.000 / 18.000 ms an hour per MiB on average at 1.5 / 2 \
+         / 3 ×"
     );
     // No ring: a miss cost, no value; no fill timed: neither.
     let no_ring = plan::Activity {

@@ -767,7 +767,8 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// Keep a ghost ring: the hashes of recently evicted keys, back over
     /// twice the capacity of evicted weight, so [`Churn::ghost_hits`] counts
     /// the misses that a cache 1.5 ×, 2 × or 3 × as large would have hit
-    /// (#1308). About 32 bytes per remembered eviction, up to 32 MiB. A
+    /// (#1308). About 35 to 70 bytes of heap per remembered eviction, 50 MiB
+    /// at its cap of 2^20 ([`Churn::ghost_ring_bytes`] says how much). A
     /// miss takes one more hash of its key and the lock of one of the ring's
     /// stripes, and an eviction the same; a hit costs nothing (the
     /// `churn_bench` example measures it). Misses counted by
@@ -1091,6 +1092,14 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
         }
     }
 
+    /// Count `entries` fills that took `elapsed` together, timed by the
+    /// caller (#1314): one GET of a batch, counting only the entries it
+    /// inserted, or a pre-warm's download and the computation after it.
+    /// `0` counts nothing, as does a disabled cache.
+    pub fn record_fills(&self, entries: u64, elapsed: std::time::Duration) {
+        self.inner.counters().record_fills(entries, elapsed);
+    }
+
     /// Count one hit (for wrappers using [`Self::get_untracked`]).
     pub fn record_hit(&self) {
         self.inner.hits.fetch_add(1, Ordering::Relaxed);
@@ -1332,33 +1341,30 @@ mod tests {
         drop(claim("b"));
         assert_eq!(fills(&cache).0, 1, "dropped unfilled");
 
+        // 600 ms before the restart: a fill timed from the claim counts all
+        // of it, a restarted one none, with 400 ms to spare for a stall.
         let mut guard = claim("c");
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(600));
         guard.restart();
         guard.insert(vec![3]).unwrap();
         let (count, after) = fills(&cache);
         assert_eq!(count, 2);
-        assert!(after - time < Duration::from_millis(200), "restarted");
+        let restarted = after - time;
+        assert!(restarted < Duration::from_millis(400), "{restarted:?}");
 
         let batch: Vec<_> = ["d", "e", "f", "g"].map(claim).into_iter().collect();
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(400));
         let before = fills(&cache).1;
         for guard in batch {
             guard.insert_batched(vec![4], 4).unwrap();
         }
         let (count, time) = fills(&cache);
         assert_eq!(count, 6);
-        // Four quarters of at least 40 ms each: the batch's time once.
-        assert!(
-            time - before >= Duration::from_millis(40),
-            "{:?}",
-            time - before
-        );
-        assert!(
-            time - before < Duration::from_millis(160),
-            "{:?}",
-            time - before
-        );
+        // Four quarters of at least 400 ms each: the batch's time once, not
+        // four times (1.6 s), with 600 ms to spare for a stall.
+        let batched = time - before;
+        assert!(batched >= Duration::from_millis(400), "{batched:?}");
+        assert!(batched < Duration::from_millis(1000), "{batched:?}");
     }
 
     /// #1314: a fill a caller times around its own lookup and insert counts
@@ -2436,7 +2442,13 @@ mod tests {
         before.inner.counters().resize(90 * 1000, 100 * 1000, shard);
         let (now, then) = (resized.churn(), before.churn());
         assert!(now.evictions() > 0);
-        assert_eq!(now, then);
+        // The ring's tables grow with the order it learns keys in, which
+        // the two take differently: the same keys, not the same capacities.
+        let learned = |churn: Churn| Churn {
+            ghost_ring_bytes: 0,
+            ..churn
+        };
+        assert_eq!(learned(now), learned(then));
         let resident = |cache: &ByteBoundedCache<String, u64>| {
             (0..150)
                 .filter(|i| cache.contains_key(&format!("k{i}")))
@@ -2449,7 +2461,7 @@ mod tests {
                 let _ = cache.get(&format!("k{i}"));
             }
         }
-        assert_eq!(resized.churn(), before.churn());
+        assert_eq!(learned(resized.churn()), learned(before.churn()));
         assert!(resized.churn().ghost_hits.unwrap()[0] > 0);
     }
 

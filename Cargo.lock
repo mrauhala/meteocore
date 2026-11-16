@@ -1270,6 +1270,7 @@ dependencies = [
 name = "ds-cache"
 version = "0.1.0"
 dependencies = [
+ "ds-core",
  "quick_cache 0.7.0",
 ]
 
