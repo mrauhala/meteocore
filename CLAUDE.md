@@ -1343,6 +1343,18 @@ rate_limit_per_min = 60     # PER BUCKET — authenticated requests and failed
 [memory]
 total_mb = 28672
 # mode = "auto"
+# elastic = "report"   # #1314, only with mode = "auto" (else nothing moves),
+                       # re-read on reload; an unknown value is a load error.
+                       # "off": weighs nothing. "report" (default): proposes
+                       # moves of memory between caches at each re-plan tick,
+                       # resizes nothing. "apply": makes them, booked as loans
+                       # in a ledger kept in memory only (a restart starts
+                       # every cache at its plan); leaving "apply" ends every
+                       # loan, a move under the tick's 10 % / 64 MiB staying
+                       # until the next reload. Under pressure the valve takes
+                       # back what caches borrowed first; its restore climbs to
+                       # the planned size, and caches borrow above it again
+                       # only by elastic steps.
 
 # Optional: the one home for process-wide cache and budget sizes (#1313),
 # one key per /metrics family without `_cache` (keys:
@@ -1786,13 +1798,18 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   `governor::decide::tick_target` as the filter. Decisions live in
   `governor/decide.rs`, pure (inputs in, actions out, no clock): test
   them there. #1314's elastic sharing is a step of this loop, never a
-  second loop: report only for now (`decide::elastic` proposes moves by
-  value per byte, `Grant::ceiling_bytes` and the plan's floors bound them,
-  never past the pool's expected use; nothing applies them until a switch
-  sets `governor::ELASTIC_APPLIES`, when a ledger of per-cache offsets,
-  added to the grants by the tick and by a reload's plan, keeps the
-  re-plan from undoing them; `cache_elastic_proposed_bytes` shows them,
-  `cache_elastic_moves_total` counts them). Every size change counts in `cache_plan_changes_total`
+  second loop, as `[memory] elastic` says (`off`, `report`, `apply`;
+  `AcceptedLoad::memory_elastic`, off outside `auto`): `decide::elastic`
+  decides reclaims (a cache below its grant, at 1 ×), borrows (the pool's
+  headroom first, then caches at 2 ×) and idle decays by value per byte,
+  `Grant::ceiling_bytes` and the plan's floors bound them, never past the
+  pool's expected use. Applied, each is a loan in `governor/ledger.rs`
+  (pure; either side may be the pool), whose offsets the tick and a
+  reload's plan add to the grants; anything that ends a cache's loans
+  ends both sides, so borrowed always equals lent (`Ledger::balanced`,
+  `ledger_holds`). The valve takes loans back first (`relief`) and ends
+  the loans of a cache it lowers. `cache_elastic_proposed_bytes` shows
+  the moves, `cache_elastic_moves_total` counts them. Every size change counts in `cache_plan_changes_total`
   (`memory_plan::count_changes`; a reload's staged resizes through
   `memory_plan::counting_resizes`); a new resize path counts there too.
   A valve ceiling never takes a cache below the plan's floor or its

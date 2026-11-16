@@ -375,33 +375,62 @@ need no reload pruning.
   `jemalloc::purge` (`arena.4096.purge`, a void mallctl called through
   tikv-jemalloc-sys: the ctl crate's typed write passes a value, which
   jemalloc refuses with EPERM).
-  Elastic memory (#1314) is one more step of the tick: after
-  `apply_tick`, the tick snapshots the rows again and `run_elastic` weighs
-  them (`elastic_inputs`: a borrower's value at its best depth,
+  Elastic memory (#1314) is one more step of the tick, as `[memory]
+  elastic` says (`governor::elastic_mode`: `AcceptedLoad::memory_elastic`,
+  off outside `auto` and wherever the gate is closed). After `apply_tick`
+  the tick snapshots the rows again and `run_elastic` weighs them
+  (`elastic_inputs`: a borrower's value at its best depth,
   `decide::best_depth`, from window ghost hits × miss cost ÷ the depth's
   bytes, ghost hits being cumulative by depth and never summed; a lender's
   `decide::lend_value`, the higher of that and hits × cost ÷ capacity;
   borrowing only with fills timed in the window; floor = `floor_of` and
   `least_bytes`, ceiling = `Grant::ceiling_bytes`, need = the grant's
-  expected use when under its size) and `decide::elastic` decides the
-  moves, within the pool's headroom (`elastic_headroom`). Rules and
-  parameters are `decide::ELASTIC_*`. Applying is behind
-  `ELASTIC_APPLIES`, false: no config switch yet. Applied, a move resizes
-  the lender then the borrower through `ds_cache::plan::apply` and
-  `Governor::ledger` keeps each cache's offset (`decide::Lent`), which
-  the tick (`elastic_grant` in its `wanted`) and a reload's `capped` add to
-  the grant, so the 10 %/64 MiB re-plan never pulls a moved cache back.
-  `reconcile_ledger` drops an offset whose cache's source or configured
-  size changed, `forget_elastic` (from `do_reload`'s stale list) a rebuilt
-  or removed collection's, `bound_ledger` holds each to floor and
-  ceiling. The simulations in `governor/tests.rs` run the real tick over
-  planned rows (`real_tick`: `grant::plan`, `tick_target` with the
-  ledger, `run_elastic` applying). `record_elastic` keeps the proposal for
-  `/admin/cache-plan` (`governor.elastic`, with the ledger), sets
+  expected use when under its size; grant, offset, used, idle; `decays`
+  false for a spared cache and a `Churn::prewarmed` one) and
+  `decide::elastic` decides the moves in order: reclaims (a cache below
+  its grant, from the lowest-valued borrower, at 1 ×), borrows (the pool's
+  headroom first, a lender at value 0, then caches at 2 ×; none unless
+  `Rules::may_borrow`, resident under 90 % of the total) and, applied
+  only, idle decays to the pool. Rules and parameters are
+  `decide::ELASTIC_*` and `DECAY_*`. Under `report` nothing is applied
+  and the ledger stays empty; under `off` nothing is weighed.
+  Applied, `apply_move` resizes the lender then the borrower through
+  `ds_cache::plan::apply`, gives the lender back what the borrower could
+  not take, and books what the borrower gained in `Governor::ledger`
+  (`governor/ledger.rs`, pure: a list of `Loan { borrower, lender, bytes
+  }`, either side a cache `Party` or the pool, `None`), in place, a move at
+  a time, through a `WithLedger` closure, never with the lock held over a
+  resize. A cache's offset, borrowed less lent, is what the tick
+  (`elastic_grant` in its `wanted`) and a reload's `capped` add to the
+  grant, so the 10 %/64 MiB re-plan never pulls a moved cache back.
+  `keep_ledger` runs at every tick and before a reload's plan
+  (`reconcile`): outside `apply` it clears the ledger; in `apply`
+  `reconcile_ledger` ends the loans of a cache whose source or configured
+  size changed, `forget_elastic` (from `do_reload`'s stale list) those of
+  a rebuilt or removed collection, `bound_ledger` holds each offset to
+  floor and ceiling and the loans' expected use to the pool, the
+  lowest-valued counterparts shedding first, and `ledger_holds` checks
+  the invariant (borrowed = lent, no empty or self loan, expected use
+  within the pool), clearing the ledger with a WARN should it ever break.
+  Ending a cache's loans always ends both sides (`Ledger::drop_cache`).
+  The valve's `relief` first takes loans back (`take_back`: each
+  borrower, lowest-valued first, `Ledger::release`, its lenders' loans
+  becoming loans to the pool), and lowers the others to 90 % only when
+  that does not cover the excess, ending the loans of each cache it lowers
+  (`Ledger::end`): the restore climbs to the planned size, and elastic
+  memory borrows above it again by its steps once no ceiling holds. The
+  ledger is in memory only. The simulations in `governor/tests.rs` run the
+  real tick over planned rows (`real_tick_with`: `grant::plan`,
+  `keep_ledger`, the valve's ceilings and restore, `tick_target` with the
+  ledger, `run_elastic` applying, then the floors and `ledger_holds`
+  checked), and `relief` itself. `record_elastic` keeps the proposal for
+  `/admin/cache-plan` (`governor.elastic`, with the loans and offsets;
+  `governor.elastic_mode` is the setting now), sets
   `cache_elastic_proposed_bytes{cache,role}` and counts
   `cache_elastic_moves_total{cache,role,mode}` (report: a recurring move
-  once) and logs only when the moves change. The valve comes first: no
-  proposal while it is over the total or holds a ceiling.
+  once; applied: each, logged with its reason; the valve's `give_back`).
+  The valve comes first: no proposal while it is over the total or holds
+  a ceiling.
 - `memory_plan.rs` (#1312) fits every row to the memory total in
   `cache_plan::log`, so at boot, after every accepted reload and on a
   recovery reload: `ds_cache::plan::grant::plan` over the snapshot rows,

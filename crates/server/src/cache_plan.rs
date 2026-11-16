@@ -420,7 +420,7 @@ pub async fn handler(
     let memory = crate::admin::refresh_metrics(&state);
     let report = memory_plan::last();
     let mut document = to_json(&snapshot(&state), &memory, report.as_deref());
-    document["governor"] = crate::governor::json();
+    document["governor"] = crate::governor::json(&state);
     Ok(Json(document))
 }
 

@@ -7691,6 +7691,8 @@ pub struct AcceptedLoad {
     memory_total_mb: Option<u64>,
     /// `[memory] mode`: whether the plan resizes anything (#1312).
     memory_mode: ds_core::config::MemoryMode,
+    /// `[memory] elastic`: what elastic memory does (#1314).
+    memory_elastic: ds_core::config::ElasticMode,
     mcp_enabled: bool,
     fingerprint: u64,
 }
@@ -7716,6 +7718,11 @@ impl AcceptedLoad {
             cache_settings,
             memory_total_mb: config.memory.as_ref().and_then(|m| m.total_mb),
             memory_mode: config.memory.as_ref().map(|m| m.mode).unwrap_or_default(),
+            memory_elastic: config
+                .memory
+                .as_ref()
+                .map(|m| m.elastic)
+                .unwrap_or_default(),
             mcp_enabled: config.mcp.as_ref().is_some_and(|m| m.enabled),
             fingerprint,
         }
@@ -7735,6 +7742,12 @@ impl AcceptedLoad {
 
     pub(crate) fn memory_mode(&self) -> ds_core::config::MemoryMode {
         self.memory_mode
+    }
+
+    /// What elastic memory does (#1314): `[memory] elastic` in `mode =
+    /// "auto"`, else off, since nothing moves outside it.
+    pub(crate) fn memory_elastic(&self) -> ds_core::config::ElasticMode {
+        self.memory_elastic.under(self.memory_mode)
     }
 
     /// Whether the memory plan applies its sizes: `[memory] mode = "auto"`

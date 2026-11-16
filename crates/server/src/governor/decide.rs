@@ -334,6 +334,19 @@ pub(crate) struct Elastic {
     /// grant): its expected use at a capacity of `c` is `min(c, need)`;
     /// otherwise it is `c`.
     pub need: Option<u64>,
+    /// Its planned grant: its fair share, which a cache below it reclaims
+    /// at an even ratio.
+    pub grant: u64,
+    /// What it borrowed less what it lent, from the ledger.
+    pub offset: i64,
+    /// What it holds now.
+    pub used: u64,
+    /// Its window's label is idle: under 60 lookups an hour.
+    pub idle: bool,
+    /// It may decay while idle: it lends, and nothing fills it ahead of
+    /// reads (`Churn::prewarmed`: the PVOL pixels, GRIB messages and COG
+    /// tiles that keep a quiet deployment warm).
+    pub decays: bool,
 }
 
 impl Elastic {
@@ -343,12 +356,37 @@ impl Elastic {
     }
 }
 
-/// Memory elastic sharing would move: `bytes` from `lender` to `borrower`,
-/// with the value per byte of each.
+/// Why memory moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MoveKind {
+    /// A cache whose byte more is worth twice what the lender's serves
+    /// borrows it.
+    Borrow,
+    /// A cache below its grant takes back what a lower-valued borrower
+    /// holds, up to its grant, at an even ratio.
+    Reclaim,
+    /// An idle cache gives the pool what it does not hold.
+    Decay,
+}
+
+impl MoveKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MoveKind::Borrow => "borrow",
+            MoveKind::Reclaim => "reclaim",
+            MoveKind::Decay => "decay",
+        }
+    }
+}
+
+/// Memory elastic sharing moves: `bytes` from `lender` to `borrower`, each
+/// a cache or, `None`, the pool's free headroom, with the value per byte of
+/// each.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Move {
-    pub borrower: Key,
-    pub lender: Key,
+    pub kind: MoveKind,
+    pub borrower: Option<Key>,
+    pub lender: Option<Key>,
     pub bytes: u64,
     /// The borrower's value, and the depth it comes from.
     pub borrower_value: f64,
@@ -392,111 +430,240 @@ pub(crate) fn lend_value(value: f64, hits_per_hour: f64, cost: f64, capacity: u6
     value.max(hits_per_hour * cost / capacity.max(1) as f64)
 }
 
-/// The moves one tick would make between `caches` over a pool of
-/// `pool_bytes`, with `headroom` bytes of the pool the plan's expected use
-/// leaves (#1314). The caches whose byte more is worth the most borrow, in
-/// that order, each from the cache whose byte serves the least, while the
-/// borrower's value is at least [`ELASTIC_VALUE_RATIO`] times the lender's:
+/// What a tick may do besides weighing (#1314).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Rules {
+    /// Caches may borrow: the process is under [`UNDER_PERCENT`] of its
+    /// total, or the valve has no total to hold it to.
+    pub may_borrow: bool,
+    /// Idle caches decay toward what they hold: only when moves apply.
+    pub decays: bool,
+}
+
+/// An idle cache decays by at most this share of the step a tick...
+pub(crate) const DECAY_STEP_PERCENT: u64 = 50;
+
+/// ... and at most this share of its capacity, in percent: half of what a
+/// busy cache grows by.
+pub(crate) const DECAY_MAX_PERCENT: u64 = 5;
+
+/// An idle cache decays toward what it holds plus this share, in percent.
+pub(crate) const DECAY_HEADROOM_PERCENT: u64 = 10;
+
+/// The moves one tick makes between `caches` over a pool of `pool_bytes`,
+/// with `headroom` bytes of the pool the plan's expected use leaves
+/// (#1314), in this order:
 ///
-/// - a borrower borrows ([`Elastic::borrows`]), with at least
-///   [`ELASTIC_MIN_GHOST_HITS`] at its value's depth and room under its
-///   ceiling;
-/// - a lender lends ([`Elastic::lends`]), with room above its floor, by its
-///   [`Elastic::lend_value`];
-/// - a move is the step ([`elastic_step`]), at most
-///   [`ELASTIC_MAX_PERCENT`] of either cache, the lender's room above its
-///   floor and the borrower's under its ceiling, in whole MiB, at least one;
-/// - a move raises the expected use the plan fitted to the pool by no more
-///   than the headroom left: lending capacity a cache does not use to one
-///   that fills all it gets would put the process over its total, and the
-///   pressure valve would take it back. It shrinks to what fits, or goes;
-/// - at most [`ELASTIC_MAX_MOVES`], each cache in one at most.
-pub(crate) fn elastic(caches: &[Elastic], pool_bytes: u64, headroom: u64) -> Vec<Move> {
+/// 1. **Reclaim**: a cache below its grant, its fair share, that passes the
+///    borrowing gate takes back what a borrower holds above its own grant,
+///    the lowest-valued borrower first, while its value is at least that
+///    borrower's ([`Elastic::lend_value`]), up to its grant.
+/// 2. **Borrow**, while `rules` allow it: the caches whose byte more is
+///    worth the most borrow, in that order, from the pool's free headroom
+///    first (worth nothing), then from the cache whose byte serves the
+///    least, while the borrower's value is at least [`ELASTIC_VALUE_RATIO`]
+///    times the lender's.
+/// 3. **Decay**, where `rules` say so: an idle cache that decays
+///    ([`Elastic::decays`]) and moved nothing this tick gives the pool what
+///    it does not hold, down to the
+///    larger of its floor and what it holds plus
+///    [`DECAY_HEADROOM_PERCENT`], by at most [`DECAY_STEP_PERCENT`] of the
+///    step and [`DECAY_MAX_PERCENT`] of its capacity: slower than a busy
+///    cache grows.
+///
+/// A borrower borrows ([`Elastic::borrows`]), with at least
+/// [`ELASTIC_MIN_GHOST_HITS`] at its value's depth. A lender lends
+/// ([`Elastic::lends`]). A reclaim or a borrow is the step
+/// ([`elastic_step`]), at most [`ELASTIC_MAX_PERCENT`] of either cache,
+/// within the lender's floor and the borrower's ceiling, in whole MiB, at
+/// least one, and raises the expected use the plan fitted to the pool by no
+/// more than the headroom left: it shrinks to what fits, or goes. At most
+/// [`ELASTIC_MAX_MOVES`] reclaims and borrows, each cache in one move at
+/// most.
+pub(crate) fn elastic(
+    caches: &[Elastic],
+    pool_bytes: u64,
+    headroom: u64,
+    rules: Rules,
+) -> Vec<Move> {
     let step = elastic_step(pool_bytes);
     let share = |c: &Elastic| c.capacity / 100 * ELASTIC_MAX_PERCENT;
-    let mut borrowers: Vec<&Elastic> = caches
+    let gated = |c: &&Elastic| c.borrows && c.ghost_hits >= ELASTIC_MIN_GHOST_HITS && c.value > 0.0;
+    let mut headroom = headroom;
+    let mut moved: HashSet<&Key> = HashSet::new();
+    let mut moves = Vec::new();
+    // The expected use a move of `bytes` from `lender` to `borrower` adds.
+    let raises = |borrower: &Elastic, lender: Option<&Elastic>, bytes: u64| {
+        let up = borrower.expected_at(borrower.capacity + bytes)
+            - borrower.expected_at(borrower.capacity);
+        let down = lender.map_or(0, |l| {
+            l.expected_at(l.capacity) - l.expected_at(l.capacity - bytes)
+        });
+        up.saturating_sub(down)
+    };
+    // The most whole MiB up to `most` whose move fits the headroom.
+    let fits = |borrower: &Elastic, lender: Option<&Elastic>, most: u64, headroom: u64| {
+        (1..=most / MIB)
+            .rev()
+            .map(|mib| mib * MIB)
+            .find(|&bytes| raises(borrower, lender, bytes) <= headroom)
+    };
+
+    // 1. Reclaim.
+    let mut reclaimers: Vec<&Elastic> = caches
         .iter()
-        .filter(|c| c.borrows && c.ghost_hits >= ELASTIC_MIN_GHOST_HITS && c.value > 0.0)
-        .filter(|c| c.ceiling > c.capacity)
+        .filter(gated)
+        .filter(|c| c.capacity < c.grant)
         .collect();
-    borrowers.sort_by(|a, b| b.value.total_cmp(&a.value).then_with(|| a.key.cmp(&b.key)));
-    let mut lenders: Vec<&Elastic> = caches
+    reclaimers.sort_by(|a, b| b.value.total_cmp(&a.value).then_with(|| a.key.cmp(&b.key)));
+    let mut donors: Vec<&Elastic> = caches
         .iter()
-        .filter(|c| c.lends && c.capacity > c.floor)
+        .filter(|c| c.offset > 0 && c.capacity > c.floor)
         .collect();
-    lenders.sort_by(|a, b| {
+    donors.sort_by(|a, b| {
         a.lend_value
             .total_cmp(&b.lend_value)
             .then_with(|| a.key.cmp(&b.key))
     });
-    let mut headroom = headroom;
-    let mut moved: HashSet<&Key> = HashSet::new();
-    let mut moves = Vec::new();
-    for borrower in borrowers {
+    for reclaimer in reclaimers {
         if moves.len() == ELASTIC_MAX_MOVES {
             break;
         }
-        if moved.contains(&borrower.key) {
-            continue;
-        }
         let room = step
-            .min(share(borrower))
-            .min(borrower.ceiling - borrower.capacity);
-        // The lowest value first: the first that is not worth enough ends it.
-        for lender in &lenders {
-            if moved.contains(&lender.key) || lender.key == borrower.key {
+            .min(share(reclaimer))
+            .min(reclaimer.grant - reclaimer.capacity);
+        for donor in &donors {
+            if moved.contains(&donor.key) || donor.key == reclaimer.key {
                 continue;
             }
-            if borrower.value < ELASTIC_VALUE_RATIO * lender.lend_value {
+            if reclaimer.value < donor.lend_value {
                 break;
             }
-            let most = room.min(share(lender)).min(lender.capacity - lender.floor) / MIB;
-            // The most whole MiB whose move fits the headroom.
-            let raises = |bytes: u64| {
-                let up = borrower.expected_at(borrower.capacity + bytes)
-                    - borrower.expected_at(borrower.capacity);
-                let down = lender.expected_at(lender.capacity)
-                    - lender.expected_at(lender.capacity - bytes);
-                up.saturating_sub(down)
-            };
-            let Some(bytes) = (1..=most)
-                .rev()
-                .map(|mib| mib * MIB)
-                .find(|&bytes| raises(bytes) <= headroom)
-            else {
+            let most = room
+                .min(share(donor))
+                .min(donor.offset as u64)
+                .min(donor.capacity - donor.floor);
+            let Some(bytes) = fits(reclaimer, Some(donor), most, headroom) else {
                 continue;
             };
-            headroom -= raises(bytes);
-            moved.insert(&borrower.key);
-            moved.insert(&lender.key);
+            headroom -= raises(reclaimer, Some(donor), bytes);
+            moved.insert(&reclaimer.key);
+            moved.insert(&donor.key);
             moves.push(Move {
-                borrower: borrower.key.clone(),
-                lender: lender.key.clone(),
+                kind: MoveKind::Reclaim,
+                borrower: Some(reclaimer.key.clone()),
+                lender: Some(donor.key.clone()),
                 bytes,
-                borrower_value: borrower.value,
-                depth: borrower.depth,
-                lender_value: lender.lend_value,
+                borrower_value: reclaimer.value,
+                depth: reclaimer.depth,
+                lender_value: donor.lend_value,
             });
             break;
         }
     }
+
+    // 2. Borrow.
+    if rules.may_borrow {
+        let mut borrowers: Vec<&Elastic> = caches
+            .iter()
+            .filter(gated)
+            .filter(|c| c.ceiling > c.capacity)
+            .collect();
+        borrowers.sort_by(|a, b| b.value.total_cmp(&a.value).then_with(|| a.key.cmp(&b.key)));
+        let mut lenders: Vec<&Elastic> = caches
+            .iter()
+            .filter(|c| c.lends && c.capacity > c.floor)
+            .collect();
+        lenders.sort_by(|a, b| {
+            a.lend_value
+                .total_cmp(&b.lend_value)
+                .then_with(|| a.key.cmp(&b.key))
+        });
+        for borrower in borrowers {
+            if moves.len() == ELASTIC_MAX_MOVES {
+                break;
+            }
+            if moved.contains(&borrower.key) {
+                continue;
+            }
+            let room = step
+                .min(share(borrower))
+                .min(borrower.ceiling - borrower.capacity);
+            // The pool first: its headroom is worth nothing where it is.
+            if let Some(bytes) = fits(borrower, None, room.min(headroom), headroom) {
+                headroom -= raises(borrower, None, bytes);
+                moved.insert(&borrower.key);
+                moves.push(Move {
+                    kind: MoveKind::Borrow,
+                    borrower: Some(borrower.key.clone()),
+                    lender: None,
+                    bytes,
+                    borrower_value: borrower.value,
+                    depth: borrower.depth,
+                    lender_value: 0.0,
+                });
+                continue;
+            }
+            // The lowest value first: the first that is not worth enough
+            // ends it.
+            for lender in &lenders {
+                if moved.contains(&lender.key) || lender.key == borrower.key {
+                    continue;
+                }
+                if borrower.value < ELASTIC_VALUE_RATIO * lender.lend_value {
+                    break;
+                }
+                let most = room.min(share(lender)).min(lender.capacity - lender.floor);
+                let Some(bytes) = fits(borrower, Some(lender), most, headroom) else {
+                    continue;
+                };
+                headroom -= raises(borrower, Some(lender), bytes);
+                moved.insert(&borrower.key);
+                moved.insert(&lender.key);
+                moves.push(Move {
+                    kind: MoveKind::Borrow,
+                    borrower: Some(borrower.key.clone()),
+                    lender: Some(lender.key.clone()),
+                    bytes,
+                    borrower_value: borrower.value,
+                    depth: borrower.depth,
+                    lender_value: lender.lend_value,
+                });
+                break;
+            }
+        }
+    }
+
+    // 3. Decay.
+    if rules.decays {
+        for cache in caches.iter().filter(|c| c.idle && c.decays) {
+            if moved.contains(&cache.key) {
+                continue;
+            }
+            let held = cache
+                .used
+                .saturating_add(cache.used / 100 * DECAY_HEADROOM_PERCENT);
+            let target = cache.floor.max(held.div_ceil(MIB) * MIB);
+            let most = (step / 100 * DECAY_STEP_PERCENT)
+                .min(cache.capacity / 100 * DECAY_MAX_PERCENT)
+                .min(cache.capacity.saturating_sub(target));
+            let bytes = most / MIB * MIB;
+            if bytes == 0 {
+                continue;
+            }
+            moves.push(Move {
+                kind: MoveKind::Decay,
+                borrower: None,
+                lender: Some(cache.key.clone()),
+                bytes,
+                borrower_value: 0.0,
+                depth: 0,
+                lender_value: cache.lend_value,
+            });
+        }
+    }
     moves
 }
-
-/// A cache's elastic offset (#1314): the bytes it borrowed (positive) or
-/// lent (negative), which the re-plan tick and a reload's plan add to its
-/// grant, and what its size came from when it moved: a reload that pins it,
-/// re-bounds it or gives it another configured size drops the offset, as
-/// does one that rebuilds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Lent {
-    pub offset: i64,
-    pub source: SizeSource,
-    pub configured: u64,
-}
-
-/// The offsets of the caches elastic memory moved, by cache.
-pub(crate) type Ledger = HashMap<Key, Lent>;
 
 /// The size a cache whose grant is `grant` is held to with an elastic
 /// `offset`: the grant plus the offset, within `floor` and `ceiling`.
