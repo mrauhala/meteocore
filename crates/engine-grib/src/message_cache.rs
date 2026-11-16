@@ -800,8 +800,11 @@ impl MessageCache {
         let admitted = self.admit();
         self.cache.insert(key.clone(), bytes);
         drop(admitted);
-        timer.finish();
-        if !self.cache.contains_key(key) {
+        // A fill only of a message the cache now holds: an insert it refused
+        // (heavier than its hot share) fills nothing (#1314).
+        if self.cache.contains_key(key) {
+            timer.finish();
+        } else {
             self.read_ahead.forget(key);
         }
         Ok(Some(fetched))
@@ -846,8 +849,9 @@ impl MessageCache {
         let _ = fill.insert_untimed(bytes.clone());
         self.cache.keep(key.clone(), bytes);
         drop(admitted);
-        timer.finish();
+        // As a read-ahead: a fill only of a message the cache now holds.
         if self.cache.contains_key(key) {
+            timer.finish();
             self.prewarmed.insert(key, &self.cache);
         }
         Ok(Some(fetched))
