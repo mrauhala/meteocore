@@ -426,8 +426,9 @@ need no reload pruning.
   take-back sets `Governor::borrow_held`: `tick_rules` keeps borrowing
   off (`decide::borrowing`) until `Pressure::may_restore`, the restore's
   10 minutes under 90 %; returns (`MoveKind::Return`, a cache no longer
-  idle taking back its `Ledger::lent_to_pool` at the restore's pace)
-  need only under 90 %. The tick lifts every cache with a loan before or
+  idle taking back its `Ledger::lent_to_pool` at the restore's pace,
+  never past its owed `-offset`) and recalls (below) need only under
+  90 % and no hold. The tick lifts every cache with a loan before or
   after `keep_ledger`, so `tick_target` applies its grant plus offset
   exactly; elastic headroom is `held_use`, each cache at the larger of
   its capacity and its target, while `bound_ledger` and `ledger_holds`
@@ -466,7 +467,16 @@ need no reload pruning.
   a reclaimer takes from an idle `Elastic::ahead` cache (prewarmed or a
   demand filled ahead) above its floor, at 1 ×: the only move that takes
   from a cache filled ahead of its reads. A reclaimer makes one move a
-  tick, a return included. A borrower that decays releases what it
+  tick, a return or recall included. A reclaimer takes back only what it
+  lent (`room` ≤ `-offset`, every tier): a cache below its grant only by
+  the tick's dead band takes nothing, or its next target, grant plus the
+  offset the move booked, would end above its grant (#1475 review).
+  Recall (`MoveKind::Recall`, before returns): an `ahead` cache no longer
+  idle takes back its largest loan to a cache
+  (`Ledger::largest_loan_to_a_cache`, `Elastic::recall`) at the restore's
+  pace with no ghost gate, its borrower shedding as much down to its
+  floor; booked as an ordinary move, it repays that loan. Roles: `return`
+  and `repay`. A borrower that decays releases what it
   borrowed first (`Ledger::release_part` in `apply_move`), its lenders'
   share becoming their pool loans, which `MoveKind::Return` brings back. `decays` stays false
   for a prewarmed cache: its keep floor is a first view's, smaller than

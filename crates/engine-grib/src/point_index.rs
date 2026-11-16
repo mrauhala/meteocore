@@ -170,15 +170,6 @@ pub(crate) struct PointIndex {
     stores: Mutex<()>,
 }
 
-impl PointIndex {
-    /// The weight of the indexes held of messages in `paths`, as the cache
-    /// weighs them (#1314): the newest run's, for its keep floor. Visits
-    /// every index: from the poll only.
-    pub(crate) fn weight_of(&self, paths: &std::collections::HashSet<&str>) -> u64 {
-        self.cache.weight_where(|key, _| paths.contains(key.path()))
-    }
-}
-
 /// One run's latest index of a parameter's messages.
 type RunIndex = (DateTime<Utc>, WeakIndex);
 

@@ -1355,6 +1355,7 @@ fn weigh(cache: &SimCache, noise: f64) -> Elastic {
         pool_lent: 0,
         ahead: cache.prewarmed,
         keep: cache.keep,
+        recall: None,
     }
 }
 
@@ -1889,6 +1890,7 @@ fn a_cache_past_an_lru_cliff_borrows_by_its_best_depth() {
         pool_lent: 0,
         ahead: false,
         keep: 0,
+        recall: None,
     };
     let (value, depth) = best_depth(
         1024 * MIB,
@@ -1996,6 +1998,7 @@ fn elastic_cache(id: &'static str, capacity_mib: u64, value: f64, ghost_hits: u6
         pool_lent: 0,
         ahead: false,
         keep: 0,
+        recall: None,
     }
 }
 
@@ -2723,8 +2726,10 @@ fn the_pool_lends_its_headroom_first_and_never_past_it() {
 #[test]
 fn a_cache_below_its_grant_reclaims_from_the_lowest_valued_borrower() {
     let pool = 8 * GIB;
+    // It lent 1 GiB: what it is owed.
     let reclaimer = Elastic {
         grant: 2 * GIB,
+        offset: -(GIB as i64),
         ..elastic_cache("short_cache", 1024, 1.0, 100)
     };
     let donor = |id, lend_value, offset_mib: i64| Elastic {
@@ -2792,8 +2797,45 @@ fn a_cache_below_its_grant_reclaims_from_the_lowest_valued_borrower() {
     ];
     assert_eq!(elastic(&at_grant, pool, 0, BORROW), []);
     // A lender that borrowed nothing is not reclaimed from.
-    let lent_only = [reclaimer, donor("cheap_cache", 0.2, -512)];
+    let lent_only = [reclaimer.clone(), donor("cheap_cache", 0.2, -512)];
     assert_eq!(elastic(&lent_only, pool, 0, no_borrowing), []);
+    // #1475 review: what it lent, never the tick's dead band. Owed 10 MiB,
+    // it takes 10; below its grant with no loan, nothing at all.
+    let owed = Elastic {
+        offset: -(10 * MIB as i64),
+        ..reclaimer.clone()
+    };
+    let moves = elastic(&[owed, donor("cheap_cache", 0.2, 512)], pool, 0, BORROW);
+    assert_eq!(
+        (moves[0].kind, moves[0].bytes),
+        (MoveKind::Reclaim, 10 * MIB)
+    );
+    let dead_band = Elastic {
+        offset: 0,
+        ..reclaimer
+    };
+    let warm = Elastic {
+        ahead: true,
+        idle: true,
+        lends: false,
+        value: 0.0,
+        ghost_hits: 0,
+        ..elastic_cache("warm_cache", 4096, 0.0, 0)
+    };
+    assert_eq!(
+        elastic(
+            &[dead_band, donor("cheap_cache", 0.2, 512), warm],
+            pool,
+            GIB,
+            BORROW
+        )
+        .iter()
+        .filter(|m| id(&m.borrower) == "short_cache")
+        .filter(|m| matches!(m.kind, MoveKind::Reclaim | MoveKind::ReclaimPrewarmed))
+        .count(),
+        0,
+        "the dead band is the tick's to close: it may only borrow"
+    );
 }
 
 /// #1314 C: an idle cache that decays and moved nothing this tick gives
@@ -3893,6 +3935,7 @@ fn a_reclaim_takes_borrowed_memory_first_then_idle_prewarmed_entries() {
     let pool = 8 * GIB;
     let reclaimer = Elastic {
         grant: 2 * GIB,
+        offset: -(GIB as i64),
         ..elastic_cache("short_cache", 1024, 1.0, 100)
     };
     let borrower = Elastic {
@@ -4044,13 +4087,15 @@ fn through_the_real_tick_keep_floors_hold_until_a_quiet_day() {
     );
 }
 
-/// #1314 C2, through the real tick in apply mode: a cache below its grant
-/// with no borrower to take back from and no free headroom in the pool
-/// (left in the tick's dead band by a grant that grew) takes from an idle
+/// #1314 C2, through the real tick in apply mode: a cache owed what it
+/// lent, with no borrower to take it back from and no return or free
+/// headroom to take (a valve take-back holds both off), takes from an idle
 /// cache its engines fill ahead of reads, above that cache's keep floor,
-/// never the floor, and never from such a cache while it is read.
+/// never the floor, never past what it is owed, and never from such a
+/// cache while it is read.
 #[test]
 fn through_the_real_tick_tier_2_reclaims_idle_prewarmed_memory_after_borrowed() {
+    let metatile = (Kind::Cache, "metatile_cache", Scope::Process);
     let caches = RefCell::new(vec![
         sim_cache("metatile_cache", 1024, 128, thrash(3)),
         SimCache {
@@ -4066,18 +4111,23 @@ fn through_the_real_tick_tier_2_reclaims_idle_prewarmed_memory_after_borrowed() 
     ]);
     let total = fitting_total(&caches.borrow());
     let grant = grant_in(&caches, total, "metatile_cache");
-    // Inside the dead band below its grant, with no loan.
-    caches.borrow_mut()[0].capacity = grant - 96 * MIB;
-    let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
-    let plan = sim_plan(&rows, total);
-    assert!(
-        elastic_headroom(&rows, &plan, &Ledger::default()) < MIB,
-        "no free headroom"
-    );
+    // It decayed by 256 MiB while idle, its memory now in the pool; read
+    // again under a take-back's hold, it cannot return it.
     let mut ledger = Ledger::default();
+    ledger.book(None, Some(party("metatile_cache", GIB)), 256 * MIB);
+    caches.borrow_mut()[0].capacity = grant - 256 * MIB;
+    let held = (false, false);
     let mut kinds = Vec::new();
     for _ in 0..10 {
-        let proposal = real_tick(&caches, total, &mut ledger);
+        let proposal = real_tick_ruled(
+            &caches,
+            total,
+            &mut ledger,
+            ElasticMode::Apply,
+            &mut HashMap::new(),
+            false,
+            held,
+        );
         for m in proposal.moves {
             if id(&m.borrower) == "metatile_cache" {
                 kinds.push((m.kind, id(&m.lender)));
@@ -4085,17 +4135,253 @@ fn through_the_real_tick_tier_2_reclaims_idle_prewarmed_memory_after_borrowed() 
             assert_ne!(id(&m.lender), "pvol_pixel_cache", "read: never taken");
         }
         assert!(capacity_of(&caches, "vector_tile_cache") >= 1536 * MIB);
+        assert!(
+            capacity_of(&caches, "metatile_cache") <= grant,
+            "never past what it is owed"
+        );
     }
     assert!(!kinds.is_empty(), "{caches:?}");
-    assert_eq!(
-        kinds[0],
-        (MoveKind::ReclaimPrewarmed, "vector_tile_cache"),
+    assert!(
+        kinds
+            .iter()
+            .all(|k| *k == (MoveKind::ReclaimPrewarmed, "vector_tile_cache")),
         "{kinds:?}"
     );
-    assert!(
-        capacity_of(&caches, "metatile_cache") >= grant,
-        "{caches:?}"
+    assert_eq!(
+        capacity_of(&caches, "metatile_cache"),
+        grant,
+        "owed no more"
     );
+    assert_eq!(
+        ledger.offset(&metatile),
+        0,
+        "its pool loan repaid by the cache's"
+    );
+}
+
+/// #1475 review probe: a cache below its grant only by the tick's dead
+/// band (no loan, offset 0) takes nothing by a reclaim: it never ends
+/// above its plan from a pre-warmed cache.
+#[test]
+fn a_dead_band_cache_reclaims_nothing() {
+    let caches = RefCell::new(vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        SimCache {
+            prewarmed: true,
+            keep: 1536 * MIB,
+            quiet_keep: 1536 * MIB,
+            ..sim_cache("vector_tile_cache", 2048, 256, IDLE)
+        },
+    ]);
+    let total = fitting_total(&caches.borrow());
+    let grant = grant_in(&caches, total, "metatile_cache");
+    caches.borrow_mut()[0].capacity = grant - 96 * MIB;
+    let mut ledger = Ledger::default();
+    for _ in 0..6 {
+        let proposal = real_tick(&caches, total, &mut ledger);
+        assert!(
+            proposal
+                .moves
+                .iter()
+                .all(|m| !matches!(m.kind, MoveKind::Reclaim | MoveKind::ReclaimPrewarmed)),
+            "{:?}",
+            proposal.moves
+        );
+    }
+    assert!(capacity_of(&caches, "metatile_cache") <= grant);
+    assert_eq!(
+        ledger.lent(&(Kind::Cache, "vector_tile_cache", Scope::Process)),
+        0
+    );
+}
+
+/// #1475 review probe: a cache filled ahead of its reads that tier 2 took
+/// from is read again: with few ghost hits, pre-warmed, it takes back what
+/// tier 2 took at the restore's pace, 5 % of its grant a tick, with no
+/// ghost gate, its borrower shedding as much; never while still idle, nor
+/// at 90 % of the total or more.
+#[test]
+fn a_tier_2_lender_read_again_recalls_its_memory() {
+    let metatile = (Kind::Cache, "metatile_cache", Scope::Process);
+    let reclaimer = Elastic {
+        grant: 2 * GIB,
+        offset: -(512 * MIB as i64),
+        capacity: 1536 * MIB,
+        ..elastic_cache("metatile_cache", 1536, 1e-6, 1000)
+    };
+    let warm = Elastic {
+        ahead: true,
+        lends: false,
+        decays: false,
+        idle: true,
+        lend_value: 1e-9,
+        value: 0.0,
+        ghost_hits: 0,
+        floor: 128 * MIB,
+        keep: 128 * MIB,
+        ..elastic_cache("grib_message_cache", 1024, 0.0, 0)
+    };
+    let night = elastic(&[reclaimer.clone(), warm.clone()], 8 * GIB, 0, BORROW);
+    assert_eq!(night[0].kind, MoveKind::ReclaimPrewarmed);
+    let taken = night[0].bytes;
+    let morning_warm = Elastic {
+        idle: false,
+        capacity: 1024 * MIB - taken,
+        offset: -(taken as i64),
+        value: 1e-7,
+        ghost_hits: 5,
+        lend_value: 1e-6,
+        recall: Some((metatile.clone(), taken)),
+        ..warm
+    };
+    let morning_borrower = Elastic {
+        capacity: 1536 * MIB + taken,
+        offset: -(512 * MIB as i64) + taken as i64,
+        idle: false,
+        ..reclaimer
+    };
+    let morning = elastic(
+        &[morning_borrower.clone(), morning_warm.clone()],
+        8 * GIB,
+        0,
+        BORROW,
+    );
+    let m = morning
+        .iter()
+        .find(|m| id(&m.borrower) == "grib_message_cache")
+        .expect("a recall");
+    assert_eq!(
+        (m.kind, id(&m.lender)),
+        (MoveKind::Recall, "metatile_cache")
+    );
+    assert_eq!(
+        m.bytes,
+        taken.min(52 * MIB),
+        "5 % of its grant, in whole MiB"
+    );
+    let idle = Elastic {
+        idle: true,
+        ..morning_warm.clone()
+    };
+    let at_90 = Rules {
+        may_borrow: false,
+        may_return: false,
+        decays: true,
+    };
+    // Its borrower sheds down to its floor, never below.
+    let near_floor = Elastic {
+        floor: morning_borrower.capacity - 10 * MIB,
+        ..morning_borrower.clone()
+    };
+    let recalled = elastic(&[near_floor, morning_warm.clone()], 8 * GIB, 0, BORROW);
+    assert_eq!(
+        recalled
+            .iter()
+            .map(|m| (m.kind, m.bytes))
+            .collect::<Vec<_>>(),
+        [(MoveKind::Recall, 10 * MIB)]
+    );
+    for (caches, rules) in [
+        ([morning_borrower.clone(), idle], BORROW),
+        ([morning_borrower, morning_warm], at_90),
+    ] {
+        assert!(elastic(&caches, 8 * GIB, 0, rules)
+            .iter()
+            .all(|m| m.kind != MoveKind::Recall));
+    }
+}
+
+/// #1475 review: a return takes back no more than the cache is owed. One
+/// that lent the pool 256 MiB but borrowed as much from a cache by a
+/// reclaim nets to nothing: returning would take it past its grant.
+#[test]
+fn a_return_takes_no_more_than_the_cache_is_owed() {
+    let cache = |offset_mib: i64| Elastic {
+        grant: 2 * GIB,
+        offset: offset_mib * MIB as i64,
+        pool_lent: 256 * MIB,
+        ..elastic_cache("short_cache", 2048, 1.0, 100)
+    };
+    let returned = |offset_mib| {
+        elastic(&[cache(offset_mib)], 8 * GIB, GIB, BORROW)
+            .iter()
+            .filter(|m| m.kind == MoveKind::Return)
+            .map(|m| m.bytes / MIB)
+            .sum::<u64>()
+    };
+    assert_eq!(returned(-256), 103, "5 % of its grant");
+    assert_eq!(returned(-40), 40, "what it is owed");
+    assert_eq!(returned(0), 0, "owed nothing");
+}
+
+/// #1475 review, through the real tick: tier 2 takes from an idle
+/// pre-warmed cache; read again, that cache recalls it a step of 5 % of its
+/// grant a tick until it is whole, its borrower shedding as much, the
+/// ledger balanced throughout.
+#[test]
+fn through_the_real_tick_a_tier_2_lender_gets_its_memory_back() {
+    let metatile = (Kind::Cache, "metatile_cache", Scope::Process);
+    let vector = (Kind::Cache, "vector_tile_cache", Scope::Process);
+    let caches = RefCell::new(vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        SimCache {
+            prewarmed: true,
+            keep: 1536 * MIB,
+            quiet_keep: 1536 * MIB,
+            ..sim_cache("vector_tile_cache", 2048, 256, IDLE)
+        },
+    ]);
+    let total = fitting_total(&caches.borrow());
+    let grant = grant_in(&caches, total, "metatile_cache");
+    let vgrant = grant_in(&caches, total, "vector_tile_cache");
+    let mut ledger = Ledger::default();
+    ledger.book(None, Some(party("metatile_cache", GIB)), 256 * MIB);
+    caches.borrow_mut()[0].capacity = grant - 256 * MIB;
+    let tick = |ledger: &mut Ledger, rules| {
+        real_tick_ruled(
+            &caches,
+            total,
+            ledger,
+            ElasticMode::Apply,
+            &mut HashMap::new(),
+            false,
+            rules,
+        )
+    };
+    for _ in 0..10 {
+        tick(&mut ledger, (false, false));
+    }
+    let lent = ledger.lent(&vector);
+    assert!(lent > 0, "tier 2 took from it");
+    // Read again.
+    caches.borrow_mut()[1].load = thrash(1);
+    let pace = (vgrant / 100 * 5).div_ceil(MIB) * MIB;
+    let mut ticks = 0;
+    while ledger.lent(&vector) > 0 {
+        let before = capacity_of(&caches, "vector_tile_cache");
+        let proposal = tick(&mut ledger, (true, true));
+        let recall = proposal
+            .moves
+            .iter()
+            .find(|m| id(&m.borrower) == "vector_tile_cache")
+            .expect("a recall a tick");
+        assert_eq!(recall.kind, MoveKind::Recall);
+        assert!(capacity_of(&caches, "vector_tile_cache") - before <= pace);
+        ledger.balanced().unwrap();
+        assert!(capacity_of(&caches, "metatile_cache") <= grant);
+        ticks += 1;
+        assert!(ticks <= 20);
+    }
+    assert_eq!(capacity_of(&caches, "vector_tile_cache"), vgrant);
+    // Its borrower, owed again what it lent the pool, returns it: never
+    // past its grant, since a return takes no more than the cache is owed.
+    for _ in 0..20 {
+        tick(&mut ledger, (true, true));
+        assert!(capacity_of(&caches, "metatile_cache") <= grant);
+    }
+    assert_eq!(capacity_of(&caches, "metatile_cache"), grant);
+    assert_eq!(ledger.offset(&metatile), 0);
+    assert!(ledger.is_empty(), "every loan repaid");
 }
 
 /// #1314 C2: the valve's take-back gives back what a cache borrowed, but

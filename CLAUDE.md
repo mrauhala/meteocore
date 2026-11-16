@@ -1812,13 +1812,16 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   them there. #1314's elastic sharing is a step of this loop, never a
   second loop, as `[memory] elastic` says (`off`, `report`, `apply`;
   `AcceptedLoad::memory_elastic`, off outside `auto`): `decide::elastic`
-  decides returns (a cache read again takes back what it lent the pool,
-  at the restore's pace, under 90 %), reclaims (a cache below its grant,
-  at 1 ×, from borrowers, then tier 2 from idle caches filled ahead of
-  reads), borrows (the pool's headroom first, then caches at 2 ×) and
-  idle decays by value per byte; `Grant::ceiling_bytes`, the plan's floors
-  and the keep floors bound them, within the headroom the caches leave
-  where they are (`held_use`). A cache filled ahead of its reads (spared,
+  decides recalls (a cache filled ahead of reads, read again, takes back
+  what tier 2 took), returns (a cache read again takes back what it lent
+  the pool, never more than it is owed; both at the restore's pace, under
+  90 %), reclaims (a cache below its grant takes back what it lent, never
+  the tick's dead band, at 1 ×, from borrowers, then tier 2 from idle
+  caches filled ahead of reads), borrows (the pool's headroom first, then
+  caches at 2 ×) and idle decays by value per byte;
+  `Grant::ceiling_bytes`, the plan's floors and the keep floors bound
+  them, within the headroom the caches leave where they are
+  (`held_use`). A cache filled ahead of its reads (spared,
   or `Churn::prewarmed`) neither lends nor decays: its keep floor covers
   a first view, not its pre-warm; mark a cache `prewarmed` wherever a
   pre-warm or read-ahead fills it. Applied, each is a loan in

@@ -684,7 +684,10 @@ impl GeoTiffEngine {
         if self.reads_local_files() {
             return None;
         }
-        let cap = prewarm::frame_cap(self.tile_cache.capacity());
+        // From the size its settings give the cache, never the capacity
+        // elastic memory left it (#1475 review): the newest frame a keep
+        // describes stays protected while tier 2 has shrunk the cache.
+        let cap = prewarm::frame_cap(self.tile_cache.configured(), 0);
         let entry = catalog
             .select_timestamp(None)
             .and_then(|time| catalog.entries.get(&time))?;
@@ -858,6 +861,7 @@ impl GeoTiffEngine {
             );
             self.tile_cache.resize(bytes);
         }
+        self.tile_cache.set_configured(bytes);
     }
 
     /// Resize the tile cache to `bytes` for the memory plan (#1312),
@@ -2080,7 +2084,8 @@ impl GeoTiffEngine {
         if matches!(self.store_mode, StoreMode::Local { .. }) || self.shutdown.is_shutdown() {
             return Vec::new();
         }
-        let cap = prewarm::frame_cap(self.tile_cache.capacity());
+        let keep = self.keep.get().map_or(0, |keep| keep.bytes);
+        let cap = prewarm::frame_cap(self.tile_cache.capacity(), keep);
         if cap == 0 {
             return Vec::new();
         }

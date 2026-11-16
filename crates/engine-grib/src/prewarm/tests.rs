@@ -155,36 +155,6 @@ fn the_first_position_query_after_new_steps_reads_nothing_from_storage() {
     );
 }
 
-/// #1314: the point-index cache's keep floor is the indexes it holds of
-/// the newest run's messages, as it weighs them, after the poll's
-/// pre-warm; the same after a quiet day. A new run's poll keeps only the
-/// new run's.
-#[test]
-fn the_point_index_keep_is_the_newest_runs_indexes() {
-    let source = TestSource::new();
-    for step in 0..2 {
-        write_step(&source, "", RUN, step, &["q"]);
-    }
-    let (owner, view, store) = served(&source, 20, Duration::ZERO);
-    series(&view, "q", &[NORTH], RUN, None);
-    for step in 2..4 {
-        write_step(&source, "", RUN, step, &["q"]);
-    }
-    publish(&source, &store);
-    owner.scan_once().unwrap();
-    let keep = owner.cache_keeps().1.expect("published");
-    let held = owner.point_index_cache_metrics().bytes;
-    assert!(held > 0);
-    assert_eq!(keep.bytes, held, "every index held is of the newest run");
-    assert_eq!(keep.quiet_bytes, keep.bytes);
-    // A new run, its messages not yet indexed: none of the old run's kept.
-    write_step(&source, "next", NEXT_RUN, 0, &["w"]);
-    publish(&source, &store);
-    owner.scan_once().unwrap();
-    assert_eq!(owner.cache_keeps().1.unwrap().bytes, 0);
-    assert_eq!(owner.point_index_cache_metrics().bytes, held);
-}
-
 /// A source nobody read in the last 24 hours makes no pre-warm request:
 /// nothing read at all, maps and areas, which read no point, and a
 /// position read a day ago.

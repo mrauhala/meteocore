@@ -106,8 +106,6 @@ pub(super) fn keep_slot(cache: &'static str, collection_id: &str) -> DemandSlot 
 /// How the compressed-message cache's keep floor is computed (#1314).
 const MESSAGE_KEEP_RULE: &str = "the default parameter's message at the default time of the \
                                  newest run; none after a day without a lookup";
-/// How the point-index cache's keep floor is computed (#1314).
-const POINT_INDEX_KEEP_RULE: &str = "the point indexes held of the newest run's messages";
 
 /// The compressed-message cache's keep floor in `catalog` (#1314): the
 /// message a map without a parameter or a time draws, weighed as the cache
@@ -166,40 +164,22 @@ pub(super) fn message_demand(catalog: &Catalog) -> Option<CacheDemand> {
 }
 
 impl GribEngine {
-    /// Publish the message and point-index caches' keep floors (#1314),
-    /// from the catalog and what the point-index cache holds of its newest
-    /// run: after each poll's pre-warm.
+    /// Publish the message cache's keep floor (#1314) from the catalog,
+    /// with each catalog. The point-index cache keeps none: its size is
+    /// fixed, never one elastic memory moves.
     pub(super) fn publish_keeps(&self) {
-        let catalog = self.source.catalog.load();
-        match message_keep(&catalog) {
+        match message_keep(&self.source.catalog.load()) {
             Some(keep) if self.source.message_cache.is_some() => {
                 self.source.message_keep.publish(keep);
             }
             _ => self.source.message_keep.clear(),
         }
-        let index = self.source.point_index.as_ref();
-        let Some((index, run)) = index.zip(catalog.latest_run()) else {
-            self.source.point_index_keep.clear();
-            return;
-        };
-        let paths: HashSet<&str> = run
-            .steps
-            .values()
-            .flat_map(|file| file.messages.iter().map(move |m| file.message_url(m)))
-            .collect();
-        let bytes = index.weight_of(&paths);
-        self.source.point_index_keep.publish(
-            CacheDemand::keep(bytes, POINT_INDEX_KEEP_RULE).input("messages", paths.len() as u64),
-        );
     }
 
-    /// What the source last published as its message and point-index
-    /// caches' keep floors (#1314).
-    pub fn cache_keeps(&self) -> (Option<CacheDemand>, Option<CacheDemand>) {
-        (
-            self.source.message_keep.get(),
-            self.source.point_index_keep.get(),
-        )
+    /// What the source last published as its message cache's keep floor
+    /// (#1314).
+    pub fn message_cache_keep(&self) -> Option<CacheDemand> {
+        self.source.message_keep.get()
     }
 
     pub(super) fn publish_catalog(&self, catalog: Catalog) {
@@ -549,12 +529,12 @@ mod tests {
             );
         }
         let none = GribEngine::new("keep-none", &source.config()).unwrap();
-        assert_eq!(none.cache_keeps().0, None, "no message cache");
+        assert_eq!(none.message_cache_keep(), None, "no message cache");
         let mut config = source.config();
         config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(16));
         config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(0));
         let engine = GribEngine::new("keep", &config).unwrap();
-        let keep = engine.cache_keeps().0.expect("published");
+        let keep = engine.message_cache_keep().expect("published");
         let length = message(0, 280.0, [0; 4], 103, 2).len() as u64;
         assert!((length + 1..length + 512).contains(&keep.bytes), "{keep:?}");
         assert_eq!(keep.inputs, [("message_bytes", keep.bytes)]);

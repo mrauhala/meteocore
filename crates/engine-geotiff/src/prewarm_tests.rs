@@ -1081,3 +1081,60 @@ async fn the_keep_floor_is_the_newest_frames_prewarmed_tiles() {
     assert_eq!(keep.quiet_bytes, weight);
     assert!(0 < weight && weight < keep.bytes);
 }
+
+/// #1475 review: elastic memory's tier 2 can take the tile cache below
+/// eight of its keeps. The keep stays what the cache's settings give it,
+/// and the frame cap never falls below the keep, so the newest frame the
+/// keep protects is still pre-warmed whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cache_tier_2_shrank_still_prewarms_the_frame_its_keep_protects() {
+    let (empty, remote) = (TempDir::new("shrunk_local"), TempDir::new("shrunk_remote"));
+    publish(&remote, FRAMES[0]);
+    let mut engine = remote_engine(&empty, &remote);
+    engine.poll_once();
+    publish(&remote, FRAMES[1]);
+    engine.poll_cycle().await;
+    let keep = engine.tile_cache_keep().expect("published").bytes;
+    // Tier 2 took the cache to six keeps, its settings still saying
+    // 64 MiB: an eighth of it is under the newest frame, though the cache
+    // holds two such frames in its cold half. (One resize in place shrinks
+    // by a tenth at most: a cache built that small stands in for the steps.)
+    let shrunk = 6 * keep;
+    let configured = engine.tile_cache.configured();
+    engine.tile_cache = TileCache::new(shrunk);
+    engine.tile_cache.set_configured(configured);
+    assert!((shrunk / 8) < keep - 64 * 1024, "the cap binds: {keep}");
+    // The next frame: the same tiles under a later time.
+    let next = "radar_20260324T2325Z.tif";
+    std::fs::copy(fixture_dir().join(FRAMES[1]), remote.0.join("d").join(next)).unwrap();
+    engine.poll_cycle().await;
+    assert_eq!(
+        engine.tile_cache_keep().expect("published").bytes,
+        keep,
+        "the keep is sized from the configured cache, not the shrunk one"
+    );
+    let (cached, total) = cached_tiles(&engine, frame_time(next));
+    assert_eq!(cached, total, "every level of the newest frame is warm");
+}
+
+/// #1475 review: the size the keep is computed from is the one the
+/// settings give the tile cache: a reload's `apply_cache_sizes` moves it,
+/// the memory plan's and elastic memory's resizes do not.
+#[test]
+fn the_configured_size_follows_the_settings_not_the_capacity() {
+    let (empty, remote) = (
+        TempDir::new("configured_local"),
+        TempDir::new("configured_remote"),
+    );
+    let engine = remote_engine(&empty, &remote);
+    let built = config().effective_tile_cache_mb() * 1024 * 1024;
+    assert_eq!(engine.tile_cache.configured(), built);
+    engine.resize_tile_cache(built - built / 10);
+    assert_eq!(engine.tile_cache.configured(), built, "a plan resize");
+    let mut bigger = config();
+    bigger.tile_cache_mb = Some(ds_core::config::CacheSize::Mib(
+        config().effective_tile_cache_mb() * 2,
+    ));
+    engine.apply_cache_sizes(&bigger);
+    assert_eq!(engine.tile_cache.configured(), 2 * built, "a reload");
+}

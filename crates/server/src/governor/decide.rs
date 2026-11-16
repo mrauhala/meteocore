@@ -359,6 +359,10 @@ pub(crate) struct Elastic {
     /// Its keep floor (#1314, `governor::keep_of`), within `floor`: what
     /// elastic memory never takes, its engines' or the fixed one.
     pub keep: u64,
+    /// Of what it lent other caches, the largest loan: its borrower and
+    /// the bytes. For a cache filled ahead of its reads, what tier 2 took,
+    /// which it recalls once read again ([`MoveKind::Recall`]).
+    pub recall: Option<(Key, u64)>,
 }
 
 impl Elastic {
@@ -385,6 +389,9 @@ pub(crate) enum MoveKind {
     /// A cache read again takes back what it lent the pool, at the
     /// restore's pace.
     Return,
+    /// A cache filled ahead of its reads, read again, takes back what tier
+    /// 2 took from it, at the restore's pace: its borrower sheds as much.
+    Recall,
 }
 
 impl MoveKind {
@@ -395,6 +402,7 @@ impl MoveKind {
             MoveKind::ReclaimPrewarmed => "reclaim_prewarmed",
             MoveKind::Decay => "decay",
             MoveKind::Return => "return",
+            MoveKind::Recall => "recall",
         }
     }
 }
@@ -495,8 +503,14 @@ pub(crate) const DECAY_HEADROOM_PERCENT: u64 = 10;
 ///    what it lent the pool ([`Elastic::pool_lent`]), [`RESTORE_PERCENT`]
 ///    of its grant a tick, at least 1 MiB, as the valve's restore climbs,
 ///    with no ghost gate: its own memory. Within the headroom left.
+///    Then **recall**: a cache its engines fill ahead of reads
+///    ([`Elastic::ahead`]), no longer idle, takes back what tier 2 took from
+///    it ([`Elastic::recall`]) at the same pace, with no ghost gate, its
+///    borrower shedding as much. Neither counts toward a tick's moves.
 /// 1. **Reclaim**: a cache below its grant, its fair share, that passes the
-///    borrowing gate takes back what a borrower holds above its own grant,
+///    borrowing gate takes back what it lent, never more, and never the
+///    gap the tick's dead band leaves below its grant: what a borrower
+///    holds above its own grant,
 ///    the lowest-valued borrower first, while its value is at least that
 ///    borrower's ([`Elastic::lend_value`]), up to its grant; with no
 ///    borrower to take from, from the pool's free headroom while caches may
@@ -554,11 +568,56 @@ pub(crate) fn elastic(
             .find(|&bytes| raises(borrower, lender, bytes) <= headroom)
     };
 
-    // 0. Return.
+    // 0. Recall: a cache filled ahead of its reads, read again, takes back
+    // what tier 2 took, as a return does what it lent the pool; no ghost
+    // gate, since a pre-warmed cache's ghost hits undercount (#1335). First,
+    // so the cache read again is whole before its borrower returns.
+    if rules.may_return {
+        for cache in caches.iter().filter(|c| c.ahead && !c.idle) {
+            let Some((holder, lent)) = &cache.recall else {
+                continue;
+            };
+            let Some(borrower) = caches.iter().find(|c| c.key == *holder) else {
+                continue;
+            };
+            if moved.contains(&cache.key) || moved.contains(&borrower.key) {
+                continue;
+            }
+            let pace = (cache.grant / 100 * RESTORE_PERCENT).div_ceil(MIB).max(1) * MIB;
+            let most = (*lent)
+                .min(pace)
+                .min(borrower.capacity.saturating_sub(borrower.floor));
+            let Some(bytes) = fits(cache, Some(borrower), most, headroom) else {
+                continue;
+            };
+            headroom -= raises(cache, Some(borrower), bytes);
+            moved.insert(&cache.key);
+            moved.insert(&borrower.key);
+            moves.push(Move {
+                kind: MoveKind::Recall,
+                borrower: Some(cache.key.clone()),
+                lender: Some(borrower.key.clone()),
+                bytes,
+                borrower_value: cache.value,
+                depth: cache.depth,
+                lender_value: borrower.lend_value,
+            });
+        }
+    }
+
+    // 0b. Return: what it lent the pool, never more than it is owed: a
+    // cache that also borrowed from a cache (by a reclaim) nets the two.
     if rules.may_return {
         for cache in caches.iter().filter(|c| !c.idle && c.pool_lent > 0) {
+            if moved.contains(&cache.key) {
+                continue;
+            }
             let pace = (cache.grant / 100 * RESTORE_PERCENT).div_ceil(MIB).max(1) * MIB;
-            let Some(bytes) = fits(cache, None, cache.pool_lent.min(pace), headroom) else {
+            let most = cache
+                .pool_lent
+                .min(pace)
+                .min(cache.offset.min(0).unsigned_abs());
+            let Some(bytes) = fits(cache, None, most, headroom) else {
                 continue;
             };
             headroom -= raises(cache, None, bytes);
@@ -575,14 +634,15 @@ pub(crate) fn elastic(
         }
     }
 
-    // Returns are restores: the moves a tick makes are counted after them.
+    // Returns and recalls are restores: the moves a tick makes are counted
+    // after them.
     let returns = moves.len();
 
     // 1. Reclaim.
     let mut reclaimers: Vec<&Elastic> = caches
         .iter()
         .filter(gated)
-        .filter(|c| c.capacity < c.grant)
+        .filter(|c| c.capacity < c.grant && c.offset < 0)
         .collect();
     reclaimers.sort_by(|a, b| b.value.total_cmp(&a.value).then_with(|| a.key.cmp(&b.key)));
     let mut donors: Vec<&Elastic> = caches
@@ -620,9 +680,13 @@ pub(crate) fn elastic(
         if moved.contains(&reclaimer.key) {
             continue;
         }
+        // What it lent and is owed, never the tick's dead band: a cache
+        // below its grant only because the tick did not grow it takes
+        // nothing, or its target would end above its grant (#1475 review).
         let room = step
             .min(share(reclaimer))
-            .min(reclaimer.grant - reclaimer.capacity);
+            .min(reclaimer.grant - reclaimer.capacity)
+            .min(reclaimer.offset.min(0).unsigned_abs());
         'tiers: for (kind, donors) in tiers {
             let Some(donors) = donors else {
                 if !rules.may_borrow {

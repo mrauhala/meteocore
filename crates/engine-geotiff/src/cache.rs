@@ -75,6 +75,10 @@ const APPROX_TILE_BYTES: u64 = 32 * 1024;
 pub struct TileCache {
     inner: ByteBoundedCache<TileCacheKey, Bytes>,
     namespace: u64,
+    /// The size its settings give it ([`Self::configured`]): what its keep
+    /// floor and the pre-warm's frame cap are sized from, never the
+    /// capacity elastic memory moved (#1475 review).
+    configured: AtomicU64,
 }
 
 impl TileCache {
@@ -94,7 +98,20 @@ impl TileCache {
             .with_ghosts()
             .prewarmed(),
             namespace: NEXT_NAMESPACE.fetch_add(1, Ordering::Relaxed),
+            configured: AtomicU64::new(max_bytes),
         }
+    }
+
+    /// The size its settings give it, as built or as a reload last set it
+    /// ([`Self::set_configured`]): not the capacity the memory plan or
+    /// elastic memory gave it.
+    pub(crate) fn configured(&self) -> u64 {
+        self.configured.load(Ordering::Relaxed)
+    }
+
+    /// A reload gave it another size ([`crate::GeoTiffEngine::apply_cache_sizes`]).
+    pub(crate) fn set_configured(&self, bytes: u64) {
+        self.configured.store(bytes, Ordering::Relaxed);
     }
 
     /// Process-unique id of this cache. Keys here are an object path and a

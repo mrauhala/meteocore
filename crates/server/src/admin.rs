@@ -733,7 +733,13 @@ static CACHE_KEEP: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     let gauge = IntGaugeVec::new(
         Opts::new(
             "cache_keep_bytes",
-            "The keep floor of a cache of /admin/cache-plan: the least elastic memory leaves it              (#1314), the largest of 64 MiB for the meta-tile, rendered-image and vector-tile              caches, a demand cache's demand or a floor, and what its engines publish for a              first view (the newest frame's pre-warmed tiles, a forecast's default field and              point indexes), smaller after a day without a lookup. cache is the /metrics              family, collection empty for a process-wide one, whose keep sums its              collections'. No series for a cache that keeps nothing",
+            "The keep floor of a cache of /admin/cache-plan: the least elastic memory leaves it \
+             (#1314), the largest of 64 MiB for the meta-tile, rendered-image and vector-tile \
+             caches, a demand cache's demand or a floor, and what its engines publish for a \
+             first view (the newest frame's pre-warmed tiles, a forecast's default field), \
+             smaller after a day without a lookup. cache is the /metrics family, collection \
+             empty for a process-wide one, whose keep sums its collections'. No series for a \
+             cache that keeps nothing",
         ),
         &["cache", "collection"],
     )

@@ -839,6 +839,7 @@ pub(crate) fn elastic_inputs(rows: &[Row], plan: &grant::Plan, ledger: &Ledger) 
                 pool_lent: ledger.lent_to_pool(&decide::key(entry)),
                 ahead: prewarmed(row) || row.demand.as_ref().is_some_and(|d| d.ahead),
                 keep,
+                recall: ledger.largest_loan_to_a_cache(&decide::key(entry)),
             })
         })
         .collect()
@@ -1111,6 +1112,7 @@ fn roles(kind: MoveKind) -> (&'static str, &'static str) {
         MoveKind::ReclaimPrewarmed => ("reclaim", "prewarmed"),
         MoveKind::Decay => ("borrow", "decay"),
         MoveKind::Return => ("return", "return"),
+        MoveKind::Recall => ("return", "repay"),
     }
 }
 
@@ -1243,6 +1245,9 @@ fn elastic_block(proposal: &Proposal) -> String {
             MoveKind::Decay => "idle: down toward what it holds plus 10 %".to_string(),
             MoveKind::Return => {
                 "read again: what it lent the pool, back at the restore's pace".to_string()
+            }
+            MoveKind::Recall => {
+                "read again: what tier 2 took from it, back at the restore's pace".to_string()
             }
         };
         let _ = write!(
@@ -1706,7 +1711,8 @@ static ELASTIC_MOVES: LazyLock<IntCounterVec> = LazyLock::new(|| {
              whose MiB serves at most half as much; reclaim, a cache below its grant taking \
              back what a borrower holds, at an even ratio; repay, that borrower; prewarmed, an \
              idle cache filled ahead of reads it then takes from, above its keep floor; return, \
-             a cache read again taking back what it lent the pool, at the restore's pace; decay, \
+             a cache read again taking back what it lent the pool, or a cache filled ahead of \
+             reads what tier 2 took, at the restore's pace; decay, \
              an idle cache giving the pool what it does not hold; give_back, a borrower the \
              pressure valve made give back what it borrowed, as much as the excess. mode = report ([memory] elastic \
              = \"report\"): proposed, never applied, counted once while the same move recurs \
@@ -1729,9 +1735,9 @@ static ELASTIC_PROPOSED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
         Opts::new(
             "cache_elastic_proposed_bytes",
             "Bytes the last re-plan tick's elastic memory moves took or would take from (role \
-             = lend, repay, prewarmed or decay) or give to (role = borrow or reclaim) each \
-             cache (#1314), \
-             summed over its collections; none with [memory] elastic = \"off\"",
+             = lend, repay, prewarmed or decay) or give to (role = borrow, reclaim or return) \
+             each cache (#1314), summed over its collections; none with [memory] elastic = \
+             \"off\"",
         ),
         &["cache", "role"],
     )

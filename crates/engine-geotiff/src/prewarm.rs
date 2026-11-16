@@ -65,13 +65,16 @@ const DEFAULT_FRAME_CAP_MB: usize = 32;
 /// The most encoded bytes one frame pre-warms: `MC_COG_PREWARM_MB` (default
 /// 32 MiB; 0 turns the pre-warm off), and at most an eighth of the engine's
 /// tile cache, so the newest frames fit side by side and one large file
-/// cannot evict the rest. Levels are taken coarsest first while the frame's
-/// running total stays within it, so a file too large for the cap still gets
-/// its overviews.
-pub(crate) fn frame_cap(tile_cache_capacity: u64) -> usize {
+/// cannot evict the rest, but never less than the cache's keep floor
+/// `keep` (#1475 review): when elastic memory took the cache below eight of
+/// its keeps, the newest frame the keep protects is still pre-warmed whole.
+/// Levels are taken coarsest first while the frame's running total stays
+/// within it, so a file too large for the cap still gets its overviews.
+pub(crate) fn frame_cap(tile_cache_capacity: u64, keep: u64) -> usize {
     static CAP: LazyLock<usize> =
         LazyLock::new(|| parse_frame_cap(std::env::var("MC_COG_PREWARM_MB").ok().as_deref()));
-    (*CAP).min(usize::try_from(tile_cache_capacity / 8).unwrap_or(usize::MAX))
+    let share = (tile_cache_capacity / 8).max(keep);
+    (*CAP).min(usize::try_from(share).unwrap_or(usize::MAX))
 }
 
 /// `MC_COG_PREWARM_MB` in bytes; unset or unparsable is the default.
