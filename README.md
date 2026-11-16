@@ -3728,6 +3728,9 @@ runs from the Actions tab. Results appear in
 [Security → Code scanning](https://github.com/mrauhala/meteocore/security/code-scanning)
 and on pull requests.
 
+To report a vulnerability, see [SECURITY.md](SECURITY.md): reports go
+through GitHub's private vulnerability reporting, never a public issue.
+
 Rust uses CodeQL's `none` build mode; the extractor handles build scripts and
 procedural macros and enables all Cargo features by default, including
 `engine-zarr/icechunk`. Review extraction warnings as well as alerts, since
