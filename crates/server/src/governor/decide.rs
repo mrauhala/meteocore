@@ -347,6 +347,10 @@ pub(crate) struct Elastic {
     /// reads (`Churn::prewarmed`: the PVOL pixels, GRIB messages and COG
     /// tiles that keep a quiet deployment warm).
     pub decays: bool,
+    /// What it lent the pool (its decays, a lender's share of a valve's
+    /// take-back): what it takes back once it is read again
+    /// ([`MoveKind::Return`]).
+    pub pool_lent: u64,
 }
 
 impl Elastic {
@@ -367,6 +371,9 @@ pub(crate) enum MoveKind {
     Reclaim,
     /// An idle cache gives the pool what it does not hold.
     Decay,
+    /// A cache read again takes back what it lent the pool, at the
+    /// restore's pace.
+    Return,
 }
 
 impl MoveKind {
@@ -375,6 +382,7 @@ impl MoveKind {
             MoveKind::Borrow => "borrow",
             MoveKind::Reclaim => "reclaim",
             MoveKind::Decay => "decay",
+            MoveKind::Return => "return",
         }
     }
 }
@@ -434,10 +442,24 @@ pub(crate) fn lend_value(value: f64, hits_per_hour: f64, cost: f64, capacity: u6
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Rules {
     /// Caches may borrow: the process is under [`UNDER_PERCENT`] of its
-    /// total, or the valve has no total to hold it to.
+    /// total, or the valve has no total to hold it to, and no take-back of
+    /// the valve's is waiting out the restore's [`UNDER_FOR`].
     pub may_borrow: bool,
+    /// Caches may take back what they lent the pool: the process is under
+    /// [`UNDER_PERCENT`] of its total, or the valve has no total.
+    pub may_return: bool,
     /// Idle caches decay toward what they hold: only when moves apply.
     pub decays: bool,
+}
+
+/// What [`Rules`] a tick gets from the valve's last `sample` (resident
+/// bytes and the total) and whether a take-back of the valve's still holds
+/// borrowing off (`held`): `(may_borrow, may_return)`.
+pub(crate) fn borrowing(sample: Option<(u64, u64)>, held: bool) -> (bool, bool) {
+    let under = sample.is_none_or(|(resident, total)| {
+        resident.saturating_mul(100) < total.saturating_mul(UNDER_PERCENT)
+    });
+    (under && !held, under)
 }
 
 /// An idle cache decays by at most this share of the step a tick...
@@ -454,6 +476,10 @@ pub(crate) const DECAY_HEADROOM_PERCENT: u64 = 10;
 /// with `headroom` bytes of the pool the plan's expected use leaves
 /// (#1314), in this order:
 ///
+/// 0. **Return**, while `rules` allow it: a cache no longer idle takes back
+///    what it lent the pool ([`Elastic::pool_lent`]), [`RESTORE_PERCENT`]
+///    of its grant a tick, at least 1 MiB, as the valve's restore climbs,
+///    with no ghost gate: its own memory. Within the headroom left.
 /// 1. **Reclaim**: a cache below its grant, its fair share, that passes the
 ///    borrowing gate takes back what a borrower holds above its own grant,
 ///    the lowest-valued borrower first, while its value is at least that
@@ -509,6 +535,30 @@ pub(crate) fn elastic(
             .find(|&bytes| raises(borrower, lender, bytes) <= headroom)
     };
 
+    // 0. Return.
+    if rules.may_return {
+        for cache in caches.iter().filter(|c| !c.idle && c.pool_lent > 0) {
+            let pace = (cache.grant / 100 * RESTORE_PERCENT).div_ceil(MIB).max(1) * MIB;
+            let Some(bytes) = fits(cache, None, cache.pool_lent.min(pace), headroom) else {
+                continue;
+            };
+            headroom -= raises(cache, None, bytes);
+            moved.insert(&cache.key);
+            moves.push(Move {
+                kind: MoveKind::Return,
+                borrower: Some(cache.key.clone()),
+                lender: None,
+                bytes,
+                borrower_value: cache.value,
+                depth: cache.depth,
+                lender_value: 0.0,
+            });
+        }
+    }
+
+    // Returns are restores: the moves a tick makes are counted after them.
+    let returns = moves.len();
+
     // 1. Reclaim.
     let mut reclaimers: Vec<&Elastic> = caches
         .iter()
@@ -526,7 +576,7 @@ pub(crate) fn elastic(
             .then_with(|| a.key.cmp(&b.key))
     });
     for reclaimer in reclaimers {
-        if moves.len() == ELASTIC_MAX_MOVES {
+        if moves.len() - returns == ELASTIC_MAX_MOVES {
             break;
         }
         let room = step
@@ -580,7 +630,7 @@ pub(crate) fn elastic(
                 .then_with(|| a.key.cmp(&b.key))
         });
         for borrower in borrowers {
-            if moves.len() == ELASTIC_MAX_MOVES {
+            if moves.len() - returns == ELASTIC_MAX_MOVES {
                 break;
             }
             if moved.contains(&borrower.key) {

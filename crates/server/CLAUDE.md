@@ -414,16 +414,36 @@ need no reload pruning.
   within the pool), clearing the ledger with a WARN should it ever break.
   Ending a cache's loans always ends both sides (`Ledger::drop_cache`).
   The valve's `relief` first takes loans back (`take_back`: each
-  borrower, lowest-valued first, `Ledger::release`, its lenders' loans
-  becoming loans to the pool), and lowers the others to 90 % only when
-  that does not cover the excess, ending the loans of each cache it lowers
+  borrower, lowest-valued first, shrinks by the excess still uncovered,
+  in whole MiB, plus the capacity it holds nothing in, at most what it
+  borrowed; after the resize `Ledger::release_part` gives back what the
+  shrink took off, pool loans first, its lenders' share becoming their
+  loans to the pool; a refused shrink keeps its loans and lands in
+  `Relief::refused`), and lowers the others to 90 % only when that does
+  not cover the excess, ending the loans of each cache it lowers
   (`Ledger::end`): the restore climbs to the planned size, and elastic
-  memory borrows above it again by its steps once no ceiling holds. The
-  ledger is in memory only. The simulations in `governor/tests.rs` run the
-  real tick over planned rows (`real_tick_with`: `grant::plan`,
-  `keep_ledger`, the valve's ceilings and restore, `tick_target` with the
-  ledger, `run_elastic` applying, then the floors and `ledger_holds`
-  checked), and `relief` itself. `record_elastic` keeps the proposal for
+  memory borrows above it again by its steps once no ceiling holds. A
+  take-back sets `Governor::borrow_held`: `tick_rules` keeps borrowing
+  off (`decide::borrowing`) until `Pressure::may_restore`, the restore's
+  10 minutes under 90 %; returns (`MoveKind::Return`, a cache no longer
+  idle taking back its `Ledger::lent_to_pool` at the restore's pace)
+  need only under 90 %. The tick lifts every cache with a loan before or
+  after `keep_ledger`, so `tick_target` applies its grant plus offset
+  exactly; elastic headroom is `held_use`, each cache at the larger of
+  its capacity and its target, while `bound_ledger` and `ledger_holds`
+  keep `expected_use` at the targets. A reload's `memory_plan::replan`
+  bounds the ledger against its own plan (`governor::bound_to`) before
+  `capped` applies offsets. `apply_move` books what a lender's regrow
+  did not get back as its loan to the pool. `show_offsets` publishes
+  `cache_elastic_offset_bytes{cache,role}` after each tick, relief and
+  reload. A cache filled ahead of its reads (`decide::spared` or
+  `Churn::prewarmed`) neither lends nor decays. The ledger is in memory
+  only. The simulations in `governor/tests.rs` run the real tick over
+  planned rows (`real_tick_with` / `real_tick_ruled`: `grant::plan`,
+  `keep_ledger`, the lifting, the valve's ceilings and restore,
+  `tick_target` with the ledger, `run_elastic` applying under the tick's
+  rules, then the floors and `ledger_holds` checked), and `relief`
+  itself. `record_elastic` keeps the proposal for
   `/admin/cache-plan` (`governor.elastic`, with the loans and offsets;
   `governor.elastic_mode` is the setting now), sets
   `cache_elastic_proposed_bytes{cache,role}` and counts

@@ -434,6 +434,32 @@ mod tests {
         assert_eq!(messages.bytes, 16 * mean);
     }
 
+    /// #1314: a message cache a map's read-ahead or the pre-warm fills is
+    /// filled ahead of its reads, so elastic memory neither lends nor
+    /// decays it; with neither, it is filled by reads alone.
+    #[test]
+    fn a_message_cache_read_ahead_or_prewarmed_is_marked_so() {
+        let source = TestSource::new();
+        source.write(
+            "f000",
+            &[("TMP", "2 m above ground", message(0, 280.0, [0; 4], 103, 2))],
+            0,
+        );
+        for (prewarm, read_ahead, marked) in [(false, 3, true), (true, 0, true), (false, 0, false)]
+        {
+            let mut config = source.config();
+            config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(16));
+            config.prewarm = prewarm;
+            config.read_ahead = read_ahead;
+            let engine = GribEngine::new("marked", &config).unwrap();
+            assert_eq!(
+                engine.message_cache_metrics().churn.prewarmed,
+                marked,
+                "prewarm {prewarm}, read_ahead {read_ahead}"
+            );
+        }
+    }
+
     #[test]
     fn geometry_matches_global_regional_seam_and_duplicate_seam_grids() {
         for ni in [1440, 1441] {

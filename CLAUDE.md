@@ -1350,11 +1350,11 @@ total_mb = 28672
                        # resizes nothing. "apply": makes them, booked as loans
                        # in a ledger kept in memory only (a restart starts
                        # every cache at its plan); leaving "apply" ends every
-                       # loan, a move under the tick's 10 % / 64 MiB staying
-                       # until the next reload. Under pressure the valve takes
-                       # back what caches borrowed first; its restore climbs to
-                       # the planned size, and caches borrow above it again
-                       # only by elastic steps.
+                       # loan. Under pressure the valve takes back what caches
+                       # borrowed first, only the excess, then holds borrowing
+                       # off for the restore's 10 minutes under 90 %; its
+                       # restore climbs to the planned size, and caches borrow
+                       # above it again only by elastic steps.
 
 # Optional: the one home for process-wide cache and budget sizes (#1313),
 # one key per /metrics family without `_cache` (keys:
@@ -1800,16 +1800,24 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   them there. #1314's elastic sharing is a step of this loop, never a
   second loop, as `[memory] elastic` says (`off`, `report`, `apply`;
   `AcceptedLoad::memory_elastic`, off outside `auto`): `decide::elastic`
-  decides reclaims (a cache below its grant, at 1 ×), borrows (the pool's
-  headroom first, then caches at 2 ×) and idle decays by value per byte,
-  `Grant::ceiling_bytes` and the plan's floors bound them, never past the
-  pool's expected use. Applied, each is a loan in `governor/ledger.rs`
-  (pure; either side may be the pool), whose offsets the tick and a
-  reload's plan add to the grants; anything that ends a cache's loans
-  ends both sides, so borrowed always equals lent (`Ledger::balanced`,
-  `ledger_holds`). The valve takes loans back first (`relief`) and ends
-  the loans of a cache it lowers. `cache_elastic_proposed_bytes` shows
-  the moves, `cache_elastic_moves_total` counts them. Every size change counts in `cache_plan_changes_total`
+  decides returns (a cache read again takes back what it lent the pool,
+  at the restore's pace, under 90 %), reclaims (a cache below its grant,
+  at 1 ×), borrows (the pool's headroom first, then caches at 2 ×) and
+  idle decays by value per byte; `Grant::ceiling_bytes` and the plan's
+  floors bound them, within the headroom the caches leave where they are
+  (`held_use`). A cache filled ahead of its reads (spared, or
+  `Churn::prewarmed`) neither lends nor decays: mark a cache `prewarmed`
+  wherever a pre-warm or read-ahead fills it. Applied, each is a loan in
+  `governor/ledger.rs` (pure; either side may be the pool), whose offsets
+  the tick and a reload's plan add to the grants, a cache with loans held
+  to its target exactly; anything that ends a cache's loans ends both
+  sides, so borrowed always equals lent (`Ledger::balanced`,
+  `ledger_holds`). The valve takes loans back first, only the excess
+  (`relief`, `take_back`), holds borrowing off for the restore's 10
+  minutes after, and ends the loans of a cache it lowers.
+  `cache_elastic_proposed_bytes` shows the moves,
+  `cache_elastic_offset_bytes` the ledger, `cache_elastic_moves_total`
+  counts the moves. Every size change counts in `cache_plan_changes_total`
   (`memory_plan::count_changes`; a reload's staged resizes through
   `memory_plan::counting_resizes`); a new resize path counts there too.
   A valve ceiling never takes a cache below the plan's floor or its

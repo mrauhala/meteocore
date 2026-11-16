@@ -754,9 +754,21 @@ async fn the_elastic_setting_is_read_on_every_reload() {
         source: metatile.entry.source.clone(),
         configured: metatile.configured_bytes,
     };
-    governor().ledger.book(Some(party), None, 64 * MIB);
+    let rendered = row(&state, "rendered_cache");
+    let lender = Party {
+        key: decide::key(&rendered.entry),
+        source: rendered.entry.source.clone(),
+        configured: rendered.configured_bytes,
+    };
+    governor()
+        .ledger
+        .book(Some(party.clone()), Some(lender.clone()), 64 * MIB);
+    // A loan from the pool the reload's plan has no headroom for: shed
+    // before the plan applies its grants (#1473 review).
+    governor().ledger.book(Some(party), None, 4 * 8192 * MIB);
     crate::admin::do_reload(&state).unwrap();
     assert_eq!(governor().ledger.offset(&key), 64 * MIB as i64, "kept");
+    assert_eq!(governor().ledger.pool_net(), 0, "the pool's loan shed");
     let grant = grant_of(&metatile.entry);
     assert_eq!(
         row(&state, "metatile_cache").usage.capacity_bytes,
@@ -1276,6 +1288,7 @@ fn id(key: &Option<Key>) -> &'static str {
 /// Rules with borrowing and no decay: the pure simulations'.
 const BORROW: Rules = Rules {
     may_borrow: true,
+    may_return: true,
     decays: false,
 };
 
@@ -1328,6 +1341,7 @@ fn weigh(cache: &SimCache, noise: f64) -> Elastic {
         used: cache.capacity.min(cache.load.working_set),
         idle: cache.load.lookups < 60.0,
         decays: cache.lends && !cache.prewarmed,
+        pool_lent: 0,
     }
 }
 
@@ -1471,6 +1485,20 @@ fn real_tick_with(
     caps: &mut HashMap<Key, Ceiling>,
     restore: bool,
 ) -> Proposal {
+    real_tick_ruled(caches, total, ledger, mode, caps, restore, (true, true))
+}
+
+/// [`real_tick_with`] under the tick's `(may_borrow, may_return)`
+/// ([`decide::borrowing`]).
+fn real_tick_ruled(
+    caches: &RefCell<Vec<SimCache>>,
+    total: u64,
+    ledger: &mut Ledger,
+    mode: ElasticMode,
+    caps: &mut HashMap<Key, Ceiling>,
+    restore: bool,
+    rules: (bool, bool),
+) -> Proposal {
     let set = |id: &str, bytes: u64| {
         for cache in caches.borrow_mut().iter_mut() {
             if cache.key.1 == id {
@@ -1480,7 +1508,10 @@ fn real_tick_with(
     };
     let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
     let plan = sim_plan(&rows, total);
+    // As the tick: a cache with a loan before or after is held exactly.
+    let mut moved: HashSet<Key> = ledger.keys().into_iter().collect();
     keep_ledger(ledger, mode, &rows, Some(&plan));
+    moved.extend(ledger.keys());
     let valve_holds = !caps.is_empty();
     let grant_of = |key: &Key| {
         rows.iter()
@@ -1493,11 +1524,12 @@ fn real_tick_with(
         Some(floor_of(&row.entry, plan.grant(&row.entry)?))
     };
     decide::floor_ceilings(caps, &floor_of_key);
-    let lifted = if restore {
+    let mut lifted = if restore {
         decide::restore(caps, &grant_of).1
     } else {
         HashSet::new()
     };
+    lifted.extend(moved);
     for row in &rows {
         let key = decide::key(&row.entry);
         let grant = plan.grant(&row.entry).unwrap();
@@ -1523,7 +1555,15 @@ fn real_tick_with(
     };
     let cell = RefCell::new(std::mem::take(ledger));
     let with_ledger = |book: &mut dyn FnMut(&mut Ledger)| book(&mut cell.borrow_mut());
-    let proposal = run_elastic(&rows, &plan, &with_ledger, mode, valve_holds, true, &resize);
+    let proposal = run_elastic(
+        &rows,
+        &plan,
+        &with_ledger,
+        mode,
+        valve_holds,
+        rules,
+        &resize,
+    );
     *ledger = cell.into_inner();
     for row in &rows {
         let floor = floor_of(&row.entry, plan.grant(&row.entry).unwrap());
@@ -1590,7 +1630,12 @@ fn through_the_real_tick_memory_moves_to_the_thrashing_cache_and_back() {
         assert!(ticks <= 40, "{caches:?}");
     }
     let held = capacity_of(&caches, "metatile_cache");
-    assert_eq!(ledger.offset(&metatile), held as i64 - GIB as i64);
+    let grants = (
+        grant_in(&caches, total, "metatile_cache"),
+        grant_in(&caches, total, "rendered_cache"),
+    );
+    // A cache with loans is held to its grant plus its offset exactly.
+    assert_eq!(ledger.offset(&metatile), held as i64 - grants.0 as i64);
     // Its working set held, it borrows no more, and the re-plan keeps it.
     // The idle cache decays to what it holds plus 10 %, by at most half a
     // step and 5 % of its size a tick, and stays there.
@@ -1607,14 +1652,15 @@ fn through_the_real_tick_memory_moves_to_the_thrashing_cache_and_back() {
     }
     assert_eq!(capacity_of(&caches, "rendered_cache"), decayed);
     assert_eq!(real_tick(&caches, total, &mut ledger).moves, []);
-    assert_eq!(ledger.offset(&rendered), decayed as i64 - 4 * GIB as i64);
+    assert_eq!(ledger.offset(&rendered), decayed as i64 - grants.1 as i64);
     assert_eq!(
         ledger.pool_net(),
-        held as i64 + decayed as i64 - 5 * GIB as i64
+        held as i64 + decayed as i64 - (grants.0 + grants.1) as i64
     );
 
-    // The load swaps: below its grant, the busy cache takes back what the
-    // other borrowed, at an even ratio, ahead of any other move.
+    // The load swaps: read again, the cache takes back what it lent the
+    // pool, at the restore's pace (#1473 review), then, below its grant,
+    // what the other borrowed, at an even ratio, ahead of any other move.
     for cache in caches.borrow_mut().iter_mut() {
         cache.load = if cache.key.1 == "metatile_cache" {
             IDLE
@@ -1622,18 +1668,29 @@ fn through_the_real_tick_memory_moves_to_the_thrashing_cache_and_back() {
             thrash(3)
         };
     }
-    let mut ticks = 0;
+    let mut kinds = Vec::new();
     while capacity_of(&caches, "rendered_cache") < 3 * GIB {
         let proposal = real_tick(&caches, total, &mut ledger);
-        let m = &proposal.moves[0];
-        assert_eq!(
-            (m.kind, id(&m.borrower), id(&m.lender)),
-            (MoveKind::Reclaim, "rendered_cache", "metatile_cache"),
-            "tick {ticks}: {caches:?}"
-        );
-        ticks += 1;
-        assert!(ticks <= 40, "{caches:?}");
+        let m = proposal
+            .moves
+            .iter()
+            .find(|m| id(&m.borrower) == "rendered_cache")
+            .expect("it grows every tick");
+        kinds.push((m.kind, id(&m.lender)));
+        assert!(kinds.len() <= 40, "{caches:?}");
     }
+    let reclaims = kinds
+        .iter()
+        .position(|kind| *kind == (MoveKind::Reclaim, "metatile_cache"))
+        .expect("a reclaim");
+    assert!(reclaims > 0, "{kinds:?}");
+    assert!(kinds[..reclaims]
+        .iter()
+        .all(|kind| *kind == (MoveKind::Return, "pool")));
+    assert!(kinds[reclaims..]
+        .iter()
+        .all(|kind| *kind == (MoveKind::Reclaim, "metatile_cache")));
+    assert_eq!(ledger.lent_to_pool(&rendered), 0, "its decay came back");
     assert!(capacity_of(&caches, "metatile_cache") < held);
 }
 
@@ -1802,6 +1859,7 @@ fn a_cache_past_an_lru_cliff_borrows_by_its_best_depth() {
         used: 1024 * MIB,
         idle: false,
         decays: true,
+        pool_lent: 0,
     };
     let (value, depth) = best_depth(
         1024 * MIB,
@@ -1906,6 +1964,7 @@ fn elastic_cache(id: &'static str, capacity_mib: u64, value: f64, ghost_hits: u6
         used: capacity_mib * MIB,
         idle: false,
         decays: true,
+        pool_lent: 0,
     }
 }
 
@@ -2440,6 +2499,7 @@ fn proposals_wait_for_the_valve_and_report_mode_counts_only_new_moves() {
         mode: ElasticMode::Report,
         held: None,
         may_borrow: true,
+        may_return: true,
         step_bytes: elastic_step(8 * GIB),
         headroom_bytes: GIB,
         caches: caches.clone(),
@@ -2567,7 +2627,15 @@ fn proposals_wait_for_the_valve_and_report_mode_counts_only_new_moves() {
     let with_ledger = |book: &mut dyn FnMut(&mut Ledger)| book(&mut ledger.borrow_mut());
     let resize = |_: &Entry, _: u64| -> Option<u64> { panic!("report mode resized") };
     let run = |mode, valve_holds| {
-        run_elastic(&rows, &plan, &with_ledger, mode, valve_holds, true, &resize)
+        run_elastic(
+            &rows,
+            &plan,
+            &with_ledger,
+            mode,
+            valve_holds,
+            (true, true),
+            &resize,
+        )
     };
     let held = run(ElasticMode::Report, true);
     assert_eq!(held.held, Some(VALVE_HOLDS));
@@ -2604,6 +2672,7 @@ fn the_pool_lends_its_headroom_first_and_never_past_it() {
     );
     let no_borrowing = Rules {
         may_borrow: false,
+        may_return: true,
         decays: false,
     };
     assert_eq!(
@@ -2639,6 +2708,7 @@ fn a_cache_below_its_grant_reclaims_from_the_lowest_valued_borrower() {
     ];
     let no_borrowing = Rules {
         may_borrow: false,
+        may_return: true,
         decays: false,
     };
     for rules in [BORROW, no_borrowing] {
@@ -2702,6 +2772,7 @@ fn an_idle_cache_decays_by_half_a_step_toward_what_it_holds() {
     let pool = 8 * GIB;
     let decays = Rules {
         may_borrow: true,
+        may_return: true,
         decays: true,
     };
     let idle = Elastic {
@@ -2746,6 +2817,7 @@ fn an_idle_cache_decays_by_half_a_step_toward_what_it_holds() {
     for spared in [
         Elastic {
             decays: false,
+            pool_lent: 0,
             ..idle.clone()
         },
         Elastic {
@@ -2869,6 +2941,32 @@ fn a_borrower_short_of_the_move_gives_the_rest_back_to_its_lender() {
             assert_eq!(m.bytes, gained);
         }
     }
+    // #1473 review: a lender whose regrow stops short keeps what it did not
+    // get back as a loan to the pool, so the ledger holds what the sizes
+    // did.
+    caches.borrow_mut()[0].capacity = GIB;
+    caches.borrow_mut()[1].capacity = 4 * GIB;
+    let resize = |entry: &Entry, bytes: u64| {
+        let mut caches = caches.borrow_mut();
+        let cache = caches.iter_mut().find(|c| c.key.1 == entry.id).unwrap();
+        cache.capacity = match entry.id {
+            "metatile_cache" => bytes.min(cache.capacity + 40 * MIB),
+            // Shrinks, but grows back 10 MiB at most.
+            _ => bytes.min(cache.capacity + 10 * MIB),
+        };
+        Some(cache.capacity)
+    };
+    let ledger = RefCell::new(Ledger::default());
+    let with_ledger = |book: &mut dyn FnMut(&mut Ledger)| book(&mut ledger.borrow_mut());
+    let mut m = template.clone();
+    assert!(apply_move(&mut m, &rows, &with_ledger, &resize));
+    assert_eq!(m.bytes, 40 * MIB);
+    assert_eq!(capacity_of(&caches, "rendered_cache"), 4 * GIB - 90 * MIB);
+    let ledger = ledger.into_inner();
+    let rendered = template.lender.clone().unwrap();
+    assert_eq!(ledger.lent(&rendered), 90 * MIB, "what it gave and kept");
+    assert_eq!(ledger.lent_to_pool(&rendered), 50 * MIB);
+    ledger.balanced().unwrap();
 }
 
 /// #1314 C, through the real tick and the valve: under pressure, what
@@ -2940,9 +3038,10 @@ fn under_pressure_borrowers_give_back_first_and_restores_climb_to_the_plan() {
         relief.taken[0].entry.id, "metatile_cache",
         "worth less a byte"
     );
-    assert_eq!(relief.taken[0].to_bytes, before - borrowed);
+    // #1473 review: only the excess, in whole MiB; it holds all it has.
+    assert_eq!(relief.taken[0].to_bytes, before - MIB);
     assert!(relief.changes.is_empty() && relief.caps.is_empty());
-    assert_eq!(small.borrowed(&metatile), 0);
+    assert_eq!(small.borrowed(&metatile), borrowed - MIB);
     assert_eq!(capacity_of(&caches, "vector_tile_cache"), vector_before);
     assert_eq!(small.lent(&rendered), lent, "the lender stays where it is");
 
@@ -2959,6 +3058,7 @@ fn under_pressure_borrowers_give_back_first_and_restores_climb_to_the_plan() {
     let grant = grant_in(&caches, total, "metatile_cache");
     let mut lifted_at = None;
     let mut last = capacity_of(&caches, "metatile_cache");
+    let mut borrows = 0;
     for tick in 0..60 {
         let capped = !caps.is_empty();
         let proposal = real_tick_with(
@@ -2979,8 +3079,14 @@ fn under_pressure_borrowers_give_back_first_and_restores_climb_to_the_plan() {
             let plan = grant_in(&caches, total, "rendered_cache");
             assert_eq!(capacity_of(&caches, "rendered_cache"), plan, "its plan");
         }
+        // Above its grant by no more than a step for each tick it borrowed.
+        borrows += proposal
+            .moves
+            .iter()
+            .filter(|m| id(&m.borrower) == "metatile_cache")
+            .count() as u64;
         assert!(
-            now <= last.max(grant) + proposal.step_bytes,
+            now <= grant + borrows * proposal.step_bytes,
             "tick {tick}: {caches:?}"
         );
         last = now;
@@ -2990,10 +3096,10 @@ fn under_pressure_borrowers_give_back_first_and_restores_climb_to_the_plan() {
 }
 
 /// #1314 C: `[memory] elastic` is read at every tick. Leaving `apply`
-/// ends every loan, and the re-plan tick returns each cache to its grant as
-/// it moves any cache: a move under its 10 % and 64 MiB thresholds stays
-/// until a reload. Report proposes and resizes nothing; off weighs
-/// nothing; entering `apply` again starts from an empty ledger.
+/// ends every loan, and the re-plan tick returns each cache that had one to
+/// its grant exactly, inside its 10 % and 64 MiB dead band too (#1473
+/// review). Report proposes and resizes nothing; off weighs nothing;
+/// entering `apply` again starts from an empty ledger.
 #[test]
 fn leaving_apply_ends_every_loan_and_off_weighs_nothing() {
     let caches = RefCell::new(vec![
@@ -3005,7 +3111,7 @@ fn leaving_apply_ends_every_loan_and_off_weighs_nothing() {
     let tick = |ledger: &mut Ledger, mode| {
         real_tick_with(&caches, total, ledger, mode, &mut HashMap::new(), false)
     };
-    // One step: under the thresholds once apply ends.
+    // One step, inside the dead band: still taken back once apply ends.
     let first = tick(&mut ledger, ElasticMode::Apply);
     assert_eq!(first.moves.len(), 1, "{first:?}");
     let once = capacity_of(&caches, "metatile_cache");
@@ -3015,7 +3121,7 @@ fn leaving_apply_ends_every_loan_and_off_weighs_nothing() {
     assert!(ledger.is_empty());
     assert_eq!(report.mode, ElasticMode::Report);
     assert!(!report.moves.is_empty(), "still proposed");
-    assert_eq!(capacity_of(&caches, "metatile_cache"), once, "the residue");
+    assert_eq!(capacity_of(&caches, "metatile_cache"), grant, "no residue");
 
     // Many steps: the tick takes them back once apply ends.
     for _ in 0..8 {
@@ -3041,4 +3147,492 @@ fn leaving_apply_ends_every_loan_and_off_weighs_nothing() {
     assert_eq!(capacity_of(&caches, "metatile_cache"), grants.0 + bytes);
     let metatile = (Kind::Cache, "metatile_cache", Scope::Process);
     assert_eq!(ledger.borrowed(&metatile), bytes);
+}
+
+// --- #1473 review --------------------------------------------------------
+
+/// What the capacities of the caches with loans sit above their ledger
+/// targets, the most of any, over the plan at `total`; and that the
+/// headroom elastic memory weighs leaves room for every cache where it is.
+fn worst_gap(caches: &RefCell<Vec<SimCache>>, total: u64, ledger: &Ledger) -> i64 {
+    let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
+    let plan = sim_plan(&rows, total);
+    let held: u64 = rows
+        .iter()
+        .map(|row| {
+            let grant = plan.grant(&row.entry).unwrap();
+            let target = elastic_grant(ledger, &decide::key(&row.entry), &row.entry, grant);
+            target.max(row.usage.capacity_bytes)
+        })
+        .sum();
+    assert!(
+        elastic_headroom(&rows, &plan, ledger) <= plan.pool_bytes.saturating_sub(held),
+        "headroom counted under what the caches hold"
+    );
+    let loans: HashSet<Key> = ledger.keys().into_iter().collect();
+    rows.iter()
+        .filter(|row| loans.contains(&decide::key(&row.entry)))
+        .map(|row| {
+            let grant = plan.grant(&row.entry).unwrap();
+            let target = elastic_grant(ledger, &decide::key(&row.entry), &row.entry, grant);
+            row.usage.capacity_bytes as i64 - target as i64
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// #1473 review: the valve's take-back gives back only the excess, in
+/// whole MiB, plus what the borrower holds no data in, not all it
+/// borrowed; then borrowing stays off until the process has been under
+/// 90 % of its total for the restore's 10 minutes, and resumes a step a
+/// tick. Before, a 16 MiB excess took 3.3 GiB off the meta-tile cache,
+/// which borrowed it back the next ticks.
+#[test]
+fn the_take_back_gives_back_the_excess_and_holds_borrowing_off() {
+    let metatile = (Kind::Cache, "metatile_cache", Scope::Process);
+    let caches = RefCell::new(vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(6)),
+        sim_cache("rendered_cache", 8192, 512, IDLE),
+    ]);
+    let total = fitting_total(&caches.borrow()) + 2 * GIB;
+    let mut ledger = Ledger::default();
+    for _ in 0..40 {
+        real_tick(&caches, total, &mut ledger);
+    }
+    let borrowed = ledger.borrowed(&metatile);
+    assert!(borrowed > GIB, "{ledger:?}");
+    let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
+    let plan = sim_plan(&rows, total);
+    let before = capacity_of(&caches, "metatile_cache");
+    let resize = |entry: &Entry, bytes: u64| {
+        let mut caches = caches.borrow_mut();
+        let cache = caches.iter_mut().find(|c| c.key.1 == entry.id).unwrap();
+        cache.capacity = bytes;
+        Some(bytes)
+    };
+    let cell = RefCell::new(ledger);
+    let with_ledger = |book: &mut dyn FnMut(&mut Ledger)| book(&mut cell.borrow_mut());
+    let excess = 16 * MIB;
+    let relief = relief(
+        &rows,
+        Some(&plan),
+        &with_ledger,
+        ElasticMode::Apply,
+        excess,
+        &resize,
+    );
+    let mut ledger = cell.into_inner();
+    assert_eq!(relief.taken.len(), 1, "{relief:?}");
+    assert!(relief.changes.is_empty(), "the take-back covered it");
+    let after = capacity_of(&caches, "metatile_cache");
+    // What it held less what it holds: the excess alone; the capacity it
+    // held nothing in went with it.
+    let used = rows[0].usage.used_bytes;
+    assert_eq!(used.min(before) - used.min(after), excess);
+    assert_eq!(before - after, excess + (before - used).div_ceil(MIB) * MIB);
+    assert_eq!(ledger.borrowed(&metatile), borrowed - (before - after));
+    ledger_holds(&rows, &plan, &ledger).unwrap();
+
+    // Borrowing held off: no borrow, and the cache stays where it is.
+    for _ in 0..3 {
+        let proposal = real_tick_ruled(
+            &caches,
+            total,
+            &mut ledger,
+            ElasticMode::Apply,
+            &mut HashMap::new(),
+            false,
+            (false, true),
+        );
+        assert!(proposal.moves.iter().all(|m| m.kind != MoveKind::Borrow));
+        assert_eq!(capacity_of(&caches, "metatile_cache"), after);
+    }
+    // Released: a step a tick.
+    let proposal = real_tick(&caches, total, &mut ledger);
+    let grown = capacity_of(&caches, "metatile_cache") - after;
+    assert!(grown > 0 && grown <= proposal.step_bytes, "{grown}");
+}
+
+/// #1473 review: a take-back holds borrowing off until the process has
+/// been under 90 % of its total for 10 minutes; returns need only under
+/// 90 %; at 90 % or more neither.
+#[test]
+fn a_take_back_holds_borrowing_off_for_the_restores_ten_minutes() {
+    let start = Instant::now();
+    let mut governor = Governor {
+        borrow_held: true,
+        sample: Some((80, 100)),
+        ..Governor::default()
+    };
+    governor.pressure.observe(start, 80, 100);
+    assert_eq!(tick_rules(&mut governor, start), (false, true));
+    let almost = start + decide::UNDER_FOR - Duration::from_secs(1);
+    governor.pressure.observe(almost, 80, 100);
+    assert_eq!(tick_rules(&mut governor, almost), (false, true));
+    let after = start + decide::UNDER_FOR;
+    governor.pressure.observe(after, 80, 100);
+    assert_eq!(tick_rules(&mut governor, after), (true, true));
+    assert!(!governor.borrow_held);
+    governor.sample = Some((95, 100));
+    assert_eq!(tick_rules(&mut governor, after), (false, false));
+    governor.sample = None;
+    assert_eq!(tick_rules(&mut governor, after), (true, true), "no valve");
+}
+
+/// #1473 review: a cache that decayed while idle, read again, takes back
+/// what it lent the pool at the restore's pace, 5 % of its grant a tick,
+/// with no ghost hits needed, while the process is under 90 % of its
+/// total; at 90 % or more, or while still idle, nothing.
+#[test]
+fn a_cache_read_again_takes_back_what_it_lent_the_pool() {
+    let pool = 8 * GIB;
+    let decayed = |capacity_mib: u64, lent_mib: u64| Elastic {
+        capacity: capacity_mib * MIB,
+        grant: GIB,
+        floor: 128 * MIB,
+        ceiling: 8 * GIB,
+        offset: -(lent_mib as i64 * MIB as i64),
+        pool_lent: lent_mib * MIB,
+        used: capacity_mib * MIB,
+        idle: false,
+        value: 0.0,
+        ghost_hits: 0,
+        ..elastic_cache("metatile_cache", capacity_mib, 0.0, 0)
+    };
+    let other = Elastic {
+        lend_value: 1e-12,
+        value: 0.0,
+        ghost_hits: 0,
+        ..elastic_cache("rendered_cache", 4096, 0.0, 0)
+    };
+    let headroom = 896 * MIB;
+    let rules = |may_borrow, may_return| Rules {
+        may_borrow,
+        may_return,
+        decays: true,
+    };
+    let at_90 = elastic(
+        &[decayed(128, 896), other.clone()],
+        pool,
+        headroom,
+        rules(false, false),
+    );
+    assert_eq!(at_90, [], "at 90 % or more");
+    let idle = Elastic {
+        idle: true,
+        ..decayed(128, 896)
+    };
+    assert!(elastic(&[idle], pool, headroom, rules(true, true))
+        .iter()
+        .all(|m| m.kind != MoveKind::Return));
+    let (mut capacity, mut lent, mut ticks) = (128, 896, 0);
+    while lent > 0 {
+        let moves = elastic(
+            &[decayed(capacity, lent), other.clone()],
+            pool,
+            headroom,
+            rules(false, true),
+        );
+        let m = &moves[0];
+        assert_eq!((m.kind, id(&m.lender)), (MoveKind::Return, "pool"));
+        assert!(m.bytes <= 52 * MIB, "5 % of its grant, in whole MiB");
+        capacity += m.bytes / MIB;
+        lent -= m.bytes / MIB;
+        ticks += 1;
+        assert!(ticks <= 20);
+    }
+    assert_eq!(
+        (capacity, ticks),
+        (1024, 18),
+        "back to its grant in 90 minutes"
+    );
+    // Never more than the headroom left.
+    let moves = elastic(
+        &[decayed(128, 896), other],
+        pool,
+        10 * MIB,
+        rules(true, true),
+    );
+    assert_eq!(moves[0].bytes, 10 * MIB);
+}
+
+/// #1473 review, through the real tick: what the ledger sheds as a total
+/// shrinks reaches the caches: a cache with loans is held to its grant
+/// plus its offset exactly, never left in the tick's dead band above it,
+/// and the headroom counts every cache where it is, the dead band's
+/// slack included; with or without a cache filled ahead of its reads.
+#[test]
+fn the_ledgers_sheds_reach_the_caches() {
+    for prewarmed in [false, true] {
+        let caches = RefCell::new(vec![
+            sim_cache("metatile_cache", 1024, 128, thrash(3)),
+            SimCache {
+                prewarmed,
+                ..sim_cache("rendered_cache", 4096, 512, IDLE)
+            },
+        ]);
+        let mut total = fitting_total(&caches.borrow()) + 2 * GIB;
+        let mut ledger = Ledger::default();
+        for _ in 0..30 {
+            real_tick(&caches, total, &mut ledger);
+            assert!(worst_gap(&caches, total, &ledger) < 64 * MIB as i64);
+        }
+        for _ in 0..24 {
+            total -= 48 * MIB;
+            real_tick(&caches, total, &mut ledger);
+            let worst = worst_gap(&caches, total, &ledger);
+            assert!(worst < 64 * MIB as i64, "{} MiB over", worst / MIB as i64);
+        }
+    }
+}
+
+/// #1473 review: a borrower whose shrink in place is refused gives back
+/// nothing: its loans stay, and the relief reports the refusal.
+#[test]
+fn a_refused_give_back_keeps_its_loans_and_is_reported() {
+    let metatile = (Kind::Cache, "metatile_cache", Scope::Process);
+    let caches = RefCell::new(vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        sim_cache("rendered_cache", 4096, 512, IDLE),
+    ]);
+    let total = fitting_total(&caches.borrow());
+    let mut ledger = Ledger::default();
+    for _ in 0..10 {
+        real_tick(&caches, total, &mut ledger);
+    }
+    let borrowed = ledger.borrowed(&metatile);
+    assert!(borrowed > 0);
+    let before = capacity_of(&caches, "metatile_cache");
+    let rows: Vec<Row> = caches.borrow().iter().map(sim_row).collect();
+    let plan = sim_plan(&rows, total);
+    // Every cache refuses its shrink in place: the 90 % relief that
+    // follows lowers nothing either, so no lender's loans end.
+    let resize = |entry: &Entry, bytes: u64| {
+        let mut caches = caches.borrow_mut();
+        let cache = caches.iter_mut().find(|c| c.key.1 == entry.id).unwrap();
+        cache.capacity = cache.capacity.max(bytes);
+        Some(cache.capacity)
+    };
+    let cell = RefCell::new(ledger);
+    let with_ledger = |book: &mut dyn FnMut(&mut Ledger)| book(&mut cell.borrow_mut());
+    let relief = relief(
+        &rows,
+        Some(&plan),
+        &with_ledger,
+        ElasticMode::Apply,
+        MIB,
+        &resize,
+    );
+    let ledger = cell.into_inner();
+    assert!(relief.taken.is_empty() && relief.changes.is_empty());
+    assert_eq!(relief.refused[0].entry.id, "metatile_cache", "{relief:?}");
+    assert_eq!(capacity_of(&caches, "metatile_cache"), before);
+    assert_eq!(ledger.borrowed(&metatile), borrowed, "its loans stay");
+    ledger.balanced().unwrap();
+}
+
+/// #1473 review: a cache its engines fill ahead of its reads
+/// (`Churn::prewarmed`) neither lends nor decays: no move takes from it,
+/// even worth nothing.
+#[test]
+fn a_prewarmed_cache_neither_lends_nor_decays() {
+    let caches = vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        SimCache {
+            prewarmed: true,
+            ..sim_cache("rendered_cache", 4096, 512, IDLE)
+        },
+    ];
+    let rows: Vec<Row> = caches.iter().map(sim_row).collect();
+    let plan = sim_plan(&rows, fitting_total(&caches));
+    let weighed = elastic_inputs(&rows, &plan, &Ledger::default());
+    let prewarmed = weighed
+        .iter()
+        .find(|c| c.key.1 == "rendered_cache")
+        .unwrap();
+    assert!(!prewarmed.lends && !prewarmed.decays);
+    let decays = Rules {
+        may_borrow: true,
+        may_return: true,
+        decays: true,
+    };
+    for m in elastic(&weighed, plan.pool_bytes, 0, decays) {
+        assert_ne!(id(&m.lender), "rendered_cache", "{m:?}");
+    }
+}
+
+/// #1473 review: `/metrics` shows each cache's borrowed and lent bytes,
+/// summed over its collections; a cache with no loan has no series.
+#[test]
+fn the_ledger_is_shown_on_metrics() {
+    let collection = |id: &str| Party {
+        key: (
+            Kind::Cache,
+            "offset_test_cache",
+            Scope::Collection {
+                engine: "geotiff",
+                id: id.into(),
+            },
+        ),
+        source: SizeSource::Default,
+        configured: GIB,
+    };
+    let mut ledger = Ledger::default();
+    ledger.book(Some(collection("a")), None, 64 * MIB);
+    ledger.book(Some(collection("b")), None, 32 * MIB);
+    ledger.book(None, Some(party("offset_test_lender_cache", GIB)), 16 * MIB);
+    show_offsets(&ledger);
+    let gauge = |cache: &str, role: &str| ELASTIC_OFFSETS.with_label_values(&[cache, role]).get();
+    assert_eq!(gauge("offset_test_cache", "borrowed"), 96 * MIB as i64);
+    assert_eq!(gauge("offset_test_lender_cache", "lent"), 16 * MIB as i64);
+    show_offsets(&Ledger::default());
+    assert_eq!(gauge("offset_test_cache", "borrowed"), 0, "reset");
+}
+
+/// #1473 review: the ledger's invariant names the limit it hit: the pool,
+/// or the plan's own expected use where that is past the pool already.
+#[test]
+fn a_broken_ledger_names_the_limit_it_passed() {
+    let caches = vec![
+        sim_cache("metatile_cache", 1024, 128, thrash(3)),
+        sim_cache("rendered_cache", 4096, 512, IDLE),
+    ];
+    let rows: Vec<Row> = caches.iter().map(sim_row).collect();
+    let mut ledger = Ledger::default();
+    ledger.book(Some(party("metatile_cache", GIB)), None, 64 * GIB);
+    let roomy = sim_plan(&rows, fitting_total(&caches));
+    assert!(roomy.pool_bytes >= roomy.expected_bytes);
+    let error = ledger_holds(&rows, &roomy, &ledger).unwrap_err();
+    assert!(error.contains("past the pool of"), "{error}");
+    let tight = sim_plan(&rows, 512 * MIB);
+    assert!(tight.expected_bytes > tight.pool_bytes, "{tight:?}");
+    let error = ledger_holds(&rows, &tight, &ledger).unwrap_err();
+    assert!(
+        error.contains("past the plan's own expected use"),
+        "{error}"
+    );
+}
+
+/// #1473 review: a working-set borrower whose plan counts it at its need
+/// borrows from a working-set lender's unused capacity, and fills what it
+/// gets; through real ticks, what the caches hold never passes the pool,
+/// and the tick never has to claw it back.
+#[test]
+fn a_working_set_borrower_never_fills_past_the_pool() {
+    let caches = RefCell::new(vec![
+        sim_cache("grid_cache", 1024, 64, thrash(4)),
+        sim_cache("tile_cache", 4096, 64, IDLE),
+    ]);
+    let row_of = |c: &SimCache| {
+        let mut row = sim_row(c);
+        row.demand = Some(Demand {
+            bytes: 256 * MIB,
+            rule: "probe",
+            floor: false,
+            ahead: false,
+            setting: "probe",
+            parts: Vec::new(),
+        });
+        row
+    };
+    let rows_now = || caches.borrow().iter().map(row_of).collect::<Vec<Row>>();
+    let set = |id: &str, bytes: u64| {
+        for cache in caches.borrow_mut().iter_mut() {
+            if cache.key.1 == id {
+                cache.capacity = bytes;
+            }
+        }
+    };
+    let rows = rows_now();
+    let mut total = caches.borrow().iter().map(|c| c.configured).sum::<u64>();
+    while rows
+        .iter()
+        .any(|row| sim_plan(&rows, total).grant(&row.entry).unwrap().bytes < row.configured_bytes)
+    {
+        total += 64 * MIB;
+    }
+    let mut ledger = Ledger::default();
+    let mut shrinks = 0;
+    for tick in 0..30 {
+        let rows = rows_now();
+        let plan = sim_plan(&rows, total);
+        keep_ledger(&mut ledger, ElasticMode::Apply, &rows, Some(&plan));
+        for row in &rows {
+            let key = decide::key(&row.entry);
+            let grant = plan.grant(&row.entry).unwrap();
+            let target = elastic_grant(&ledger, &key, &row.entry, grant);
+            let floor = floor_of(&row.entry, grant);
+            if let Some(to) =
+                tick_target(row.usage.capacity_bytes, target, floor, None, false, false)
+            {
+                if to < row.usage.capacity_bytes && row.entry.id == "grid_cache" {
+                    shrinks += 1;
+                }
+                set(row.entry.id, to);
+            }
+        }
+        let rows = rows_now();
+        let resize = |entry: &Entry, bytes: u64| {
+            set(entry.id, bytes);
+            Some(bytes)
+        };
+        let cell = RefCell::new(std::mem::take(&mut ledger));
+        let with_ledger = |book: &mut dyn FnMut(&mut Ledger)| book(&mut cell.borrow_mut());
+        run_elastic(
+            &rows,
+            &plan,
+            &with_ledger,
+            ElasticMode::Apply,
+            false,
+            (true, true),
+            &resize,
+        );
+        ledger = cell.into_inner();
+        let held: u64 = rows_now().iter().map(|r| r.usage.used_bytes).sum();
+        assert!(held <= plan.pool_bytes, "tick {tick}");
+    }
+    assert_eq!(shrinks, 0, "the tick clawed nothing back");
+    let rows = rows_now();
+    let plan = sim_plan(&rows, total);
+    let held: u64 = rows.iter().map(|r| r.usage.used_bytes).sum();
+    assert!(
+        held <= plan.pool_bytes,
+        "the caches hold {} MiB of a {} MiB pool",
+        held / MIB,
+        plan.pool_bytes / MIB
+    );
+}
+
+/// #1473 review: the headroom elastic memory moves within counts each cache
+/// where it is: one the tick's dead band left above its grant takes that
+/// much off, though the ledger's targets say less.
+#[test]
+fn the_headroom_counts_a_cache_above_its_target_where_it_is() {
+    // A working-set cache counted at its need leaves headroom in the pool.
+    let caches = vec![
+        sim_cache("grid_cache", 1024, 64, thrash(4)),
+        sim_cache("tile_cache", 4096, 64, IDLE),
+    ];
+    let row_of = |c: &SimCache| Row {
+        demand: Some(Demand {
+            bytes: 256 * MIB,
+            ..demand(256 * MIB, MIB)
+        }),
+        ..sim_row(c)
+    };
+    let rows: Vec<Row> = caches.iter().map(row_of).collect();
+    let plan = sim_plan(&rows, fitting_total(&caches) + GIB);
+    let ledger = Ledger::default();
+    let at_grants = elastic_headroom(&rows, &plan, &ledger);
+    assert!(at_grants > GIB, "{at_grants}");
+    // The busy one, held at its grant: counted at its capacity.
+    let grant = plan.grant(&rows[0].entry).unwrap().bytes;
+    let mut above = caches.clone();
+    above[0].capacity = grant + 300 * MIB;
+    let rows: Vec<Row> = above.iter().map(row_of).collect();
+    assert_eq!(expected_use(&rows, &plan, &ledger), plan.expected_bytes);
+    assert_eq!(
+        elastic_headroom(&rows, &plan, &ledger),
+        at_grants - 300 * MIB
+    );
 }

@@ -683,7 +683,10 @@ access = "opendap"` reads a remote family through DAP2.
   `CHUNKS`, the field cache keeps the frames being drawn. Each (ingest,
   variable, step) once (`PollState::prewarmed`); the first failure
   (budget, network) stops it until the next poll. ~100 MB per MEPS
-  variable and run.
+  variable and run. A collection with `prewarm_variables` marks the
+  process-wide chunk cache filled ahead of its reads
+  (`remote::mark_chunks_prewarmed`, sticky): elastic memory neither lends
+  nor decays it (#1314).
 - **Metrics** (server `metrics_handler`, while a NetCDF collection is
   loaded): `netcdf_{field,block,chunk}_cache_{hits_total,misses_total,
   bytes,capacity_bytes}` (the chunk cache's include OPeNDAP field replies),

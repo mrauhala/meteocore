@@ -205,6 +205,53 @@ impl Ledger {
         released
     }
 
+    /// Give back `bytes` of what `key` borrowed, as [`Ledger::release`]
+    /// does all of it: what it borrowed from the pool first, then from its
+    /// lenders, the ones `value` ranks lowest first, each lender's share
+    /// becoming its loan to the pool. Returns the bytes given back: at most
+    /// what it borrowed. The valve's take-back, for the excess alone.
+    pub(crate) fn release_part(
+        &mut self,
+        key: &Key,
+        bytes: u64,
+        value: &dyn Fn(&Key) -> f64,
+    ) -> u64 {
+        let mut order: Vec<usize> = (0..self.loans.len())
+            .filter(|&i| key_of(&self.loans[i].borrower) == Some(key))
+            .collect();
+        let rank = |loan: &Loan| key_of(&loan.lender).map_or(f64::NEG_INFINITY, value);
+        order.sort_by(|&a, &b| rank(&self.loans[a]).total_cmp(&rank(&self.loans[b])));
+        let mut left = bytes;
+        let mut to_pool = Vec::new();
+        for i in order {
+            if left == 0 {
+                break;
+            }
+            let shed = left.min(self.loans[i].bytes);
+            self.loans[i].bytes -= shed;
+            left -= shed;
+            if let Some(lender) = &self.loans[i].lender {
+                to_pool.push((lender.clone(), shed));
+            }
+        }
+        self.loans.retain(|loan| loan.bytes > 0);
+        for (lender, shed) in to_pool {
+            self.book(None, Some(lender), shed);
+        }
+        bytes - left
+    }
+
+    /// What `key` lent the pool: what a return gives back ([`MoveKind::Return`]).
+    ///
+    /// [`MoveKind::Return`]: super::decide::MoveKind::Return
+    pub(crate) fn lent_to_pool(&self, key: &Key) -> u64 {
+        self.loans
+            .iter()
+            .filter(|loan| loan.borrower.is_none() && key_of(&loan.lender) == Some(key))
+            .map(|loan| loan.bytes)
+            .sum()
+    }
+
     /// End the loans of every cache `current` no longer gives the size
     /// source and configured size it moved under (a reload pinned,
     /// re-bounded or resized it), or no longer lists.

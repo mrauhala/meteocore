@@ -784,8 +784,14 @@ impl<K: Eq + Hash, V: Clone> ByteBoundedCache<K, V> {
     /// (evictions, ghost hits) undervalues them (#992). Reports show its
     /// numbers with that caveat ([`Churn::prewarmed`]).
     pub fn prewarmed(self) -> Self {
-        self.inner.counters().set_prewarmed();
+        self.mark_prewarmed();
         self
+    }
+
+    /// [`Self::prewarmed`] on a cache already built: a process-wide one that
+    /// a collection's pre-warm starts filling ahead of reads. It stays so.
+    pub fn mark_prewarmed(&self) {
+        self.inner.counters().set_prewarmed();
     }
 
     /// Build a cache sized from the environment: `var` (MB, [`env_mb`]) with

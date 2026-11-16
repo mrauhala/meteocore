@@ -898,9 +898,19 @@ reload does: a step a reload holds the reload lock through is skipped.
     since it was built when the window timed none. A cache nobody reads
     serves nothing and lends first; one that holds its working set serves
     plenty, and keeps it. It lends down to its floor: the plan's floor for
-    it, its range's `min` and what it shrinks to in place. A cache its
-    engines fill ahead of requests never lends;
-  - first, a cache below its grant, its fair share, that passes the
+    it, its range's `min` and what it shrinks to in place;
+  - **a cache its engines fill ahead of its reads neither lends nor
+    decays**: a demand cache (satellite scans, station grids), one with a
+    floor or a demand filled ahead (the PVOL pixels), and one marked
+    filled ahead of reads (`prewarmed` in `/admin/cache-plan`): the COG
+    tiles, a GRIB message cache with the pre-warm or a map's read-ahead
+    (`read_ahead`, on by default), and the NetCDF chunk cache once a
+    collection sets `prewarm_variables`;
+  - a cache read again (no longer idle) first takes back what it lent the
+    pool, its decays and its share of a valve take-back, 5 % of its grant
+    a tick, the restore's pace, with no ghost hits needed, while the
+    process holds under 90 % of its total;
+  - then a cache below its grant, its fair share, that passes the
     borrowing gate takes back what a borrower holds, the lowest-valued
     borrower first, at an even ratio: while its value is at least what the
     borrower's bytes serve, up to its grant;
@@ -913,16 +923,15 @@ reload does: a step a reload holds the reload lock through is skipped.
   - under `apply`, an idle cache (under 60 lookups an hour) that moved
     nothing gives the pool what it does not hold: down to what it holds
     plus 10 %, or its floor if higher, by at most half a step and 5 % of
-    its capacity a tick, slower than a busy cache grows. A cache its
-    engines fill ahead of requests, or fill ahead of reads (the PVOL
-    pixels, GRIB messages and COG tiles that keep a quiet deployment
-    warm), never decays;
+    its capacity a tick, slower than a busy cache grows;
   - a move is max(64 MiB, 1 % of the pool), at most a tenth of either
     cache, at most four reclaims and borrows a tick, each cache in one,
     and never lifts the plan's expected use past its pool: lending
     capacity a working-set cache does not use to one that fills all it
     gets would put the process over its total, and the pressure valve
-    would take it back;
+    would take it back. The headroom counts each cache at the larger of
+    its capacity and its grant plus its offset, so a cache the tick left
+    above its target is counted where it is;
   - a cache without a ghost ring, or that never timed a fill, neither
     borrows nor lends; nor a pinned one, nor one no collection reaches;
   - nothing while the pressure valve holds: over the total, or a ceiling
@@ -935,29 +944,38 @@ reload does: a step a reload holds the reload lock through is skipped.
   moved instead of pulling it back. A reload that pins, re-bounds or
   resizes a cache ends its loans, and so does one that rebuilds or removes
   its collection: its counterparts shed exactly those bytes, so what
-  caches borrowed always equals what caches and the pool lent. Each tick
-  holds every offset within its cache's floor and ceiling, and the loans'
-  expected use within the pool, the lowest-valued counterparts giving way
-  first. The ledger is in memory only: a restart starts every cache at its
-  plan.
+  caches borrowed always equals what caches and the pool lent. Each tick,
+  and each reload's plan before it applies its grants, holds every offset
+  within its cache's floor and ceiling, and the loans' expected use within
+  the pool, the lowest-valued counterparts giving way first. A cache with
+  loans is held to its grant plus its offset exactly, past the tick's
+  10 % and 64 MiB dead band, so what a shed takes off reaches it. A move
+  whose lender cannot grow back what the borrower did not take books that
+  part as the lender's loan to the pool. The ledger is in memory only: a
+  restart starts every cache at its plan.
 
-  Under pressure, the valve first takes back what caches borrowed, the
-  lowest-valued borrower first, its lenders staying where they are; only
-  when that does not cover the excess does it lower the other caches to
-  90 % of what they hold, ending their loans. The restore then climbs to
-  each cache's planned size, and elastic memory borrows above it again
-  only by its steps, once every ceiling is lifted.
+  Under pressure, the valve first takes back what caches borrowed, only
+  as much as the excess: each borrower, the lowest-valued first, shrinks
+  by the part of the excess still uncovered, in whole MiB, plus whatever
+  capacity it holds nothing in, at most what it borrowed, and gives that
+  back, the part it borrowed from the pool first, its lenders' share
+  becoming their loans to the pool, so they stay where they are. A
+  borrower whose shrink in place is refused gives back nothing, keeps its
+  loans and is named. Only when the take-back does not cover the excess
+  does the valve lower the other caches to 90 % of what they hold, ending
+  their loans. After a take-back no cache borrows until the process has
+  been under 90 % of its total for the restore's 10 minutes; the restore
+  climbs to each lowered cache's planned size, and elastic memory borrows
+  above it again only by its steps, once every ceiling is lifted.
 
   Leaving `apply` on a reload ends every loan, and the reload's plan gives
-  each cache its grant; a later `apply` starts from an empty ledger. A
-  change of the setting on its own reaches the caches at the next reload
-  or tick, whichever comes first; the tick moves a cache back only where
-  that moves it by more than 10 % and 64 MiB, so a move under that stays
-  until the next reload.
+  each cache its grant; a later `apply` starts from an empty ledger.
 
   `cache_elastic_proposed_bytes{cache,role}` shows what the last tick's
   moves took or would take from (`lend`, `repay`, `decay`) or give to
-  (`borrow`, `reclaim`) each cache, and
+  (`borrow`, `reclaim`, `return`) each cache;
+  `cache_elastic_offset_bytes{cache,role}` what each cache's loans add up
+  to, `borrowed` and `lent`; and
   `cache_elastic_moves_total{cache,role,mode}` counts the moves: in `mode`
   `report` a move that recurs tick after tick once, `applied` each time,
   and the valve's `give_back`. Per-collection caches share their `cache`
@@ -966,9 +984,9 @@ reload does: a step a reload holds the reload lock through is skipped.
   `moves` (kind, borrower, lender, bytes, the borrower's value and its
   depth, the lender's value), every cache it weighed (capacity, grant,
   offset, floor, ceiling, used, idle, ghost hits, depth, both values,
-  whether it borrows and lends), the headroom of the pool, whether it may
-  borrow, and the `ledger`'s `loans` and `offsets`. The dashboard's
-  Elastic memory panels show both.
+  whether it borrows and lends, what it lent the pool), the headroom of the
+  pool, whether it may borrow and return, and the `ledger`'s `loans` and
+  `offsets`. The dashboard's Elastic memory panels show all three.
 
 A key set to exactly its default (`metatile = 1024`, `[grib]
 grid_cache_mb = 256`) pins it like any other value. An `MC_…` variable
@@ -3483,8 +3501,9 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `memory_plan_pool_bytes` | gauge | — | What the caches share of the total after the reserves |
 | `memory_plan_shortfall_bytes` | gauge | — | How much more memory the plan needs with its pins kept and every other cache and budget at its floor; 0 when it fits |
 | `cache_plan_changes_total` | counter | cache | Size changes of each cache and admission budget: the memory plan's at boot and on reload in `auto` mode, its re-plan tick's, the pressure valve's, a `[memory.caches]` key's, report mode giving a size back. Each is logged with its reason |
-| `cache_elastic_moves_total` | counter | cache, role, mode | [Elastic memory](#memory-memory)'s moves (#1314): `role` `borrow`, `lend`, `reclaim`, `repay`, `decay` or the valve's `give_back`; `mode` `report` (proposed, a recurring move once) or `applied` (each). Only in `[memory] mode = "auto"` |
-| `cache_elastic_proposed_bytes` | gauge | cache, role | The bytes the last re-plan tick's elastic moves took or would take from (`lend`, `repay`, `decay`) or give to (`borrow`, `reclaim`) each cache; none with `[memory] elastic = "off"` |
+| `cache_elastic_moves_total` | counter | cache, role, mode | [Elastic memory](#memory-memory)'s moves (#1314): `role` `borrow`, `lend`, `reclaim`, `repay`, `return`, `decay` or the valve's `give_back`; `mode` `report` (proposed, a recurring move once) or `applied` (each). Only in `[memory] mode = "auto"` |
+| `cache_elastic_proposed_bytes` | gauge | cache, role | The bytes the last re-plan tick's elastic moves took or would take from (`lend`, `repay`, `decay`) or give to (`borrow`, `reclaim`, `return`) each cache; none with `[memory] elastic = "off"` |
+| `cache_elastic_offset_bytes` | gauge | cache, role | What each cache's loans in elastic memory's ledger add up to, summed over its collections: `borrowed` above its grant, `lent` below it; its offset is the one less the other. None outside `[memory] elastic = "apply"` |
 | `memory_pressure_actions_total` | counter | action | The memory pressure valve's actions: `relieve` (resident above the total for a minute took back what elastic memory lent and, unless that covered it, lowered the flexible caches), `purge` (every arena's dirty pages purged), `restore` (a tick raised the lowered caches toward the plan). With `total_mb` or a cgroup limit only |
 | `memory_plan_unapplied_bytes` | gauge | — | In `[memory] mode = "auto"`, the capacity above the plan that applying it could not take away yet: warm caches giving up a quarter of what they hold per reload, shrinks that stop in place. The plan counts it, its shortfall what does not fit; 0 in `report` mode |
 

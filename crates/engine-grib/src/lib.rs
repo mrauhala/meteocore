@@ -640,8 +640,10 @@ impl GribEngine {
         let grid_cache = GridCache::new(config.effective_grid_cache_mb());
         let mut message_cache =
             message_cache::MessageCache::new(config.effective_message_cache_mb());
-        if config.prewarm {
-            // Filled ahead of its reads: its churn reports say so (#1335).
+        if config.prewarm || config.read_ahead > 0 {
+            // Filled ahead of its reads, by the pre-warm or a map's
+            // read-ahead: its churn reports say so (#1335), and elastic
+            // memory neither lends nor decays it (#1314).
             message_cache = message_cache.map(message_cache::MessageCache::prewarmed);
         }
         let prewarm = prewarm::Prewarm::new(config.prewarm, message_cache.as_ref());

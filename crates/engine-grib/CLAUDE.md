@@ -353,8 +353,9 @@ on the request path. Single-level and legacy views require exact metadata.
   goes to the cold ring and the next one evicts it
   (`prewarm::tests::a_prewarm_into_a_full_cache_keeps_every_message_it_fetched`
   fails without `keep`). Resident messages are not fetched; a fill counts no
-  hit or miss. With `prewarm` on, the cache is built `prewarmed()` (the
-  cache-plan caveat). `/metrics`: `grib_prewarm_{gets,bytes,hits}_total`;
+  hit or miss. With `prewarm` on, or the map read-ahead (`read_ahead`,
+  on by default), the cache is built `prewarmed()`: the cache-plan
+  caveat, and elastic memory neither lends nor decays it (#1314). `/metrics`: `grib_prewarm_{gets,bytes,hits}_total`;
   hits counts a pre-warmed message's first request read, from an unread set
   of at most 4096 keys pruned to resident ones before each pre-warm, and
   forgotten when a request fills the key itself.

@@ -1528,6 +1528,19 @@
                                     "name": "panel-229"
                                   }
                                 }
+                              },
+                              {
+                                "kind": "GridLayoutItem",
+                                "spec": {
+                                  "x": 0,
+                                  "y": 54,
+                                  "width": 24,
+                                  "height": 8,
+                                  "element": {
+                                    "kind": "ElementReference",
+                                    "name": "panel-230"
+                                  }
+                                }
                               }
                             ]
                           }
@@ -25440,7 +25453,7 @@
         "spec": {
           "id": 228,
           "title": "Elastic memory: new moves",
-          "description": "Elastic memory (#1314): at each re-plan tick, every 5 minutes, the moves of memory between caches, as [memory] elastic says, only in mode = \"auto\": off, none; report (the default), proposed and never made (mode = report); apply, made (mode = applied) and kept in a ledger of loans whose offsets the plan adds to each cache's grant, in memory only. In order: a cache below its grant that passes the gate takes back what a borrower holds, the lowest-valued first, at an even ratio (reclaim, repay); a cache whose MiB more saves the most fill time (its ghost hits within the best of 1.5, 2 or 3 × its size, times its miss cost, on average over those bytes) borrows from the pool's free headroom first, then from a cache whose MiB serves at most half as much (the higher of that and its hits times its miss cost over its capacity) (borrow, lend); under apply, an idle cache gives the pool what it does not hold, toward what it holds plus 10 %, by at most half a step and 5 % of it a tick (decay), never one its engines fill ahead of reads. Steps of max(64 MiB, 1 % of the pool), at most a tenth of either cache and four moves a tick, never below a cache's floor nor above its ceiling, never past the pool's expected use, no borrowing at or above 90 % of the total, and none while the pressure valve holds, which first takes back what caches borrowed (give_back). Per-collection caches share their cache label; /admin/cache-plan (governor.elastic) has each collection's, with every cache weighed and the ledger's loans and offsets. Moves by cache, role and mode (cache_elastic_moves_total): in report mode a move counts once while it recurs tick after tick; applied moves count each time.",
+          "description": "Elastic memory (#1314): at each re-plan tick, every 5 minutes, the moves of memory between caches, as [memory] elastic says, only in mode = \"auto\": off, none; report (the default), proposed and never made (mode = report); apply, made (mode = applied) and kept in a ledger of loans whose offsets the plan adds to each cache's grant, in memory only. In order: a cache read again takes back what it lent the pool, 5 % of its grant a tick, under 90 % of the total (return); a cache below its grant that passes the gate takes back what a borrower holds, the lowest-valued first, at an even ratio (reclaim, repay); a cache whose MiB more saves the most fill time (its ghost hits within the best of 1.5, 2 or 3 × its size, times its miss cost, on average over those bytes) borrows from the pool's free headroom first, then from a cache whose MiB serves at most half as much (the higher of that and its hits times its miss cost over its capacity) (borrow, lend); under apply, an idle cache gives the pool what it does not hold, toward what it holds plus 10 %, by at most half a step and 5 % of it a tick (decay). A cache its engines fill ahead of its reads (a demand cache, a demand floor, or one marked prewarmed: COG tiles, GRIB messages with the pre-warm or read-ahead, the NetCDF chunk cache with prewarm_variables) neither lends nor decays. Steps of max(64 MiB, 1 % of the pool), at most a tenth of either cache and four moves a tick, never below a cache's floor nor above its ceiling, never past the pool's expected use, no borrowing at or above 90 % of the total, and none while the pressure valve holds, which first takes back what caches borrowed, only the excess (give_back), and then holds borrowing off for the restore's 10 minutes under 90 %. Per-collection caches share their cache label; /admin/cache-plan (governor.elastic) has each collection's, with every cache weighed and the ledger's loans and offsets. Moves by cache, role and mode (cache_elastic_moves_total): in report mode a move counts once while it recurs tick after tick; applied moves count each time.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -25545,7 +25558,7 @@
         "spec": {
           "id": 229,
           "title": "Elastic memory: proposed now",
-          "description": "Elastic memory (#1314): at each re-plan tick, every 5 minutes, the moves of memory between caches, as [memory] elastic says, only in mode = \"auto\": off, none; report (the default), proposed and never made (mode = report); apply, made (mode = applied) and kept in a ledger of loans whose offsets the plan adds to each cache's grant, in memory only. In order: a cache below its grant that passes the gate takes back what a borrower holds, the lowest-valued first, at an even ratio (reclaim, repay); a cache whose MiB more saves the most fill time (its ghost hits within the best of 1.5, 2 or 3 × its size, times its miss cost, on average over those bytes) borrows from the pool's free headroom first, then from a cache whose MiB serves at most half as much (the higher of that and its hits times its miss cost over its capacity) (borrow, lend); under apply, an idle cache gives the pool what it does not hold, toward what it holds plus 10 %, by at most half a step and 5 % of it a tick (decay), never one its engines fill ahead of reads. Steps of max(64 MiB, 1 % of the pool), at most a tenth of either cache and four moves a tick, never below a cache's floor nor above its ceiling, never past the pool's expected use, no borrowing at or above 90 % of the total, and none while the pressure valve holds, which first takes back what caches borrowed (give_back). Per-collection caches share their cache label; /admin/cache-plan (governor.elastic) has each collection's, with every cache weighed and the ledger's loans and offsets. The bytes the last tick's moves took or would take from (lend, repay, decay) or give to (borrow, reclaim) each cache (cache_elastic_proposed_bytes).",
+          "description": "Elastic memory (#1314): at each re-plan tick, every 5 minutes, the moves of memory between caches, as [memory] elastic says, only in mode = \"auto\": off, none; report (the default), proposed and never made (mode = report); apply, made (mode = applied) and kept in a ledger of loans whose offsets the plan adds to each cache's grant, in memory only. In order: a cache read again takes back what it lent the pool, 5 % of its grant a tick, under 90 % of the total (return); a cache below its grant that passes the gate takes back what a borrower holds, the lowest-valued first, at an even ratio (reclaim, repay); a cache whose MiB more saves the most fill time (its ghost hits within the best of 1.5, 2 or 3 × its size, times its miss cost, on average over those bytes) borrows from the pool's free headroom first, then from a cache whose MiB serves at most half as much (the higher of that and its hits times its miss cost over its capacity) (borrow, lend); under apply, an idle cache gives the pool what it does not hold, toward what it holds plus 10 %, by at most half a step and 5 % of it a tick (decay). A cache its engines fill ahead of its reads (a demand cache, a demand floor, or one marked prewarmed: COG tiles, GRIB messages with the pre-warm or read-ahead, the NetCDF chunk cache with prewarm_variables) neither lends nor decays. Steps of max(64 MiB, 1 % of the pool), at most a tenth of either cache and four moves a tick, never below a cache's floor nor above its ceiling, never past the pool's expected use, no borrowing at or above 90 % of the total, and none while the pressure valve holds, which first takes back what caches borrowed, only the excess (give_back), and then holds borrowing off for the restore's 10 minutes under 90 %. Per-collection caches share their cache label; /admin/cache-plan (governor.elastic) has each collection's, with every cache weighed and the ledger's loans and offsets. The bytes the last tick's moves took or would take from (lend, repay, decay) or give to (borrow, reclaim, return) each cache (cache_elastic_proposed_bytes).",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -25565,6 +25578,112 @@
                       },
                       "spec": {
                         "expr": "sum by (cache, role) (cache_elastic_proposed_bytes{job=~\"$job\"}) > 0",
+                        "legendFormat": "{{cache}} {{role}}",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                }
+              ],
+              "transformations": [],
+              "queryOptions": {}
+            }
+          },
+          "vizConfig": {
+            "kind": "VizConfig",
+            "group": "timeseries",
+            "version": "",
+            "spec": {
+              "options": {
+                "legend": {
+                  "displayMode": "table",
+                  "placement": "bottom",
+                  "showLegend": true,
+                  "calcs": [
+                    "mean",
+                    "max",
+                    "lastNotNull"
+                  ],
+                  "sortBy": "Max",
+                  "sortDesc": true
+                },
+                "tooltip": {
+                  "mode": "multi",
+                  "sort": "desc"
+                }
+              },
+              "fieldConfig": {
+                "defaults": {
+                  "unit": "bytes",
+                  "color": {
+                    "mode": "palette-classic"
+                  },
+                  "custom": {
+                    "drawStyle": "line",
+                    "lineWidth": 1,
+                    "fillOpacity": 10,
+                    "gradientMode": "none",
+                    "showPoints": "never",
+                    "pointSize": 4,
+                    "spanNulls": false,
+                    "lineInterpolation": "linear",
+                    "axisPlacement": "auto",
+                    "axisLabel": "",
+                    "barAlignment": 0,
+                    "stacking": {
+                      "mode": "none",
+                      "group": "A"
+                    },
+                    "thresholdsStyle": {
+                      "mode": "off"
+                    },
+                    "insertNulls": false
+                  },
+                  "thresholds": {
+                    "mode": "absolute",
+                    "steps": [
+                      {
+                        "color": "green",
+                        "value": null
+                      }
+                    ]
+                  },
+                  "links": [],
+                  "min": 0
+                },
+                "overrides": []
+              }
+            }
+          }
+        }
+      },
+      "panel-230": {
+        "kind": "Panel",
+        "spec": {
+          "id": 230,
+          "title": "Elastic memory: ledger",
+          "description": "Elastic memory's ledger (#1314), only with [memory] elastic = \"apply\": what each cache's loans add up to, summed over its collections (cache_elastic_offset_bytes). borrowed: what it holds above its grant, from other caches or the pool; lent: what it gave other caches or the pool below its grant, its decays and a lender's share of a valve take-back included. Its offset, which the re-plan tick and a reload's plan add to its grant, is borrowed less lent. A lent line that stays after its cache is read again comes back at the restore's pace while the process is under 90 % of its total; /admin/cache-plan (governor.elastic.ledger) lists each loan.",
+          "links": [],
+          "data": {
+            "kind": "QueryGroup",
+            "spec": {
+              "queries": [
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "A",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum by (cache, role) (cache_elastic_offset_bytes{job=~\"$job\"}) > 0",
                         "legendFormat": "{{cache}} {{role}}",
                         "range": true,
                         "instant": false,
