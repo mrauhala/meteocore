@@ -755,6 +755,16 @@ static MEMORY_CAPACITY_TOTAL: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     gauge
 });
 
+static CACHE_GHOST_RING: LazyLock<IntGauge> = LazyLock::new(|| {
+    int_gauge(
+        "cache_ghost_ring_bytes",
+        "Heap the caches' ghost rings hold, summed (#1314): the hashes of evicted keys a \
+         cache remembers back over twice its capacity of evictions, about 35 to 70 bytes \
+         each and at most 50 MiB a cache, outside every *_cache_bytes. Counted in the memory plan's heap as the stores \
+         are; /admin/cache-plan has each cache's ghost_ring_bytes",
+    )
+});
+
 /// Set the plan gauges from `rows`, dropping series of entries gone since
 /// the last scrape.
 fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
@@ -784,6 +794,9 @@ fn update_cache_plan_gauges(rows: &[ds_cache::plan::Row]) {
         MEMORY_CAPACITY_TOTAL
             .with_label_values(&[kind.as_str()])
             .set(total.capacity_bytes.min(i64::MAX as u64) as i64);
+        if kind == ds_cache::plan::Kind::Cache {
+            CACHE_GHOST_RING.set(total.ghost_ring_bytes.min(i64::MAX as u64) as i64);
+        }
     }
     crate::memory_plan::update_gauges();
 }

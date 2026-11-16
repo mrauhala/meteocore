@@ -124,6 +124,12 @@ impl TileCache {
         self.inner.fill_timer()
     }
 
+    /// Count `tiles` fills one coalesced read of `elapsed` filled (#1314):
+    /// the tiles of the read it inserted.
+    pub(crate) fn record_fills(&self, tiles: u64, elapsed: std::time::Duration) {
+        self.inner.record_fills(tiles, elapsed);
+    }
+
     /// Speculative planning lookup: counters belong to the later worker read.
     pub(crate) fn contains_untracked(
         &self,

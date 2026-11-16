@@ -6,3 +6,9 @@ license.workspace = true
 
 [dependencies]
 quick_cache = "0.7"
+
+[dev-dependencies]
+# ds_core::heap::Counting, the counting allocator the ghost ring's heap
+# estimate is measured against (tests/ghost_ring_heap.rs). Tests only: the
+# crate itself stays on quick_cache and std.
+ds-core = { path = "../core" }

@@ -2674,7 +2674,14 @@ fn read_bbox_tiles(
             jobs.push(Job::Batch(batch));
         }
     }
-    let read_one = |i: usize, batch: Option<(&std::ops::Range<usize>, &Bytes)>| {
+    // A coalesced read's tiles: its range, its bytes, and how many of them
+    // the tile cache admitted, which share the read's time (#1314).
+    type Batched<'a> = (
+        &'a std::ops::Range<usize>,
+        &'a Bytes,
+        &'a std::sync::atomic::AtomicU64,
+    );
+    let read_one = |i: usize, batch: Option<Batched<'_>>| {
         let (row, col) = coords[i];
         let chunk = chunks[i];
         let data = read_remote_chunk_with_retry(
@@ -2698,17 +2705,18 @@ fn read_bbox_tiles(
                         }
                         // A single read's cost is timed here, a batch's
                         // around its one read (#1314).
-                        let (bytes, fill) = if let Some((whole, bytes)) = batch {
+                        let (bytes, fill, inserted) = if let Some((whole, bytes, inserted)) = batch
+                        {
                             // Copy ONLY this tile. A Bytes slice in the LRU would
                             // retain the whole batch while charging just the slice.
                             // The chunk's admission already covers this copy.
                             let tile = Bytes::copy_from_slice(
                                 &bytes[range.start - whole.start..range.end - whole.start],
                             );
-                            (tile, None)
+                            (tile, None, Some(inserted))
                         } else {
                             let fill = cache.map(crate::cache::TileCache::fill_timer);
-                            (fetch(range.clone())?, fill)
+                            (fetch(range.clone())?, fill, None)
                         };
                         if bytes.len() != range.len() {
                             return Err(TileReadError::Fetch(DataServerError::Engine(
@@ -2723,6 +2731,9 @@ fn read_bbox_tiles(
                                 ifd_index,
                                 bytes.clone(),
                             );
+                            if let Some(inserted) = inserted {
+                                inserted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                         if let Some(fill) = fill {
                             fill.finish();
@@ -2749,14 +2760,17 @@ fn read_bbox_tiles(
                         // compressed copy + decoder/output allocations. It lives
                         // until the whole batch is decoded; failures unwind it.
                         let permit = BUDGET.reserve(batch.range.len() as u64)?;
-                        // One read fills the batch's tiles: each counts its
-                        // share of it (#1314).
-                        let fill = cache.map(crate::cache::TileCache::fill_timer);
+                        // One read fills the batch's tiles: each it inserts
+                        // counts its share of the read, which ends here,
+                        // before any tile decodes (#1314).
+                        let started = std::time::Instant::now();
                         let bytes = match fetch(batch.range.clone()) {
                             Ok(bytes) if bytes.len() == batch.range.len() => Some(bytes),
                             Err(TileReadError::Fatal(e)) => return Err(e),
                             _ => None,
                         };
+                        let fetched_in = started.elapsed();
+                        let inserted = std::sync::atomic::AtomicU64::new(0);
                         if bytes.is_none() {
                             // The failed input has already been released. Do not
                             // charge an absent batch throughout individual retries.
@@ -2770,10 +2784,13 @@ fn read_bbox_tiles(
                         let read: Result<Vec<_>, _> = batch
                             .tiles
                             .iter()
-                            .map(|&i| read_one(i, bytes.as_ref().map(|b| (&batch.range, b))))
+                            .map(|&i| {
+                                read_one(i, bytes.as_ref().map(|b| (&batch.range, b, &inserted)))
+                            })
                             .collect();
-                        if let (Some(fill), Some(_), Ok(tiles)) = (fill, &bytes, &read) {
-                            fill.finish_many(tiles.len() as u64);
+                        if let (Some(cache), Some(_)) = (cache, &bytes) {
+                            let inserted = inserted.load(std::sync::atomic::Ordering::Relaxed);
+                            cache.record_fills(inserted, fetched_in);
                         }
                         read
                     }
@@ -4379,6 +4396,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #1314 review: a coalesced read counts one fill for each tile it
+    /// inserted into the tile cache, sharing the read's time and not the
+    /// decodes after it; a tile another reader cached meanwhile is not one.
+    /// Before, the batch's timer ran through every tile's decode and counted
+    /// every tile of the batch.
+    #[test]
+    fn a_coalesced_read_counts_the_tiles_it_inserted_at_its_reads_time() {
+        let (meta, info, bytes) = batch_fixture();
+        let cache = crate::cache::TileCache::new(4096);
+        let file = Path::new("batch-fixture");
+        let coords = [(0, 0), (0, 1), (0, 2), (0, 3)];
+        let read = std::time::Duration::from_millis(300);
+        // Tile 1 is cached, so tile 0 is read alone and tiles 2 and 3 in
+        // one read, during which another reader caches tile 3.
+        cache.insert(
+            file,
+            info.generation,
+            1,
+            0,
+            Bytes::copy_from_slice(&bytes[68..132]),
+        );
+        let fetch = |range: std::ops::Range<usize>| {
+            if range.len() > 64 {
+                std::thread::sleep(read);
+                cache.insert(
+                    file,
+                    info.generation,
+                    3,
+                    0,
+                    Bytes::copy_from_slice(&bytes[204..268]),
+                );
+            }
+            Ok(Bytes::copy_from_slice(&bytes[range]))
+        };
+        let result = read_bbox_tiles(
+            &coords,
+            &info,
+            &meta,
+            Some(&cache),
+            None,
+            file,
+            0,
+            0,
+            None,
+            4,
+            &fetch,
+        )
+        .unwrap();
+        assert_eq!(result.len(), 4);
+        let churn = cache.metrics().churn;
+        assert_eq!(churn.fills, 2, "tile 0 alone, tile 2 from the batch");
+        let time = std::time::Duration::from_nanos(churn.fill_nanos);
+        assert!(time >= read, "{time:?}");
+        assert!(time < 2 * read, "the batch's read once: {time:?}");
     }
 
     fn batch_fixture() -> (TiffMetadata, RemoteTileInfo, Vec<u8>) {

@@ -853,3 +853,51 @@ fn until(done: impl Fn() -> bool) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+/// #1314 review: a pre-warm and a map's read-ahead each count their fill at
+/// its full cost, the GET included, though the pre-warm claims only once
+/// fetched: a cache pre-warmed well rarely misses, so its miss cost is
+/// mostly its pre-warm's. Before, a 50 ms pre-warm GET counted 509 µs, the
+/// copy after it.
+#[test]
+fn a_prewarm_and_a_read_ahead_count_their_fill_with_its_get() {
+    let get = Duration::from_millis(100);
+    let cache = MessageCache::new(64).unwrap();
+    let fetched = cache
+        .prewarm(
+            &named("prewarmed", MIB),
+            || {
+                std::thread::sleep(get);
+                Ok(Bytes::from(vec![0u8; MIB as usize]))
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(fetched, Some(MIB as usize));
+    let churn = cache.metrics().churn;
+    assert_eq!(churn.fills, 1);
+    assert!(Duration::from_nanos(churn.fill_nanos) >= get, "{churn:?}");
+
+    let ahead = cache
+        .read_ahead(&named("read-ahead", MIB), || {
+            std::thread::sleep(get);
+            Ok(Bytes::from(vec![0u8; MIB as usize]))
+        })
+        .unwrap();
+    assert_eq!(ahead, Some(MIB as usize));
+    let churn = cache.metrics().churn;
+    assert_eq!(churn.fills, 2);
+    assert!(
+        Duration::from_nanos(churn.fill_nanos) >= 2 * get,
+        "{churn:?}"
+    );
+
+    // A failed GET counts nothing.
+    let failed = cache.prewarm(
+        &named("failed", MIB),
+        || Err(DataServerError::Engine("offline".into())),
+        |_| Ok(()),
+    );
+    assert!(failed.is_err());
+    assert_eq!(cache.metrics().churn.fills, 2);
+}

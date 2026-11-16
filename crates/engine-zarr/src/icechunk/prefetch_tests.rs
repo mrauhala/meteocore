@@ -419,6 +419,15 @@ async fn a_panicking_prefetch_gives_back_its_staging_room() {
     assert_eq!(read_ahead(&engine).used, NINE.len() as u64);
 }
 
+/// The payload cache's metrics without its fill timing (#1314), which
+/// differs between the two by design: a read takes its own time, and a
+/// range staged ahead by a prefetch is not timed.
+fn untimed(mut metrics: ds_cache::CacheMetrics) -> ds_cache::CacheMetrics {
+    metrics.churn.fills = 0;
+    metrics.churn.fill_nanos = 0;
+    metrics
+}
+
 /// Fetched ahead or read one variable at a time, the payload cache ends up
 /// the same: the same misses, entries and churn, and no hits. Asked again,
 /// with no decoded cache in front, both answer from it.
@@ -432,7 +441,10 @@ async fn ranges_fetched_ahead_fill_the_payload_cache_as_serial_reads_do() {
     let (serial, _) = engine("serial", &config);
     let names: Vec<String> = NINE.iter().map(|(name, _)| name.to_string()).collect();
     let before = ahead.icechunk_payload_cache_metrics().unwrap();
-    assert_eq!(before, serial.icechunk_payload_cache_metrics().unwrap());
+    assert_eq!(
+        untimed(before),
+        untimed(serial.icechunk_payload_cache_metrics().unwrap())
+    );
     for round in 0..2 {
         meter(&ahead).take_log();
         meter(&serial).take_log();
@@ -452,8 +464,8 @@ async fn ranges_fetched_ahead_fill_the_payload_cache_as_serial_reads_do() {
         }
         let cache = ahead.icechunk_payload_cache_metrics().unwrap();
         assert_eq!(
-            cache,
-            serial.icechunk_payload_cache_metrics().unwrap(),
+            untimed(cache),
+            untimed(serial.icechunk_payload_cache_metrics().unwrap()),
             "round {round}"
         );
         let nine = NINE.len() as u64;

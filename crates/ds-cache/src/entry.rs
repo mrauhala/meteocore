@@ -61,6 +61,13 @@ impl<K: Eq + Hash, V: Clone> CacheFillGuard<'_, K, V> {
     pub fn insert_batched(self, value: V, batch: u32) -> Result<(), V> {
         let elapsed = self.started.elapsed() / batch.max(1);
         self.lifecycle.counters().record_fills(1, elapsed);
+        self.insert_untimed(value)
+    }
+
+    /// [`Self::insert`] counting no fill: for a caller that times the fill
+    /// itself, from before it claimed (a pre-warm that fetches, then claims),
+    /// with [`crate::FillTimer`] or [`crate::ByteBoundedCache::record_fills`].
+    pub fn insert_untimed(self, value: V) -> Result<(), V> {
         let weight = self
             .key
             .as_ref()

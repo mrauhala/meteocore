@@ -460,7 +460,9 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   10–20 ns per miss) for ghost hits at 0.5, 1 and 2 × capacity: every cache
   the memory plan sizes keeps one (#1314). Count its misses with the key,
   `record_miss_for(key)` or `record_claimed_miss(&claim)`, never the keyless
-  `record_miss()`. `prewarmed()` marks a cache filled ahead of its reads.
+  `record_miss()` unless the key is resident (a GRIB point-index extension:
+  a ghost lookup of a resident key would count a ghost hit for a key a
+  larger cache would not have kept any longer). `prewarmed()` marks a cache filled ahead of its reads.
   **Time your fills** (#1314): `Churn::fills`/`fill_nanos` are the cache's
   miss cost, which #1314 multiplies by ghost hits. The `get_or_insert_with*`
   fills and claims (`CacheFillGuard`, timed from the claim; `restart()` it
@@ -468,7 +470,13 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   time themselves. A cache filled by `get` then `insert` takes a
   `fill_timer()` at the miss and `finish()`es it after the insert
   (`finish_many(n)` when one computation filled n entries); a failed fill
-  drops it and counts nothing.
+  drops it and counts nothing. A fill counts at its full cost, a
+  pre-warm's included: one that fetches before it claims takes the timer
+  before the fetch and inserts with `insert_untimed`; one that times
+  itself (a batch read, a download shared by several) calls
+  `record_fills(n, elapsed)`. A ring's heap is `Churn::ghost_ring_bytes`
+  (about 35 to 70 B an eviction, 50 MiB at the cap), which the plan counts
+  with the stores (`cache_ghost_ring_bytes`).
   Every cache resizes in place (`set_capacity`, #1311), keeping what fits,
   and returns the capacity it applied. A shrink goes in steps of at most a
   tenth of the capacity. quick_cache calls `end_request` under the shard
@@ -1758,9 +1766,10 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   Each cache row also carries `churn` and a `last_hour` label (#1308):
   `idle`, `thrashing`, `scan`, `churning` (no ghost ring to tell) or
   `healthy`, with the hit ratio at 1.5, 2 and 3 × the size, and its miss
-  cost and value per byte (#1314: `miss_cost_ms`, `value_ms_per_mib_hour`
-  = ghost hits within a depth × miss cost ÷ the depth's bytes,
-  `Activity::value_per_byte`); the Grafana Cache churn row mirrors it. A cache whose engines publish a demand (#1309) also
+  cost and average value per byte (#1314: `miss_cost_ms`, `value_ms_per_mib_hour`
+  = ghost hits within a depth, cumulative, × miss cost ÷ the depth's
+  bytes: the average up to the depth, `Activity::value_per_byte`; a step's
+  marginal value is the hits between two depths over the bytes between); the Grafana Cache churn row mirrors it. A cache whose engines publish a demand (#1309) also
   carries `demand_bytes`, `demand_rule`, `demand_kind`, `suggested_bytes`
   and `demand_inputs`; `/metrics` has `cache_demand_bytes` and
   `cache_demand_ratio`, one series per such cache, labelled as
