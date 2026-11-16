@@ -299,8 +299,9 @@ pub(crate) const ELASTIC_MIN_GHOST_HITS: u64 = 10;
 pub(crate) struct Elastic {
     pub key: Key,
     pub capacity: u64,
-    /// The least it may lend down to: the plan's floor for it, its range's
-    /// `min`, and what it shrinks to in place.
+    /// The least it may lend or decay down to: the plan's floor for it,
+    /// its range's `min`, what it shrinks to in place, and its keep floor
+    /// ([`Self::keep`]).
     pub floor: u64,
     /// The most it may borrow up to: the plan's ceiling for it
     /// (`Grant::ceiling_bytes`).
@@ -351,6 +352,13 @@ pub(crate) struct Elastic {
     /// take-back): what it takes back once it is read again
     /// ([`MoveKind::Return`]).
     pub pool_lent: u64,
+    /// Its engines fill it ahead of reads (`Churn::prewarmed`, or a demand
+    /// filled ahead): while idle, what it holds above its floor is what a
+    /// reclaim takes after borrowed memory (tier 2, #1314).
+    pub ahead: bool,
+    /// Its keep floor (#1314, `governor::keep_of`), within `floor`: what
+    /// elastic memory never takes, its engines' or the fixed one.
+    pub keep: u64,
 }
 
 impl Elastic {
@@ -369,6 +377,9 @@ pub(crate) enum MoveKind {
     /// A cache below its grant takes back what a lower-valued borrower
     /// holds, up to its grant, at an even ratio.
     Reclaim,
+    /// With no borrower to take back from, from a cache filled ahead of
+    /// reads that has gone idle, above its floor (tier 2).
+    ReclaimPrewarmed,
     /// An idle cache gives the pool what it does not hold.
     Decay,
     /// A cache read again takes back what it lent the pool, at the
@@ -381,6 +392,7 @@ impl MoveKind {
         match self {
             MoveKind::Borrow => "borrow",
             MoveKind::Reclaim => "reclaim",
+            MoveKind::ReclaimPrewarmed => "reclaim_prewarmed",
             MoveKind::Decay => "decay",
             MoveKind::Return => "return",
         }
@@ -486,7 +498,11 @@ pub(crate) const DECAY_HEADROOM_PERCENT: u64 = 10;
 /// 1. **Reclaim**: a cache below its grant, its fair share, that passes the
 ///    borrowing gate takes back what a borrower holds above its own grant,
 ///    the lowest-valued borrower first, while its value is at least that
-///    borrower's ([`Elastic::lend_value`]), up to its grant.
+///    borrower's ([`Elastic::lend_value`]), up to its grant; with no
+///    borrower to take from, from the pool's free headroom while caches may
+///    borrow; and only then from an idle cache its engines fill ahead of
+///    reads ([`Elastic::ahead`]), above that cache's floor, its keep
+///    included (tier 2): the only move that takes from such a cache.
 /// 2. **Borrow**, while `rules` allow it: the caches whose byte more is
 ///    worth the most borrow, in that order, from the pool's free headroom
 ///    first (worth nothing), then from the cache whose byte serves the
@@ -578,40 +594,88 @@ pub(crate) fn elastic(
             .total_cmp(&b.lend_value)
             .then_with(|| a.key.cmp(&b.key))
     });
+    // Tier 2: an idle cache filled ahead of reads, above its floor.
+    let mut warm: Vec<&Elastic> = caches
+        .iter()
+        .filter(|c| c.ahead && c.idle && c.capacity > c.floor)
+        .collect();
+    warm.sort_by(|a, b| {
+        a.lend_value
+            .total_cmp(&b.lend_value)
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    // Borrowed memory first, then the pool's free headroom while caches
+    // may borrow, then tier 2: an idle cache's pre-warmed entries are the
+    // last memory a reclaim takes.
+    let tiers = [
+        (MoveKind::Reclaim, Some(&donors)),
+        (MoveKind::Reclaim, None),
+        (MoveKind::ReclaimPrewarmed, Some(&warm)),
+    ];
     for reclaimer in reclaimers {
         if moves.len() - returns == ELASTIC_MAX_MOVES {
             break;
         }
+        // One move a cache a tick: a return is its move.
+        if moved.contains(&reclaimer.key) {
+            continue;
+        }
         let room = step
             .min(share(reclaimer))
             .min(reclaimer.grant - reclaimer.capacity);
-        for donor in &donors {
-            if moved.contains(&donor.key) || donor.key == reclaimer.key {
-                continue;
-            }
-            if reclaimer.value < donor.lend_value {
-                break;
-            }
-            let most = room
-                .min(share(donor))
-                .min(donor.offset as u64)
-                .min(donor.capacity - donor.floor);
-            let Some(bytes) = fits(reclaimer, Some(donor), most, headroom) else {
+        'tiers: for (kind, donors) in tiers {
+            let Some(donors) = donors else {
+                if !rules.may_borrow {
+                    continue;
+                }
+                if let Some(bytes) = fits(reclaimer, None, room.min(headroom), headroom) {
+                    headroom -= raises(reclaimer, None, bytes);
+                    moved.insert(&reclaimer.key);
+                    moves.push(Move {
+                        kind,
+                        borrower: Some(reclaimer.key.clone()),
+                        lender: None,
+                        bytes,
+                        borrower_value: reclaimer.value,
+                        depth: reclaimer.depth,
+                        lender_value: 0.0,
+                    });
+                    break 'tiers;
+                }
                 continue;
             };
-            headroom -= raises(reclaimer, Some(donor), bytes);
-            moved.insert(&reclaimer.key);
-            moved.insert(&donor.key);
-            moves.push(Move {
-                kind: MoveKind::Reclaim,
-                borrower: Some(reclaimer.key.clone()),
-                lender: Some(donor.key.clone()),
-                bytes,
-                borrower_value: reclaimer.value,
-                depth: reclaimer.depth,
-                lender_value: donor.lend_value,
-            });
-            break;
+            for donor in donors.iter() {
+                if moved.contains(&donor.key) || donor.key == reclaimer.key {
+                    continue;
+                }
+                if reclaimer.value < donor.lend_value {
+                    break;
+                }
+                let borrowed = match kind {
+                    MoveKind::Reclaim => donor.offset as u64,
+                    _ => u64::MAX,
+                };
+                let most = room
+                    .min(share(donor))
+                    .min(borrowed)
+                    .min(donor.capacity - donor.floor);
+                let Some(bytes) = fits(reclaimer, Some(donor), most, headroom) else {
+                    continue;
+                };
+                headroom -= raises(reclaimer, Some(donor), bytes);
+                moved.insert(&reclaimer.key);
+                moved.insert(&donor.key);
+                moves.push(Move {
+                    kind,
+                    borrower: Some(reclaimer.key.clone()),
+                    lender: Some(donor.key.clone()),
+                    bytes,
+                    borrower_value: reclaimer.value,
+                    depth: reclaimer.depth,
+                    lender_value: donor.lend_value,
+                });
+                break 'tiers;
+            }
         }
     }
 

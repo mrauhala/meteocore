@@ -440,7 +440,12 @@ pub async fn handler(
 /// `configured_bytes`, the size its settings give it; `source` is
 /// `plan:auto` while its capacity is the plan's. One sized by a `{ min,
 /// max }` key (#1313) has its `floor_bytes` and `ceiling_bytes`, which no
-/// planned size falls outside; null otherwise.
+/// planned size falls outside; null otherwise. A cache has its `keep_bytes`
+/// (#1314, `governor::keep_of`): the least elastic memory leaves it, the
+/// fixed one, its demand's, or the one its engines publish, then in `keep`
+/// with its floor after a quiet day, `rule` and each collection's part
+/// ([`keep_json`]); and `quiet_secs`, how long it has gone without a
+/// lookup.
 pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Report>) -> Value {
     let entries = |kind: Kind| -> Vec<Value> {
         rows.iter()
@@ -470,6 +475,9 @@ pub(crate) fn to_json(rows: &[Row], memory: &MemoryReading, report: Option<&Repo
                     "demand_kind": demand.map(Demand::kind),
                     "suggested_bytes": demand.map(Demand::suggested_bytes),
                     "demand_inputs": demand.map(demand_inputs_json),
+                    "keep_bytes": (kind == Kind::Cache).then(|| crate::governor::keep_of(row)),
+                    "keep": row.keep.as_ref().map(keep_json),
+                    "quiet_secs": row.quiet_for.map(|quiet| quiet.as_secs()),
                     "planned_bytes": grant.map(|g| g.bytes),
                     "planned_reason": grant.map(|g| g.reason.to_string()),
                     "expected_bytes": grant.map(|g| g.expected_bytes),
@@ -518,6 +526,35 @@ fn demand_inputs_json(demand: &Demand) -> Value {
             json!({"collection": collection, "bytes": part.bytes, "inputs": inputs})
         })
         .collect()
+}
+
+/// The keep floor a cache's engines publish (#1314): its bytes, its floor
+/// after a day without a lookup, its rule and each collection's part with
+/// the facts its engine computed it from.
+fn keep_json(keep: &ds_cache::plan::Keep) -> Value {
+    let parts: Vec<Value> = keep
+        .parts
+        .iter()
+        .map(|(collection, part)| {
+            let inputs: serde_json::Map<String, Value> = part
+                .inputs
+                .iter()
+                .map(|(name, value)| (name.to_string(), json!(value)))
+                .collect();
+            json!({
+                "collection": collection,
+                "bytes": part.bytes,
+                "quiet_bytes": part.quiet_bytes,
+                "inputs": inputs,
+            })
+        })
+        .collect();
+    json!({
+        "bytes": keep.bytes,
+        "quiet_bytes": keep.quiet_bytes,
+        "rule": keep.rule,
+        "parts": parts,
+    })
 }
 
 /// What a cache admitted, refused and evicted since it was built.

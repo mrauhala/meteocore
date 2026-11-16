@@ -124,6 +124,9 @@ pub struct NetcdfEngine {
     /// What the collection needs of the field cache (#1309), published by
     /// each scan.
     field_demand: ds_cache::plan::DemandSlot,
+    /// The least elastic memory leaves the chunk cache of the collection's
+    /// default field (#1314).
+    chunk_keep: ds_cache::plan::DemandSlot,
     shutdown: Shutdown,
 }
 
@@ -410,6 +413,11 @@ impl NetcdfEngine {
                 ds_cache::plan::Scope::Engine("netcdf"),
                 collection_id,
             ),
+            chunk_keep: ds_cache::plan::DemandSlot::keep(
+                "netcdf_chunk_cache",
+                ds_cache::plan::Scope::Engine("netcdf"),
+                collection_id,
+            ),
             shutdown: Shutdown::new(),
         };
         if let Err(e) = engine.initial_scan() {
@@ -601,6 +609,12 @@ impl NetcdfEngine {
         self.field_demand.get()
     }
 
+    /// What the collection last published as its keep floor on the chunk
+    /// cache (#1314).
+    pub fn chunk_cache_keep(&self) -> Option<ds_cache::plan::CacheDemand> {
+        self.chunk_keep.get()
+    }
+
     /// The estimated heap the catalog's open files hold (#1307): each
     /// file's reader with the metadata it parsed (a model for a
     /// NetCDF-4 file, see `source::HANDLE_BYTES`; walked for OPeNDAP) and
@@ -773,6 +787,12 @@ impl NetcdfEngine {
             catalog.info.times.len()
         );
         let demand = field::field_demand(&catalog);
+        match field::chunk_keep(&catalog) {
+            Some(keep) => {
+                self.chunk_keep.publish(keep);
+            }
+            None => self.chunk_keep.clear(),
+        }
         self.catalog.store(Arc::new(catalog));
         if let Some(demand) = demand {
             // Entered in the plan, so the publish finds its size.

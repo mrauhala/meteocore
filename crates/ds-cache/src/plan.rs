@@ -54,7 +54,9 @@ use crate::{CacheMetrics, Churn, MIB};
 pub mod demand;
 pub mod grant;
 pub mod keys;
-pub use demand::{check_rows, CacheDemand, Demand, DemandSlot, Shortfall, DEMAND_FIELDS};
+pub use demand::{
+    check_rows, CacheDemand, Demand, DemandSlot, Keep, Shortfall, DEMAND_FIELDS, QUIET_FOR,
+};
 
 /// A cache holds entries for reuse; a budget admits transient work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -328,6 +330,13 @@ pub struct Row {
     /// The least capacity the plan can resize it to now ([`Resize::least`]):
     /// its capacity when it cannot be resized, 0 for a budget.
     pub least_bytes: u64,
+    /// The least elastic memory leaves the cache, as its engines last
+    /// published it (#1314, [`DemandSlot::keep`]). `None` for a budget, and
+    /// for a cache no engine publishes a keep for.
+    pub keep: Option<Keep>,
+    /// How long the cache has gone without a lookup, as sampled: since it
+    /// was first sampled when it never had one. `None` for a budget.
+    pub quiet_for: Option<Duration>,
 }
 
 impl Row {
@@ -352,11 +361,27 @@ pub const SAMPLE_EVERY: Duration = Duration::from_secs(300);
 /// that long: up to [`SAMPLE_EVERY`] more, as samples fall.
 pub const WINDOW: Duration = Duration::from_secs(3600);
 
-/// A cache's counters as sampled, oldest first.
+/// A cache's counters as sampled, oldest first, and when it was last seen
+/// looked up: the snapshot that found its hits or misses grown, or, before
+/// any, the first that sampled it (#1314).
 #[derive(Default)]
-struct History(VecDeque<(Instant, Usage)>);
+struct History(VecDeque<(Instant, Usage)>, Option<(Instant, u64)>);
 
 impl History {
+    /// Note the lookups `usage` counts at `now`, and how long the cache has
+    /// gone without one since: a rebuilt cache, whose counters went back,
+    /// starts over.
+    fn quiet_for(&mut self, now: Instant, usage: &Usage) -> Option<Duration> {
+        usage.churn?;
+        let lookups = usage.hits?.saturating_add(usage.misses?);
+        let at = match self.1 {
+            Some((at, seen)) if lookups == seen => at,
+            _ => now,
+        };
+        self.1 = Some((at, lookups));
+        Some(now.saturating_duration_since(at))
+    }
+
     /// Sample `usage` at `now` if the last sample is [`SAMPLE_EVERY`] old,
     /// keep the newest sample at least [`WINDOW`] old and those after it,
     /// and return what the cache did since the oldest kept.
@@ -937,6 +962,7 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
         registry.clone()
     };
     let demands = demand::demands();
+    let keeps = demand::keeps();
     // Read outside the lock: a cache's usage takes its own shard locks.
     let mut rows: Vec<(u64, Row)> = registered
         .iter()
@@ -959,14 +985,14 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
                 Some(resize) => (resize.least)().unwrap_or(usage.capacity_bytes),
                 None => usage.capacity_bytes,
             };
-            let window = r
-                .history
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .observe(now, &usage);
-            let demand = match r.entry.kind {
-                Kind::Cache => demands.get(&(r.entry.id, r.entry.scope.clone())).cloned(),
-                Kind::Budget => None,
+            let (window, quiet_for) = {
+                let mut history = r.history.lock().unwrap_or_else(|e| e.into_inner());
+                (history.observe(now, &usage), history.quiet_for(now, &usage))
+            };
+            let key = (r.entry.id, r.entry.scope.clone());
+            let (demand, keep) = match r.entry.kind {
+                Kind::Cache => (demands.get(&key).cloned(), keeps.get(&key).cloned()),
+                Kind::Budget => (None, None),
             };
             Some((
                 r.seq,
@@ -978,6 +1004,8 @@ fn snapshot_at(now: Instant) -> Vec<Row> {
                     configured_bytes,
                     planned,
                     least_bytes,
+                    keep,
+                    quiet_for,
                 },
             ))
         })
@@ -1415,6 +1443,49 @@ mod tests {
         assert_eq!(budget.observe(at(0), &reserved), None);
         assert_eq!(budget.observe(at(61), &reserved), None);
         assert!(budget.0.is_empty());
+    }
+
+    /// #1314: a cache's quiet time is since the snapshot that last found
+    /// its lookups grown, since its first sample before any; a rebuilt
+    /// cache starts over; a budget has none.
+    #[test]
+    fn a_cache_is_quiet_since_its_last_lookup() {
+        let usage = |hits: u64, misses: u64| Usage {
+            capacity_bytes: 100,
+            hits: Some(hits),
+            misses: Some(misses),
+            churn: Some(Churn::default()),
+            ..Usage::default()
+        };
+        let start = Instant::now();
+        let at = |minutes: u64| start + Duration::from_secs(60 * minutes);
+        let mut history = History::default();
+        assert_eq!(history.quiet_for(at(0), &usage(0, 0)), Some(Duration::ZERO));
+        assert_eq!(
+            history.quiet_for(at(30), &usage(0, 0)),
+            Some(Duration::from_secs(30 * 60))
+        );
+        assert_eq!(
+            history.quiet_for(at(31), &usage(0, 1)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            history.quiet_for(at(31 + 24 * 60), &usage(0, 1)),
+            Some(QUIET_FOR)
+        );
+        assert_eq!(
+            history.quiet_for(at(2000), &usage(5, 1)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            history.quiet_for(at(2001), &usage(0, 0)),
+            Some(Duration::ZERO),
+            "rebuilt"
+        );
+        assert_eq!(
+            History::default().quiet_for(at(0), &Usage::budget(100, 10)),
+            None
+        );
     }
 
     struct Hits(AtomicU64);

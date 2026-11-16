@@ -36,6 +36,28 @@ impl Source {
         })
     }
 
+    /// The plan's id of the cache that holds the store's chunks as stored:
+    /// a plain store's object cache, an Icechunk repository's payload
+    /// cache.
+    pub(crate) fn chunk_cache_id(&self) -> &'static str {
+        match self {
+            Self::Plain(_) => "zarr_object_cache",
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(_) => "zarr_icechunk_payload_cache",
+        }
+    }
+
+    /// The weight of the objects a plain store's cache holds whose path
+    /// `select` picks; 0 for Icechunk.
+    #[cfg(test)]
+    pub(crate) fn cached_weight(&self, select: impl Fn(&str) -> bool) -> u64 {
+        match self {
+            Self::Plain(source) => source.store.cached_weight(select),
+            #[cfg(feature = "icechunk")]
+            Self::Icechunk(_) => 0,
+        }
+    }
+
     /// The plain store's object cache (`[zarr] cache_mb`); `None` for
     /// Icechunk, whose payload cache is the library's own.
     pub(crate) fn object_cache_metrics(&self) -> Option<ds_cache::CacheMetrics> {

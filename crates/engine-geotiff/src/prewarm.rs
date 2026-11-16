@@ -185,18 +185,24 @@ impl FramePlan {
     }
 }
 
-/// Plan the pre-warm of one catalog entry: every level, coarsest first, whose
-/// encoded tiles keep the frame within `cap`, and of those the tiles `cache`
-/// does not hold. `None` for a source with nothing to fetch (local, in
+/// One level of a frame the pre-warm reads: its IFD, its tile layout, and
+/// its non-empty tiles with their absolute byte ranges.
+struct Level<'a> {
+    ifd: u16,
+    info: &'a RemoteTileInfo,
+    tiles: Vec<(u32, Range<usize>)>,
+}
+
+/// The levels of a frame the pre-warm reads, coarsest first: every level
+/// whose encoded tiles keep the frame within `cap`, and how many finer
+/// ones it leaves out. `None` for a source with nothing to fetch (local, in
 /// memory) or with a tile layout the request path would reject too.
-pub(crate) fn plan_frame(
-    path: &Path,
-    metadata: &TiffMetadata,
-    source: &Arc<DataSource>,
-    cache: &TileCache,
+fn levels_within<'a>(
+    metadata: &'a TiffMetadata,
+    source: &'a DataSource,
     cap: usize,
-) -> Option<FramePlan> {
-    let full = match source.as_ref() {
+) -> Option<(Vec<Level<'a>>, usize)> {
+    let full = match source {
         DataSource::Remote { tile_info, .. } | DataSource::HttpDirect { tile_info, .. } => {
             tile_info
         }
@@ -224,12 +230,7 @@ pub(crate) fn plan_frame(
         )))
         .collect();
 
-    let mut plan = FramePlan {
-        path: path.to_path_buf(),
-        source: Arc::clone(source),
-        reads: Vec::new(),
-        capped_levels: 0,
-    };
+    let mut within = Vec::new();
     let mut total = 0usize;
     for (level, &(ifd, info, across, down)) in levels.iter().enumerate() {
         // An overview without tile info (a header read too short to reach
@@ -251,10 +252,33 @@ pub(crate) fn plan_frame(
             tiles.push((u32::try_from(chunk).ok()?, offset..offset + count));
         }
         if total.saturating_add(bytes) > cap {
-            plan.capped_levels = levels.len() - level;
-            break;
+            return Some((within, levels.len() - level));
         }
         total += bytes;
+        within.push(Level { ifd, info, tiles });
+    }
+    Some((within, 0))
+}
+
+/// Plan the pre-warm of one catalog entry: every level, coarsest first, whose
+/// encoded tiles keep the frame within `cap`, and of those the tiles `cache`
+/// does not hold. `None` for a source with nothing to fetch (local, in
+/// memory) or with a tile layout the request path would reject too.
+pub(crate) fn plan_frame(
+    path: &Path,
+    metadata: &TiffMetadata,
+    source: &Arc<DataSource>,
+    cache: &TileCache,
+    cap: usize,
+) -> Option<FramePlan> {
+    let (levels, capped_levels) = levels_within(metadata, source, cap)?;
+    let mut plan = FramePlan {
+        path: path.to_path_buf(),
+        source: Arc::clone(source),
+        reads: Vec::new(),
+        capped_levels,
+    };
+    for Level { ifd, info, tiles } in levels {
         let misses: Vec<(usize, Range<usize>)> = tiles
             .iter()
             .enumerate()
@@ -271,6 +295,31 @@ pub(crate) fn plan_frame(
         }
     }
     Some(plan)
+}
+
+/// The most a frame's keep floor holds (#1314): the default per-frame
+/// pre-warm cap.
+pub(crate) const KEEP_MAX_BYTES: u64 = (DEFAULT_FRAME_CAP_MB * 1024 * 1024) as u64;
+
+/// What the tile cache holds of a frame the pre-warm warms within `cap`,
+/// weighed as the cache weighs its tiles (#1314): every tile of the levels
+/// [`plan_frame`] takes, and of its coarsest level alone. `None` where
+/// [`plan_frame`] fetches nothing.
+pub(crate) fn frame_keep(
+    metadata: &TiffMetadata,
+    source: &DataSource,
+    cap: usize,
+) -> Option<(u64, u64)> {
+    let (levels, _) = levels_within(metadata, source, cap)?;
+    let weight = |level: &Level| -> u64 {
+        level
+            .tiles
+            .iter()
+            .map(|(_, range)| crate::cache::tile_weight(range.len()))
+            .sum()
+    };
+    let coarsest = levels.first().map_or(0, weight);
+    Some((levels.iter().map(weight).sum(), coarsest))
 }
 
 /// What one pre-warm did, for its log line.

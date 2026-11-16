@@ -451,6 +451,18 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
   own engine registered after it, never a replaced engine's;
   `cache_plan::snapshot` covers the rest. A disabled cache (0) is never
   short. Never hand-roll a per-engine "cache too small" WARN.
+  The least elastic memory leaves a cache is its keep floor (#1314): an
+  engine publishes it like a demand, a `CacheDemand::keep` through a
+  slot of its own (`DemandSlot::keep`, beside its demand slot; it never
+  shadows it), with `.when_quiet(bytes)` for the smaller floor once the
+  cache has gone `QUIET_FOR` (a day) without a lookup, which
+  `Row::quiet_for` counts from the registry's samples. The plan's sizes,
+  suggestions and shortfalls ignore keeps; `governor::keep_of` adds the
+  fixed one (64 MiB: meta-tile, rendered, vector-tile) and a demand
+  cache's demand or a published floor. A new engine cache filled ahead
+  of reads or holding a first view's data publishes one: weigh it with
+  the cache's own weight function (`ByteBoundedCache::weight_where` for
+  what it holds), and test it against the fixture's cache.
   Every cache counts churn (#1308, `ds_cache::Churn`) in its `quick_cache`
   `Lifecycle`: evictions by ring, admitted and evicted bytes, refusals
   (heavier than a shard's hot target, not evictions) and bypasses. The hooks
@@ -1802,12 +1814,14 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   `AcceptedLoad::memory_elastic`, off outside `auto`): `decide::elastic`
   decides returns (a cache read again takes back what it lent the pool,
   at the restore's pace, under 90 %), reclaims (a cache below its grant,
-  at 1 ×), borrows (the pool's headroom first, then caches at 2 ×) and
-  idle decays by value per byte; `Grant::ceiling_bytes` and the plan's
-  floors bound them, within the headroom the caches leave where they are
-  (`held_use`). A cache filled ahead of its reads (spared, or
-  `Churn::prewarmed`) neither lends nor decays: mark a cache `prewarmed`
-  wherever a pre-warm or read-ahead fills it. Applied, each is a loan in
+  at 1 ×, from borrowers, then tier 2 from idle caches filled ahead of
+  reads), borrows (the pool's headroom first, then caches at 2 ×) and
+  idle decays by value per byte; `Grant::ceiling_bytes`, the plan's floors
+  and the keep floors bound them, within the headroom the caches leave
+  where they are (`held_use`). A cache filled ahead of its reads (spared,
+  or `Churn::prewarmed`) neither lends nor decays: its keep floor covers
+  a first view, not its pre-warm; mark a cache `prewarmed` wherever a
+  pre-warm or read-ahead fills it. Applied, each is a loan in
   `governor/ledger.rs` (pure; either side may be the pool), whose offsets
   the tick and a reload's plan add to the grants, a cache with loans held
   to its target exactly; anything that ends a cache's loans ends both
@@ -1816,8 +1830,8 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   (`relief`, `take_back`), holds borrowing off for the restore's 10
   minutes after, and ends the loans of a cache it lowers.
   `cache_elastic_proposed_bytes` shows the moves,
-  `cache_elastic_offset_bytes` the ledger, `cache_elastic_moves_total`
-  counts the moves. Every size change counts in `cache_plan_changes_total`
+  `cache_elastic_offset_bytes` the ledger, `cache_keep_bytes` the keep
+  floors, `cache_elastic_moves_total` counts the moves. Every size change counts in `cache_plan_changes_total`
   (`memory_plan::count_changes`; a reload's staged resizes through
   `memory_plan::counting_resizes`); a new resize path counts there too.
   A valve ceiling never takes a cache below the plan's floor or its

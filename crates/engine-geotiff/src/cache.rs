@@ -34,7 +34,13 @@ struct TileCacheKey {
 /// Weight function: count the compressed byte size of each entry
 /// (plus ~32 bytes of `Bytes` overhead).
 fn weigh_tile(_key: &TileCacheKey, val: &Bytes) -> u64 {
-    val.len() as u64 + 32
+    tile_weight(val.len())
+}
+
+/// The weight of a cached tile of `len` encoded bytes: what the pre-warm's
+/// keep floor counts it at (#1314).
+pub(crate) fn tile_weight(len: usize) -> u64 {
+    len as u64 + 32
 }
 
 /// Source of [`TileCache::namespace`] ids; never reused within a process.
@@ -170,6 +176,14 @@ impl TileCache {
     /// `None`, and return about how many bytes that freed. Visits every
     /// entry: for the poll's pre-warm of an unread collection (#1318), never
     /// per request.
+    /// The weight of the tiles of `file_path` the cache holds, as it
+    /// weighs them (#1314).
+    #[cfg(test)]
+    pub(crate) fn frame_weight(&self, file_path: &Path) -> u64 {
+        let path = file_path.to_string_lossy();
+        self.inner.weight_where(|key, _| *key.file_path == *path)
+    }
+
     pub(crate) fn keep_only(&self, file_path: Option<&Path>) -> u64 {
         let keep = file_path.map(|path| path.to_string_lossy().into_owned());
         let before = self.weight();

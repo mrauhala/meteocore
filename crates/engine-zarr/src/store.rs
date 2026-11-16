@@ -50,7 +50,17 @@ struct Key {
 }
 
 fn weigh_bytes(key: &Key, val: &Option<Bytes>) -> u64 {
-    val.as_ref().map_or(0, |bytes| bytes.len() as u64) + key.path.len() as u64 + 80
+    object_weight(
+        val.as_ref().map_or(0, |bytes| bytes.len() as u64),
+        &key.path,
+    )
+}
+
+/// The weight of an object of `bytes` at `path` in the object cache: what
+/// a keep floor counts it at (#1314). An Icechunk payload weighs the same
+/// (`icechunk::metered`).
+pub(crate) fn object_weight(bytes: u64, path: &str) -> u64 {
+    bytes + path.len() as u64 + 80
 }
 
 /// Shared across catalog generations: refresh must not multiply cache budgets
@@ -133,6 +143,13 @@ impl DsStore {
     /// generation.
     pub(crate) fn cache_metrics(&self) -> ds_cache::CacheMetrics {
         self.shared.cache.metrics()
+    }
+
+    /// The weight of the objects held whose path `select` picks, as the
+    /// cache weighs them.
+    #[cfg(test)]
+    pub(crate) fn cached_weight(&self, select: impl Fn(&str) -> bool) -> u64 {
+        self.shared.cache.weight_where(|key, _| select(&key.path))
     }
 
     /// Resize the object cache in place, keeping the objects that fit; the

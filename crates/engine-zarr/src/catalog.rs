@@ -220,6 +220,31 @@ impl Catalog {
             .input("chunk_bytes", mean)
     }
 
+    /// What elastic memory leaves the cache of the store's chunks (#1314):
+    /// the first variable's chunks over the grid at the time a map without
+    /// one draws, of the newest run, each weighed as the object cache
+    /// weighs it at its decoded size, at least its compressed one; and how
+    /// many. `None` before a time, or for a data type of no fixed size.
+    pub(crate) fn chunk_keep(&self) -> Option<(u64, u64)> {
+        let var = self.vars.first()?;
+        let run = self.resolve_run(None).ok()?;
+        let time = crate::nearest_time_idx(self.valid_times(run), None)?;
+        let read = self
+            .window_read(var, run, time..time + 1, self.extent)
+            .ok()??;
+        let native = var.array.data_type().fixed_size()? as u64;
+        let chunks = var.array.chunks_in_array_subset(&read.subset).ok()??;
+        let (mut bytes, mut count) = (0u64, 0u64);
+        for indices in chunks.indices() {
+            let shape = var.array.chunk_shape(&indices).ok()?;
+            let cells: u64 = shape.iter().map(|d| d.get()).product();
+            let key = var.array.chunk_key(&indices);
+            bytes += crate::store::object_weight(cells * native, key.as_str());
+            count += 1;
+        }
+        Some((bytes, count))
+    }
+
     /// Resolve a requested model run to its reference-axis index: `None` ⇒
     /// the latest run, `Some(rt)` ⇒ that exact run or `ReferenceTimeNotFound`.
     /// A non-forecast store has no runs and answers `Ok(None)` for any

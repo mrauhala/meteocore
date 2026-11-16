@@ -37,6 +37,11 @@ impl MessageKey {
         }
     }
 
+    /// The message's object path or URL.
+    pub(crate) fn path(&self) -> &str {
+        &self.path
+    }
+
     /// The key's own bytes and its path, for cache weights.
     pub(crate) fn size_bytes(&self) -> usize {
         self.path.len() + size_of::<Self>()

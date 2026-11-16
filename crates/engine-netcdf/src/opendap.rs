@@ -106,6 +106,11 @@ pub(crate) enum OpenError {
 }
 
 impl DapFile {
+    /// The dataset's URL, which every cache keys on.
+    pub(crate) fn url(&self) -> &str {
+        &self.id.url
+    }
+
     /// Open `key` under `origin`, listed at `version`, for the ingest
     /// `ingest`: its metadata and coordinates, three requests in two
     /// rounds. Whole reads reserve from `budget`.

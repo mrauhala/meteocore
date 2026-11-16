@@ -469,6 +469,21 @@ cube) return `default_parameters` instead, every parameter of the view
 pressure/model view, else the products of the selected steps, near-surface
 ones only in the legacy layout.
 
+## Keep floors (#1314)
+
+- `publish_keeps` (after each catalog publish and after the poll's
+  pre-warm) publishes two keep floors through `discovery::keep_slot`:
+  - the message cache's, `message_keep`: the default message of the step
+    `select_run_step(catalog, &[], None, None)` draws, weighed by
+    `message_weight`, none after a quiet day (`when_quiet(0)`); only with
+    a message cache;
+  - the point-index cache's: the weight of the indexes it holds of the
+    newest run's messages (`PointIndex::weight_of`, by message path),
+    the same after a quiet day.
+- No decoded grids: the grid cache keeps none. Pinned by
+  `a_source_keeps_its_default_message` (against the cache's own weight
+  after a map read) and `the_point_index_keep_is_the_newest_runs_indexes`.
+
 ## Per-parameter time axes (#1005)
 
 - Hour-window aggregates (`PRATE_avg_6h`) and maxima absent from the

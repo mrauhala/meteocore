@@ -78,6 +78,9 @@ pub struct ZarrEngine {
     /// What the collection needs of its decoded-chunk cache (#1309),
     /// published with each catalog.
     demand: ds_cache::plan::DemandSlot,
+    /// The least elastic memory leaves the cache of its stored chunks
+    /// (#1314): the default variable at the default time of the newest run.
+    keep: ds_cache::plan::DemandSlot,
     /// Edge-triggered stop signal for `poll_loop` (shared lifecycle, #481).
     shutdown: Shutdown,
     /// How long a catalog build may spend loading manifests and shard
@@ -147,6 +150,7 @@ impl ZarrEngine {
 
         log_loaded(collection_id, &catalog);
 
+        let keep_cache = source.chunk_cache_id();
         let engine = Self {
             collection_id: collection_id.to_string(),
             source,
@@ -156,6 +160,14 @@ impl ZarrEngine {
             poll_interval: Duration::from_secs(config.poll_interval_secs.max(1)),
             demand: ds_cache::plan::DemandSlot::new(
                 "zarr_decoded_cache",
+                ds_cache::plan::Scope::Collection {
+                    engine: "zarr",
+                    id: collection_id.to_string(),
+                },
+                collection_id,
+            ),
+            keep: ds_cache::plan::DemandSlot::keep(
+                keep_cache,
                 ds_cache::plan::Scope::Collection {
                     engine: "zarr",
                     id: collection_id.to_string(),
@@ -173,9 +185,26 @@ impl ZarrEngine {
     /// Publish the catalog's demand on the decoded-chunk cache (#1309),
     /// and log the plan's WARN when the cache has just fallen below it.
     fn publish_demand(&self) {
-        if let Some(short) = self.demand.publish(self.catalog.load().decoded_demand()) {
+        let catalog = self.catalog.load();
+        if let Some(short) = self.demand.publish(catalog.decoded_demand()) {
             tracing::warn!("{short}");
         }
+        match catalog.chunk_keep() {
+            Some((bytes, chunks)) => {
+                self.keep.publish(
+                    ds_cache::plan::CacheDemand::keep(bytes, CHUNK_KEEP_RULE)
+                        .when_quiet(0)
+                        .input("chunks", chunks),
+                );
+            }
+            None => self.keep.clear(),
+        }
+    }
+
+    /// What the collection last published as the keep floor of the cache
+    /// of its stored chunks (#1314).
+    pub fn chunk_cache_keep(&self) -> Option<ds_cache::plan::CacheDemand> {
+        self.keep.get()
     }
 
     /// What the collection last published as its decoded-chunk cache's
@@ -372,6 +401,11 @@ fn select_vars<'a>(
         .filter_map(|name| cat.vars.iter().find(|v| v.name == name))
         .collect())
 }
+
+/// How the keep floor on a store's chunk cache is computed (#1314).
+const CHUNK_KEEP_RULE: &str = "the first variable's chunks at the default time of the newest \
+                               run, decoded size: at least their stored one; none after a day \
+                               without a lookup";
 
 /// The time-axis indices an EDR query addresses: every step when
 /// `datetime` is absent, else the closed interval; none has no data → 404,
@@ -1133,6 +1167,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod keep_tests;
 #[cfg(test)]
 mod moisture_tests;
 #[cfg(test)]

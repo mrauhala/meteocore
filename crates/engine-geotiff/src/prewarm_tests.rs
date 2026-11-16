@@ -1044,3 +1044,40 @@ fn a_local_file_replaced_under_its_name_moves_the_version() {
     engine.poll_once();
     assert_eq!(engine.content_version(), 1);
 }
+
+/// #1314: a remote collection's keep floor is what the pre-warm holds of
+/// its newest frame, as the tile cache weighs it, and after a day without a
+/// lookup its coarsest level; a local collection keeps nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_keep_floor_is_the_newest_frames_prewarmed_tiles() {
+    let local = GeoTiffEngine::new("keep-local", fixture_dir().to_str(), &config()).unwrap();
+    assert_eq!(local.tile_cache_keep(), None);
+
+    let (empty, remote) = (TempDir::new("keep_local"), TempDir::new("keep_remote"));
+    publish(&remote, FRAMES[0]);
+    let engine = remote_engine(&empty, &remote);
+    engine.poll_once();
+    publish(&remote, FRAMES[1]);
+    engine.poll_cycle().await;
+    let newest = frame_time(FRAMES[1]);
+    let (cached, total) = cached_tiles(&engine, newest);
+    assert_eq!(cached, total, "warm");
+    let keep = engine.tile_cache_keep().expect("published");
+    let catalog = engine.catalog.load();
+    let entry = &catalog.entries[&newest];
+    assert_eq!(keep.bytes, engine.tile_cache.frame_weight(&entry.path));
+    assert!(keep.keep && keep.bytes <= prewarm::KEEP_MAX_BYTES);
+    // The coarsest level alone: the last overview, finest first.
+    let coarsest = entry.metadata().unwrap().overviews.last().unwrap();
+    let weight: u64 = coarsest
+        .tile_info
+        .as_ref()
+        .unwrap()
+        .tile_byte_counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .map(|&count| crate::cache::tile_weight(count as usize))
+        .sum();
+    assert_eq!(keep.quiet_bytes, weight);
+    assert!(0 < weight && weight < keep.bytes);
+}

@@ -898,14 +898,18 @@ reload does: a step a reload holds the reload lock through is skipped.
     since it was built when the window timed none. A cache nobody reads
     serves nothing and lends first; one that holds its working set serves
     plenty, and keeps it. It lends down to its floor: the plan's floor for
-    it, its range's `min` and what it shrinks to in place;
+    it, its range's `min`, what it shrinks to in place and its keep floor
+    (below);
   - **a cache its engines fill ahead of its reads neither lends nor
     decays**: a demand cache (satellite scans, station grids), one with a
     floor or a demand filled ahead (the PVOL pixels), and one marked
     filled ahead of reads (`prewarmed` in `/admin/cache-plan`): the COG
     tiles, a GRIB message cache with the pre-warm or a map's read-ahead
     (`read_ahead`, on by default), and the NetCDF chunk cache once a
-    collection sets `prewarm_variables`;
+    collection sets `prewarm_variables`. Its keep floor covers a first
+    view, not what its engines fill (a GRIB source's pre-warm is a share
+    of its message cache's capacity, so a decay would cut the next run's):
+    only a tier-2 reclaim takes from it, above that floor;
   - a cache read again (no longer idle) first takes back what it lent the
     pool, its decays and its share of a valve take-back, 5 % of its grant
     a tick, the restore's pace, with no ghost hits needed, while the
@@ -913,7 +917,12 @@ reload does: a step a reload holds the reload lock through is skipped.
   - then a cache below its grant, its fair share, that passes the
     borrowing gate takes back what a borrower holds, the lowest-valued
     borrower first, at an even ratio: while its value is at least what the
-    borrower's bytes serve, up to its grant;
+    borrower's bytes serve, up to its grant. With no borrower left to take
+    from, it takes the pool's free headroom while caches may borrow, and
+    only then, at the same ratio, from an idle cache its engines fill ahead
+    of reads (pre-warmed COG tiles, GRIB messages, PVOL pixels, satellite
+    scans), what that cache holds above its floor: tier 2. Each cache makes
+    one move a tick, a return included;
   - then borrowers borrow, the most valuable first: from the pool's free
     headroom (the pool less the plan's expected use), which is worth
     nothing where it is, and otherwise from a cache, only where the
@@ -923,7 +932,30 @@ reload does: a step a reload holds the reload lock through is skipped.
   - under `apply`, an idle cache (under 60 lookups an hour) that moved
     nothing gives the pool what it does not hold: down to what it holds
     plus 10 %, or its floor if higher, by at most half a step and 5 % of
-    its capacity a tick, slower than a busy cache grows;
+    its capacity a tick, slower than a busy cache grows. What it borrowed
+    goes first, its lenders' share becoming their loans to the pool, which
+    they take back once read again;
+  - no cache lends, decays or is taken from below its **keep floor**, the
+    least a first view of a quiet collection needs, the largest of:
+    - 64 MiB for the meta-tile, rendered-image and vector-tile caches;
+    - its demand for a demand cache (satellite scans, station grids), and
+      a floor its engines publish as its demand (the PVOL pixels: two
+      pre-warms);
+    - what its engines publish, where their facts change, weighed as the
+      cache weighs its entries: a remote GeoTIFF collection, the tiles
+      its pre-warm holds of the newest frame, at most 32 MiB; a GRIB
+      source, the message of its default parameter at the default time of
+      the newest run, and that run's point indexes the cache holds; a
+      remote NetCDF collection, its first variable's field at the default
+      time of the newest run, as stored uncompressed, at least its
+      compressed chunks or an OPeNDAP reply of it; a Zarr store, its first
+      variable's chunks at that time, at their decoded size, in its object
+      or Icechunk payload cache. The NetCDF and Zarr floors are an upper
+      bound on purpose: compressed sizes are not known before a read. No
+      decoded grids; the QueryData caches and the stores keep none;
+    - after a day without a lookup, the smaller floor the engines publish
+      for it: one coarse overview of imagery (the newest frame's coarsest
+      level), only the point indexes of a forecast;
   - a move is max(64 MiB, 1 % of the pool), at most a tenth of either
     cache, at most four reclaims and borrows a tick, each cache in one,
     and never lifts the plan's expected use past its pool: lending
@@ -946,8 +978,10 @@ reload does: a step a reload holds the reload lock through is skipped.
   its collection: its counterparts shed exactly those bytes, so what
   caches borrowed always equals what caches and the pool lent. Each tick,
   and each reload's plan before it applies its grants, holds every offset
-  within its cache's floor and ceiling, and the loans' expected use within
-  the pool, the lowest-valued counterparts giving way first. A cache with
+  within its cache's floor, its keep floor included as far as its grant
+  reaches, and its ceiling, and the loans' expected use within the pool,
+  the lowest-valued counterparts giving way first: a cache whose keep
+  floor grows past what it has left gets back what it lent. A cache with
   loans is held to its grant plus its offset exactly, past the tick's
   10 % and 64 MiB dead band, so what a shed takes off reaches it. A move
   whose lender cannot grow back what the borrower did not take books that
@@ -957,13 +991,16 @@ reload does: a step a reload holds the reload lock through is skipped.
   Under pressure, the valve first takes back what caches borrowed, only
   as much as the excess: each borrower, the lowest-valued first, shrinks
   by the part of the excess still uncovered, in whole MiB, plus whatever
-  capacity it holds nothing in, at most what it borrowed, and gives that
+  capacity it holds nothing in, at most what it borrowed and never below
+  its keep floor, and gives that
   back, the part it borrowed from the pool first, its lenders' share
   becoming their loans to the pool, so they stay where they are. A
   borrower whose shrink in place is refused gives back nothing, keeps its
   loans and is named. Only when the take-back does not cover the excess
   does the valve lower the other caches to 90 % of what they hold, ending
-  their loans. After a take-back no cache borrows until the process has
+  their loans: that relief keeps the plan's own floors, not the keep
+  floors, the one deliberate exception to them, since the process's safety
+  comes first. After a take-back no cache borrows until the process has
   been under 90 % of its total for the restore's 10 minutes; the restore
   climbs to each lowered cache's planned size, and elastic memory borrows
   above it again only by its steps, once every ceiling is lifted.
@@ -972,21 +1009,26 @@ reload does: a step a reload holds the reload lock through is skipped.
   each cache its grant; a later `apply` starts from an empty ledger.
 
   `cache_elastic_proposed_bytes{cache,role}` shows what the last tick's
-  moves took or would take from (`lend`, `repay`, `decay`) or give to
-  (`borrow`, `reclaim`, `return`) each cache;
+  moves took or would take from (`lend`, `repay`, `prewarmed` for tier 2,
+  `decay`) or give to (`borrow`, `reclaim`, `return`) each cache;
   `cache_elastic_offset_bytes{cache,role}` what each cache's loans add up
-  to, `borrowed` and `lent`; and
+  to, `borrowed` and `lent`; `cache_keep_bytes{cache,collection}` each
+  cache's keep floor; and
   `cache_elastic_moves_total{cache,role,mode}` counts the moves: in `mode`
   `report` a move that recurs tick after tick once, `applied` each time,
   and the valve's `give_back`. Per-collection caches share their `cache`
   label: `/admin/cache-plan` has the setting as `governor.elastic_mode`
   and the last tick as `governor.elastic`, with each collection's: its
-  `moves` (kind, borrower, lender, bytes, the borrower's value and its
-  depth, the lender's value), every cache it weighed (capacity, grant,
-  offset, floor, ceiling, used, idle, ghost hits, depth, both values,
-  whether it borrows and lends, what it lent the pool), the headroom of the
-  pool, whether it may borrow and return, and the `ledger`'s `loans` and
-  `offsets`. The dashboard's Elastic memory panels show all three.
+  `moves` (kind, `reclaim_prewarmed` for tier 2, borrower, lender, bytes,
+  the borrower's value and its depth, the lender's value), every cache it
+  weighed (capacity, grant, offset, floor, keep floor, ceiling, used,
+  idle, filled ahead, ghost hits, depth, both values, whether it borrows
+  and lends, what it lent the pool), the headroom of the pool, whether it
+  may borrow and return, and the `ledger`'s `loans` and `offsets`. Every
+  cache there also has its `keep_bytes`, the keep its engines publish
+  (`keep`: `bytes`, `quiet_bytes`, `rule` and each collection's part with
+  its inputs), and `quiet_secs`, how long it has gone without a lookup.
+  The dashboard's Elastic memory panels show them.
 
 A key set to exactly its default (`metatile = 1024`, `[grib]
 grid_cache_mb = 256`) pins it like any other value. An `MC_…` variable

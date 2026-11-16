@@ -346,6 +346,19 @@ engine-zarr.
   the client's retry fetches the rest
   (`a_deadline_cut_read_keeps_fetched_tiles_for_the_retry`).
 
+## Keep floor (#1314)
+
+- A remote collection publishes its tile cache's keep floor beside its
+  demand, in `refresh_raster_info` under `demand_lock`, only when it
+  changes: `prewarm::frame_keep` over the newest frame's loaded header,
+  the levels `plan_frame` takes within `frame_cap` (one home,
+  `levels_within`), each tile weighed as the cache weighs it
+  (`cache::tile_weight`), at most `KEEP_MAX_BYTES` (32 MiB); after a day
+  without a lookup, its coarsest level (`when_quiet`). None for a local
+  collection, before the newest header loads, or with the pre-warm off.
+  `the_keep_floor_is_the_newest_frames_prewarmed_tiles` pins it against
+  what the cache holds after a pre-warm.
+
 ## Remote tile read failures (#1051, #1074)
 
 `reader::read_remote_chunk_with_retry` is the one policy for every remote

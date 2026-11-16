@@ -451,6 +451,28 @@ need no reload pruning.
   once; applied: each, logged with its reason; the valve's `give_back`).
   The valve comes first: no proposal while it is over the total or holds
   a ceiling.
+  Keep floors (#1314 C2): `keep_of(row)` is the least elastic memory
+  leaves a cache, the largest of `FIXED_KEEP_BYTES` (64 MiB: meta-tile,
+  rendered, vector-tile), a demand cache's demand or a floor demand, and
+  the keep its engines publish (`Row::keep`, `Keep::floor(quiet_for)`:
+  the quiet floor once `Row::quiet_for` reaches `QUIET_FOR`). It is in
+  `Elastic::floor` (lending, decay, both reclaim tiers), in
+  `bound_ledger`'s floor as far as the grant reaches, and in
+  `take_back`'s target. The valve's 90 % relief is the one deliberate
+  exception to "keep floors are never taken": it keeps the plan's floors
+  only, because process safety comes first.
+  Tier 2 (`MoveKind::ReclaimPrewarmed`): with no borrower left to take
+  from and no free headroom in the pool (or while borrowing is held off),
+  a reclaimer takes from an idle `Elastic::ahead` cache (prewarmed or a
+  demand filled ahead) above its floor, at 1 ×: the only move that takes
+  from a cache filled ahead of its reads. A reclaimer makes one move a
+  tick, a return included. A borrower that decays releases what it
+  borrowed first (`Ledger::release_part` in `apply_move`), its lenders'
+  share becoming their pool loans, which `MoveKind::Return` brings back. `decays` stays false
+  for a prewarmed cache: its keep floor is a first view's, smaller than
+  its pre-warm, and GRIB's pre-warm budget is a share of the message
+  cache's capacity. `/admin/cache-plan` rows carry `keep_bytes`, `keep`
+  and `quiet_secs`; the weighed caches `keep_bytes` and `ahead`.
 - `memory_plan.rs` (#1312) fits every row to the memory total in
   `cache_plan::log`, so at boot, after every accepted reload and on a
   recovery reload: `ds_cache::plan::grant::plan` over the snapshot rows,

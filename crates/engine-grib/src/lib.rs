@@ -273,6 +273,11 @@ struct GribSource {
     /// (#1309), published as its grid geometry and catalog are.
     grid_demand: ds_cache::plan::DemandSlot,
     message_demand: ds_cache::plan::DemandSlot,
+    /// The least elastic memory leaves its message and point-index caches
+    /// (#1314): the default message of the newest run, that run's point
+    /// indexes.
+    message_keep: ds_cache::plan::DemandSlot,
+    point_index_keep: ds_cache::plan::DemandSlot,
 }
 
 /// At most how many values a decoded field of a grid of `grid_size` cells
@@ -684,6 +689,8 @@ impl GribEngine {
                 discovery: RwLock::new(discovery::Discovery::default()),
                 grid_demand: discovery::demand_slot("grid_cache", collection_id),
                 message_demand: discovery::demand_slot("grib_message_cache", collection_id),
+                message_keep: discovery::keep_slot("grib_message_cache", collection_id),
+                point_index_keep: discovery::keep_slot("grib_point_index_cache", collection_id),
             }),
         };
 
@@ -1108,6 +1115,8 @@ impl GribEngine {
         // Fetch the new steps' messages of what position queries read
         // (#1335), so their first query of the new run reads none.
         self.prewarm_new_steps(&previous);
+        // After the pre-warm, which indexes the new run's messages.
+        self.publish_keeps();
 
         Ok(())
     }

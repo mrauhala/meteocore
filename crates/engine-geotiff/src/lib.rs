@@ -281,10 +281,16 @@ pub struct GeoTiffEngine {
     /// render path refreshing at once cannot leave a stale catalog's demand
     /// published last.
     demand_lock: Mutex<()>,
+    /// The least elastic memory leaves its tile cache (#1314), published
+    /// with the demand: the newest frame's pre-warmed tiles.
+    keep: DemandSlot,
 }
 
 /// How a remote collection's tile cache demand is computed (#1309).
 const REMOTE_TILE_DEMAND_RULE: &str = "frames in the window × mean encoded frame bytes";
+/// How a remote collection's tile cache keep floor is computed (#1314).
+const TILE_KEEP_RULE: &str = "the newest frame's pre-warmed tiles, at most 32 MiB; after a day \
+                              without a lookup, its coarsest level";
 /// A local collection's: its tile cache holds nothing.
 const LOCAL_TILE_DEMAND_RULE: &str = "none: a local collection reads its files through the page \
                                       cache";
@@ -646,7 +652,8 @@ impl GeoTiffEngine {
         // STAC item: only a change is published, so a request pays no plan
         // check. Under the lock, from the catalog current then.
         let _publishing = self.demand_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let demand = self.tile_cache_demand_of(&self.catalog.load());
+        let catalog = self.catalog.load();
+        let demand = self.tile_cache_demand_of(&catalog);
         if self.demand.get() != demand {
             match demand {
                 Some(demand) => {
@@ -657,6 +664,44 @@ impl GeoTiffEngine {
                 None => self.demand.clear(),
             }
         }
+        let keep = self.tile_cache_keep_of(&catalog);
+        if self.keep.get() != keep {
+            match keep {
+                Some(keep) => {
+                    self.keep.publish(keep);
+                }
+                None => self.keep.clear(),
+            }
+        }
+    }
+
+    /// What elastic memory leaves `catalog`'s tile cache (#1314): what the
+    /// pre-warm holds of the newest frame, weighed as the cache weighs its
+    /// tiles, at most [`prewarm::KEEP_MAX_BYTES`]; after a day without a
+    /// lookup, its coarsest level. `None` for a local collection, while the
+    /// newest frame's header is not loaded, and with the pre-warm off.
+    fn tile_cache_keep_of(&self, catalog: &Catalog) -> Option<CacheDemand> {
+        if self.reads_local_files() {
+            return None;
+        }
+        let cap = prewarm::frame_cap(self.tile_cache.capacity());
+        let entry = catalog
+            .select_timestamp(None)
+            .and_then(|time| catalog.entries.get(&time))?;
+        let (frame, coarsest) = prewarm::frame_keep(entry.metadata()?, entry.source()?, cap)?;
+        let keep = frame.min(prewarm::KEEP_MAX_BYTES);
+        (keep > 0).then(|| {
+            CacheDemand::keep(keep, TILE_KEEP_RULE)
+                .when_quiet(coarsest)
+                .input("frame_tile_bytes", frame)
+                .input("coarsest_level_bytes", coarsest)
+        })
+    }
+
+    /// What the collection last published as its tile cache's keep floor
+    /// (#1314).
+    pub fn tile_cache_keep(&self) -> Option<CacheDemand> {
+        self.keep.get()
     }
 
     /// What `catalog` needs of the tile cache (#1309): nothing for a local
@@ -1062,6 +1107,14 @@ impl GeoTiffEngine {
                 collection_id,
             ),
             demand_lock: Mutex::new(()),
+            keep: DemandSlot::keep(
+                "tile_cache",
+                Scope::Collection {
+                    engine: "geotiff",
+                    id: collection_id.to_string(),
+                },
+                collection_id,
+            ),
         };
 
         // Initial scan — STAC mode fetches collection extent only (no items);
