@@ -130,6 +130,7 @@ impl MapRender {
 }
 
 /// How a GetMap turns engine output into pixels.
+#[derive(Clone)]
 pub(crate) enum Paint {
     /// One parameter through its style's colormap.
     Colormap(Arc<dyn ColorMap>),
@@ -343,6 +344,7 @@ pub(crate) fn cache_control_value(pinned: bool, content_version: u64) -> &'stati
 
 /// What a GetMap `(LAYERS, STYLES)` pair names: the engine, how its
 /// pixels are painted, and the metadata snapshot validation reads.
+#[derive(Clone)]
 struct MapLayer {
     collection_id: String,
     /// The style layer the style resolved on ([`ds_render::LayerStyle`]):
@@ -651,7 +653,10 @@ pub(crate) struct ResolvedLayer {
 /// or style this server does not serve gets that error, WMS 1.3.0 Table
 /// E.1's `LayerNotDefined` / `StyleNotDefined`, whichever layer of the list
 /// it is (#1065), before more than [`LAYER_LIMIT`](crate::params::LAYER_LIMIT)
-/// layers are refused.
+/// layers are refused. Each distinct pair is resolved once, so a repeat
+/// costs a lookup and draws as its first listing does. A list longer than
+/// [`MAX_LISTED_LAYERS`](crate::params::MAX_LISTED_LAYERS) is refused as one
+/// over the limit before any name is resolved.
 ///
 /// `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` each apply to the listed
 /// layers that have that dimension, and the others ignore it (#1181). A
@@ -663,18 +668,35 @@ pub(crate) fn resolve_layers(
     state: &WmsState,
     params: &GetMapParams,
 ) -> Result<Vec<ResolvedLayer>, WmsError> {
-    let layers = params
+    let listed = params.layers.len();
+    if listed > crate::params::MAX_LISTED_LAYERS {
+        return Err(crate::params::too_many_layers(listed));
+    }
+    // In list order, so the first pair this server does not serve is the
+    // error, whatever follows it.
+    let mut distinct: Vec<MapLayer> = Vec::new();
+    let mut index: HashMap<(&str, &str), usize> = HashMap::new();
+    let mut listing = Vec::with_capacity(listed);
+    for (layer, style) in &params.layers {
+        let i = match index.get(&(layer.as_str(), style.as_str())) {
+            Some(&i) => i,
+            None => {
+                distinct.push(resolve_map_layer(state, layer, style)?);
+                index.insert((layer, style), distinct.len() - 1);
+                distinct.len() - 1
+            }
+        };
+        listing.push(i);
+    }
+    if listed > crate::params::LAYER_LIMIT {
+        return Err(crate::params::too_many_layers(listed));
+    }
+    let layers: Vec<(&str, MapLayer)> = params
         .layers
         .iter()
-        .map(|(layer, style)| Ok((layer.as_str(), resolve_map_layer(state, layer, style)?)))
-        .collect::<Result<Vec<_>, WmsError>>()?;
-    if layers.len() > crate::params::LAYER_LIMIT {
-        return Err(WmsError::invalid_parameter(&format!(
-            "LAYERS names {} layers; at most {} are drawn in one request",
-            layers.len(),
-            crate::params::LAYER_LIMIT
-        )));
-    }
+        .zip(listing)
+        .map(|((layer, _), i)| (layer.as_str(), distinct[i].clone()))
+        .collect();
 
     // Reject an `ELEVATION` no listed layer has a vertical axis for: a
     // sample dimension value the map cannot take, Table E.1's

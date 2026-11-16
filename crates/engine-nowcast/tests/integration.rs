@@ -853,8 +853,13 @@ fn new_source_frame_rolls_a_new_generation() {
     assert_eq!(engine.raster_info().reference_times, vec![anchor1]);
 
     // Re-polling without new source data must not add generations.
+    let shared = engine.raster_info_shared();
     engine.poll_once();
     assert_eq!(engine.raster_info().reference_times.len(), 1);
+    assert!(
+        Arc::ptr_eq(&shared, &engine.raster_info_shared()),
+        "requests share one metadata snapshot between generations"
+    );
 
     // A new source frame lands → new generation, ascending reference_times,
     // and the run axis resolves to the new one (#521).
@@ -863,6 +868,11 @@ fn new_source_frame_rolls_a_new_generation() {
     engine.poll_once();
     let info = engine.raster_info();
     assert_eq!(info.reference_times, vec![anchor1, anchor2]);
+    assert_eq!(
+        engine.raster_info_shared().reference_times,
+        info.reference_times
+    );
+    assert!(!Arc::ptr_eq(&shared, &engine.raster_info_shared()));
     assert_eq!(engine.resolve_reference_time(None, None), Some(anchor2));
     // Pinning the previous generation still serves it.
     assert_eq!(

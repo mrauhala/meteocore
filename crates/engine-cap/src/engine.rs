@@ -1025,9 +1025,13 @@ impl MapEngine for CapEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        // Cheap clone of the prebuilt snapshot — no recomputation (#211); the
-        // cost is O(times), bounded by the 256-entry TIME cap.
-        (*self.snapshot().info).clone()
+        (*self.raster_info_shared()).clone()
+    }
+
+    /// The prebuilt snapshot's metadata, shared: no recomputation and no
+    /// copy of its times per request (#211).
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
+        self.snapshot().info.clone()
     }
 
     /// The one layer draws alert areas, which WMS GetFeatureInfo picks

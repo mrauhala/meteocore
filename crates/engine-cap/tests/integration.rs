@@ -485,6 +485,10 @@ fn raster_info_advertises_layer_time_and_extent() {
     // A TIME dimension is advertised (non-empty, ascending, ending at "now").
     assert!(!info.times.is_empty());
     assert!(info.times.windows(2).all(|w| w[0] <= w[1]));
+    // Requests share the snapshot's metadata rather than copying it.
+    let shared = eng.raster_info_shared();
+    assert!(std::sync::Arc::ptr_eq(&shared, &eng.raster_info_shared()));
+    assert_eq!(shared.times, info.times);
 }
 
 // ---------------------------------------------------------------------------

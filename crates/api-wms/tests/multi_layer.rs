@@ -5,6 +5,7 @@
 //! budget and deadline; and a single layer's image unchanged.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -89,6 +90,8 @@ struct Region {
     /// How long each `get_raster_tile` call takes.
     delay: std::time::Duration,
     calls: Mutex<Vec<Call>>,
+    /// How many times its metadata was read: once per layer resolved.
+    info_reads: AtomicUsize,
 }
 
 impl Region {
@@ -104,6 +107,7 @@ impl Region {
             answer: Answer::Data,
             delay: std::time::Duration::ZERO,
             calls: Mutex::new(Vec::new()),
+            info_reads: AtomicUsize::new(0),
         }
     }
 
@@ -117,6 +121,10 @@ impl Region {
 
     fn call_count(&self) -> usize {
         self.calls.lock().unwrap().len()
+    }
+
+    fn info_reads(&self) -> usize {
+        self.info_reads.load(Ordering::SeqCst)
     }
 }
 
@@ -162,6 +170,7 @@ impl MapEngine for Region {
     }
 
     fn raster_info(&self) -> RasterInfo {
+        self.info_reads.fetch_add(1, Ordering::SeqCst);
         let parameters = self
             .parameter_times
             .iter()
@@ -614,6 +623,64 @@ async fn layer_limit_is_five_and_names_are_checked_first() {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{layers}");
         assert_eq!(reply.exception_code(), code, "{layers}");
     }
+}
+
+/// A `LAYERS` list longer than `MAX_LISTED_LAYERS` is refused as a list
+/// over the layer limit, before any of its names is resolved. Up to it,
+/// every name is still checked, so an undefined one is `LayerNotDefined`
+/// wherever it is listed, and each distinct layer is resolved once.
+#[tokio::test]
+async fn a_long_layers_list_is_refused_before_its_names_are_resolved() {
+    let fixture = Fixture::new();
+    let max = api_wms::params::MAX_LISTED_LAYERS;
+    assert!(max > api_wms::params::LAYER_LIMIT);
+    let list = |listed: usize, last: &str| {
+        let mut names = vec!["base"; listed - 1];
+        names.push(last);
+        names.join(",")
+    };
+    let refused = |reply: &Reply, code: &str, message: &str| {
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+        assert_eq!(reply.exception_code(), code);
+        assert!(reply.text().contains(message), "{}", reply.text());
+    };
+
+    let reply = fixture.get_map(&list(max + 1, "nope"), "", "").await;
+    refused(
+        &reply,
+        "InvalidParameterValue",
+        &format!(
+            "LAYERS names {} layers; at most 5 are drawn in one request",
+            max + 1
+        ),
+    );
+    assert_eq!(fixture.engine("base").info_reads(), 0, "no name resolved");
+
+    let reply = fixture.get_map(&list(max, "nope"), "", "").await;
+    refused(&reply, "LayerNotDefined", "nope");
+    assert_eq!(fixture.engine("base").info_reads(), 1, "resolved once");
+
+    let reply = fixture.get_map(&list(max, "base"), "", "").await;
+    refused(
+        &reply,
+        "InvalidParameterValue",
+        &format!("LAYERS names {max} layers; at most 5 are drawn in one request"),
+    );
+    assert_eq!(fixture.engine("base").info_reads(), 2, "resolved once");
+
+    let reply = fixture
+        .get_map("base,base,base,base,base,base", ",alt,,alt,,alt", "")
+        .await;
+    refused(
+        &reply,
+        "InvalidParameterValue",
+        "LAYERS names 6 layers; at most 5 are drawn in one request",
+    );
+    assert_eq!(
+        fixture.engine("base").info_reads(),
+        4,
+        "each distinct layer and style resolved once"
+    );
 }
 
 /// `TIME` applies to the listed layers with a time dimension; a layer
