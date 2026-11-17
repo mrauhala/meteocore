@@ -603,7 +603,9 @@ impl Catalog {
     /// that covers it; without a time, the newest run. Within the run, the
     /// step nearest `time` (the earlier on a tie), or its last step without
     /// one. A time outside the chosen run is
-    /// [`DataServerError::InvalidParameter`].
+    /// [`DataServerError::InvalidParameter`]. No run at all is
+    /// [`DataServerError::no_data_yet`] (404, #1499), as an EDR query
+    /// answers it ([`Self::query_run`]).
     ///
     /// The render, `resolve_time` and `resolve_reference_time` all call
     /// this, so the cache keys name exactly what is drawn (#507, #521):
@@ -614,9 +616,7 @@ impl Catalog {
         time: Option<DateTime<Utc>>,
     ) -> Result<Selected<'_>, DataServerError> {
         if self.runs.is_empty() {
-            return Err(DataServerError::Engine(
-                "No NetCDF data available yet".to_string(),
-            ));
+            return Err(DataServerError::no_data_yet());
         }
         let run = self.covering_run(reference_time, time)?;
         let (valid, step) = match time {
@@ -668,7 +668,7 @@ impl Catalog {
                 .runs
                 .values()
                 .next_back()
-                .ok_or_else(|| DataServerError::Engine("No NetCDF data available yet".into())),
+                .ok_or_else(DataServerError::no_data_yet),
         }
     }
 
@@ -682,16 +682,15 @@ impl Catalog {
     /// `datetime` list skips the instant (#968). Without a window, the
     /// newest run. An instant `(t, t)` needs a step valid at exactly `t`,
     /// never the nearest: GetFeatureInfo asks for the step its map drew,
-    /// in the run the map drew it from.
+    /// in the run the map drew it from. No run at all is
+    /// [`DataServerError::no_data_yet`] (404), which a `datetime` list skips.
     pub(crate) fn query_run(
         &self,
         reference_time: Option<DateTime<Utc>>,
         window: Option<(DateTime<Utc>, DateTime<Utc>)>,
     ) -> Result<&Run, DataServerError> {
         if self.runs.is_empty() {
-            return Err(DataServerError::LocationNotFound(
-                "No NetCDF data available yet".into(),
-            ));
+            return Err(DataServerError::no_data_yet());
         }
         if let Some(rt) = reference_time {
             return self.runs.get(&Some(rt)).ok_or_else(|| {

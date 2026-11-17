@@ -268,6 +268,10 @@ The `engine_type → supported_apis` allowlist in `server/src/admin.rs` lists
 `"zarr" => &["edr", "wms", "maps", "tiles"]`. WMS/Maps/Tiles need a `[wms]`
 colormap (or a `style_bundle`) like the other raster engines; each variable
 becomes its own layer via `register_parameter_layer_styles`.
+A store whose time axis is still empty (a fresh store waiting for its first
+append) answers every EDR query and map render
+`DataServerError::no_data_yet()`, a 404 a `datetime` list skips, never an
+`Engine` 500 (#1499; `src/empty_tests.rs`).
 
 ## Config
 

@@ -79,6 +79,19 @@ impl DataServerError {
     pub const UNAVAILABLE_DESCRIPTION: &'static str =
         "Data source temporarily unavailable, try again later";
 
+    /// The message of [`Self::no_data_yet`], one wording for every engine.
+    pub const NO_DATA_YET: &'static str = "No data available yet";
+
+    /// A collection that holds no data yet (#1499): a fresh source, a store
+    /// unreachable since the start, a mistyped prefix. The collection exists
+    /// but has nothing to serve, so this is a [`Self::LocationNotFound`]
+    /// (404), which a `datetime` list skips like any instant without data,
+    /// never an [`Self::Engine`] error, whose 500 is logged at ERROR as a
+    /// server fault. Its health reports the condition itself.
+    pub fn no_data_yet() -> Self {
+        Self::LocationNotFound(Self::NO_DATA_YET.into())
+    }
+
     /// A store read's error with `context` added, as an engine that wraps
     /// one reports it: an [`Self::Unavailable`] stays one, so the APIs still
     /// answer it with their 503 (#1355), and any other error becomes a
@@ -233,6 +246,22 @@ mod tests {
         assert_eq!(wrapped.class(), C::SourceUnavailable);
         let wrapped = DataServerError::LocationNotFound(s()).with_storage_context("GRIB");
         assert_eq!(wrapped.class(), C::Internal);
+    }
+
+    /// A collection without data yet is a not-found, which a `datetime`
+    /// list skips, never an internal error (#1499).
+    #[test]
+    fn no_data_yet_is_a_location_not_found() {
+        let error = DataServerError::no_data_yet();
+        assert!(
+            matches!(&error, DataServerError::LocationNotFound(m) if m == "No data available yet"),
+            "{error:?}"
+        );
+        assert_eq!(error.class(), ErrorClass::NotFound);
+        assert_eq!(
+            error.to_string(),
+            "Location not found: No data available yet"
+        );
     }
 
     /// An upstream's refusal keeps its variant through an engine's context;

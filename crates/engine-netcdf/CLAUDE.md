@@ -984,7 +984,9 @@ older one; without a time, the newest run's last step. Within the run, the
 nearest step, the earlier on a tie. Every variable, and every per-step
 amount, shares the run's time axis (decision 3), so the per-parameter
 resolvers keep their defaults; `Selected::previous` is the run's step
-before, never another run's.
+before, never another run's. A catalog without runs or layout (before the
+first file) is `DataServerError::no_data_yet()`, the 404 EDR's
+`query_run` and `layout` answer too, never an `Engine` 500 (#1499).
 
 `content_version` starts at the process start's Unix seconds (nonzero, new
 per restart) and moves when a catalogued file is replaced in place: found

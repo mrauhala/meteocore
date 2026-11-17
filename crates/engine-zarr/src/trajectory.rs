@@ -33,7 +33,7 @@ pub(crate) fn query(
     ds_core::deadline::check()?;
     let path = TrajectoryPath::parse(coords)?;
     if cat.times.is_empty() {
-        return Err(DataServerError::Engine("No Zarr data available".into()));
+        return Err(DataServerError::no_data_yet());
     }
     let run = cat.resolve_run(reference_time)?;
     // A 2-D path takes the position query's steps; an M path snaps to any

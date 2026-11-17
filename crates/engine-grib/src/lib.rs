@@ -11,6 +11,8 @@ mod discovery;
 #[cfg(test)]
 mod display_units_tests;
 #[cfg(test)]
+mod empty_catalog_tests;
+#[cfg(test)]
 mod field_plan_tests;
 #[cfg(test)]
 mod geopotential_tests;
@@ -1810,13 +1812,15 @@ fn select_default_run_step(
 
 /// The run `reference_time` pins: exactly that run (absent ⇒
 /// [`DataServerError::ReferenceTimeNotFound`] → 404), or `None` to let the
-/// caller choose. See [`instances::select_run`].
+/// caller choose. See [`instances::select_run`]. A catalog without runs is
+/// [`DataServerError::no_data_yet`] (404, #1499) before any selection, on
+/// every EDR query and map render.
 fn pinned_run(
     catalog: &Catalog,
     reference_time: Option<DateTime<Utc>>,
 ) -> Result<Option<&ForecastRun>, DataServerError> {
     if catalog.runs.is_empty() {
-        return Err(no_forecast_data());
+        return Err(DataServerError::no_data_yet());
     }
     reference_time
         .map(|rt| {
@@ -1857,7 +1861,7 @@ fn covering_run<'a>(
         Some(time) => {
             DataServerError::InvalidParameter(format!("No forecast run covers time {time}"))
         }
-        None => no_forecast_data(),
+        None => DataServerError::no_data_yet(),
     })
 }
 
@@ -1896,7 +1900,7 @@ fn resolve_run<'a>(
     })
     .ok_or_else(|| match datetime {
         Some((start, end)) => no_step_within(start, end),
-        None => no_forecast_data(),
+        None => DataServerError::no_data_yet(),
     })
 }
 
@@ -1916,11 +1920,6 @@ fn preferring_runs_with<'a>(
         }
     }
     select(&|_| true)
-}
-
-/// The catalog has no run: [`pinned_run`] answers this before any selection.
-fn no_forecast_data() -> DataServerError {
-    DataServerError::Engine("No forecast data available".to_string())
 }
 
 /// A query's `parameter-name` in the catalog's spelling (#1493), the one

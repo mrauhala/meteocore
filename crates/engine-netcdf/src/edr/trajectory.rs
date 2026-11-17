@@ -66,9 +66,7 @@ impl NetcdfEngine {
         let catalog = self.catalog.load_full();
         let layout = layout(&catalog)?;
         if catalog.runs.is_empty() {
-            return Err(DataServerError::LocationNotFound(
-                "No NetCDF data available yet".into(),
-            ));
+            return Err(DataServerError::no_data_yet());
         }
         // A Z path's levels are its vertices'; `z` with it is the plan's 400.
         let query_z = z.filter(|_| !path.has_z);
