@@ -363,77 +363,233 @@ pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
     to_value(CoverageJson(result))
 }
 
-/// An upper bound of the heap `serde_json` takes to parse the JSON text
-/// `json` into a [`Value`], its high-water mark included, so a caller can
-/// admit a document before it builds it: the HTML data page lays out the
-/// CoverageJSON body parsed back.
+/// The heap `serde_json` takes at most to parse a JSON text into a
+/// [`Value`]: what an HTML data page admits for the CoverageJSON body it
+/// parses back before it parses it ([`DocumentScan`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocumentBound {
+    /// Held by the parsed document: every array and map at the capacity it
+    /// grows to, and every key and string.
+    pub retained: usize,
+    /// Held besides while it is parsed, and released by the end of the
+    /// parse: the old buffer of the largest growth, as the array or map
+    /// moves, and `serde_json`'s scratch for a string with escapes.
+    pub transient: usize,
+}
+
+impl DocumentBound {
+    /// The high-water mark of the parse.
+    pub fn peak(&self) -> usize {
+        self.retained.saturating_add(self.transient)
+    }
+}
+
+/// [`DocumentBound`] of the JSON text `json`: [`DocumentScan`] over it.
+pub fn parsed_document_bound(json: &[u8]) -> DocumentBound {
+    let mut scan = DocumentScan::default();
+    scan.feed(json);
+    scan.bound()
+}
+
+/// An open array or object: its separating commas, and whether it holds
+/// anything.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    array: bool,
+    commas: usize,
+    any: bool,
+}
+
+/// [`DocumentBound`] counted from the text's structure as it streams past,
+/// with no copy of it: the HTML page runs it over the CoverageJSON body
+/// before writing the body down.
 ///
-/// It counts the text's structure, never a size per byte. Outside strings,
-/// every array element follows its array's `[` or a `,` inside it, and every
-/// object member is followed by a `:`; the outermost value is one more.
-/// - An array element is charged three `Value`s: its slot, the room a
-///   growing array keeps, and the copy it makes while it moves.
-/// - An object member is charged twice its key, `Value`, hash and index,
-///   for the room a growing map keeps.
-/// - An object is charged the table its map allocates on its first member:
-///   a B-tree leaf, or with `preserve_order` an index table and entries for
-///   its first members.
-/// - The text itself bounds the bytes of every key and string.
+/// It models how `serde_json` builds a [`Value`], never a size per byte:
+/// - An array of `n` elements is a `Vec` grown by doubling from four
+///   slots, `next_power_of_two(max(n, 4))` `Value`s; as it last grows it
+///   briefly also holds the half as large buffer it moves from.
+/// - An object of `m` members is, with `preserve_order`, an index map:
+///   entries of hash, key and `Value` at the capacity of its hash table of
+///   `usize` slots, each with a control byte; it grows and moves likewise.
+///   Without, a B-tree: one leaf of eleven keys and values, or past eleven
+///   members nodes at least five-elevenths full.
+/// - Keys and strings take their text's bytes; a string with escapes is
+///   assembled in a scratch buffer of up to twice the longest.
 ///
-/// Pinned against the heap a parse takes, with and without
-/// `preserve_order`, by `tests/html_admission_tests.rs`.
-pub fn parsed_document_bound(json: &[u8]) -> usize {
-    use std::mem::size_of;
-    const VALUE: usize = size_of::<Value>();
-    const KEY: usize = size_of::<String>();
-    const WORD: usize = size_of::<usize>();
-    const ELEMENT: usize = 3 * VALUE;
-    const MEMBER: usize = 2 * (KEY + VALUE + 2 * WORD);
+/// It holds for the documents this crate writes, the CoverageJSON bodies
+/// of data queries, with `preserve_order` on and off, pinned against the
+/// heap a parse takes by `tests/html_admission_tests.rs`. It is not a
+/// bound for any JSON: one that `serde_json`'s growth or its allocator
+/// treats otherwise, or a map with duplicate keys, may take more.
+#[derive(Debug, Default)]
+pub(crate) struct DocumentScan {
+    len: usize,
+    frames: Vec<Frame>,
+    in_string: bool,
+    escaped: bool,
+    string_len: usize,
+    longest_string: usize,
+    strings: usize,
+    containers: usize,
+    largest_move: usize,
+}
+
+impl DocumentScan {
+    const VALUE: usize = std::mem::size_of::<Value>();
+    const KEY: usize = std::mem::size_of::<String>();
+    const WORD: usize = std::mem::size_of::<usize>();
     /// `serde_json`'s map is a B-tree unless `preserve_order` makes it an
     /// index map, which is larger than a B-tree's root.
-    const INDEXED: bool =
-        size_of::<Map<String, Value>>() > size_of::<std::collections::BTreeMap<String, Value>>();
-    const OBJECT: usize = if INDEXED {
-        4 * (KEY + VALUE + 2 * WORD)
-    } else {
-        11 * (KEY + VALUE) + 2 * WORD
-    };
-    let (mut elements, mut members, mut objects) = (1usize, 0usize, 0usize);
-    // Whether each open container is an array, innermost last.
-    let mut arrays: Vec<bool> = Vec::new();
-    let (mut in_string, mut escaped) = (false, false);
-    for &byte in json {
-        if in_string {
+    const INDEXED: bool = std::mem::size_of::<Map<String, Value>>()
+        > std::mem::size_of::<std::collections::BTreeMap<String, Value>>();
+    /// An index map entry: its hash, key and value.
+    const ENTRY: usize = Self::WORD + Self::KEY + Self::VALUE;
+    /// A B-tree leaf: eleven keys and values, its parent and two counts.
+    const LEAF: usize = 11 * (Self::KEY + Self::VALUE) + 2 * Self::WORD;
+    /// A B-tree internal node: a leaf and its twelve edges.
+    const INTERNAL: usize = Self::LEAF + 12 * Self::WORD;
+    /// The control bytes a hash table keeps past its slots.
+    const GROUP: usize = 16;
+
+    /// The bytes written so far.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Scan `bytes`, the next part of the text.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+        self.len = self.len.saturating_add(bytes.len());
+        for &byte in bytes {
+            if self.in_string {
+                match byte {
+                    _ if self.escaped => self.escaped = false,
+                    b'\\' => self.escaped = true,
+                    b'"' => {
+                        self.in_string = false;
+                        self.strings = self.strings.saturating_add(self.string_len);
+                        self.longest_string = self.longest_string.max(self.string_len);
+                        continue;
+                    }
+                    _ => {}
+                }
+                self.string_len += 1;
+                continue;
+            }
             match byte {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_string = false,
-                _ => {}
+                b' ' | b'\n' | b'\r' | b'\t' => {}
+                b']' | b'}' => {
+                    if let Some(frame) = self.frames.pop() {
+                        self.close(frame);
+                    }
+                }
+                _ => {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.any = true;
+                        if byte == b',' {
+                            frame.commas += 1;
+                        }
+                    }
+                    match byte {
+                        b'"' => {
+                            self.in_string = true;
+                            self.string_len = 0;
+                        }
+                        b'[' | b'{' => self.frames.push(Frame {
+                            array: byte == b'[',
+                            commas: 0,
+                            any: false,
+                        }),
+                        _ => {}
+                    }
+                }
             }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'[' => {
-                arrays.push(true);
-                elements += 1;
-            }
-            b'{' => {
-                arrays.push(false);
-                objects += 1;
-            }
-            b']' | b'}' => {
-                arrays.pop();
-            }
-            b',' if arrays.last() == Some(&true) => elements += 1,
-            b':' => members += 1,
-            _ => {}
         }
     }
-    json.len()
-        .saturating_add(elements.saturating_mul(ELEMENT))
-        .saturating_add(members.saturating_mul(MEMBER))
-        .saturating_add(objects.saturating_mul(OBJECT))
+
+    /// Charge a closed array or object.
+    fn close(&mut self, frame: Frame) {
+        let n = if frame.any { frame.commas + 1 } else { 0 };
+        let (held, moved) = if frame.array {
+            Self::array(n)
+        } else {
+            Self::object(n)
+        };
+        self.containers = self.containers.saturating_add(held);
+        self.largest_move = self.largest_move.max(moved);
+    }
+
+    /// An array of `n` elements: its `Vec`, and the buffer it last moved
+    /// from.
+    fn array(n: usize) -> (usize, usize) {
+        if n == 0 {
+            return (0, 0);
+        }
+        let slots = n.max(4).checked_next_power_of_two().unwrap_or(usize::MAX);
+        let held = slots.saturating_mul(Self::VALUE);
+        (held, if slots > 4 { held / 2 } else { 0 })
+    }
+
+    /// An object of `m` members: its map, and what it last moved from.
+    fn object(m: usize) -> (usize, usize) {
+        if m == 0 {
+            return (0, 0);
+        }
+        if !Self::INDEXED {
+            if m <= 11 {
+                return (Self::LEAF, 0);
+            }
+            return ((m / 5 + 2).saturating_mul(Self::INTERNAL), Self::INTERNAL);
+        }
+        let buckets = Self::buckets(m);
+        let held = Self::index_map(buckets);
+        (
+            held,
+            if buckets > 4 {
+                Self::index_map(buckets / 2)
+            } else {
+                0
+            },
+        )
+    }
+
+    /// The buckets of a hash table holding `m` entries: four up to three,
+    /// eight up to seven, else the power of two whose seven-eighths hold
+    /// them.
+    fn buckets(m: usize) -> usize {
+        match m {
+            0..=3 => 4,
+            4..=7 => 8,
+            _ => m
+                .saturating_mul(8)
+                .div_ceil(7)
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX),
+        }
+    }
+
+    /// An index map whose table has `buckets` buckets: its entries at the
+    /// table's capacity, and the table.
+    fn index_map(buckets: usize) -> usize {
+        let capacity = if buckets < 8 {
+            buckets - 1
+        } else {
+            buckets / 8 * 7
+        };
+        let table = buckets
+            .saturating_mul(Self::WORD + 1)
+            .saturating_add(Self::GROUP);
+        capacity.saturating_mul(Self::ENTRY).saturating_add(table)
+    }
+
+    /// The bound of the text scanned so far, every container closed.
+    pub(crate) fn bound(&self) -> DocumentBound {
+        DocumentBound {
+            retained: self.containers.saturating_add(self.strings),
+            transient: self
+                .largest_move
+                .saturating_add(self.longest_string.saturating_mul(2)),
+        }
+    }
 }
 
 fn build_domain(desc: &DomainDescription) -> Value {
@@ -896,22 +1052,30 @@ mod coverage_tests {
 
     /// The document bound counts structure outside strings only: brackets,
     /// commas and colons inside a string, escaped quotes included, are
-    /// text. Commas in an object separate members, not array elements.
+    /// text. Commas in an object separate members, not array elements. It
+    /// holds with serde_json's `preserve_order` on or off: the workspace
+    /// build turns it on.
     #[test]
     fn the_document_bound_counts_structure_outside_strings() {
+        let bound = |text: &[u8]| parsed_document_bound(text).peak();
         let text = br#"["a\"[{,:]}\\"]"#;
         let plain = br#"["aaaaaaaaaaa"]"#;
         assert_eq!(text.len(), plain.len());
         assert_eq!(parsed_document_bound(text), parsed_document_bound(plain));
         // Two members are charged more than two array elements of the same
-        // text length, and an object its table, with serde_json's
-        // `preserve_order` on or off: the workspace build turns it on.
+        // text length: an object its table.
         let members = br#"{"a":1,"b":2}"#;
         let elements = br#"[1    ,    2]"#;
         assert_eq!(members.len(), elements.len());
-        assert!(parsed_document_bound(members) > parsed_document_bound(elements));
-        // Every element counts.
-        assert!(parsed_document_bound(b"[1,2,3]") > parsed_document_bound(b"[1,2]  "));
+        assert!(bound(members) > bound(elements));
+        // An array holds four slots at least, then doubles: a fifth element
+        // doubles it and adds the buffer it moved from.
+        assert_eq!(bound(b"[1]"), bound(b"[1,2,3,4]"));
+        assert!(bound(b"[1,2,3,4,5]") > bound(b"[1,2,3,4]"));
+        assert_eq!(bound(b"[1,2,3,4,5,6,7,8]"), bound(b"[1,2,3,4,5]      "));
+        // Empty containers take nothing; nesting charges each level.
+        assert_eq!(bound(b"[]"), DocumentBound::default().peak());
+        assert!(bound(b"[[[1]]]") > bound(b"[[1]]  "));
     }
 }
 

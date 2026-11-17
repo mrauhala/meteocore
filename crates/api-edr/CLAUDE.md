@@ -421,14 +421,25 @@ allocating it and stops at the query deadline; CoverageJSON range values
 are written straight from the result, never through a `Value` tree. CSV
 reserves its counted size before it allocates (`csv::write_station_series`'
 `admit`). An HTML data page (`html::coverage_page`) is admitted at every
-step, each before it allocates: its CoverageJSON body through the `Writer`,
-the `Value` document parsed from that body at
-`response::parsed_document_bound` before it is parsed, and the page at its
-`body_estimate` before it renders (`DataPage::render_admitted`). A page
-that does not fit is refused at the first step it does not fit, so the
-server never builds the document of a page it cannot serve. The bound
-counts the body's structure, never a size per byte; keep it an upper
-bound (`html_admission_tests` pins it with and without `preserve_order`).
+step, each before it allocates. A first pass serialises the CoverageJSON
+into `response::DocumentScan`, which keeps nothing: the body's length and
+the `DocumentBound` of parsing it. The body, the document and the parse's
+transient part are reserved together, the body is written and parsed, and
+the body and the transient part are released before the page is reserved
+at its `body_estimate` beside the document (`DataPage::render_admitted`).
+A step that does not fit now is the 503 `ServerBusy`; one whose parts
+exceed the whole budget, which no retry can admit, is `Failure::Oversize`,
+a 400 naming `f=CoverageJSON` (`response_budget::reserve_toward`). Either
+way nothing past the step is built. The bound models how serde_json builds
+a `Value`, never a size per byte: an array's `Vec` from four slots by
+doubling, plus the half-size buffer its last growth moves from; with
+`preserve_order` an index map's entries at its hash table's capacity, else
+a B-tree's leaf or nodes; strings at their text, and a scratch buffer for
+escapes. It is a bound for the CoverageJSON this crate writes, not for any
+JSON: a document `serde_json` grows otherwise, or one with duplicate keys,
+may take more. `html_admission_tests` pins it against the heap a parse
+takes with and without `preserve_order`; keep it there when serde_json,
+indexmap or hashbrown change how they grow.
 `/locations` adds its own per-body cap
 (`Writer::locations`, `MC_EDR_LOCATIONS_MAX_BYTES`, 16 MiB);
 `MC_EDR_LOCATIONS_MEMORY_MB` is retired, ignored with a startup WARN. The
@@ -446,7 +457,8 @@ PNG plots, `items`, metadata and the engine result. `/metrics` exports `edr_resp
 `coverage_tests::the_body_streams_in_the_document_order` and
 `performance_tests`' `large_bodies_over_the_response_budget_are_503` and
 `a_disconnected_client_releases_its_response_bytes`, and
-`html_admission_tests`' `an_html_page_is_admitted_before_its_document_is_built`.
+`html_admission_tests`' page tests (a full grid's page on a small host's budget,
+a page over the whole budget a 400, one over a busy budget a 503).
 
 An answer of one `Point` coverage per item (an events collection's area,
 one per event) is bounded by coverages, not values:

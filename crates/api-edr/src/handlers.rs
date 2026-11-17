@@ -93,10 +93,11 @@ fn coverage_json_response(
 }
 
 /// The error of a response body the EDR response budget stopped (#1041):
-/// a body that does not fit is a 503 `ServerBusy` to retry, a query past
-/// its deadline the 504. Any other failure (`None`, a body that could not
-/// be built, or a size cap only `/locations` has and maps itself) is a
-/// 500, after `log`.
+/// a body that does not fit now is a 503 `ServerBusy` to retry, an HTML
+/// page that could not fit even an idle budget a 400 naming its
+/// CoverageJSON, a query past its deadline the 504. Any other failure
+/// (`None`, a body that could not be built, or a size cap only
+/// `/locations` has and maps itself) is a 500, after `log`.
 fn response_budget_error(
     failure: Option<crate::response_budget::Failure>,
     log: impl FnOnce(),
@@ -110,6 +111,11 @@ fn response_budget_error(
             ),
         ),
         Some(Failure::Cancelled) => query_timeout(),
+        Some(Failure::Oversize) => bad_request(&DataServerError::QueryTooLarge(
+            "This answer is too large for an HTML page: request it with f=CoverageJSON, or \
+             narrow the area, the datetime window or the parameters"
+                .into(),
+        )),
         Some(Failure::Limit | Failure::Internal) | None => {
             log();
             server_error()

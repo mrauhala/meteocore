@@ -305,8 +305,8 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   values per response. An answer of one `Point` coverage per item, a
   PostGIS events collection's area or radius, is capped at 100 000
   coverages (`MAX_AREA_POINT_COVERAGES`), about five 1 million-value grid
-  answers as CoverageJSON; an HTML page of such an answer is a 503 when
-  the response budget cannot hold it. On most gridded engines, masking a polygon that is not a
+  answers as CoverageJSON; the HTML page of an answer that large may not
+  fit the response budget (see Response memory below). On most gridded engines, masking a polygon that is not a
   rectangle is also capped at 20 million cell × vertex tests. Over a cap
   is a 400 that says how to narrow the query.
 - **Area resolution.** An `area` or `radius` answer of QueryData, Zarr,
@@ -334,12 +334,14 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   `[memory.caches] edr_response` (default 512 MiB). A body is charged for
   each buffer before it is allocated: CoverageJSON is serialised straight
   into it, CSV is counted first, and an HTML page is admitted at each step
-  before it takes it: its CoverageJSON, the document it lays out, parsed
-  from that, at an upper bound counted from the CoverageJSON's structure,
-  and the page at its estimated size before it renders. A page refused at
+  before it takes it: its CoverageJSON and the document it lays out,
+  parsed from that, at a bound counted from the CoverageJSON's structure,
+  then the page at its estimated size before it renders. A page refused at
   any step builds nothing past it. It stays charged until the client has read it
   or gone away. A body that does not fit is a 503 `ServerBusy` with
-  `Retry-After: 1`. An area answer at the 1 M-value budget is about 9 MB
+  `Retry-After: 1`. An HTML page that the budget could not hold even idle
+  is a 400 instead, saying to request `f=CoverageJSON` or narrow the
+  query: no retry would admit it. An area answer at the 1 M-value budget is about 9 MB
   of CoverageJSON and two to three times that as HTML, so the default
   holds about 57 of them in flight; an HTML page also holds its document,
   so far fewer pages fit. Size the budget for the largest
@@ -521,7 +523,10 @@ Each engine crate documents its own query details.
 - Every data query answers `f=html`, or a browser's `Accept`, with a page of
   its response: a summary, the PNG plot where the query offers one, every
   value in tables, the request as an editable form, and the full metadata
-  folded below. Nothing is truncated; the value caps bound the page.
+  folded below. Nothing is truncated; the value caps bound the page. The
+  page of an answer too large for the response budget is a 400 naming the
+  CoverageJSON alternative, `f=CoverageJSON`, and a 503 to retry while the
+  budget is busy with other bodies.
 - An HTML request to position, area, radius, trajectory or cube without
   coordinates (`coords`, or a cube's `bbox`) gets the query's form,
   prefilled with an example inside the collection's extent, instead of a

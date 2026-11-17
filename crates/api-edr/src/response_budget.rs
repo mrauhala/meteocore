@@ -76,6 +76,10 @@ pub(crate) enum Failure {
     /// The body could not be built for a reason of its own, logged where
     /// it failed: a 500.
     Internal,
+    /// What the body holds at once exceeds the whole budget, so no retry
+    /// can admit it: a 400 naming a smaller form (an HTML page only,
+    /// [`reserve_toward`]).
+    Oversize,
 }
 
 struct Allocation {
@@ -196,6 +200,26 @@ pub(crate) fn reserve(bytes: usize) -> Result<Reservation, Failure> {
     reserve_from(&BUDGET, bytes)
 }
 
+/// Reserve `bytes`, one part of a body whose parts held at once total
+/// `whole`: [`Failure::Oversize`] when `whole` exceeds the whole budget,
+/// which an idle budget cannot admit either, else as [`reserve`], whose
+/// [`Failure::Memory`] is worth a retry.
+pub(crate) fn reserve_toward(bytes: usize, whole: usize) -> Result<Reservation, Failure> {
+    reserve_toward_from(&BUDGET, bytes, whole)
+}
+
+fn reserve_toward_from(
+    budget: &Arc<ByteBudget>,
+    bytes: usize,
+    whole: usize,
+) -> Result<Reservation, Failure> {
+    if u64::try_from(whole).map_or(true, |whole| whole > budget.capacity()) {
+        budget.reject();
+        return Err(Failure::Oversize);
+    }
+    reserve_from(budget, bytes)
+}
+
 fn reserve_from(budget: &Arc<ByteBudget>, bytes: usize) -> Result<Reservation, Failure> {
     let permit = u64::try_from(bytes)
         .ok()
@@ -303,6 +327,27 @@ mod tests {
         expired.set(true);
         assert!(writer.write_all(b"x").is_err());
         assert_eq!(writer.failure, Some(Failure::Cancelled));
+    }
+
+    /// A part of a body over the whole budget is `Oversize`, never worth a
+    /// retry, and counted as a rejected admission; one that would fit an
+    /// idle budget but not now is `Memory`.
+    #[test]
+    fn a_body_over_the_whole_budget_is_oversize() {
+        let budget = Arc::new(ByteBudget::new(100));
+        assert_eq!(
+            reserve_toward_from(&budget, 10, 101).err(),
+            Some(Failure::Oversize)
+        );
+        assert_eq!(budget.metrics().2, 1);
+        let held = reserve_toward_from(&budget, 60, 100).unwrap();
+        assert_eq!(
+            reserve_toward_from(&budget, 60, 100).err(),
+            Some(Failure::Memory)
+        );
+        drop(held);
+        assert!(reserve_toward_from(&budget, 60, 100).is_ok());
+        assert_eq!(used(&budget), 0);
     }
 
     #[test]

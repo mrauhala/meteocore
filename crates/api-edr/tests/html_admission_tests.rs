@@ -2,9 +2,12 @@
 //! `Point`-coverage answers they rest on.
 //!
 //! - [`parsed_document_bound`] holds for the documents EDR writes: the heap
-//!   a parse takes never exceeds it, its transient peak included.
-//! - A page whose document does not fit the response budget is refused
-//!   before the document is built, and the answers that fit are unchanged.
+//!   a parse takes never exceeds it, its transient peak included, nor what
+//!   the document holds its retained part.
+//! - A page whose document cannot fit the response budget even idle is a
+//!   400 naming its CoverageJSON, one that cannot fit it now a 503, both
+//!   refused before the document is built; a full grid's page is served on
+//!   a modest budget, and the answers that fit are unchanged.
 //! - [`MAX_AREA_POINT_COVERAGES`] `Point` coverages write about five grid
 //!   answers at [`MAX_AREA_VALUES`] as CoverageJSON.
 //!
@@ -325,19 +328,24 @@ fn app(answer: fn() -> CoverageResponse) -> axum::Router {
 
 const AREA: &str = "/collections/c/area?coords=POLYGON((20%2060,21%2060,21%2061,20%2061,20%2060))";
 
-/// The status, its `Retry-After`, and the body's length.
-async fn get(app: axum::Router, uri: &str) -> (StatusCode, Option<String>, usize) {
-    let response = app
-        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+/// The response to `uri`, its body unread: held, it stays charged to the
+/// response budget.
+async fn respond(app: axum::Router, uri: &str) -> axum::response::Response {
+    app.oneshot(Request::get(uri).body(Body::empty()).unwrap())
         .await
-        .unwrap();
+        .unwrap()
+}
+
+/// The status, its `Retry-After`, and the body.
+async fn get(app: axum::Router, uri: &str) -> (StatusCode, Option<String>, Vec<u8>) {
+    let response = respond(app, uri).await;
     let status = response.status();
     let retry_after = response
         .headers()
         .get("retry-after")
         .map(|v| v.to_str().unwrap().to_owned());
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    (status, retry_after, bytes.len())
+    (status, retry_after, bytes.to_vec())
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -354,6 +362,9 @@ fn in_child(test: &str, env: &[(&str, &str)], body: impl FnOnce()) {
     if std::env::var(CHILD).is_ok() {
         return body();
     }
+    // The parent allocates too while it waits: one test at a time here as
+    // well, or it counts in another test's measurement.
+    let _serial = serial();
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", test, "--nocapture"])
         .env(CHILD, "1")
@@ -367,19 +378,22 @@ fn in_child(test: &str, env: &[(&str, &str)], body: impl FnOnce()) {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// The heap a parse of each document takes, its high-water mark included,
-/// stays within [`parsed_document_bound`] for the shapes EDR answers: a
-/// grid of the shortest values, a grid of realistic ones, one `Point`
-/// coverage per event, station series.
+/// The heap a parse of each document takes stays within
+/// [`parsed_document_bound`] for the shapes EDR answers: what the document
+/// holds within its retained part, its high-water mark within the whole. A
+/// grid of the shortest values, one with gaps, a full grid, one `Point`
+/// coverage per event, station series. The full grid's bound stays close to
+/// its peak, so a page the budget can hold is not refused for the bound.
 #[test]
 fn the_parsed_document_bound_holds_for_every_answer_shape() {
     let _serial = serial();
-    let shapes: [(&str, CoverageResponse); 4] = [
+    let shapes: [(&str, CoverageResponse); 5] = [
         ("grid of zeros", grid(300, 300, |_| Some(0.0))),
         (
             "grid with gaps",
             grid(300, 300, |k| (k % 3 != 0).then_some(273.15)),
         ),
+        ("full grid", full_grid()),
         ("points", points(5_000)),
         ("station series", station_series(500, 48)),
     ];
@@ -393,25 +407,40 @@ fn the_parsed_document_bound_holds_for_every_answer_shape() {
         let peak = (peak() - before) as usize;
         drop(document);
         println!(
-            "{name}: body {} B, document {held} B, parse peak {peak} B, bound {bound} B",
-            json.len()
+            "{name}: body {} B; document {held} B, bound {} B; parse peak {peak} B, bound {} B",
+            json.len(),
+            bound.retained,
+            bound.peak()
         );
         assert!(
-            peak <= bound,
-            "{name}: a parse peaked at {peak} B, past its bound {bound} B"
+            held <= bound.retained,
+            "{name}: the document holds {held} B, past its bound {} B",
+            bound.retained
         );
+        assert!(
+            peak <= bound.peak(),
+            "{name}: a parse peaked at {peak} B, past its bound {} B",
+            bound.peak()
+        );
+        if name == "full grid" {
+            assert!(
+                bound.peak() * 4 <= peak * 5,
+                "{name}: the bound {} B is far past the peak {peak} B",
+                bound.peak()
+            );
+        }
     }
 }
 
-/// With a response budget that holds an answer's CoverageJSON body but
-/// not its parsed document, the HTML page is the 503 `ServerBusy`, refused
-/// before the document is built: the request's heap never reaches the
-/// document's size. The CoverageJSON and a small page are still served, and
-/// every reservation is released.
+/// With a response budget that cannot hold a page's document even idle,
+/// the HTML page is a 400 naming its CoverageJSON, never a 503 to retry,
+/// refused before the document is built: the request's heap never reaches
+/// the document's size. The CoverageJSON and a small page are still served,
+/// and every reservation is released.
 #[test]
-fn an_html_page_is_admitted_before_its_document_is_built() {
+fn an_html_page_over_the_whole_budget_is_a_400_before_its_document_is_built() {
     in_child(
-        "an_html_page_is_admitted_before_its_document_is_built",
+        "an_html_page_over_the_whole_budget_is_a_400_before_its_document_is_built",
         &[("MC_EDR_RESPONSE_MEMORY_MB", "4")],
         || {
             let _serial = serial();
@@ -429,17 +458,19 @@ fn an_html_page_is_admitted_before_its_document_is_built() {
             drop(document);
             assert!(json.len() < 2 << 20, "the body itself fits the budget");
             assert!(
-                parsed_document_bound(&json) > 4 << 20,
+                parsed_document_bound(&json).peak() > 4 << 20,
                 "its document does not"
             );
 
             let rt = runtime();
             let before = reset_peak();
-            let (status, retry_after, _) = rt.block_on(get(app(many), &format!("{AREA}&f=html")));
+            let (status, retry_after, page) =
+                rt.block_on(get(app(many), &format!("{AREA}&f=html")));
             let request = (peak() - before) as usize;
-            // The budget's `ServerBusy`, as an HTML error page.
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert_eq!(retry_after.as_deref(), Some("1"));
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(retry_after, None, "no retry can admit it");
+            let page = String::from_utf8_lossy(&page);
+            assert!(page.contains("f=CoverageJSON"), "{page}");
             println!("refused page: request peak {request} B, its document {document_bytes} B");
             assert!(
                 request < document_bytes,
@@ -449,9 +480,62 @@ fn an_html_page_is_admitted_before_its_document_is_built() {
 
             let (status, _, _) = rt.block_on(get(app(many), AREA));
             assert_eq!(status, StatusCode::OK, "the CoverageJSON still fits");
-            let (status, _, bytes) = rt.block_on(get(app(few), &format!("{AREA}&f=html")));
+            let (status, _, page) = rt.block_on(get(app(few), &format!("{AREA}&f=html")));
             assert_eq!(status, StatusCode::OK, "a small page is served");
-            assert!(bytes > 0);
+            assert!(!page.is_empty());
+            assert_eq!(api_edr::response_budget_metrics().0, 0);
+        },
+    );
+}
+
+/// A page that fits an idle budget but not one other bodies hold is the
+/// 503 `ServerBusy` to retry, and is served once they are released.
+#[test]
+fn an_html_page_that_fits_an_idle_budget_is_a_503_while_it_is_busy() {
+    in_child(
+        "an_html_page_that_fits_an_idle_budget_is_a_503_while_it_is_busy",
+        &[("MC_EDR_RESPONSE_MEMORY_MB", "48")],
+        || {
+            let _serial = serial();
+            fn page() -> CoverageResponse {
+                points(2_000)
+            }
+            let html = format!("{AREA}&f=html");
+            let rt = runtime();
+            let (status, _, _) = rt.block_on(get(app(page), &html));
+            assert_eq!(status, StatusCode::OK, "it fits the idle budget");
+
+            // Two full-grid CoverageJSON bodies, unread, hold most of it.
+            let held: Vec<_> = (0..2)
+                .map(|_| rt.block_on(respond(app(full_grid), AREA)))
+                .collect();
+            assert!(held.iter().all(|r| r.status() == StatusCode::OK));
+            let (status, retry_after, _) = rt.block_on(get(app(page), &html));
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(retry_after.as_deref(), Some("1"));
+
+            drop(held);
+            let (status, _, _) = rt.block_on(get(app(page), &html));
+            assert_eq!(status, StatusCode::OK, "served once they are released");
+            assert_eq!(api_edr::response_budget_metrics().0, 0);
+        },
+    );
+}
+
+/// The HTML page of a full million-value grid is served on the response
+/// budget `[memory] mode = "auto"` grants a small host: the bound does not
+/// refuse a page the budget can hold.
+#[test]
+fn a_full_grid_html_page_is_served_on_a_small_host_budget() {
+    in_child(
+        "a_full_grid_html_page_is_served_on_a_small_host_budget",
+        &[("MC_EDR_RESPONSE_MEMORY_MB", "204")],
+        || {
+            let _serial = serial();
+            let rt = runtime();
+            let (status, _, page) = rt.block_on(get(app(full_grid), &format!("{AREA}&f=html")));
+            assert_eq!(status, StatusCode::OK);
+            assert!(!page.is_empty());
             assert_eq!(api_edr::response_budget_metrics().0, 0);
         },
     );

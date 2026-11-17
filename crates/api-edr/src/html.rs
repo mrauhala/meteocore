@@ -19,10 +19,11 @@
 //! ([`DataPage::render_into`]), so a large page never holds a second copy
 //! of itself or regrows by doubling. Everything a data page holds is
 //! admitted by the EDR response budget before it is allocated (#1041,
-//! [`coverage_page`]): the CoverageJSON body, through the budget's writer;
-//! the document parsed from it, at [`parsed_document_bound`] before it is
-//! parsed; and the page's buffer at its estimated size before it renders
-//! ([`DataPage::render_admitted`]). The `/locations` list and
+//! [`coverage_page`]): the CoverageJSON body and the document parsed from
+//! it, at a bound counted from the body's structure before either is
+//! built, then the page's buffer at its estimated size before it renders
+//! ([`DataPage::render_admitted`]). A page that cannot fit even an idle
+//! budget is a 400 naming its CoverageJSON. The `/locations` list and
 //! `items` render their GeoJSON as a feature table, the list through the
 //! same budgeted writer as its GeoJSON.
 //!
@@ -42,7 +43,7 @@ use serde_json::Value;
 
 use crate::geojson::{encode_path_segment, FeatureSummary};
 use crate::response::{
-    parsed_document_bound, CoverageJson, LocationRows, LocationsContext, COVERAGE_JSON_MEDIA_TYPE,
+    CoverageJson, DocumentScan, LocationRows, LocationsContext, COVERAGE_JSON_MEDIA_TYPE,
 };
 use crate::response_budget::Failure;
 
@@ -147,10 +148,13 @@ impl DataPage<'_> {
     /// [`Self::render_into`] admitted by the EDR response budget (#1041):
     /// the whole buffer is reserved before it is allocated, so a page over
     /// the budget fails before it renders, and stays charged until the
-    /// body is delivered or dropped.
+    /// body is delivered or dropped. `held` is what the caller holds
+    /// reserved while the page renders: a page that cannot fit beside it in
+    /// the whole budget is [`Failure::Oversize`].
     fn render_admitted(
         &self,
         estimate: usize,
+        held: usize,
         body: impl FnOnce(&mut String),
     ) -> Result<Bytes, Failure> {
         let (head, tail) = self.shell();
@@ -158,7 +162,8 @@ impl DataPage<'_> {
             .len()
             .saturating_add(estimate)
             .saturating_add(tail.len());
-        let reservation = crate::response_budget::reserve(capacity)?;
+        let reservation =
+            crate::response_budget::reserve_toward(capacity, capacity.saturating_add(held))?;
         reservation.into_bytes(fill(&head, &tail, capacity, body).into_bytes())
     }
 }
@@ -222,38 +227,97 @@ pub(crate) struct Locations {
 /// The HTML page of a data query's result: its CoverageJSON, all of it,
 /// and on a station collection which location each coverage is.
 ///
-/// Admitted by the EDR response budget at every step, each before it
-/// allocates: the CoverageJSON body is written through the budget's
-/// [`Writer`](crate::response_budget::Writer), its parsed document is
-/// admitted at [`parsed_document_bound`] before the body is parsed, and the
-/// page at its estimated size before it renders. A result too large for
-/// the budget is refused at the first step it does not fit, before the
-/// document is built. `expired` (the query's deadline) stops the body.
+/// Admitted by the EDR response budget before each allocation:
+/// 1. The CoverageJSON body is scanned as it is serialised, without being
+///    kept: its length and the
+///    [`DocumentBound`](crate::response::DocumentBound) of its parse.
+/// 2. The body, the document it parses to and the parse's transient part
+///    are reserved together, before the body is written down.
+/// 3. The body is written, parsed, and dropped with the transient part.
+/// 4. The page is reserved at its estimate beside the document, before it
+///    renders.
+///
+/// A step that does not fit the budget now is [`Failure::Memory`], a 503
+/// to retry. One that cannot fit even an idle budget is
+/// [`Failure::Oversize`], a 400 naming the CoverageJSON. Either way the
+/// document is not built past the step refused. `expired`, the query's
+/// deadline, stops the scan.
 pub(crate) fn coverage_page(
     result: &CoverageResponse,
     page: &DataPage,
     locations: Option<&Locations>,
     expired: &dyn Fn() -> bool,
 ) -> Result<Bytes, Failure> {
-    let mut writer = crate::response_budget::Writer::new(expired);
-    if let Err(e) = serde_json::to_writer(&mut writer, &CoverageJson(result)) {
-        return Err(writer.failure.unwrap_or_else(|| {
-            tracing::error!("EDR HTML page: CoverageJSON serialise error: {e}");
-            Failure::Internal
-        }));
+    let mut scan = Scan::new(expired);
+    if let Err(e) = serde_json::to_writer(&mut scan, &CoverageJson(result)) {
+        if scan.cancelled {
+            return Err(Failure::Cancelled);
+        }
+        tracing::error!("EDR HTML page: CoverageJSON serialise error: {e}");
+        return Err(Failure::Internal);
     }
-    let json = writer.into_bytes();
-    // Held until the page is written, with the document it admits.
-    let _document = crate::response_budget::reserve(parsed_document_bound(&json))?;
+    let len = scan.scan.len();
+    let bound = scan.scan.bound();
+    let parse = len.saturating_add(bound.peak());
+    // The document is held until the page is written; the body and the
+    // parse's transient part until the parse ends.
+    let _document = crate::response_budget::reserve_toward(bound.retained, parse)?;
+    let parsing = crate::response_budget::reserve_toward(len + bound.transient, parse)?;
+    let mut json = Vec::with_capacity(len);
+    if let Err(e) = serde_json::to_writer(&mut json, &CoverageJson(result)) {
+        tracing::error!("EDR HTML page: CoverageJSON serialise error: {e}");
+        return Err(Failure::Internal);
+    }
     let doc: Value = serde_json::from_slice(&json).map_err(|e| {
         tracing::error!("EDR HTML page: CoverageJSON does not parse back: {e}");
         Failure::Internal
     })?;
     drop(json);
+    drop(parsing);
     let (coverages, estimate) = coverage_layout(&doc, page, locations);
-    page.render_admitted(estimate, |body| {
+    page.render_admitted(estimate, bound.retained, |body| {
         coverage_body(body, &doc, coverages, page, locations)
     })
+}
+
+/// A [`DocumentScan`] over a body as it is serialised, checking the
+/// query's deadline once per [`Scan::UNIT`] bytes.
+struct Scan<'a> {
+    scan: DocumentScan,
+    expired: &'a dyn Fn() -> bool,
+    next_check: usize,
+    cancelled: bool,
+}
+
+impl<'a> Scan<'a> {
+    const UNIT: usize = 64 * 1024;
+
+    fn new(expired: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            scan: DocumentScan::default(),
+            expired,
+            next_check: 0,
+            cancelled: false,
+        }
+    }
+}
+
+impl io::Write for Scan<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self.scan.len() >= self.next_check {
+            if (self.expired)() {
+                self.cancelled = true;
+                return Err(io::Error::other("EDR query deadline passed"));
+            }
+            self.next_check = self.scan.len().saturating_add(Self::UNIT);
+        }
+        self.scan.feed(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A coverage page's coverages, and the bytes its body takes from above.
