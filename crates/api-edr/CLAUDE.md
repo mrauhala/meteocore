@@ -423,23 +423,32 @@ reserves its counted size before it allocates (`csv::write_station_series`'
 `admit`). An HTML data page (`html::coverage_page`) is admitted at every
 step, each before it allocates. A first pass serialises the CoverageJSON
 into `response::DocumentScan`, which keeps nothing: the body's length and
-the `DocumentBound` of parsing it. The body, the document and the parse's
-transient part are reserved together, the body is written and parsed, and
-the body and the transient part are released before the page is reserved
-at its `body_estimate` beside the document (`DataPage::render_admitted`).
-A step that does not fit now is the 503 `ServerBusy`; one whose parts
-exceed the whole budget, which no retry can admit, is `Failure::Oversize`,
-a 400 naming `f=CoverageJSON` (`response_budget::reserve_toward`). Either
-way nothing past the step is built. The bound models how serde_json builds
+the `DocumentBound` of parsing it. The page is estimated from the result
+(`html::result_estimate`, each coverage's domain built alone), the same
+`Estimate` arithmetic as the document's, pinned equal by
+`the_page_estimate_of_a_result_is_its_documents`. The larger of what the
+parse holds at once (body, document, transient part) and what the render
+does (document, page) is checked against the whole budget before anything
+is built: over it, no retry can admit the page, and it is
+`Failure::Oversize`, a 400 naming `f=CoverageJSON`
+(`response_budget::reserve_toward`), not counted among rejected
+admissions, so it never feeds the shed-requests alert. Then the body, the
+document and the transient part are reserved, the body is written and
+parsed, the body and the transient part are released, and the page is
+reserved beside the document. A step the budget cannot hold now is the
+503 `ServerBusy`, and nothing past it is built. The bound models how serde_json builds
 a `Value`, never a size per byte: an array's `Vec` from four slots by
 doubling, plus the half-size buffer its last growth moves from; with
 `preserve_order` an index map's entries at its hash table's capacity, else
 a B-tree's leaf or nodes; strings at their text, and a scratch buffer for
 escapes. It is a bound for the CoverageJSON this crate writes, not for any
 JSON: a document `serde_json` grows otherwise, or one with duplicate keys,
-may take more. `html_admission_tests` pins it against the heap a parse
-takes with and without `preserve_order`; keep it there when serde_json,
-indexmap or hashbrown change how they grow.
+may take more. It carries a margin of an eighth for allocator size
+classes and growth drift between a dependency bump and CI.
+`html_admission_tests` pins it against the heap a parse takes with and
+without `preserve_order`, and keeps it within a quarter of a full grid's
+peak; keep it there when serde_json, indexmap or hashbrown change how they
+grow.
 `/locations` adds its own per-body cap
 (`Writer::locations`, `MC_EDR_LOCATIONS_MAX_BYTES`, 16 MiB);
 `MC_EDR_LOCATIONS_MEMORY_MB` is retired, ignored with a startup WARN. The

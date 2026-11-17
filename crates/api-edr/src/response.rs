@@ -287,33 +287,67 @@ impl Serialize for CoverageJson<'_> {
             collection.serialize_entry("coverages", &[] as &[Value])?;
             return collection.end();
         }
-
-        // Hoist parameters to collection level — the union across
-        // every coverage, so a (hypothetical) mixed-parameter
-        // collection still advertises them all rather than only the
-        // first coverage's. Each coverage's domain keeps its own
-        // `referencing`, so a collection may mix domain shapes safely.
-        let mut parameters = Map::new();
-        for qr in coverages {
-            parameters.append(&mut build_parameters(qr));
-        }
-
-        // A collection-level `domainType` is only emitted when every
-        // coverage agrees (it is an optional hint). A heterogeneous
-        // collection omits it rather than emitting a type that
-        // mismatches some coverages — each coverage's domain still
-        // carries its own `domainType`.
-        let first_type = domain_type_name(&coverages[0].domain);
-        let homogeneous = coverages
-            .iter()
-            .all(|c| domain_type_name(&c.domain) == first_type);
-        if homogeneous {
-            collection.serialize_entry("domainType", first_type)?;
+        let (domain_type, parameters) = collection_head(coverages);
+        if let Some(domain_type) = domain_type {
+            collection.serialize_entry("domainType", domain_type)?;
         }
         collection.serialize_entry("parameters", &parameters)?;
         collection.serialize_entry("coverages", &Coverages(coverages))?;
         collection.end()
     }
+}
+
+/// A non-empty CoverageCollection's `domainType`, when every coverage
+/// agrees, and its hoisted `parameters`.
+///
+/// Parameters are hoisted to collection level, the union across every
+/// coverage, so a (hypothetical) mixed-parameter collection still
+/// advertises them all rather than only the first coverage's. Each
+/// coverage's domain keeps its own `referencing`, so a collection may mix
+/// domain shapes safely. A collection-level `domainType` is only emitted
+/// when every coverage agrees (it is an optional hint): a heterogeneous
+/// collection omits it rather than emitting a type that mismatches some
+/// coverages, and each coverage's domain still carries its own.
+fn collection_head(coverages: &[QueryResult]) -> (Option<&'static str>, Map<String, Value>) {
+    let mut parameters = Map::new();
+    for qr in coverages {
+        parameters.append(&mut build_parameters(qr));
+    }
+    let first_type = coverages.first().map(|c| domain_type_name(&c.domain));
+    let homogeneous = coverages
+        .iter()
+        .all(|c| Some(domain_type_name(&c.domain)) == first_type);
+    (first_type.filter(|_| homogeneous), parameters)
+}
+
+/// The members of `result`'s CoverageJSON document besides its coverages,
+/// domain and ranges: its `type`, a collection's `domainType`, and its
+/// `parameters`. Small beside the document: what the HTML page estimates
+/// from before the document is built.
+pub(crate) fn document_head(result: &CoverageResponse) -> Value {
+    let mut head = Map::new();
+    match result {
+        CoverageResponse::Single(q) => {
+            head.insert("type".into(), Value::String("Coverage".into()));
+            head.insert("parameters".into(), Value::Object(build_parameters(q)));
+        }
+        CoverageResponse::Collection(coverages) => {
+            head.insert("type".into(), Value::String("CoverageCollection".into()));
+            if !coverages.is_empty() {
+                let (domain_type, parameters) = collection_head(coverages);
+                if let Some(domain_type) = domain_type {
+                    head.insert("domainType".into(), Value::String(domain_type.into()));
+                }
+                head.insert("parameters".into(), Value::Object(parameters));
+            }
+        }
+    }
+    Value::Object(head)
+}
+
+/// A coverage's CoverageJSON `domain`, as its document writes it.
+pub(crate) fn domain_json(desc: &DomainDescription) -> Value {
+    build_domain(desc)
 }
 
 /// A CoverageCollection's coverages, without their hoisted parameters.
@@ -418,7 +452,8 @@ struct Frame {
 ///
 /// It holds for the documents this crate writes, the CoverageJSON bodies
 /// of data queries, with `preserve_order` on and off, pinned against the
-/// heap a parse takes by `tests/html_admission_tests.rs`. It is not a
+/// heap a parse takes by `tests/html_admission_tests.rs`, and carries a
+/// margin of an eighth for the allocator's rounding ([`Self::margin`]). It is not a
 /// bound for any JSON: one that `serde_json`'s growth or its allocator
 /// treats otherwise, or a map with duplicate keys, may take more.
 #[derive(Debug, Default)]
@@ -581,14 +616,27 @@ impl DocumentScan {
         capacity.saturating_mul(Self::ENTRY).saturating_add(table)
     }
 
-    /// The bound of the text scanned so far, every container closed.
+    /// The bound of the text scanned so far, every container closed, with
+    /// [`Self::margin`].
     pub(crate) fn bound(&self) -> DocumentBound {
         DocumentBound {
-            retained: self.containers.saturating_add(self.strings),
-            transient: self
-                .largest_move
-                .saturating_add(self.longest_string.saturating_mul(2)),
+            retained: Self::margin(self.containers.saturating_add(self.strings)),
+            transient: Self::margin(
+                self.largest_move
+                    .saturating_add(self.longest_string.saturating_mul(2)),
+            ),
         }
+    }
+
+    /// `bytes` and an eighth more. The model counts the bytes `serde_json`
+    /// asks its allocator for, to within a few hundred over a document,
+    /// while the allocator hands out size classes a little larger than
+    /// asked; and a dependency bump that changes how an array or map grows
+    /// takes effect before the pinning test reports it. The eighth covers
+    /// both, and stays under the test's check that the bound is not far
+    /// past the peak.
+    fn margin(bytes: usize) -> usize {
+        bytes.saturating_add(bytes / 8)
     }
 }
 

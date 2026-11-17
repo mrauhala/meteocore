@@ -4,10 +4,11 @@
 //! - [`parsed_document_bound`] holds for the documents EDR writes: the heap
 //!   a parse takes never exceeds it, its transient peak included, nor what
 //!   the document holds its retained part.
-//! - A page whose document cannot fit the response budget even idle is a
-//!   400 naming its CoverageJSON, one that cannot fit it now a 503, both
-//!   refused before the document is built; a full grid's page is served on
-//!   a modest budget, and the answers that fit are unchanged.
+//! - A page that cannot fit the response budget even idle is a 400 naming
+//!   its CoverageJSON, refused before anything is built and not counted
+//!   among shed requests; one that cannot fit it now is a 503 to retry; a
+//!   full grid's page is served on a modest budget, and the answers that
+//!   fit are unchanged.
 //! - [`MAX_AREA_POINT_COVERAGES`] `Point` coverages write about five grid
 //!   answers at [`MAX_AREA_VALUES`] as CoverageJSON.
 //!
@@ -432,11 +433,11 @@ fn the_parsed_document_bound_holds_for_every_answer_shape() {
     }
 }
 
-/// With a response budget that cannot hold a page's document even idle,
-/// the HTML page is a 400 naming its CoverageJSON, never a 503 to retry,
-/// refused before the document is built: the request's heap never reaches
-/// the document's size. The CoverageJSON and a small page are still served,
-/// and every reservation is released.
+/// With a response budget that cannot hold a page even idle, the HTML page
+/// is a 400 naming its CoverageJSON, never a 503 to retry, and not counted
+/// among shed requests; it is refused before anything is built, so the
+/// request's heap never reaches the document's size. The CoverageJSON and a
+/// small page are still served, and every reservation is released.
 #[test]
 fn an_html_page_over_the_whole_budget_is_a_400_before_its_document_is_built() {
     in_child(
@@ -463,12 +464,18 @@ fn an_html_page_over_the_whole_budget_is_a_400_before_its_document_is_built() {
             );
 
             let rt = runtime();
+            let shed = api_edr::response_budget_metrics().2;
             let before = reset_peak();
             let (status, retry_after, page) =
                 rt.block_on(get(app(many), &format!("{AREA}&f=html")));
             let request = (peak() - before) as usize;
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(retry_after, None, "no retry can admit it");
+            assert_eq!(
+                api_edr::response_budget_metrics().2,
+                shed,
+                "an oversize page is not counted among shed requests"
+            );
             let page = String::from_utf8_lossy(&page);
             assert!(page.contains("f=CoverageJSON"), "{page}");
             println!("refused page: request peak {request} B, its document {document_bytes} B");
@@ -488,8 +495,52 @@ fn an_html_page_over_the_whole_budget_is_a_400_before_its_document_is_built() {
     );
 }
 
+/// A page whose parse fits the whole budget but whose render, the document
+/// beside the page, does not is the 400 too, decided before anything is
+/// built: the page's size is estimated from the result up front, never
+/// found at the page step after the document exists. The budget sits
+/// between the two, worked out from the full grid's own bound.
+#[test]
+fn a_page_whose_render_cannot_fit_is_refused_before_its_document_is_built() {
+    const MIB: usize = 1 << 20;
+    let json = body(&full_grid());
+    let bound = parsed_document_bound(&json);
+    let parse = json.len() + bound.peak();
+    let budget = (parse.div_ceil(MIB) + 2).to_string();
+    in_child(
+        "a_page_whose_render_cannot_fit_is_refused_before_its_document_is_built",
+        &[("MC_EDR_RESPONSE_MEMORY_MB", &budget)],
+        || {
+            let _serial = serial();
+            let before = live();
+            let document: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            let document_bytes = (live() - before) as usize;
+            drop(document);
+            drop(json);
+
+            let rt = runtime();
+            let before = reset_peak();
+            let (status, retry_after, page) =
+                rt.block_on(get(app(full_grid), &format!("{AREA}&f=html")));
+            let request = (peak() - before) as usize;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(retry_after, None);
+            assert!(String::from_utf8_lossy(&page).contains("f=CoverageJSON"));
+            println!("refused render: request peak {request} B, its document {document_bytes} B");
+            assert!(
+                request < document_bytes,
+                "the refused page built its document: request peak {request} B"
+            );
+            let (status, _, _) = rt.block_on(get(app(full_grid), AREA));
+            assert_eq!(status, StatusCode::OK, "the CoverageJSON still fits");
+            assert_eq!(api_edr::response_budget_metrics().0, 0);
+        },
+    );
+}
+
 /// A page that fits an idle budget but not one other bodies hold is the
-/// 503 `ServerBusy` to retry, and is served once they are released.
+/// 503 `ServerBusy` to retry, at the first step that does not fit, and is
+/// served once they are released.
 #[test]
 fn an_html_page_that_fits_an_idle_budget_is_a_503_while_it_is_busy() {
     in_child(

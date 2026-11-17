@@ -375,8 +375,9 @@ pub const MAX_AREA_VALUES: usize = 1_000_000;
 /// about five grid answers at [`MAX_AREA_VALUES`] as CoverageJSON (pinned
 /// by api-edr's `html_admission_tests`). That cost is bounded per answer
 /// here, and across answers by the EDR query admission, which builds a
-/// few at once; an HTML page of a large answer is admitted, or refused,
-/// by the EDR response budget before its document is built. An engine
+/// few at once; an HTML page of a large answer is admitted by the EDR
+/// response budget, which refuses one too large for it before its
+/// document is built. An engine
 /// reads at most one item past the limit, so a larger answer is refused
 /// after reading that many.
 pub const MAX_AREA_POINT_COVERAGES: usize = 100_000;

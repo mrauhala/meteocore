@@ -614,7 +614,9 @@ fn large_bodies_over_the_response_budget_are_503() {
                     }
                     let (_, capacity, rejected) = api_edr::response_budget_metrics();
                     assert_eq!(capacity, 4 << 20);
-                    assert_eq!(rejected, 2);
+                    // The CoverageJSON was shed; the oversize page is the
+                    // client's 400, not counted among shed requests.
+                    assert_eq!(rejected, 1);
                     for uri in [
                         "/collections/weather/locations/small",
                         "/collections/weather/locations/small?f=html",

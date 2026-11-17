@@ -340,8 +340,9 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   any step builds nothing past it. It stays charged until the client has read it
   or gone away. A body that does not fit is a 503 `ServerBusy` with
   `Retry-After: 1`. An HTML page that the budget could not hold even idle
-  is a 400 instead, saying to request `f=CoverageJSON` or narrow the
-  query: no retry would admit it. An area answer at the 1 M-value budget is about 9 MB
+  is a 400 instead, before anything is built, saying to request
+  `f=CoverageJSON` or narrow the query: no retry would admit it, and it is
+  not counted among the budget's rejected admissions. An area answer at the 1 M-value budget is about 9 MB
   of CoverageJSON and two to three times that as HTML, so the default
   holds about 57 of them in flight; an HTML page also holds its document,
   so far fewer pages fit. Size the budget for the largest

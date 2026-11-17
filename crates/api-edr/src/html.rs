@@ -20,10 +20,10 @@
 //! of itself or regrows by doubling. Everything a data page holds is
 //! admitted by the EDR response budget before it is allocated (#1041,
 //! [`coverage_page`]): the CoverageJSON body and the document parsed from
-//! it, at a bound counted from the body's structure before either is
-//! built, then the page's buffer at its estimated size before it renders
-//! ([`DataPage::render_admitted`]). A page that cannot fit even an idle
-//! budget is a 400 naming its CoverageJSON. The `/locations` list and
+//! it, at a bound counted from the body's structure, then the page's
+//! buffer at its estimate beside the document, both estimated before
+//! anything is built. A page that cannot fit even an idle budget is a 400
+//! naming its CoverageJSON, before anything is built. The `/locations` list and
 //! `items` render their GeoJSON as a feature table, the list through the
 //! same budgeted writer as its GeoJSON.
 //!
@@ -144,28 +144,6 @@ impl DataPage<'_> {
         let capacity = head.len() + estimate + tail.len();
         fill(&head, &tail, capacity, body)
     }
-
-    /// [`Self::render_into`] admitted by the EDR response budget (#1041):
-    /// the whole buffer is reserved before it is allocated, so a page over
-    /// the budget fails before it renders, and stays charged until the
-    /// body is delivered or dropped. `held` is what the caller holds
-    /// reserved while the page renders: a page that cannot fit beside it in
-    /// the whole budget is [`Failure::Oversize`].
-    fn render_admitted(
-        &self,
-        estimate: usize,
-        held: usize,
-        body: impl FnOnce(&mut String),
-    ) -> Result<Bytes, Failure> {
-        let (head, tail) = self.shell();
-        let capacity = head
-            .len()
-            .saturating_add(estimate)
-            .saturating_add(tail.len());
-        let reservation =
-            crate::response_budget::reserve_toward(capacity, capacity.saturating_add(held))?;
-        reservation.into_bytes(fill(&head, &tail, capacity, body).into_bytes())
-    }
 }
 
 /// A page in one buffer of `capacity` bytes: `head`, what `body` writes,
@@ -227,21 +205,23 @@ pub(crate) struct Locations {
 /// The HTML page of a data query's result: its CoverageJSON, all of it,
 /// and on a station collection which location each coverage is.
 ///
-/// Admitted by the EDR response budget before each allocation:
+/// Admitted by the EDR response budget before each allocation (#1041):
 /// 1. The CoverageJSON body is scanned as it is serialised, without being
 ///    kept: its length and the
-///    [`DocumentBound`](crate::response::DocumentBound) of its parse.
-/// 2. The body, the document it parses to and the parse's transient part
-///    are reserved together, before the body is written down.
-/// 3. The body is written, parsed, and dropped with the transient part.
-/// 4. The page is reserved at its estimate beside the document, before it
-///    renders.
+///    [`DocumentBound`](crate::response::DocumentBound) of its parse. The
+///    page's size is estimated from the result ([`result_estimate`]).
+/// 2. What the page holds at once at its largest, the body, the document
+///    and the parse's transient part, or the document and the page, is
+///    checked against the whole budget: over it, no retry can admit the
+///    page, and it is [`Failure::Oversize`], a 400 naming the
+///    CoverageJSON, before anything is built.
+/// 3. The body, the document and the transient part are reserved; the
+///    body is written, parsed, and dropped with the transient part.
+/// 4. The page is reserved beside the document, then rendered.
 ///
-/// A step that does not fit the budget now is [`Failure::Memory`], a 503
-/// to retry. One that cannot fit even an idle budget is
-/// [`Failure::Oversize`], a 400 naming the CoverageJSON. Either way the
-/// document is not built past the step refused. `expired`, the query's
-/// deadline, stops the scan.
+/// A step the budget cannot hold now is [`Failure::Memory`], a 503 to
+/// retry, and nothing past it is built. `expired`, the query's deadline,
+/// stops the scan.
 pub(crate) fn coverage_page(
     result: &CoverageResponse,
     page: &DataPage,
@@ -258,11 +238,19 @@ pub(crate) fn coverage_page(
     }
     let len = scan.scan.len();
     let bound = scan.scan.bound();
+    let (head, tail) = page.shell();
+    let capacity = head
+        .len()
+        .saturating_add(result_estimate(result, page))
+        .saturating_add(locations.map_or(0, locations_len))
+        .saturating_add(tail.len());
     let parse = len.saturating_add(bound.peak());
+    let render = bound.retained.saturating_add(capacity);
+    let whole = parse.max(render);
     // The document is held until the page is written; the body and the
     // parse's transient part until the parse ends.
-    let _document = crate::response_budget::reserve_toward(bound.retained, parse)?;
-    let parsing = crate::response_budget::reserve_toward(len + bound.transient, parse)?;
+    let _document = crate::response_budget::reserve_toward(bound.retained, whole)?;
+    let parsing = crate::response_budget::reserve_toward(len + bound.transient, whole)?;
     let mut json = Vec::with_capacity(len);
     if let Err(e) = serde_json::to_writer(&mut json, &CoverageJson(result)) {
         tracing::error!("EDR HTML page: CoverageJSON serialise error: {e}");
@@ -274,10 +262,14 @@ pub(crate) fn coverage_page(
     })?;
     drop(json);
     drop(parsing);
-    let (coverages, estimate) = coverage_layout(&doc, page, locations);
-    page.render_admitted(estimate, bound.retained, |body| {
-        coverage_body(body, &doc, coverages, page, locations)
-    })
+    let reservation = crate::response_budget::reserve_toward(capacity, whole)?;
+    let coverages = coverage_list(&doc);
+    reservation.into_bytes(
+        fill(&head, &tail, capacity, |body| {
+            coverage_body(body, &doc, coverages, page, locations)
+        })
+        .into_bytes(),
+    )
 }
 
 /// A [`DocumentScan`] over a body as it is serialised, checking the
@@ -320,16 +312,23 @@ impl io::Write for Scan<'_> {
     }
 }
 
-/// A coverage page's coverages, and the bytes its body takes from above.
+/// A coverage page's coverages: a collection's, or the document itself.
+fn coverage_list(doc: &Value) -> Vec<&Value> {
+    match doc["coverages"].as_array() {
+        Some(coverages) => coverages.iter().collect(),
+        None => vec![doc],
+    }
+}
+
+/// A coverage page's coverages, and the bytes its body takes from above,
+/// estimated from the document.
+#[cfg(test)]
 fn coverage_layout<'d>(
     doc: &'d Value,
     page: &DataPage,
     locations: Option<&Locations>,
 ) -> (Vec<&'d Value>, usize) {
-    let coverages: Vec<&Value> = match doc["coverages"].as_array() {
-        Some(coverages) => coverages.iter().collect(),
-        None => vec![doc],
-    };
+    let coverages = coverage_list(doc);
     let estimate = body_estimate(doc, &coverages, page) + locations.map_or(0, locations_len);
     (coverages, estimate)
 }
@@ -395,16 +394,63 @@ fn locations_len(locations: &Locations) -> usize {
 
 /// The bytes a coverage page's body takes, from above: a value cell is at
 /// most `<td title="`, an f64's longest JSON form, `">`, its longest display
-/// form and `</td>` ([`CELL`]); a row table adds a cell per axis coordinate
-/// and the row tags per value; a grid table a header cell per column and
-/// row ([`HEADER`]); the domain table lists every axis value. The request,
-/// links, form, chart, facts, parameters and any other member are measured
-/// ([`panels_estimate`], [`json_html_len`]); 16 KiB covers the page's fixed
-/// markup, [`SECTION`] each coverage section's and [`TABLE`] each range
-/// table's.
-fn body_estimate(doc: &Value, coverages: &[&Value], page: &DataPage) -> usize {
+/// form and `</td>` ([`Estimate::CELL`]); a row table adds a cell per axis
+/// coordinate and the row tags per value; a grid table a header cell per
+/// column and row ([`Estimate::HEADER`]); the domain table lists every axis
+/// value. The request, links, form, chart, facts, parameters and any other
+/// member are measured ([`panels_estimate`], [`json_html_len`]); 16 KiB
+/// covers the page's fixed markup, [`Estimate::SECTION`] each coverage
+/// section's and [`Estimate::TABLE`] each range table's.
+///
+/// One arithmetic over a document's parts, so the estimate of a document
+/// and of the result it serialises ([`result_estimate`]) are the same
+/// number (`the_page_estimate_of_a_result_is_its_documents`).
+struct Estimate {
+    bytes: usize,
+}
+
+/// What the page estimate reads of a range: how many values, the names of
+/// its axes, and its shape.
+struct RangeLayout<'a> {
+    values: usize,
+    axis_names: Vec<&'a str>,
+    shape: Vec<usize>,
+}
+
+impl<'a> RangeLayout<'a> {
+    /// A range of the CoverageJSON document.
+    #[cfg(test)]
+    fn of_json(range: &'a Value) -> Self {
+        Self {
+            values: range["values"].as_array().map_or(0, Vec::len),
+            axis_names: range["axisNames"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect(),
+            shape: range["shape"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|n| n.as_u64().and_then(|n| usize::try_from(n).ok()))
+                .collect(),
+        }
+    }
+
+    /// A range of the result, as its document writes it.
+    fn of_array(range: &'a ds_core::model::NdArray) -> Self {
+        Self {
+            values: range.values.len(),
+            axis_names: range.axis_names.iter().map(String::as_str).collect(),
+            shape: range.shape.clone(),
+        }
+    }
+}
+
+impl Estimate {
     const CELL: usize = 68;
-    /// A grid table's `<th scope="…">` with its title, as [`CELL`].
+    /// A grid table's `<th scope="…">` with its title, as [`Self::CELL`].
     const HEADER: usize = 80;
     const ROW: usize = 9;
     const AXIS_VALUE: usize = 40;
@@ -413,67 +459,102 @@ fn body_estimate(doc: &Value, coverages: &[&Value], page: &DataPage) -> usize {
     const SECTION: usize = 2048;
     /// A range table's head, caption and column headers.
     const TABLE: usize = 512;
-    let mut bytes: usize = 16 * 1024 + panels_estimate(page);
-    bytes = bytes.saturating_add(coverages.len().saturating_mul(SECTION));
-    bytes += members_len(doc, &["coverages", "parameters", "domain", "ranges"]);
-    // A parameter's row shows its label, unit and observed property, each
-    // part of the parameter, then all of it; the summary names it again.
-    for (key, parameter) in doc["parameters"].as_object().into_iter().flatten() {
-        bytes = bytes.saturating_add(256 + escaped_len(key) + 5 * json_html_len(parameter));
+    /// The members of a coverage the page lays out elsewhere.
+    const COVERAGE_LAID_OUT: [&'static str; 4] = ["type", "domain", "ranges", "parameters"];
+
+    /// The page's fixed parts, `coverages` sections, and the document's
+    /// own members and parameters from `head`: the document, or its
+    /// [`document_head`](crate::response::document_head).
+    fn new(page: &DataPage, head: &Value, coverages: usize) -> Self {
+        let mut bytes: usize = 16 * 1024 + panels_estimate(page);
+        bytes = bytes.saturating_add(coverages.saturating_mul(Self::SECTION));
+        bytes += members_len(head, &["coverages", "parameters", "domain", "ranges"]);
+        // A parameter's row shows its label, unit and observed property, each
+        // part of the parameter, then all of it; the summary names it again.
+        for (key, parameter) in head["parameters"].as_object().into_iter().flatten() {
+            bytes = bytes.saturating_add(256 + escaped_len(key) + 5 * json_html_len(parameter));
+        }
+        Self { bytes }
     }
-    for coverage in coverages {
-        bytes = bytes.saturating_add(members_len(
-            &coverage["domain"],
-            &["type", "domainType", "axes"],
-        ));
-        bytes = bytes.saturating_add(members_len(
-            coverage,
-            &["type", "domain", "ranges", "parameters"],
-        ));
-        let axes = &coverage["domain"]["axes"];
+
+    /// One coverage: its `domain`, the length of its members the page shows
+    /// besides ([`members_len`]), and its ranges.
+    fn coverage<'r>(
+        &mut self,
+        domain: &Value,
+        members: usize,
+        ranges: impl Iterator<Item = RangeLayout<'r>>,
+    ) {
+        let mut bytes = self.bytes;
+        bytes = bytes.saturating_add(members_len(domain, &["type", "domainType", "axes"]));
+        bytes = bytes.saturating_add(members);
+        let axes = &domain["axes"];
         for axis in axes.as_object().into_iter().flatten().map(|(_, a)| a) {
             let width = axis["coordinates"].as_array().map_or(1, Vec::len);
-            bytes = bytes.saturating_add(axis_len(axis).saturating_mul(AXIS_VALUE * width));
+            bytes = bytes.saturating_add(axis_len(axis).saturating_mul(Self::AXIS_VALUE * width));
         }
-        for range in coverage["ranges"]
-            .as_object()
-            .into_iter()
-            .flatten()
-            .map(|(_, r)| r)
-        {
-            bytes = bytes.saturating_add(TABLE);
-            let values = range["values"].as_array().map_or(0, Vec::len);
-            let names: Vec<&str> = range["axisNames"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
+        for range in ranges {
+            bytes = bytes.saturating_add(Self::TABLE);
+            let names = &range.axis_names;
             let per_value = if names.len() >= 2 && names[names.len() - 2..] == ["y", "x"] {
                 // Each y × x table: a header cell per column and per row.
-                let shape: Vec<usize> = range["shape"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|n| n.as_u64().and_then(|n| usize::try_from(n).ok()))
-                    .collect();
-                if let [.., ny, nx] = shape[..] {
-                    let tables = values / ny.saturating_mul(nx).max(1);
-                    let headers = ny.saturating_add(nx).saturating_mul(HEADER);
-                    bytes = bytes.saturating_add(tables.saturating_mul(TABLE + headers));
+                if let [.., ny, nx] = range.shape[..] {
+                    let tables = range.values / ny.saturating_mul(nx).max(1);
+                    let headers = ny.saturating_add(nx).saturating_mul(Self::HEADER);
+                    bytes = bytes.saturating_add(tables.saturating_mul(Self::TABLE + headers));
                 }
-                CELL
+                Self::CELL
             } else {
                 let axis_cells: usize = names
                     .iter()
                     .map(|a| axes[*a]["coordinates"].as_array().map_or(1, Vec::len))
                     .sum();
-                CELL * (1 + axis_cells) + ROW
+                Self::CELL * (1 + axis_cells) + Self::ROW
             };
-            bytes = bytes.saturating_add(values.saturating_mul(per_value));
+            bytes = bytes.saturating_add(range.values.saturating_mul(per_value));
         }
+        self.bytes = bytes;
     }
-    bytes
+}
+
+/// [`Estimate`] of a CoverageJSON document.
+#[cfg(test)]
+fn body_estimate(doc: &Value, coverages: &[&Value], page: &DataPage) -> usize {
+    let mut estimate = Estimate::new(page, doc, coverages.len());
+    for coverage in coverages {
+        estimate.coverage(
+            &coverage["domain"],
+            members_len(coverage, &Estimate::COVERAGE_LAID_OUT),
+            coverage["ranges"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(_, range)| RangeLayout::of_json(range)),
+        );
+    }
+    estimate.bytes
+}
+
+/// [`Estimate`] of `result`'s CoverageJSON document, from the result: each
+/// coverage's domain is built alone and dropped, never the document, so a
+/// page is estimated before its document exists. Every member of a
+/// coverage the page shows besides is one [`Estimate::COVERAGE_LAID_OUT`]
+/// skips, so a coverage's [`members_len`] is that of none.
+fn result_estimate(result: &CoverageResponse, page: &DataPage) -> usize {
+    let coverages: &[ds_core::model::QueryResult] = match result {
+        CoverageResponse::Single(q) => std::slice::from_ref(q),
+        CoverageResponse::Collection(v) => v,
+    };
+    let head = crate::response::document_head(result);
+    let mut estimate = Estimate::new(page, &head, coverages.len());
+    for q in coverages {
+        estimate.coverage(
+            &crate::response::domain_json(&q.domain),
+            members_len(&Value::Null, &Estimate::COVERAGE_LAID_OUT),
+            q.ranges.values().map(RangeLayout::of_array),
+        );
+    }
+    estimate.bytes
 }
 
 /// A data page: what it answers, then the data (summary, the location
@@ -2029,5 +2110,131 @@ mod tests {
     fn unravel_is_row_major() {
         assert_eq!(unravel(5, &[2, 3]), [1, 2]);
         assert_eq!(unravel(0, &[]), Vec::<usize>::new());
+    }
+
+    /// The page estimate of a result, made before its document is built,
+    /// is the estimate of the document it serialises to, for every domain
+    /// type, a single coverage, mixed and empty collections, foreign
+    /// members and vertical axes: a page refused for size is refused before
+    /// its document is built, at the size the page step would reserve.
+    #[test]
+    fn the_page_estimate_of_a_result_is_its_documents() {
+        use ds_core::model::{
+            DomainDescription as D, GridResolution, NdArray, ParameterDescription, QueryResult,
+            ValuePrecision, VerticalCoord,
+        };
+        use ds_core::vertical::VerticalKind;
+        use std::collections::HashMap;
+        let t: chrono::DateTime<chrono::Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+        let range = |shape: Vec<usize>, axes: &[&str]| NdArray {
+            values: (0..shape.iter().product::<usize>())
+                .map(|i| (i % 3 != 0).then_some(i as f64 * 0.5))
+                .collect(),
+            axis_names: axes.iter().map(|a| a.to_string()).collect(),
+            shape,
+            precision: ValuePrecision::F64,
+        };
+        let coverage = |domain: D, ranges: Vec<(&str, NdArray)>| QueryResult {
+            domain,
+            parameters: ranges
+                .iter()
+                .map(|(name, _)| {
+                    (
+                        name.to_string(),
+                        ParameterDescription {
+                            label: format!("<{name}>"),
+                            unit: "K".into(),
+                            observed_property: name.to_string(),
+                            standard_name: Some("air_temperature".into()),
+                        },
+                    )
+                })
+                .collect::<HashMap<_, _>>(),
+            ranges: ranges
+                .into_iter()
+                .map(|(name, range)| (name.to_string(), range))
+                .collect(),
+        };
+        let z = |values: Vec<f64>| VerticalCoord {
+            kind: VerticalKind::Pressure,
+            values,
+        };
+        let grid = coverage(
+            D::Grid {
+                x: vec![1.0, 2.0, 3.0],
+                y: vec![4.0, 5.0],
+                t: Some(vec![t]),
+                z: Some(z(vec![850.0, 500.0])),
+                coarsened: Some(Box::new(GridResolution {
+                    native: [0.1, 0.1],
+                    served: [0.2, 0.2],
+                })),
+            },
+            vec![("a", range(vec![1, 2, 2, 3], &["t", "z", "y", "x"]))],
+        );
+        let point = coverage(
+            D::Point {
+                x: 1.0,
+                y: 2.0,
+                t: Some(t),
+                z: None,
+            },
+            vec![("b", range(vec![], &[]))],
+        );
+        let series = coverage(
+            D::PointSeries {
+                x: 1.0,
+                y: 2.0,
+                t: vec![t, t + chrono::Duration::hours(1)],
+                z: Some(z(vec![850.0])),
+            },
+            vec![("a", range(vec![2], &["t"])), ("b", range(vec![2], &["t"]))],
+        );
+        let profile = coverage(
+            D::VerticalProfile {
+                x: 1.0,
+                y: 2.0,
+                t: Some(t),
+                z: z(vec![850.0, 700.0, 500.0]),
+            },
+            vec![("a", range(vec![3], &["z"]))],
+        );
+        let nodes = vec![(t, 1.0, 2.0), (t, 1.5, 2.5)];
+        let section = coverage(
+            D::Section {
+                nodes: nodes.clone(),
+                z: VerticalCoord {
+                    kind: VerticalKind::HeightAboveAntenna,
+                    values: vec![0.0, 500.0],
+                },
+                coverage_floor: Some(vec![10.0, 20.0]),
+            },
+            vec![("a", range(vec![2, 2], &["composite", "z"]))],
+        );
+        let trajectory = coverage(
+            D::Trajectory {
+                nodes,
+                node_z: Some(z(vec![850.0, 700.0])),
+                z: None,
+            },
+            vec![("a", range(vec![2], &["composite"]))],
+        );
+        let results = [
+            CoverageResponse::Single(grid.clone()),
+            CoverageResponse::Single(section.clone()),
+            CoverageResponse::Collection(vec![point.clone(), point]),
+            CoverageResponse::Collection(vec![grid, series, profile, section, trajectory]),
+            CoverageResponse::Collection(Vec::new()),
+        ];
+        let page = page();
+        for result in &results {
+            let doc = crate::response::coverage_response_to_json(result);
+            let coverages = coverage_list(&doc);
+            assert_eq!(
+                result_estimate(result, &page),
+                body_estimate(&doc, &coverages, &page),
+                "{doc}"
+            );
+        }
     }
 }

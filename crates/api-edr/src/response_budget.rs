@@ -203,7 +203,10 @@ pub(crate) fn reserve(bytes: usize) -> Result<Reservation, Failure> {
 /// Reserve `bytes`, one part of a body whose parts held at once total
 /// `whole`: [`Failure::Oversize`] when `whole` exceeds the whole budget,
 /// which an idle budget cannot admit either, else as [`reserve`], whose
-/// [`Failure::Memory`] is worth a retry.
+/// [`Failure::Memory`] is worth a retry. An oversize body is the client's
+/// request, answered 400, not admission turning work away: it is not
+/// counted among the budget's rejected admissions, which `/metrics`
+/// exports as `edr_response_rejected_total` for the shed-requests alert.
 pub(crate) fn reserve_toward(bytes: usize, whole: usize) -> Result<Reservation, Failure> {
     reserve_toward_from(&BUDGET, bytes, whole)
 }
@@ -214,7 +217,6 @@ fn reserve_toward_from(
     whole: usize,
 ) -> Result<Reservation, Failure> {
     if u64::try_from(whole).map_or(true, |whole| whole > budget.capacity()) {
-        budget.reject();
         return Err(Failure::Oversize);
     }
     reserve_from(budget, bytes)
@@ -330,8 +332,8 @@ mod tests {
     }
 
     /// A part of a body over the whole budget is `Oversize`, never worth a
-    /// retry, and counted as a rejected admission; one that would fit an
-    /// idle budget but not now is `Memory`.
+    /// retry, and not counted as a rejected admission; one that would fit
+    /// an idle budget but not now is `Memory`, and is.
     #[test]
     fn a_body_over_the_whole_budget_is_oversize() {
         let budget = Arc::new(ByteBudget::new(100));
@@ -339,12 +341,13 @@ mod tests {
             reserve_toward_from(&budget, 10, 101).err(),
             Some(Failure::Oversize)
         );
-        assert_eq!(budget.metrics().2, 1);
+        assert_eq!(budget.metrics().2, 0, "an oversize request is not shed");
         let held = reserve_toward_from(&budget, 60, 100).unwrap();
         assert_eq!(
             reserve_toward_from(&budget, 60, 100).err(),
             Some(Failure::Memory)
         );
+        assert_eq!(budget.metrics().2, 1, "a busy budget sheds it");
         drop(held);
         assert!(reserve_toward_from(&budget, 60, 100).is_ok());
         assert_eq!(used(&budget), 0);
