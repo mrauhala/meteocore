@@ -332,7 +332,8 @@ column's index probe.
   EDR location. Event Features: see [Event collection](#event-collection).
 
 A response holds at most 500 000 values (NULLs and filtered values
-included) and an area at most 200 000 stations. Windows up to 12 hours run
+included), an area at most 200 000 stations, and an events area at most
+100 000 events (each is a coverage of its own). Windows up to 12 hours run
 one statement per observation table. Longer windows and no `datetime` run
 one per station (and parameter, for `per_parameter`), each at most 10 000
 rows; past 20 000 statements a window runs per table again and no

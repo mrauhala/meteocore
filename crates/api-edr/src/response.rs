@@ -363,6 +363,79 @@ pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
     to_value(CoverageJson(result))
 }
 
+/// An upper bound of the heap `serde_json` takes to parse the JSON text
+/// `json` into a [`Value`], its high-water mark included, so a caller can
+/// admit a document before it builds it: the HTML data page lays out the
+/// CoverageJSON body parsed back.
+///
+/// It counts the text's structure, never a size per byte. Outside strings,
+/// every array element follows its array's `[` or a `,` inside it, and every
+/// object member is followed by a `:`; the outermost value is one more.
+/// - An array element is charged three `Value`s: its slot, the room a
+///   growing array keeps, and the copy it makes while it moves.
+/// - An object member is charged twice its key, `Value`, hash and index,
+///   for the room a growing map keeps.
+/// - An object is charged the table its map allocates on its first member:
+///   a B-tree leaf, or with `preserve_order` an index table and entries for
+///   its first members.
+/// - The text itself bounds the bytes of every key and string.
+///
+/// Pinned against the heap a parse takes, with and without
+/// `preserve_order`, by `tests/html_admission_tests.rs`.
+pub fn parsed_document_bound(json: &[u8]) -> usize {
+    use std::mem::size_of;
+    const VALUE: usize = size_of::<Value>();
+    const KEY: usize = size_of::<String>();
+    const WORD: usize = size_of::<usize>();
+    const ELEMENT: usize = 3 * VALUE;
+    const MEMBER: usize = 2 * (KEY + VALUE + 2 * WORD);
+    /// `serde_json`'s map is a B-tree unless `preserve_order` makes it an
+    /// index map, which is larger than a B-tree's root.
+    const INDEXED: bool =
+        size_of::<Map<String, Value>>() > size_of::<std::collections::BTreeMap<String, Value>>();
+    const OBJECT: usize = if INDEXED {
+        4 * (KEY + VALUE + 2 * WORD)
+    } else {
+        11 * (KEY + VALUE) + 2 * WORD
+    };
+    let (mut elements, mut members, mut objects) = (1usize, 0usize, 0usize);
+    // Whether each open container is an array, innermost last.
+    let mut arrays: Vec<bool> = Vec::new();
+    let (mut in_string, mut escaped) = (false, false);
+    for &byte in json {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => {
+                arrays.push(true);
+                elements += 1;
+            }
+            b'{' => {
+                arrays.push(false);
+                objects += 1;
+            }
+            b']' | b'}' => {
+                arrays.pop();
+            }
+            b',' if arrays.last() == Some(&true) => elements += 1,
+            b':' => members += 1,
+            _ => {}
+        }
+    }
+    json.len()
+        .saturating_add(elements.saturating_mul(ELEMENT))
+        .saturating_add(members.saturating_mul(MEMBER))
+        .saturating_add(objects.saturating_mul(OBJECT))
+}
+
 fn build_domain(desc: &DomainDescription) -> Value {
     match desc {
         DomainDescription::Point { x, y, t, z } => {
@@ -819,6 +892,24 @@ mod coverage_tests {
             serde_json::to_string(&CoverageJson(&empty)).unwrap(),
             r#"{"type":"CoverageCollection","coverages":[]}"#
         );
+    }
+
+    /// The document bound counts structure outside strings only: brackets,
+    /// commas and colons inside a string, escaped quotes included, are
+    /// text. Commas in an object separate members, not array elements.
+    #[test]
+    fn the_document_bound_counts_structure_outside_strings() {
+        let text = br#"["a\"[{,:]}\\"]"#;
+        let plain = br#"["aaaaaaaaaaa"]"#;
+        assert_eq!(text.len(), plain.len());
+        assert_eq!(parsed_document_bound(text), parsed_document_bound(plain));
+        // Two members are charged more than two array elements, and an
+        // object its table.
+        assert!(
+            parsed_document_bound(br#"{"a":1,"b":2}"#) > parsed_document_bound(br#"[1,2,3,4,5]"#)
+        );
+        // Every element counts.
+        assert!(parsed_document_bound(b"[1,2,3]") > parsed_document_bound(b"[1,2]  "));
     }
 }
 

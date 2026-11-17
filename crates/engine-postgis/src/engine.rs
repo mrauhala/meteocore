@@ -21,7 +21,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
     check_mask_budget, parse_area_coords, Feature, FeaturePage, FeatureQuery, Geometry,
-    PropertyValue, QueryPolygon,
+    PropertyValue, QueryPolygon, MAX_AREA_POINT_COVERAGES,
 };
 use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::model::{
@@ -37,9 +37,10 @@ use crate::metadata::{CollectionMeta, LocationsCut, MetadataCache};
 use crate::query::{
     build_area_set, build_events_area, build_events_feature, build_events_features,
     build_events_pick, build_events_window, build_location, build_position,
-    build_stations_in_polygon, first_observation_column, params_as_refs, BuiltQuery, EventIdMatch,
-    EventsSelection, WindowAttrs, DEFAULT_POSITION_RADIUS_M, MAX_AREA_QUERIES, MAX_EVENTS_PAGE,
-    MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
+    build_stations_in_polygon, events_area_allowed, first_observation_column, params_as_refs,
+    BuiltQuery, EventIdMatch, EventsSelection, WindowAttrs, DEFAULT_POSITION_RADIUS_M,
+    MAX_AREA_QUERIES, MAX_EVENTS_PAGE, MAX_OBSERVATION_ROWS, MAX_RESPONSE_VALUES,
+    MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
 };
 use crate::schema::{EventsShape, ObservationSchema};
 use crate::station_map::StationSymbols;
@@ -505,7 +506,8 @@ impl PostgisEngine {
     /// Events-shape area query: one SQL statement over the event table, one
     /// `Point` coverage per returned event row. An empty window is a valid
     /// empty `CoverageCollection` (no strikes in the area is an answer, not
-    /// a 404 — unlike a missing station).
+    /// a 404 — unlike a missing station). The answer holds at most
+    /// [`MAX_AREA_POINT_COVERAGES`] events ([`events_area_allowed`]).
     fn query_area_events(
         &self,
         shape: &EventsShape,
@@ -513,6 +515,56 @@ impl PostgisEngine {
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
     ) -> Result<CoverageResponse, DataServerError> {
+        self.query_area_events_within(
+            shape,
+            coords,
+            datetime,
+            parameters,
+            MAX_AREA_POINT_COVERAGES,
+        )
+    }
+
+    /// [`Self::query_area_events`] bounded by `cap` events: the statement
+    /// reads one row more, and a window that holds it is the 400, checked
+    /// before any row is decoded.
+    fn query_area_events_within(
+        &self,
+        shape: &EventsShape,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        cap: usize,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let (built, source_keys) =
+            self.events_area_query(shape, coords, datetime, parameters, cap)?;
+        let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
+        let rows = run_single_query_sync(&self.pool, built)?;
+        if rows.len() > events_area_allowed(key_refs.len(), cap) {
+            return Err(events_budget_exceeded(key_refs.len(), cap));
+        }
+        for row in &rows {
+            self.check_geometry_row(row)?;
+        }
+        let events = decode_event_rows(&rows, &key_refs)?;
+        Ok(CoverageResponse::Collection(assemble_event_coverages(
+            &self.config,
+            &key_refs,
+            events,
+        )))
+    }
+
+    /// The statement an events area query bounded by `cap` events runs,
+    /// and the source keys it reads. Its `LIMIT` is one row past
+    /// [`events_area_allowed`]: a window holding more events is detected as
+    /// that one row, never truncated silently, and nothing past it is read.
+    fn events_area_query(
+        &self,
+        shape: &EventsShape,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        cap: usize,
+    ) -> Result<(BuiltQuery, Vec<String>), DataServerError> {
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
         let polygon_wkt = normalize_area_wkt(coords)?;
@@ -521,10 +573,7 @@ impl PostgisEngine {
         // configured window ending "now", as Features does (#503).
         let (t0, t1) = datetime.unwrap_or_else(|| self.events_default_range());
 
-        let per_row = key_refs.len().max(1);
-        // +1 sentinel row: crossing the budget is detected as "one more row
-        // than fits" rather than silently truncating an over-budget window.
-        let row_limit = MAX_RESPONSE_VALUES / per_row + 1;
+        let row_limit = events_area_allowed(key_refs.len(), cap) + 1;
         let built = build_events_area(
             shape,
             &self.config.parameters,
@@ -534,20 +583,61 @@ impl PostgisEngine {
             row_limit,
         )
         .map_err(|e| DataServerError::Engine(format!("build_events_area: {e}")))?;
+        Ok((built, source_keys))
+    }
 
-        let rows = run_single_query_sync(&self.pool, built)?;
-        for row in &rows {
-            self.check_geometry_row(row)?;
+    /// The events shape, or the 400 of a station collection.
+    fn events_shape(&self) -> Result<&EventsShape, DataServerError> {
+        match &self.config.observations {
+            ObservationSchema::Events(shape) => Ok(shape),
+            _ => Err(DataServerError::InvalidParameter(
+                "not an events collection".into(),
+            )),
         }
-        if rows.len() * per_row > MAX_RESPONSE_VALUES {
-            return Err(events_budget_exceeded());
-        }
-        let events = decode_event_rows(&rows, &key_refs)?;
-        Ok(CoverageResponse::Collection(assemble_event_coverages(
-            &self.config,
-            &key_refs,
-            events,
-        )))
+    }
+
+    /// The statement [`EdrEngine::query_area`] runs for this request on an
+    /// events collection, bounded by [`MAX_AREA_POINT_COVERAGES`]. Not part
+    /// of the engine contract: public so the tests can check its `LIMIT`.
+    #[doc(hidden)]
+    pub fn events_area_statement(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+    ) -> Result<BuiltQuery, DataServerError> {
+        self.events_area_statement_within(coords, datetime, parameters, MAX_AREA_POINT_COVERAGES)
+    }
+
+    /// [`Self::events_area_statement`] bounded by `cap` events instead. Not
+    /// part of the engine contract, and never a request's, which is always
+    /// bounded by [`MAX_AREA_POINT_COVERAGES`]: the database tests pass a
+    /// small `cap`, so a window past it holds few rows.
+    #[doc(hidden)]
+    pub fn events_area_statement_within(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        cap: usize,
+    ) -> Result<BuiltQuery, DataServerError> {
+        self.events_area_query(self.events_shape()?, coords, datetime, parameters, cap)
+            .map(|(built, _)| built)
+    }
+
+    /// The area query of an events collection bounded by `cap` events
+    /// instead of [`MAX_AREA_POINT_COVERAGES`], as
+    /// [`Self::events_area_statement_within`]: for the database tests only.
+    #[doc(hidden)]
+    pub fn events_area_within(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        cap: usize,
+    ) -> Result<CoverageResponse, DataServerError> {
+        self.require_validated()?;
+        self.query_area_events_within(self.events_shape()?, coords, datetime, parameters, cap)
     }
 
     /// WMS GetFeatureInfo on the events layer (#1100): the events whose
@@ -1322,10 +1412,17 @@ fn budget_exceeded() -> DataServerError {
     budget_exceeded_for("stations × parameters × timesteps")
 }
 
-/// Events-shape budget breach — there are no stations or timesteps here,
-/// the budget is rows × selected parameter columns.
-fn events_budget_exceeded() -> DataServerError {
-    budget_exceeded_for("events × parameters")
+/// Events-shape budget breach — there are no stations or timesteps here.
+/// An answer is bounded by its events, `cap` ([`MAX_AREA_POINT_COVERAGES`]
+/// for every request), and by rows × selected parameter columns where that
+/// binds first ([`events_area_allowed`]).
+fn events_budget_exceeded(values_per_row: usize, cap: usize) -> DataServerError {
+    if events_area_allowed(values_per_row, cap) < cap {
+        return budget_exceeded_for("events × parameters");
+    }
+    DataServerError::QueryTooLarge(format!(
+        "response would exceed the {cap}-event budget (events) — narrow the time range or the polygon"
+    ))
 }
 
 /// Station-keyed queries (position, location) are meaningless on an events
@@ -2722,6 +2819,56 @@ mod tests {
         assert!(stations.summary_properties().is_empty());
         assert!(stations.items_description().is_none());
         assert_eq!(stations.default_datetime(now), None);
+    }
+
+    /// An events area answer is bounded by its events: a request's statement
+    /// reads one row past [`MAX_AREA_POINT_COVERAGES`], a test's past its own
+    /// cap, and that row is the 400, whose message names the event budget
+    /// and what to narrow.
+    #[test]
+    fn events_area_statement_reads_one_row_past_the_event_budget() {
+        let engine = engine_with(events_engine_config());
+        let window = Some((
+            "2026-01-01T00:00:00Z".parse().unwrap(),
+            "2026-01-02T00:00:00Z".parse().unwrap(),
+        ));
+        for parameters in [None, Some(vec!["peak_current".to_string()])] {
+            let built = engine
+                .events_area_statement(
+                    "POLYGON((20 60,21 60,21 61,20 61,20 60))",
+                    window,
+                    parameters.as_deref(),
+                )
+                .unwrap();
+            assert_eq!(built.row_limit(), Some(MAX_AREA_POINT_COVERAGES + 1));
+        }
+        // A smaller cap, as the database tests pass, reads one row past it.
+        let small = engine
+            .events_area_statement_within("0,0,1,1", window, None, 100)
+            .unwrap();
+        assert_eq!(small.row_limit(), Some(101));
+        let message = events_budget_exceeded(1, MAX_AREA_POINT_COVERAGES).to_string();
+        assert!(
+            message.contains(&format!("{MAX_AREA_POINT_COVERAGES}-event budget"))
+                && message.contains("narrow the time range or the polygon"),
+            "{message}"
+        );
+        // Where the parameters an event carries make the value budget bind
+        // first, the message names that budget, as before.
+        let wide = MAX_RESPONSE_VALUES / MAX_AREA_POINT_COVERAGES + 1;
+        assert!(events_budget_exceeded(wide, MAX_AREA_POINT_COVERAGES)
+            .to_string()
+            .contains(&format!(
+                "{MAX_RESPONSE_VALUES}-value budget (events × parameters)"
+            )));
+
+        // A station collection has no events statement.
+        let mut stations = events_engine_config();
+        stations.location_source = crate::schema::LocationSource::Stations(dummy_stations());
+        stations.observations = dummy_long_obs();
+        assert!(engine_with(stations)
+            .events_area_statement("0,0,1,1", window, None)
+            .is_err());
     }
 
     /// #503: an id is bound in its column's type only in the form that

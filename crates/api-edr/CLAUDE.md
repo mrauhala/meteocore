@@ -420,24 +420,46 @@ through `response_budget::Writer`, which reserves each buffer before
 allocating it and stops at the query deadline; CoverageJSON range values
 are written straight from the result, never through a `Value` tree. CSV
 reserves its counted size before it allocates (`csv::write_station_series`'
-`admit`), and an HTML data page its `body_estimate` before it renders
-(`DataPage::render_admitted`). `/locations` adds its own per-body cap
+`admit`). An HTML data page (`html::coverage_page`) is admitted at every
+step, each before it allocates: its CoverageJSON body through the `Writer`,
+the `Value` document parsed from that body at
+`response::parsed_document_bound` before it is parsed, and the page at its
+`body_estimate` before it renders (`DataPage::render_admitted`). A page
+that does not fit is refused at the first step it does not fit, so the
+server never builds the document of a page it cannot serve. The bound
+counts the body's structure, never a size per byte; keep it an upper
+bound (`html_admission_tests` pins it with and without `preserve_order`).
+`/locations` adds its own per-body cap
 (`Writer::locations`, `MC_EDR_LOCATIONS_MAX_BYTES`, 16 MiB);
 `MC_EDR_LOCATIONS_MEMORY_MB` is retired, ignored with a startup WARN. The
 reservation lives in the body's `Bytes` owner, so it is released only when
 the last clone drops: the body delivered, or the client gone. Nothing
 waits: a body that does not fit is 503 `ServerBusy` with `Retry-After: 1`
 (`api_common::JsonError` adds it to every `ServerBusy`), an expired query
-504. `coverage_response_to_json` is the `CoverageJson` body parsed back (`to_value`), so the
-HTML page and the JSON cannot drift: change member order in `CoverageJson`
+504. The HTML page lays out the `CoverageJson` body parsed back, as
+`coverage_response_to_json` (`to_value`) does for tests, so the HTML page
+and the JSON cannot drift: change member order in `CoverageJson`
 only, where it is the order the `Value` builder it replaced wrote, byte for
 byte under the server build's serde_json `preserve_order`. Not counted:
-PNG plots, `items`, metadata, the engine result and the HTML page's `Value`
-document. `/metrics` exports `edr_response_{reserved,capacity}_bytes` and
+PNG plots, `items`, metadata and the engine result. `/metrics` exports `edr_response_{reserved,capacity}_bytes` and
 `edr_response_rejected_total`. Pinned by `response_budget::tests`,
 `coverage_tests::the_body_streams_in_the_document_order` and
 `performance_tests`' `large_bodies_over_the_response_budget_are_503` and
-`a_disconnected_client_releases_its_response_bytes`.
+`a_disconnected_client_releases_its_response_bytes`, and
+`html_admission_tests`' `an_html_page_is_admitted_before_its_document_is_built`.
+
+An answer of one `Point` coverage per item (an events collection's area,
+one per event) is bounded by coverages, not values:
+`ds_core::feature::MAX_AREA_POINT_COVERAGES`, 100 000, sized for a
+lightning client's whole-box windows, which a 400 leaves with nothing to
+draw. That many write about five grid answers at `MAX_AREA_VALUES` as
+CoverageJSON (`html_admission_tests`'
+`point_coverages_at_their_limit_write_about_five_full_grid_answers`); the
+query admission bounds how many are built at once, and an HTML page of a
+large answer is admitted, or refused, by the response budget before its
+document is built. The value budgets do not bound it, since a coverage may
+hold one value. A new engine answering a coverage per item applies it at
+its source, as engine-postgis does in its statement's `LIMIT`.
 
 Range values (#1341) are written at `NdArray::precision` through
 `ds_core::model::RangeValue`: `F32` with `serialize_f32` (a value `f32`

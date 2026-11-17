@@ -46,6 +46,17 @@ pub const MAX_OBSERVATION_ROWS: usize = 10001;
 /// CoverageJSON. Breach ⇒ `QueryTooLarge` ⇒ HTTP 400.
 pub const MAX_RESPONSE_VALUES: usize = 500_000;
 
+/// Most events one EDR area or radius answer of an events collection may
+/// hold when each event carries `values_per_row` values: every event is a
+/// `Point` coverage of its own, so the answer is bounded by events, `cap`
+/// ([`ds_core::feature::MAX_AREA_POINT_COVERAGES`] for every request; the
+/// database tests pass a smaller one), and by [`MAX_RESPONSE_VALUES`] where
+/// that binds first. The statement's `LIMIT` is one more, so a larger
+/// answer is refused after reading one row past it.
+pub fn events_area_allowed(values_per_row: usize, cap: usize) -> usize {
+    (MAX_RESPONSE_VALUES / values_per_row.max(1)).min(cap)
+}
+
 /// Memory guard on the stations an area polygon matches: a ceiling of
 /// 200 000, one past it here because the prefilter fetches one extra row to
 /// detect the breach. NOT the gate on a request's size —
@@ -2827,6 +2838,25 @@ mod tests {
         assert_eq!(q.params[3], SqlParam::Int(125_001));
         assert_eq!(q.limit_param_idx, Some(3));
         assert_eq!(q.values_per_row, 2);
+    }
+
+    /// An events answer is bounded by events, each a `Point` coverage, and
+    /// by the value budget only where an event carries so many parameters
+    /// that it binds first.
+    #[test]
+    fn events_area_answers_are_bounded_by_events() {
+        use ds_core::feature::MAX_AREA_POINT_COVERAGES as CAP;
+        // One parameter an event never makes the value budget bind.
+        const { assert!(MAX_RESPONSE_VALUES / CAP >= 1) };
+        let narrow = MAX_RESPONSE_VALUES / CAP;
+        for values_per_row in 0..=narrow {
+            assert_eq!(events_area_allowed(values_per_row, CAP), CAP);
+        }
+        let wide = narrow + 1;
+        assert_eq!(events_area_allowed(wide, CAP), MAX_RESPONSE_VALUES / wide);
+        assert!(events_area_allowed(wide, CAP) < CAP);
+        // A smaller cap, as the database tests pass, bounds the same way.
+        assert_eq!(events_area_allowed(1, 100), 100);
     }
 
     /// #1210: an event's filtered value is a CASE whose binds follow the

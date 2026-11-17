@@ -363,6 +363,24 @@ pub fn check_mask_budget(cells: usize, polygon: &QueryPolygon) -> Result<(), Dat
 /// `QueryTooLarge` as HTTP 400 `BadRequest`.
 pub const MAX_AREA_VALUES: usize = 1_000_000;
 
+/// Most coverages an EDR area or radius answer may hold when it answers a
+/// `Point` coverage per item, as an event table answers one per event. The
+/// value budgets do not bound such an answer, since a coverage may hold a
+/// single value.
+///
+/// Sized for whole-box windows: a lightning client asks for every strike
+/// in its map box over a window, a busy one holds tens of thousands, and
+/// a 400 leaves it with nothing to draw. A `Point` coverage writes its
+/// whole domain where a grid value writes one number, so this many make
+/// about five grid answers at [`MAX_AREA_VALUES`] as CoverageJSON (pinned
+/// by api-edr's `html_admission_tests`). That cost is bounded per answer
+/// here, and across answers by the EDR query admission, which builds a
+/// few at once; an HTML page of a large answer is admitted, or refused,
+/// by the EDR response budget before its document is built. An engine
+/// reads at most one item past the limit, so a larger answer is refused
+/// after reading that many.
+pub const MAX_AREA_POINT_COVERAGES: usize = 100_000;
+
 /// The most area cells an engine places on a projected or curvilinear
 /// source one by one, each with its own forward transform or inverse
 /// lookup: the 256 × 256 the old per-axis cap allowed, so every answer of

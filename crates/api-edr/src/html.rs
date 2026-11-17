@@ -3,9 +3,9 @@
 //! EDR 1.2 `/req/html/definition` A: every 200 of every operation supports
 //! `text/html`. `/req/html/content` A: that page holds all the information
 //! of the response's schema, and every link as an `<a>`. A data query's page
-//! is therefore its CoverageJSON document (`coverage_response_to_json`, the
-//! value the JSON representation serialises, so the two cannot drift) laid
-//! out as tables: every parameter, each coverage's axes, referencing and
+//! is therefore its CoverageJSON document (the very body the JSON
+//! representation sends, parsed back, so the two cannot drift) laid out as
+//! tables: every parameter, each coverage's axes, referencing and
 //! foreign members, and every range value. A grid range is one y × x matrix
 //! per parameter and leading (t, z) index, one cell per value; any other
 //! range is one row per domain position. The page has no cap of its own:
@@ -17,9 +17,12 @@
 //! members folded below.
 //! It is written into one buffer reserved up front from the value count
 //! ([`DataPage::render_into`]), so a large page never holds a second copy
-//! of itself or regrows by doubling, and a data page's buffer is admitted
-//! by the EDR response budget at that size before it renders
-//! ([`DataPage::render_admitted`], #1041). The `/locations` list and
+//! of itself or regrows by doubling. Everything a data page holds is
+//! admitted by the EDR response budget before it is allocated (#1041,
+//! [`coverage_page`]): the CoverageJSON body, through the budget's writer;
+//! the document parsed from it, at [`parsed_document_bound`] before it is
+//! parsed; and the page's buffer at its estimated size before it renders
+//! ([`DataPage::render_admitted`]). The `/locations` list and
 //! `items` render their GeoJSON as a feature table, the list through the
 //! same budgeted writer as its GeoJSON.
 //!
@@ -39,7 +42,7 @@ use serde_json::Value;
 
 use crate::geojson::{encode_path_segment, FeatureSummary};
 use crate::response::{
-    coverage_response_to_json, LocationRows, LocationsContext, COVERAGE_JSON_MEDIA_TYPE,
+    parsed_document_bound, CoverageJson, LocationRows, LocationsContext, COVERAGE_JSON_MEDIA_TYPE,
 };
 use crate::response_budget::Failure;
 
@@ -217,14 +220,36 @@ pub(crate) struct Locations {
 }
 
 /// The HTML page of a data query's result: its CoverageJSON, all of it,
-/// and on a station collection which location each coverage is. Admitted
-/// by the EDR response budget at its estimated size before it renders.
+/// and on a station collection which location each coverage is.
+///
+/// Admitted by the EDR response budget at every step, each before it
+/// allocates: the CoverageJSON body is written through the budget's
+/// [`Writer`](crate::response_budget::Writer), its parsed document is
+/// admitted at [`parsed_document_bound`] before the body is parsed, and the
+/// page at its estimated size before it renders. A result too large for
+/// the budget is refused at the first step it does not fit, before the
+/// document is built. `expired` (the query's deadline) stops the body.
 pub(crate) fn coverage_page(
     result: &CoverageResponse,
     page: &DataPage,
     locations: Option<&Locations>,
+    expired: &dyn Fn() -> bool,
 ) -> Result<Bytes, Failure> {
-    let doc = coverage_response_to_json(result);
+    let mut writer = crate::response_budget::Writer::new(expired);
+    if let Err(e) = serde_json::to_writer(&mut writer, &CoverageJson(result)) {
+        return Err(writer.failure.unwrap_or_else(|| {
+            tracing::error!("EDR HTML page: CoverageJSON serialise error: {e}");
+            Failure::Internal
+        }));
+    }
+    let json = writer.into_bytes();
+    // Held until the page is written, with the document it admits.
+    let _document = crate::response_budget::reserve(parsed_document_bound(&json))?;
+    let doc: Value = serde_json::from_slice(&json).map_err(|e| {
+        tracing::error!("EDR HTML page: CoverageJSON does not parse back: {e}");
+        Failure::Internal
+    })?;
+    drop(json);
     let (coverages, estimate) = coverage_layout(&doc, page, locations);
     page.render_admitted(estimate, |body| {
         coverage_body(body, &doc, coverages, page, locations)

@@ -73,6 +73,9 @@ pub(crate) enum Failure {
     Limit,
     /// The query's deadline passed, or its client went away.
     Cancelled,
+    /// The body could not be built for a reason of its own, logged where
+    /// it failed: a 500.
+    Internal,
 }
 
 struct Allocation {

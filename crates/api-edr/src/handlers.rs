@@ -94,8 +94,9 @@ fn coverage_json_response(
 
 /// The error of a response body the EDR response budget stopped (#1041):
 /// a body that does not fit is a 503 `ServerBusy` to retry, a query past
-/// its deadline the 504. Any other failure (`None`, or a size cap only
-/// `/locations` has and maps itself) is a 500, after `log`.
+/// its deadline the 504. Any other failure (`None`, a body that could not
+/// be built, or a size cap only `/locations` has and maps itself) is a
+/// 500, after `log`.
 fn response_budget_error(
     failure: Option<crate::response_budget::Failure>,
     log: impl FnOnce(),
@@ -109,7 +110,7 @@ fn response_budget_error(
             ),
         ),
         Some(Failure::Cancelled) => query_timeout(),
-        Some(Failure::Limit) | None => {
+        Some(Failure::Limit | Failure::Internal) | None => {
             log();
             server_error()
         }
@@ -508,9 +509,14 @@ fn render_coverage_response(
         }
         EdrFormat::Html => {
             let locations = geojson.html_locations(&result, number_matched)?;
-            crate::html::coverage_page(&result, &geojson.html_page(&result), locations.as_ref())
-                .map(crate::html::response)
-                .map_err(|failure| response_budget_error(Some(failure), || ()))
+            crate::html::coverage_page(
+                &result,
+                &geojson.html_page(&result),
+                locations.as_ref(),
+                expired,
+            )
+            .map(crate::html::response)
+            .map_err(|failure| response_budget_error(Some(failure), || ()))
         }
     }
 }
@@ -3795,9 +3801,11 @@ pub async fn trajectory_query(
                 })?)
             }
             (EdrFormat::Html, Some(page)) => Rendered::Body(
-                crate::html::coverage_page(&result, &page.html_page(&result), None)
-                    .map(crate::html::response)
-                    .map_err(|failure| response_budget_error(Some(failure), || ()))?,
+                crate::html::coverage_page(&result, &page.html_page(&result), None, &|| {
+                    budget.expired()
+                })
+                .map(crate::html::response)
+                .map_err(|failure| response_budget_error(Some(failure), || ()))?,
             ),
             _ => Rendered::Plot(result),
         })
