@@ -637,6 +637,26 @@ impl DataStore {
         self.block_on(path, async { Ok(self.inner.head(path).await?) })
     }
 
+    /// Like [`Self::head`], but a refusal that no retry can change is a
+    /// [`ReadAnswer::Refused`] rather than an error, as
+    /// [`Self::get_or_refusal`] answers one: a missing object (404) is
+    /// `NotFound`, a key these credentials may not read (401/403)
+    /// `Forbidden`. Every other failure stays an `Err`, an `Unavailable`
+    /// store included, so a caller tells "the object is gone" from "this
+    /// read failed" without matching error strings (#1496). Under
+    /// [`FetchBudget::Request`].
+    pub fn head_or_refusal(
+        &self,
+        path: &ObjectPath,
+    ) -> Result<ReadAnswer<ObjectMeta>, DataServerError> {
+        self.block_on(path, async {
+            match self.inner.head(path).await {
+                Ok(meta) => Ok(ReadAnswer::Read(meta)),
+                Err(e) => refusal_or(e),
+            }
+        })
+    }
+
     /// Like [`Self::get`], but a **missing** object (`NotFound` / HTTP 404)
     /// maps to `Ok(None)` rather than an error. Zarr stores treat an absent key
     /// (an unwritten chunk, an optional metadata file) as "use the fill value"
@@ -2313,6 +2333,51 @@ mod deadline_tests {
             ReadAnswer::Read(bytes) => bytes,
             ReadAnswer::Refused(refusal) => panic!("refused: {refusal}"),
         }
+    }
+
+    /// #1496: `head_or_refusal` answers a missing object and one these
+    /// credentials may not read as refusals, as `get_or_refusal` does, with
+    /// the object's metadata otherwise; a failed HEAD stays an error, and an
+    /// expired deadline is `DeadlineExceeded`, never a refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn head_or_refusal_separates_refusals_from_failures() {
+        use crate::test_store::MetaStore;
+        let meta = MetaStore::default();
+        meta.put_body("present.h5", &b"data"[..]);
+        for key in ["forbidden.h5", "failing.h5"] {
+            meta.set(key, 4, None);
+        }
+        meta.forbidden.lock().unwrap().insert("forbidden.h5".into());
+        meta.failing.lock().unwrap().insert("failing.h5".into());
+        let store = DataStore::new(Arc::new(meta));
+        let path = ObjectPath::from;
+        assert_eq!(
+            read(store.head_or_refusal(&path("present.h5")).unwrap()).size,
+            4
+        );
+        assert_eq!(
+            store.head_or_refusal(&path("missing.h5")).unwrap(),
+            ReadAnswer::Refused(RangeRefusal::NotFound)
+        );
+        assert_eq!(
+            store.head_or_refusal(&path("forbidden.h5")).unwrap(),
+            ReadAnswer::Refused(RangeRefusal::Forbidden)
+        );
+        assert!(matches!(
+            store.head_or_refusal(&path("failing.h5")),
+            Err(DataServerError::Storage(_))
+        ));
+        tokio::task::spawn_blocking(move || {
+            let _scope = ds_core::deadline::enter(Some(std::time::Instant::now()));
+            for key in ["missing.h5", "present.h5"] {
+                assert!(matches!(
+                    store.head_or_refusal(&path(key)),
+                    Err(DataServerError::DeadlineExceeded)
+                ));
+            }
+        })
+        .await
+        .unwrap();
     }
 
     /// #1046: `get_or_refusal[_on]` answers "the object is gone" and "these

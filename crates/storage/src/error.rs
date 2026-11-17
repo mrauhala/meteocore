@@ -158,6 +158,8 @@ mod tests {
                 store.get(&path).map(drop),
                 store.get_range(&path, 2..5).map(drop),
                 store.head(&path).map(drop),
+                store.head_or_refusal(&path).map(drop),
+                store.get_or_refusal(&path).map(drop),
                 store.get_range_or_refusal(&path, 2..5).map(drop),
             ];
             for read in reads {

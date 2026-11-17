@@ -287,6 +287,84 @@ fn template_prober(
     })?)
 }
 
+/// Why [`fetch_bytes`] has no bytes for an ODIM file.
+#[derive(Debug, thiserror::Error)]
+enum FetchError {
+    /// Gone since the scan listed it: a 404, or a local file that no
+    /// longer exists. Unusable, as bytes that do not decode are; the next
+    /// scan drops it from the catalog.
+    #[error("ODIM file `{0}` is gone")]
+    Gone(String),
+    /// Grown past [`crate::catalog::MAX_REMOTE_FILE_SIZE`] since it was
+    /// listed.
+    #[error(
+        "ODIM object `{key}` is {size} bytes — exceeds the {}-byte limit",
+        crate::catalog::MAX_REMOTE_FILE_SIZE
+    )]
+    TooLarge { key: String, size: u64 },
+    /// The read failed: the store's own error, the request deadline and an
+    /// `Unavailable` store included, or a refusal the data is not at fault
+    /// for (401/403, a local file the server may not read, #1046).
+    #[error("failed to read ODIM file `{location}`: {source}")]
+    Failed {
+        location: String,
+        source: DataServerError,
+    },
+}
+
+impl FetchError {
+    /// What a request answers for a composite read that found no bytes
+    /// (#1496), as root CLAUDE.md has a `MapEngine` answer a failed read:
+    /// the deadline stays `DeadlineExceeded`; a store that kept answering
+    /// 429, 502, 503 or 504 through its retries stays `Unavailable` (503
+    /// with `Retry-After: 10`, #1355), naming the file; any other failed
+    /// read is `ResourceExhausted` (503), its detail logged at WARN here.
+    /// A file gone or grown too large is an `Engine` error, which EDR
+    /// answers as a null timestep, as a file whose bytes do not decode.
+    fn into_request_error(self, collection_id: &str) -> DataServerError {
+        match self {
+            FetchError::Failed {
+                source: DataServerError::DeadlineExceeded,
+                ..
+            } => DataServerError::DeadlineExceeded,
+            FetchError::Failed {
+                location,
+                source: source @ DataServerError::Unavailable(_),
+            } => source.with_storage_context(format!("[{collection_id}] ODIM file `{location}`")),
+            FetchError::Failed { location, source } => {
+                tracing::warn!("[{collection_id}] failed to read ODIM file `{location}`: {source}");
+                DataServerError::ResourceExhausted
+            }
+            unusable => DataServerError::Engine(format!("[{collection_id}] {unusable}")),
+        }
+    }
+}
+
+impl From<FetchError> for EngineError {
+    /// The seed composite's read at construction, with its detail.
+    fn from(err: FetchError) -> Self {
+        match err {
+            FetchError::Failed { location, source } => EngineError::Storage(
+                source.with_storage_context(format!("failed to read ODIM file `{location}`")),
+            ),
+            unusable => EngineError::Storage(DataServerError::Engine(unusable.to_string())),
+        }
+    }
+}
+
+/// A refusal of a read that no retry changes: a missing object is gone,
+/// and one these credentials may not read is a failed read, never the
+/// data's fault (#1046).
+fn refused(key: &str, refusal: ds_storage::RangeRefusal) -> FetchError {
+    match refusal {
+        ds_storage::RangeRefusal::NotFound => FetchError::Gone(key.to_owned()),
+        refusal => FetchError::Failed {
+            location: key.to_owned(),
+            source: DataServerError::Storage(format!("the store refused the read: {refusal}")),
+        },
+    }
+}
+
 /// Fetch the raw bytes of one ODIM file from its catalog location.
 ///
 /// Remote fetches re-check the object size against
@@ -294,25 +372,41 @@ fn template_prober(
 /// `scan_remote` already filters by size at list time, but an object
 /// can grow between listing and fetching — the `head` closes that gap
 /// so a runaway object can't be pulled unbounded into memory.
-fn fetch_bytes(location: &Location) -> Result<Bytes, DataServerError> {
+///
+/// A file gone since the scan is told apart from a failed read by type
+/// (a local `NotFound`, a store's 404 refusal), never by error text.
+fn fetch_bytes(location: &Location) -> Result<Bytes, FetchError> {
+    use ds_storage::ReadAnswer;
     match location {
-        Location::Local(path) => std::fs::read(path).map(Bytes::from).map_err(|e| {
-            DataServerError::Engine(format!(
-                "failed to read ODIM file `{}`: {e}",
-                path.display()
-            ))
-        }),
+        Location::Local(path) => std::fs::read(path)
+            .map(Bytes::from)
+            .map_err(|e| match e.kind() {
+                std::io::ErrorKind::NotFound => FetchError::Gone(path.display().to_string()),
+                _ => FetchError::Failed {
+                    location: path.display().to_string(),
+                    source: DataServerError::Io(e),
+                },
+            }),
         Location::Remote { store, key } => {
             let object = ds_storage::object_store::path::Path::from(key.as_str());
-            let meta = store.head(&object)?;
+            let failed = |source| FetchError::Failed {
+                location: key.clone(),
+                source,
+            };
+            let meta = match store.head_or_refusal(&object).map_err(failed)? {
+                ReadAnswer::Read(meta) => meta,
+                ReadAnswer::Refused(refusal) => return Err(refused(key, refusal)),
+            };
             if meta.size > crate::catalog::MAX_REMOTE_FILE_SIZE {
-                return Err(DataServerError::Engine(format!(
-                    "ODIM object `{key}` is {} bytes — exceeds the {}-byte limit",
-                    meta.size,
-                    crate::catalog::MAX_REMOTE_FILE_SIZE
-                )));
+                return Err(FetchError::TooLarge {
+                    key: key.clone(),
+                    size: meta.size,
+                });
             }
-            store.get(&object)
+            match store.get_or_refusal(&object).map_err(failed)? {
+                ReadAnswer::Read(bytes) => Ok(bytes),
+                ReadAnswer::Refused(refusal) => Err(refused(key, refusal)),
+            }
         }
     }
 }
@@ -820,6 +914,13 @@ impl OdimEngine {
     /// where the storage `block_in_place` bridge is valid. Do not move them
     /// back onto HTTP workers or use a blocking pool without adapting remote
     /// I/O to an explicit runtime handle.
+    ///
+    /// A read that failed is a transient error (`ErrorClass::is_transient`):
+    /// the deadline, `Unavailable` for a store that kept answering 429, 502,
+    /// 503 or 504, else `ResourceExhausted` (#1496). A file gone since the
+    /// scan, grown too large or whose bytes do not decode is an `Engine`
+    /// error, which EDR answers as a null timestep. Nothing failed is
+    /// cached, so the next request reads the file again.
     pub(crate) fn load_composite(
         &self,
         location: &Location,
@@ -850,11 +951,8 @@ impl OdimEngine {
             &key,
             ds_core::deadline::current(),
             || {
-                let bytes = fetch_bytes(location).map_err(|e| match e {
-                    // Its own fetch ran out of the request's time.
-                    DataServerError::DeadlineExceeded => e,
-                    e => DataServerError::Engine(format!("[{}] {e}", self.collection_id)),
-                })?;
+                let bytes =
+                    fetch_bytes(location).map_err(|e| e.into_request_error(&self.collection_id))?;
                 let composite = Arc::new(read_composite(&bytes).map_err(|e| {
                     DataServerError::Engine(format!(
                         "[{}] failed to parse ODIM file `{}`: {e}",
@@ -1289,6 +1387,10 @@ fn crs_label(crs: &Crs) -> String {
 }
 
 #[cfg(test)]
+#[path = "composite_read_failure_tests.rs"]
+mod composite_read_failure_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1378,7 +1480,7 @@ mod tests {
     /// Minimal `OdimConfig` for `build_source` routing tests — only the
     /// fields the source resolver reads are meaningful; the rest are
     /// zero/`None`.
-    fn config_with(
+    pub(super) fn config_with(
         endpoint: Option<&str>,
         bucket: Option<&str>,
         prefix_pattern: Option<&str>,

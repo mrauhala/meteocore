@@ -2058,7 +2058,8 @@ fn comp_engine_remote_scan_discovers_and_renders_dmi_fixture() {
     );
 
     // A render proves the streamed-then-parsed composite is intact: the
-    // bytes came through `DataStore::get`, not a local `std::fs::read`.
+    // bytes came through `DataStore::get_or_refusal`, not a local
+    // `std::fs::read`.
     let tile = engine
         .get_raster_tile(
             [9.5, 55.0, 12.5, 57.0], // over Jylland / Sjælland
