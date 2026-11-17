@@ -903,11 +903,13 @@ mod coverage_tests {
         let plain = br#"["aaaaaaaaaaa"]"#;
         assert_eq!(text.len(), plain.len());
         assert_eq!(parsed_document_bound(text), parsed_document_bound(plain));
-        // Two members are charged more than two array elements, and an
-        // object its table.
-        assert!(
-            parsed_document_bound(br#"{"a":1,"b":2}"#) > parsed_document_bound(br#"[1,2,3,4,5]"#)
-        );
+        // Two members are charged more than two array elements of the same
+        // text length, and an object its table, with serde_json's
+        // `preserve_order` on or off: the workspace build turns it on.
+        let members = br#"{"a":1,"b":2}"#;
+        let elements = br#"[1    ,    2]"#;
+        assert_eq!(members.len(), elements.len());
+        assert!(parsed_document_bound(members) > parsed_document_bound(elements));
         // Every element counts.
         assert!(parsed_document_bound(b"[1,2,3]") > parsed_document_bound(b"[1,2]  "));
     }
