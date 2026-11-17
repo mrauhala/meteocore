@@ -1421,7 +1421,7 @@ fn events_budget_exceeded(values_per_row: usize, cap: usize) -> DataServerError 
         return budget_exceeded_for("events × parameters");
     }
     DataServerError::QueryTooLarge(format!(
-        "response would exceed the {cap}-event budget (events) — narrow the time range or the polygon"
+        "response would exceed the {cap}-event budget — narrow the time range or the polygon"
     ))
 }
 
