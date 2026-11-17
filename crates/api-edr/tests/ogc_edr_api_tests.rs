@@ -1634,6 +1634,23 @@ mod unimplemented_queries {
         assert_eq!(json["code"], "BadRequest");
     }
 
+    /// `é` (`%C3%A9`) covering the byte after the keyword once panicked the
+    /// handler, and the client got no response at all (#1492).
+    #[tokio::test]
+    async fn position_query_with_a_multi_byte_character_in_the_keyword_is_400() {
+        for coords in ["POIN%C3%A9(25%2060)", "MULTIPOIN%C3%A9((25%2060))"] {
+            let (status, json) =
+                get(&format!("/collections/weather/position?coords={coords}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{coords}: {json}");
+            assert_eq!(json["code"], "BadRequest", "{coords}: {json}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains("Expected WKT POINT or MULTIPOINT geometry"),
+                "{coords}: {description}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn radius_query() {
         // 10 km around Helsinki: matches Helsinki, not Tampere (~160 km away).

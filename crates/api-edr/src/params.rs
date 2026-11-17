@@ -1440,8 +1440,8 @@ pub fn split_position_coords(coords: &str) -> Result<Vec<String>, DataServerErro
     let trimmed = coords.trim();
 
     // Normalize only the keyword so engines receive the same WKT spelling.
-    if starts_with_ignore_ascii_case(trimmed, "POINT") {
-        let normalized = format!("POINT{}", &trimmed[5..]);
+    if let Some(rest) = strip_prefix_ignore_ascii_case(trimmed, "POINT") {
+        let normalized = format!("POINT{rest}");
         ds_core::feature::parse_point_coords(&normalized)?;
         return Ok(vec![normalized]);
     }
@@ -1500,16 +1500,20 @@ pub fn split_position_coords(coords: &str) -> Result<Vec<String>, DataServerErro
     ))
 }
 
+/// `s` after an ASCII `prefix`, matched case-insensitively, or `None`.
+///
+/// Compares bytes, never a `str` slice of the request: a multi-byte
+/// character covering byte `prefix.len()` (`POINé(…)`) made
+/// `&s[..prefix.len()]` panic the handler (#1492). Bytes that match an ASCII
+/// prefix are ASCII, so after a match the rest starts on a char boundary.
 fn strip_prefix_ignore_ascii_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
+    debug_assert!(prefix.is_ascii());
+    let head = s.as_bytes().get(..prefix.len())?;
+    if head.eq_ignore_ascii_case(prefix.as_bytes()) {
+        s.get(prefix.len()..)
     } else {
         None
     }
-}
-
-fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    strip_prefix_ignore_ascii_case(s, prefix).is_some()
 }
 
 #[cfg(test)]
@@ -2486,6 +2490,71 @@ mod tests {
     #[test]
     fn rejects_polygon() {
         assert!(split_position_coords("POLYGON((0 0,1 0,1 1,0 1,0 0))").is_err());
+    }
+
+    /// A multi-byte character covering the byte after the keyword
+    /// (`POINé`: `é` is bytes 4–5) once panicked the handler (#1492).
+    #[test]
+    fn a_multi_byte_character_in_the_keyword_is_an_invalid_geometry() {
+        for coords in [
+            "POIN\u{e9}(25 60)",
+            "MULTIPOIN\u{e9}((25 60))",
+            "MULTIPOIN\u{e9}(25 60)",
+            "POI\u{20ac}(25 60)",
+            "MULTIPOI\u{1f600}((25 60))",
+            "\u{e9}",
+            "POIN\u{e9}",
+            "MULTIPOIN\u{e9}",
+        ] {
+            let err = split_position_coords(coords).expect_err(coords);
+            assert!(
+                matches!(&err, DataServerError::InvalidParameter(m)
+                    if m == "Expected WKT POINT or MULTIPOINT geometry"),
+                "{coords}: {err}"
+            );
+        }
+    }
+
+    /// Insert a multi-byte character (2, 3 and 4 bytes, and multi-byte
+    /// whitespace, which `trim` and `split_whitespace` accept) at every byte
+    /// offset of valid inputs: each answer is a parse or a 400, never a
+    /// panic, and inside the keyword always the invalid-geometry 400.
+    #[test]
+    fn a_multi_byte_character_at_any_offset_never_panics() {
+        use ds_core::error::ErrorClass;
+        let inputs = [
+            ("POINT(25 60)", "POINT".len()),
+            ("point (25 60)", "POINT".len()),
+            ("MULTIPOINT((25 60),(26 61))", "MULTIPOINT".len()),
+            ("MultiPoint(25 60, 26 61)", "MULTIPOINT".len()),
+        ];
+        let inserted = ['\u{e9}', '\u{20ac}', '\u{1f600}', '\u{a0}', '\u{2003}'];
+        for (valid, keyword_len) in inputs {
+            assert!(split_position_coords(valid).is_ok(), "{valid}");
+            for at in 0..=valid.len() {
+                for c in inserted {
+                    let mut coords = valid.to_string();
+                    coords.insert(at, c);
+                    match split_position_coords(&coords) {
+                        Ok(points) => assert!(
+                            points.iter().all(|p| p.starts_with("POINT")
+                                && ds_core::feature::parse_point_coords(p).is_ok()),
+                            "{coords:?}: {points:?}"
+                        ),
+                        Err(err) => {
+                            assert_eq!(err.class(), ErrorClass::BadRequest, "{coords:?}: {err}");
+                            if (1..keyword_len).contains(&at) {
+                                assert!(
+                                    err.to_string()
+                                        .contains("Expected WKT POINT or MULTIPOINT geometry"),
+                                    "{coords:?}: {err}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
