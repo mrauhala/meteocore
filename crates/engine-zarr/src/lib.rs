@@ -575,7 +575,7 @@ impl EdrEngine for ZarrEngine {
         let polygon = parse_area_coords(coords)?;
         let cat = self.catalog.load();
         if cat.times.is_empty() {
-            return Err(DataServerError::Engine("No Zarr data available".into()));
+            return Err(DataServerError::no_data_yet());
         }
 
         let run = cat.resolve_run(reference_time)?;
@@ -795,7 +795,7 @@ impl EdrEngine for ZarrEngine {
             .collect::<Result<_, _>>()?;
         let cat = self.catalog.load();
         if cat.times.is_empty() {
-            return Err(DataServerError::Engine("No Zarr data available".into()));
+            return Err(DataServerError::no_data_yet());
         }
 
         let run = cat.resolve_run(reference_time)?;
@@ -951,7 +951,7 @@ impl MapEngine for ZarrEngine {
         })?;
 
         let time_idx = nearest_time_idx(cat.valid_times(run), time)
-            .ok_or_else(|| DataServerError::Engine("No Zarr data available".into()))?;
+            .ok_or_else(DataServerError::no_data_yet)?;
 
         let n = (width as usize) * (height as usize);
         let Some(window) = cat.read_window(var, run, time_idx, bbox)? else {
@@ -1167,6 +1167,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod empty_tests;
 #[cfg(test)]
 mod keep_tests;
 #[cfg(test)]

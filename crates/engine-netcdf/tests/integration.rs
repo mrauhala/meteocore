@@ -505,6 +505,111 @@ fn packed_values_are_unpacked_and_fill_is_nodata() {
     assert!((packed - float).abs() < 0.011, "{packed} {float}");
 }
 
+/// A directory with no file yet (#1499): every map render and EDR query
+/// type answers the shared not-found, a 404 a `datetime` list skips. The
+/// map path used to answer an internal error, a 500 in Maps and Tiles.
+#[test]
+fn an_empty_directory_answers_no_data_yet() {
+    use ds_core::cube::CubeResolution;
+    use ds_core::edr_engine::EdrEngine;
+    use ds_core::error::ErrorClass;
+    use ds_core::feature::Bbox;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = NetcdfEngine::new("empty", &meps_config(dir.path())).unwrap();
+    engine.poll_once();
+    let expect = |what: &str, result: Result<(), DataServerError>| match result {
+        Err(error @ DataServerError::LocationNotFound(_)) => {
+            assert_eq!(error.class(), ErrorClass::NotFound, "{what}");
+            assert_eq!(
+                error.to_string(),
+                DataServerError::no_data_yet().to_string(),
+                "{what}"
+            );
+        }
+        other => panic!("{what}: expected no_data_yet, got {other:?}"),
+    };
+    let instant = at("2026-10-15T06:00:00Z");
+    for time in [None, Some(instant)] {
+        for parameter in [None, Some("air_temperature_2m")] {
+            let tile = engine.get_raster_tile(
+                [5.0, 55.0, 15.0, 65.0],
+                4,
+                4,
+                time,
+                &OutputCrs::Wgs84,
+                parameter,
+                None,
+                None,
+            );
+            expect(&format!("map {parameter:?} at {time:?}"), tile.map(|_| ()));
+        }
+        let tiles = engine.get_raster_tiles(
+            [5.0, 55.0, 15.0, 65.0],
+            4,
+            4,
+            time,
+            &OutputCrs::Wgs84,
+            &["x_wind_10m", "y_wind_10m"],
+            None,
+            None,
+        );
+        expect(&format!("bands at {time:?}"), tiles.map(|_| ()));
+    }
+    for datetime in [None, Some((instant, instant))] {
+        let queries = [
+            (
+                "position",
+                engine.query_position("POINT(10 60)", datetime, None, None, None),
+            ),
+            (
+                "area",
+                engine.query_area(
+                    "POLYGON((9 59,11 59,11 61,9 61,9 59))",
+                    datetime,
+                    None,
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "radius",
+                engine.query_radius("POINT(10 60)", 10_000.0, datetime, None, None, None),
+            ),
+            (
+                "trajectory",
+                engine.query_trajectory("LINESTRING(9 60, 11 60)", datetime, None, None, None),
+            ),
+            (
+                "cube",
+                engine.query_cube(
+                    &Bbox::new(9.0, 59.0, 11.0, 61.0).unwrap(),
+                    datetime,
+                    None,
+                    None,
+                    CubeResolution::default(),
+                    None,
+                ),
+            ),
+        ];
+        for (kind, result) in queries {
+            expect(&format!("{kind} at {datetime:?}"), result.map(|_| ()));
+        }
+    }
+    expect(
+        "trajectory M",
+        engine
+            .query_trajectory(
+                "LINESTRING M(9 60 1792044000, 11 60 1792065600)",
+                None,
+                None,
+                None,
+                None,
+            )
+            .map(|_| ()),
+    );
+}
+
 /// A field read that fails is an error, never a map of nodata, and is not
 /// cached: the next render reads again.
 #[test]

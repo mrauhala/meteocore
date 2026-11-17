@@ -286,6 +286,14 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   checked the tables is a 503 `ServerBusy`. An inventory the engine
   reports not found, as an ODIM PVOL site not in the network catalog yet,
   is an empty `/locations` list, and each of its location ids a 404.
+- **A collection without data yet.** A GRIB or NetCDF collection whose
+  source holds no file yet (a fresh source, a store unreachable since the
+  start, a mistyped prefix), or a Zarr store whose time axis is still
+  empty, answers every data query, position, area, radius, trajectory and
+  cube, with 404 `NotFound` and the description `Location not found: No
+  data available yet`, a `datetime` list included; so would QueryData,
+  which does not start without a file. It is not logged: the collection's
+  health reports the condition.
 - **Upstream throttling.** An object store that keeps answering 429, 502,
   503 or 504 through all of its retries fails the query with 503
   `SourceUnavailable` and `Retry-After: 10`, whose description names no
@@ -600,7 +608,7 @@ CoverageJSON they produce against `schemas/coveragejson.json`, metadata and
 `/api` against the OpenAPI 3.0 meta-schema, checking that every status a
 route answers is documented. End-to-end tests with real engines and
 fixtures are in `crates/server/tests/` (`edr_geojson.rs`,
-`edr_locations_filter.rs`, `grib_cube_edr.rs`, `netcdf_edr.rs`,
-`satellite_edr.rs`).
+`edr_locations_filter.rs`, `empty_catalog_edr.rs`, `grib_cube_edr.rs`,
+`netcdf_edr.rs`, `satellite_edr.rs`).
 
 Contributor rules are in [CLAUDE.md](CLAUDE.md).

@@ -167,18 +167,22 @@ impl QueryDataEngine {
     /// The data for a requested model run: `None` ⇒ the latest run; `Some(rt)` ⇒
     /// the run with exactly that reference time (absent ⇒ error → 404). Shares
     /// the selection rule with every forecast engine via [`instances::select_run`].
+    /// No run at all is [`DataServerError::no_data_yet`] (404, #1499).
     fn select_data(
         &self,
         reference_time: Option<DateTime<Utc>>,
     ) -> Result<Arc<QueryData>, DataServerError> {
         let set = self.runs.load();
+        if set.runs.is_empty() {
+            return Err(DataServerError::no_data_yet());
+        }
         instances::select_run(&set.runs, reference_time)
             .map(|(_, e)| e.data.clone())
             .ok_or_else(|| match reference_time {
                 Some(rt) => DataServerError::ReferenceTimeNotFound(format!(
                     "no model run for reference time {rt}"
                 )),
-                None => DataServerError::Engine("No data available".into()),
+                None => DataServerError::no_data_yet(),
             })
     }
 
@@ -641,9 +645,8 @@ impl MapEngine for QueryDataEngine {
             self.resolve_map_param_idx(&data)
         };
 
-        let time_idx = find_time_idx(&data, time).ok_or_else(|| {
-            DataServerError::Engine("No data available for the requested time".into())
-        })?;
+        // `None` only for a run without a timestep: nothing to draw yet.
+        let time_idx = find_time_idx(&data, time).ok_or_else(DataServerError::no_data_yet)?;
 
         let mut values = Vec::with_capacity((width * height) as usize);
 
@@ -2275,6 +2278,8 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod empty_tests;
 #[cfg(test)]
 mod footprint_tests;
 #[cfg(test)]

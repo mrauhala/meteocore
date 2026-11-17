@@ -1669,7 +1669,7 @@ impl MapEngine for NetcdfEngine {
         let layout = catalog
             .layout
             .as_ref()
-            .ok_or_else(|| DataServerError::Engine("No NetCDF data available yet".to_string()))?;
+            .ok_or_else(DataServerError::no_data_yet)?;
         let param = Self::param(layout, parameter)?;
         let level = layout.map_level(z)?;
         let fields = self.fields_of(layout, &selected, param, level)?;
@@ -1700,7 +1700,7 @@ impl MapEngine for NetcdfEngine {
         let layout = catalog
             .layout
             .as_ref()
-            .ok_or_else(|| DataServerError::Engine("No NetCDF data available yet".to_string()))?;
+            .ok_or_else(DataServerError::no_data_yet)?;
         let params = parameters
             .iter()
             .map(|&p| Self::param(layout, Some(p)))

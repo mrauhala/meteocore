@@ -107,9 +107,10 @@ impl NetcdfEngine {
             .filter(|level| z_source.contains(level))
             .collect();
 
-        let extent = catalog.info.spatial_extent.ok_or_else(|| {
-            DataServerError::LocationNotFound("No NetCDF data available yet".into())
-        })?;
+        let extent = catalog
+            .info
+            .spatial_extent
+            .ok_or_else(DataServerError::no_data_yet)?;
         let (columns, rows) = layout.source.size();
         let (lon_span, lat_span) = ds_core::geo::crs84_bbox_spans(extent);
         let res_lon = lon_span / f64::from(columns.max(1));

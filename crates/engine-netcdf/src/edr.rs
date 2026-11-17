@@ -586,7 +586,7 @@ fn layout(catalog: &Catalog) -> Result<&Arc<Layout>, DataServerError> {
     catalog
         .layout
         .as_ref()
-        .ok_or_else(|| DataServerError::LocationNotFound("No NetCDF data available yet".into()))
+        .ok_or_else(DataServerError::no_data_yet)
 }
 
 impl NetcdfEngine {
@@ -1133,9 +1133,10 @@ impl NetcdfEngine {
         let polygon = parse_area_coords(coords)?;
         let catalog = self.catalog.load_full();
         let reads = Self::select(&catalog, reference_time, datetime, parameters, z, false)?;
-        let extent = catalog.info.spatial_extent.ok_or_else(|| {
-            DataServerError::LocationNotFound("No NetCDF data available yet".into())
-        })?;
+        let extent = catalog
+            .info
+            .spatial_extent
+            .ok_or_else(DataServerError::no_data_yet)?;
         if !polygon.bbox.intersects_bbox(&extent) {
             return Err(DataServerError::LocationNotFound(
                 "The polygon lies outside the collection's spatial extent".into(),

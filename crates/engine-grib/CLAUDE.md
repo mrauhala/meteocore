@@ -165,6 +165,11 @@ unlike GeoTIFF's one band per collection.
 
 Catalog keeps a `runs` map (`BTreeMap` keyed by reference time) and
 implements the shared `ds_core::instances` contract (see root CLAUDE.md).
+A catalog without runs (an empty or unreachable source, a mistyped
+prefix) is `DataServerError::no_data_yet()` from `pinned_run`, before
+either selection: a not-found on every EDR query and map render (404,
+WMS GetMap's `not_found` error tile), which a `datetime` list skips,
+never an `Engine` 500 (#1499).
 Two selections, never mixed (#967):
 - **Maps** (`select_run_step`): without a parameter (the default layer;
   M trajectories use its `covering_run`) the newest run whose published
