@@ -969,12 +969,46 @@ fn parse_wkt_ring(ring_str: &str) -> Result<Vec<[f64; 2]>, DataServerError> {
     Ok(coords)
 }
 
+/// The rings of a WKT `POLYGON`, from the text between its outer
+/// parentheses: each ring in its own parentheses, the rings separated by
+/// commas, whitespace optional around every token, as the Simple Feature
+/// Access grammar writes it (#1491). Each ring's text is its coordinate
+/// list, for [`parse_wkt_ring`]. Never empty on success.
+fn split_wkt_rings(text: &str) -> Result<Vec<&str>, DataServerError> {
+    let malformed = || {
+        DataServerError::InvalidParameter(
+            "Expected coords as POLYGON((lon1 lat1, lon2 lat2, ...)), \
+             each ring in parentheses and the rings separated by commas"
+                .into(),
+        )
+    };
+    let mut rings = Vec::new();
+    let mut rest = text;
+    loop {
+        let ring = rest.trim_start().strip_prefix('(').ok_or_else(malformed)?;
+        let end = ring.find(')').ok_or_else(malformed)?;
+        rings.push(&ring[..end]);
+        // `end` is the byte index of an ASCII `)`, so `end + 1` is a char
+        // boundary.
+        rest = ring[end + 1..].trim_start();
+        if rest.is_empty() {
+            return Ok(rings);
+        }
+        rest = rest.strip_prefix(',').ok_or_else(malformed)?;
+    }
+}
+
 /// Parse EDR area query coordinates into a polygon.
 ///
 /// Accepts:
 /// - `POLYGON((lon1 lat1, lon2 lat2, ...))` — single ring
 /// - `POLYGON((exterior), (hole1), (hole2), ...)` — with holes
 /// - `west,south,east,north` — bbox format (converted to rectangular polygon)
+///
+/// The `POLYGON` keyword matches in any case, and whitespace is optional
+/// between every token, as Simple Feature Access - Part 1 writes WKT:
+/// `POLYGON ((…))`, `polygon((…))`, `POLYGON( (…) , (…) )` (#1491).
+/// `MULTIPOLYGON` and the Z/M tags are not accepted (#1048).
 pub fn parse_area_coords(coords: &str) -> Result<QueryPolygon, DataServerError> {
     if coords.len() > MAX_WKT_LENGTH {
         return Err(DataServerError::InvalidParameter(format!(
@@ -984,30 +1018,18 @@ pub fn parse_area_coords(coords: &str) -> Result<QueryPolygon, DataServerError> 
         )));
     }
 
-    let trimmed = coords.trim().to_uppercase();
+    let trimmed = coords.trim();
 
-    // Try WKT POLYGON format
-    if let Some(inner) = trimmed
-        .strip_prefix("POLYGON((")
-        .or_else(|| trimmed.strip_prefix("POLYGON (("))
-        .and_then(|s| s.strip_suffix("))"))
-    {
-        // Re-parse from original (not uppercased) to preserve numeric precision
-        let original_trimmed = coords.trim();
-        let original_inner = original_trimmed
-            .get("POLYGON((".len()..original_trimmed.len() - "))".len())
-            .or_else(|| {
-                original_trimmed.get("POLYGON ((".len()..original_trimmed.len() - "))".len())
-            })
-            .unwrap_or(inner);
-        let original_rings: Vec<&str> = original_inner.split("),(").collect();
-
-        let exterior = parse_wkt_ring(original_rings[0])?;
-
-        let mut holes = Vec::new();
-        for ring_str in original_rings.iter().skip(1) {
-            holes.push(parse_wkt_ring(ring_str)?);
-        }
+    // WKT POLYGON: the keyword, matched by bytes, then `(`, the rings, `)`.
+    // The numbers are parsed from the client's own text.
+    if let Some(rings_text) = strip_wkt_prefix(trimmed, "POLYGON") {
+        let rings = split_wkt_rings(rings_text)?;
+        let exterior = parse_wkt_ring(rings[0])?;
+        let holes = rings[1..]
+            .iter()
+            .copied()
+            .map(parse_wkt_ring)
+            .collect::<Result<Vec<_>, _>>()?;
 
         let bb = ring_bbox(&exterior);
         let bbox = Bbox::new(bb[0], bb[1], bb[2], bb[3]).map_err(DataServerError::InvalidBbox)?;
@@ -1020,7 +1042,7 @@ pub fn parse_area_coords(coords: &str) -> Result<QueryPolygon, DataServerError> 
     }
 
     // Try simple bbox format: west,south,east,north
-    let parts: Vec<&str> = coords.trim().split(',').collect();
+    let parts: Vec<&str> = trimmed.split(',').collect();
     if parts.len() == 4 {
         let west: f64 = parts[0].trim().parse().map_err(|_| {
             DataServerError::InvalidParameter(format!("Invalid west: {}", parts[0]))
@@ -2056,6 +2078,121 @@ mod tests {
     #[test]
     fn parse_rejects_out_of_range_coords() {
         assert!(parse_area_coords("POLYGON((0 0, 200 0, 200 10, 0 10, 0 0))").is_err());
+    }
+
+    /// The exterior, holes and bbox of a parsed polygon.
+    type PolygonParts = (Vec<[f64; 2]>, Vec<Vec<[f64; 2]>>, [f64; 4]);
+
+    /// [`PolygonParts`] of `coords`, for comparing two spellings
+    /// (`QueryPolygon` has no `PartialEq`).
+    fn polygon_parts(coords: &str) -> PolygonParts {
+        let poly = parse_area_coords(coords).unwrap_or_else(|e| panic!("{coords:?}: {e}"));
+        let b = poly.bbox;
+        (
+            poly.exterior,
+            poly.holes,
+            [b.west, b.south, b.east, b.north],
+        )
+    }
+
+    /// #1491: WKT allows whitespace between every token (Simple Feature
+    /// Access - Part 1), and the keyword in any case. Every spelling parses
+    /// to the compact form's polygon, numbers taken verbatim.
+    #[test]
+    fn spaced_polygon_spellings_parse_like_the_compact_form() {
+        let compact =
+            "POLYGON((24.123456789012345 60, 26 60, 26 61, 24 61, 24.123456789012345 60))";
+        let ring = "24.123456789012345 60, 26 60, 26 61, 24 61, 24.123456789012345 60";
+        let expected = polygon_parts(compact);
+        assert_eq!(expected.0[0], [24.123456789012345, 60.0]);
+        for spelling in [
+            format!("POLYGON (({ring}))"),
+            format!("polygon (({ring}))"),
+            format!("polygon(({ring}))"),
+            format!("Polygon(({ring}))"),
+            format!("POLYGON( ({ring}) )"),
+            format!("POLYGON ( ( {ring} ) )"),
+            format!("  POLYGON\t((\n{ring}\n))  "),
+            "POLYGON(( 24.123456789012345  60 ,26 60,  26 61 , 24 61,24.123456789012345 60 ))"
+                .to_string(),
+        ] {
+            assert_eq!(polygon_parts(&spelling), expected, "{spelling:?}");
+        }
+    }
+
+    /// #1491: rings separated by `), (` (with whitespace), the way shapely,
+    /// GEOS and QGIS write holes, parse like `),(`.
+    #[test]
+    fn spaced_polygon_holes_parse_like_the_compact_form() {
+        let outer = "0 0, 20 0, 20 20, 0 20, 0 0";
+        let hole1 = "5 5, 8 5, 8 8, 5 8, 5 5";
+        let hole2 = "12 12, 15 12, 15 15, 12 15, 12 12";
+        let expected = polygon_parts(&format!("POLYGON(({outer}),({hole1}),({hole2}))"));
+        assert_eq!(expected.1.len(), 2);
+        for spelling in [
+            format!("POLYGON (({outer}), ({hole1}), ({hole2}))"),
+            format!("POLYGON(({outer}), ({hole1}),({hole2}))"),
+            format!("POLYGON (({outer}) , ({hole1}) , ({hole2}))"),
+            format!("polygon ( ( {outer} ) ,( {hole1} ),\n( {hole2} ) )"),
+        ] {
+            assert_eq!(polygon_parts(&spelling), expected, "{spelling:?}");
+        }
+        let one_hole = polygon_parts(&format!("POLYGON (({outer}), ({hole1}))"));
+        assert_eq!(
+            one_hole,
+            polygon_parts(&format!("POLYGON(({outer}),({hole1}))"))
+        );
+        assert_eq!(one_hole.1.len(), 1);
+    }
+
+    /// #1491: malformed polygons stay a 400, never a panic, including a
+    /// non-ASCII character next to the keyword or straddling its end.
+    #[test]
+    fn malformed_polygons_are_bad_requests() {
+        let ring = "24 60, 26 60, 26 61, 24 60";
+        let hole = "25 60.2, 25.5 60.2, 25.5 60.5, 25 60.2";
+        for coords in [
+            format!("POLYGON(({ring})"),
+            format!("POLYGON ({ring})"),
+            format!("POLYGON({ring})"),
+            format!("POLYGON(({ring})) x"),
+            format!("POLYGON(({ring}) x)"),
+            format!("POLYGON(({ring}),)"),
+            format!("POLYGON(({ring}), )"),
+            format!("POLYGON(({ring}) ({hole}))"),
+            format!("POLYGON(({ring});({hole}))"),
+            format!("POLYGON((({ring})))"),
+            format!("POLYGON(({ring}), (25 60.2, 25.5 60.2))"),
+            format!("POLYGON(({ring}), {hole})"),
+            "POLYGON()".to_string(),
+            "POLYGON ( )".to_string(),
+            "POLYGON(())".to_string(),
+            "POLYGON ((), ())".to_string(),
+            "POLYGON".to_string(),
+            "POLYGON EMPTY".to_string(),
+            "POLYGON((24 60 26 60, 26 61, 24 60))".to_string(),
+            // Out of scope here, still refused (#1048).
+            "POLYGON Z((20 60 500, 21 60 500, 21 61 500, 20 60 500))".to_string(),
+            format!("MULTIPOLYGON((({ring})))"),
+            // Non-ASCII next to, inside, or straddling the keyword's end.
+            format!("POLYGON\u{e9}(({ring}))"),
+            format!("\u{e9}POLYGON(({ring}))"),
+            format!("POLYGO\u{e9}(({ring}))"),
+            format!("POLYGO\u{20ac}(({ring}))"),
+            format!("POLYG\u{e9}N(({ring}))"),
+            "POLYGON((24 60\u{e9}, 26 60, 26 61, 24 60))".to_string(),
+            format!("POLYGON(({ring})\u{e9})"),
+            "POLYGO\u{e9}".to_string(),
+        ] {
+            match parse_area_coords(&coords) {
+                Err(e) => assert_eq!(
+                    e.class(),
+                    crate::error::ErrorClass::BadRequest,
+                    "{coords:?}: {e}"
+                ),
+                Ok(poly) => panic!("{coords:?} parsed: {poly:?}"),
+            }
+        }
     }
 
     #[test]
