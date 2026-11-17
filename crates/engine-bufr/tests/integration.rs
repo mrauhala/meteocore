@@ -3,6 +3,7 @@
 //! 307084 + extras, 307096; master tables 28–34). Expected values were
 //! cross-checked with ecCodes `bufr_dump -p`.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use chrono::{DateTime, TimeZone, Utc};
@@ -11,7 +12,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{Bbox, DatetimeInterval, FeatureQuery, SortKey};
 use ds_core::feature_engine::FeatureEngine;
-use ds_core::model::{CoverageResponse, DomainDescription};
+use ds_core::model::{CoverageResponse, DomainDescription, RangeValue, ValuePrecision};
 use engine_bufr::decode::xy_from_code;
 use engine_bufr::{BufrEngine, Decoder};
 
@@ -280,6 +281,41 @@ fn edr_area_and_radius() {
         panic!()
     };
     assert_eq!(c.len(), 1);
+}
+
+/// The store holds `f32`, so every range is the stored value widened
+/// exactly and tagged `F32` (#1341, #1497): its CoverageJSON number is the
+/// shortest `f32` text. Pressures above 1000 hPa are values `f32` does not
+/// hold exactly, which the `F64` tag wrote as `1013.40002`.
+#[test]
+fn edr_values_are_written_as_their_shortest_f32_text() {
+    let e = engine();
+    let CoverageResponse::Collection(c) = e
+        .query_area("-180,-90,180,90", None, None, None, None)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let mut pressures = BTreeSet::new();
+    for q in &c {
+        for (name, range) in &q.ranges {
+            assert_eq!(range.precision, ValuePrecision::F32, "{name}");
+            for value in range.values.iter().flatten() {
+                assert_eq!(*value, f64::from(*value as f32), "{name}: not an f32");
+                let written = RangeValue::new(Some(*value), range.precision).unwrap();
+                if ["pressure", "pressure_msl"].contains(&name.as_str()) {
+                    pressures.insert(serde_json::to_string(&written).unwrap());
+                }
+            }
+        }
+    }
+    for expected in ["1006.4", "1011.6", "1011.8", "1012.6", "1013.4", "1024.4"] {
+        assert!(
+            pressures.contains(expected),
+            "{expected} not in {pressures:?}"
+        );
+    }
+    assert_ne!(f64::from(1013.4f32), 1013.4, "f32 holds 1013.4 exactly");
 }
 
 /// The `serves_station_series` contract EDR GeoJSON relies on (#929): every
