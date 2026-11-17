@@ -99,4 +99,19 @@ ignore = [
     "RUSTSEC-2026-0404",
     "RUSTSEC-2026-0405",
     "RUSTSEC-2026-0406",
+
+    # RUSTSEC-2026-0543 — `chrono` is unmaintained (no vulnerability; all
+    # versions, 0.4.45 the latest). It is MeteoCore's date and time type
+    # throughout: ds-core's public domain types carry `DateTime<Utc>`, and
+    # some dependencies pull it in too, so no version bump removes it.
+    # Replacing it with jiff or time, as the advisory recommends, is a
+    # workspace-wide migration. Tracked in #1488.
+    "RUSTSEC-2026-0543",
+
+    # RUSTSEC-2026-0542 — `humantime` is unmaintained (no vulnerability),
+    # flagged because it wraps chrono. Not a direct dependency: it reaches
+    # Cargo.lock only through `object_store` 0.14.2, the latest release,
+    # under ds-storage. Removed by an object_store release without it.
+    # Tracked in #1489.
+    "RUSTSEC-2026-0542",
 ]
