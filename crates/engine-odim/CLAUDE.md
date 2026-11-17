@@ -35,9 +35,11 @@ around `ds-storage` calls (Critical Rules 6–7).
   `"odim-volume"` arm): build the engine once, enumerate `engine.sites()`
   (`(nod, label)` pairs), register one view per site (cloning the base
   `CollectionConfig` with per-site id/title). Site discovery is a scan
-  snapshot — sites added later surface on the next reload. An initially
-  empty remote source is re-expanded automatically by server startup recovery
-  once its poll finds sites (#190).
+  snapshot. The server's recovery loop registers a site a later poll finds,
+  local or remote, an initially empty source included, within 30 s of that
+  poll, reusing the engine (#1462, `crates/server/CLAUDE.md`). A site whose
+  volumes leave the catalog keeps its collection, which answers with no
+  data, until an explicit reload.
 - `catalog_bytes()` (#1307) is computed in `derive_catalog`: each
   catalogued volume's parsed metadata once (the parse cache shares the
   `Arc`s), the parse cache's table and keys, its `left_out` memory, and
@@ -662,6 +664,9 @@ not guarantee monotonic improvement. This baseline does not enable #642.
 
 COMP/PVOL constructors still report scan/configuration errors; poll failures
 still preserve the last good catalog. The server retries failed remote startup
-construction with backoff and re-registers per-site APIs when an initially empty
-remote catalog becomes populated. This recovery reuses accepted configuration
-and existing healthy engines; it does not turn scan errors into empty catalogs.
+construction with backoff and registers per-site APIs for every site a poll
+adds to a PVOL catalog, local or remote (#1462). This recovery reuses accepted
+configuration and existing healthy engines; it does not turn scan errors into
+empty catalogs. A local `data_path` that is missing still fails the load: an
+empty directory is a `Degraded` source whose poll keeps scanning, a missing one
+a configuration error.

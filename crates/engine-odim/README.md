@@ -257,8 +257,10 @@ discovery), `radar-fi-volume-s3-h5` (polar volumes on public S3). The
   with no slant-range correction. Rays are assumed evenly spaced from
   north, so sector scans are not supported.
 - Each radar is its own collection; there is no multi-radar mosaic. A
-  radar that appears after load becomes a collection on the next reload.
-  A remote source that found no radar at load is retried in the background.
+  radar that appears after load, in a local or a remote source, becomes a
+  collection within about 30 s of the poll that finds it, with no reload,
+  also when the source held no radar at load. A radar whose volumes leave
+  the source keeps its collection, which then has no data, until a reload.
 
 ## Testing
 

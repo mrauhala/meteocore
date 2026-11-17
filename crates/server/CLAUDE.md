@@ -883,8 +883,8 @@ Wiring:
 Remote COMP/PVOL sources whose startup scan fails keep `failed` health (503
 when every collection failed) but no longer require a manual reload to recover.
 A serialized background task retries after 30 seconds, backing off to five
-minutes while failures persist. An initially empty remote PVOL catalog also
-gets its per-site routes registered once polling discovers sites. Rebuilding
+minutes while failures persist. PVOL sites a poll adds are registered by the
+same loop, local or remote (PVOL site registration below). Rebuilding
 registration also retries failed dependent nowcasts. Healthy engines, static
 CSV/GeoJSON snapshots and warm render caches are reused; ordinary explicit
 reloads still rebuild static sources as before.
@@ -912,6 +912,31 @@ within 30 s of the poll that reads its first files, and `apply_load` evicts
 that collection's rendered and meta-tile entries, drawn meanwhile with the
 collection's style. The layout is fixed for an engine's life, so this
 happens at most once per engine.
+
+## PVOL site registration (#1462)
+
+A PVOL source registers a collection per radar site its catalog holds when
+it loads (`{base}-{nod}`). `LoadResult::pvol_sites` records each source's
+sites with the label and quantities each was registered with, a site whose
+id collides with another collection included, so it is not retried every
+pass. The recovery loop's `pvol_registration_changed` registers the source
+again (accepted config, engine and caches reused) once a live engine's
+`sites()` holds a site missing there: within 30 s of the poll that finds it,
+or the loop's back-off while a remote radar source keeps failing. Local and
+remote alike: a local drop directory that is empty at a restart is
+`Degraded`, its poll keeps scanning, and its sites appear without a reload.
+`has_pending_radar` and local fail-fast are unchanged: a missing local
+`data_path` still fails the load and is never retried.
+
+Only an added site counts, and a recovery pass never drops one, or an
+outage would remove collections one by one at whatever pass came next. The
+pass hands the live `pvol_sites` to `load_collections`
+(`EngineReuse::pvol_sites`), which registers a reused source's sites that
+left the catalog again with their recorded label and quantities, so titles
+and layer styles stay; they stay `Ready` with `collection_has_data` 0. An
+explicit reload or the watcher hands none over: it registers what the
+catalog holds and lists a vanished site `Degraded`, as before, and the loop
+registers the site again once it returns.
 
 ## GRIB level collections
 
