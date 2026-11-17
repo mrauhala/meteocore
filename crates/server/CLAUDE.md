@@ -716,7 +716,7 @@ need no reload pruning.
   class-`Internal` errors (#1476). `not_found` and `invalid_request` are
   mostly a client's request; some engines report a data fault with them
   too (a GRIB message missing from its step, a GeoTIFF source over its
-  pixel cap), which the alert misses (#FOLLOWUP). A new reason goes in the
+  pixel cap), which the alert misses (#1506). A new reason goes in the
   rule, its test and the dashboard's ratio panel when it is server-side.
 
 ## Operational notes

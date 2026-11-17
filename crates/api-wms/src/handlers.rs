@@ -239,7 +239,7 @@ pub struct ErrorTile {
 /// #1476). The first two are mostly a client's request, but some engines
 /// report a data fault with them too, such as a GRIB message missing from
 /// its step or a GeoTIFF source over its pixel cap; the alert misses those
-/// (#FOLLOWUP).
+/// (#1506).
 pub const ERROR_TILE_REASONS: [&str; 4] = ["not_found", "invalid_request", "storage", "internal"];
 
 impl ErrorTile {
