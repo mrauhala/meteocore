@@ -468,6 +468,13 @@ cube) return `default_parameters` instead, every parameter of the view
 (EDR 1.2 `/req/edr/parameter-name-response` A, #966): every key of a
 pressure/model view, else the products of the selected steps, near-surface
 ones only in the legacy layout.
+A query with `parameter-name` passes it through `requested_parameters`
+first (#1493), on every layout: `select_parameters` over the view's
+advertised names (`Catalog::param_names`, the `get_parameters` order), so
+a case variant becomes the catalog's spelling and an unknown name is the
+shared 400, before `resolve_run`/`covering_run` and `grid_steps` see the
+names. Run selection then prefers runs by the canonical names. Pinned by
+`parameter_name_tests.rs` and `tests/local_source.rs`.
 
 ## Keep floors (#1314)
 

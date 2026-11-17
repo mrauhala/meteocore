@@ -449,6 +449,66 @@ fn edr_position_is_a_time_series_on_the_union_axis() {
         .is_err());
 }
 
+/// `parameter-name` follows the shared EDR rule (#1493): a case variant
+/// answers the product under its own name (it used to be a 400), and an
+/// unknown name is a 400 listing the products.
+#[test]
+fn edr_parameter_name_is_case_insensitive() {
+    let (engine, _dir) = engine(&[(C13, C13), (ACHT, ACHT)]);
+    let (lon, lat, _) = reference_pixel(C13, "CMI", 200, 40);
+    let point = format!("POINT({lon} {lat})");
+    let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let exact = single(
+        engine
+            .query_position(&point, None, Some(&names(&["ir_10_3"])), None, None)
+            .unwrap(),
+    );
+    let variant = single(
+        engine
+            .query_position(
+                &point,
+                None,
+                Some(&names(&["IR_10_3", "ir_10_3"])),
+                None,
+                None,
+            )
+            .unwrap(),
+    );
+    assert_eq!(variant.ranges.keys().collect::<Vec<_>>(), ["ir_10_3"]);
+    assert_eq!(variant.parameters.keys().collect::<Vec<_>>(), ["ir_10_3"]);
+    assert_eq!(
+        variant.ranges["ir_10_3"].values,
+        exact.ranges["ir_10_3"].values
+    );
+    assert!(exact.ranges["ir_10_3"].values[0].is_some());
+
+    let polygon = format!(
+        "POLYGON(({w} {s}, {e} {s}, {e} {n}, {w} {n}, {w} {s}))",
+        w = lon - 0.1,
+        e = lon + 0.1,
+        s = lat - 0.1,
+        n = lat + 0.1
+    );
+    let area = single(
+        engine
+            .query_area(&polygon, None, Some(&names(&["Ir_10_3"])), None, None)
+            .unwrap(),
+    );
+    assert_eq!(area.ranges.keys().collect::<Vec<_>>(), ["ir_10_3"]);
+
+    let unknown =
+        engine.query_position(&point, None, Some(&names(&["ir_10_3", "NOPE"])), None, None);
+    match unknown {
+        Err(ds_core::error::DataServerError::InvalidParameter(m)) => assert!(
+            m.starts_with("Unknown parameter 'NOPE'; available: ")
+                && m.contains("ir_10_3")
+                && m.contains("cloud_top_temperature"),
+            "{m}"
+        ),
+        other => panic!("expected a 400, got {:?}", other.map(drop)),
+    }
+}
+
 /// An area is a CRS84 grid at the nadir resolution over the polygon,
 /// masked to it; with two scans it gains a time axis. A radius delegates to
 /// the area query.

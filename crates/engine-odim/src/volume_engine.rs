@@ -4545,10 +4545,14 @@ fn quantity_description(quantity: &str) -> ParameterDescription {
 /// sweeps, a quantity may be present only on higher elevations (e.g.
 /// dual-PRF `VRADH`/`WRADH`), and a quantity may drop out of the newest
 /// scan (firmware change / reduced strategy) while earlier volumes in the
-/// window still carry it — intersected with the optional `parameters`
-/// filter. `sample_profile`/`level_series` map a missing moment in any one
-/// timestep to `None`, so unioning here never fabricates data; it only
-/// keeps a quantity queryable for the timesteps that actually have it.
+/// window still carry it — narrowed by the optional `parameters` through
+/// the shared EDR rule (`select_parameters`, #1493): each name matched
+/// case-insensitively, and a name outside the union is a 400 listing it,
+/// never dropped from an answer that keeps the others. The quantities
+/// stay in the union's order. `sample_profile`/`level_series` map a
+/// missing moment in any one timestep to `None`, so unioning here never
+/// fabricates data; it only keeps a quantity queryable for the timesteps
+/// that actually have it.
 fn resolve_quantities(
     selected: &[&VolumeEntry],
     parameters: Option<&[String]>,
@@ -4564,19 +4568,21 @@ fn resolve_quantities(
         .collect();
     available.sort();
     available.dedup();
-    let quantities: Vec<String> = match parameters {
-        Some(req) => available
-            .into_iter()
-            .filter(|q| req.iter().any(|p| p == q))
-            .collect(),
-        None => available,
-    };
-    if quantities.is_empty() {
+    if available.is_empty() {
         return Err(DataServerError::InvalidParameter(
             "No requested parameter is available at this PVOL site".into(),
         ));
     }
-    Ok(quantities)
+    if parameters.is_none() {
+        return Ok(available);
+    }
+    let names: Vec<&str> = available.iter().map(String::as_str).collect();
+    let chosen = ds_core::edr_engine::select_parameters(parameters, &names)?;
+    Ok(available
+        .iter()
+        .filter(|q| chosen.contains(&q.as_str()))
+        .cloned()
+        .collect())
 }
 
 /// How far (degrees) a requested elevation angle may lie from an advertised
@@ -12954,6 +12960,124 @@ mod tests {
         let q = resolve_quantities(&selected, Some(&["VRADH".to_string()]))
             .expect("VRADH is available in the window's union");
         assert_eq!(q, vec!["VRADH".to_string()]);
+    }
+
+    /// `parameter-name` follows the shared EDR rule (#1493): a name is
+    /// matched case-insensitively and served under the quantity's own
+    /// spelling, and a name outside the window's union is a 400 listing
+    /// the union. `DBZH,NOPE` used to answer DBZH alone, and `dbzh` was a
+    /// 400.
+    #[test]
+    fn resolve_quantities_follows_the_shared_parameter_rule() {
+        let mut volume = synthetic_volume(25.0, 60.0);
+        let mut vradh = volume.sweeps[0].moments[0].clone();
+        vradh.quantity = "VRADH".to_string();
+        volume.sweeps[0].moments.push(vradh);
+        let owned = [entry(volume, "a")];
+        let selected: Vec<&VolumeEntry> = owned.iter().collect();
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            resolve_quantities(&selected, Some(&names(&["dbzh"]))).unwrap(),
+            ["DBZH"]
+        );
+        // The union's order, each quantity once, whatever the request's.
+        assert_eq!(
+            resolve_quantities(&selected, Some(&names(&["vradh", "DBZH", "Dbzh"]))).unwrap(),
+            ["DBZH", "VRADH"]
+        );
+        assert_eq!(
+            resolve_quantities(&selected, None).unwrap(),
+            ["DBZH", "VRADH"]
+        );
+        match resolve_quantities(&selected, Some(&names(&["DBZH", "NOPE"]))) {
+            Err(DataServerError::InvalidParameter(m)) => assert_eq!(
+                m, "Unknown parameter 'NOPE'; available: DBZH, VRADH",
+                "the shared rule's message, which the HTML error page recognises"
+            ),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    /// The per-site queries all resolve `parameter-name` through
+    /// [`resolve_quantities`] (#1493): `dbzh` answers DBZH under its own
+    /// name, and `DBZH,NOPE` is a 400 on position, location, area and the
+    /// cross-section, never DBZH alone.
+    #[test]
+    fn site_view_parameter_name_is_case_insensitive_and_exhaustive() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+        let point = "POINT(25.0 60.1)";
+
+        // The one profile a single volume answers, whichever wrapping.
+        let profile = |names: &[String]| {
+            let coverages =
+                match EdrEngine::query_position(&view, point, None, Some(names), None, None)
+                    .unwrap()
+                {
+                    CoverageResponse::Single(cov) => vec![cov],
+                    CoverageResponse::Collection(covs) => covs,
+                };
+            assert_eq!(coverages.len(), 1, "one volume, one profile");
+            coverages.into_iter().next().unwrap()
+        };
+        let cov = profile(&["dbzh".to_string()]);
+        assert_eq!(cov.ranges.keys().collect::<Vec<_>>(), ["DBZH"]);
+        assert_eq!(cov.parameters.keys().collect::<Vec<_>>(), ["DBZH"]);
+        let advertised = profile(&["DBZH".to_string()]);
+        // A case variant answers exactly what the advertised name does.
+        assert_eq!(cov.ranges["DBZH"].values, advertised.ranges["DBZH"].values);
+        assert!(cov.ranges["DBZH"].values.iter().any(Option::is_some));
+        assert_eq!(
+            format!("{:?}", cov.domain),
+            format!("{:?}", advertised.domain)
+        );
+
+        let unknown = ["DBZH".to_string(), "NOPE".to_string()];
+        for (query, result) in [
+            (
+                "position",
+                EdrEngine::query_position(&view, point, None, Some(&unknown), None, None),
+            ),
+            (
+                "location",
+                EdrEngine::query_location(&view, "fivih", None, Some(&unknown), None, None),
+            ),
+            (
+                "area",
+                EdrEngine::query_area(
+                    &view,
+                    "POLYGON((24 59, 26 59, 26 61, 24 61, 24 59))",
+                    None,
+                    Some(&unknown),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "trajectory",
+                EdrEngine::query_trajectory(
+                    &view,
+                    "LINESTRING(24.5 60.3, 24.5 60.9)",
+                    None,
+                    Some(&unknown),
+                    None,
+                    None,
+                ),
+            ),
+        ] {
+            match result {
+                Err(DataServerError::InvalidParameter(m)) => assert!(
+                    m.contains("'NOPE'") && m.ends_with("available: DBZH"),
+                    "{query}: {m}"
+                ),
+                other => panic!("{query}: expected a 400, got {other:?}"),
+            }
+        }
     }
 
     /// A position query for a point clearly outside the radar's coverage

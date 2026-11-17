@@ -492,6 +492,12 @@ impl Catalog {
         self.param_names.clone()
     }
 
+    /// [`Self::all_params`] without a copy: the names EDR `parameter-name`
+    /// is matched against (#1493).
+    pub fn param_names(&self) -> &[String] {
+        &self.param_names
+    }
+
     /// All unique parameters with level info from every step of every
     /// retained run, the newest run's first (#1026).
     pub fn all_params_with_levels(&self) -> Vec<(String, String, Option<u32>)> {

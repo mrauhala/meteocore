@@ -809,6 +809,9 @@ impl SatelliteEngine {
     /// The products an EDR query names (all for `None`), each with the scans
     /// it addresses, and the query's time axis: the union of those scans. A
     /// product without a scan at one of the union's times reads null there.
+    /// The names follow the shared rule (`select_parameters`, #1493):
+    /// matched case-insensitively, and an unknown one is a 400 listing the
+    /// products, except a composite, whose 400 says what it is.
     #[allow(clippy::type_complexity)]
     fn query_plan(
         &self,
@@ -818,10 +821,20 @@ impl SatelliteEngine {
     ) -> Result<(Vec<(usize, Vec<DateTime<Utc>>)>, Vec<DateTime<Utc>>), DataServerError> {
         let mut indices: Vec<usize> = match parameters {
             None => (0..self.products.len()).collect(),
-            Some(names) => names
-                .iter()
-                .map(|name| self.product_index(Some(name)))
-                .collect::<Result<_, _>>()?,
+            Some(names) => {
+                let products: Vec<&str> = self.products.iter().map(|p| &*p.parameter).collect();
+                ds_core::edr_engine::select_parameters(Some(names), &products)
+                    .map_err(|unknown| {
+                        names
+                            .iter()
+                            .find(|n| !products.iter().any(|p| p.eq_ignore_ascii_case(n)))
+                            .filter(|n| self.composite_index(n).is_some())
+                            .map_or(unknown, |n| self.not_a_band(n))
+                    })?
+                    .into_iter()
+                    .filter_map(|name| products.iter().position(|p| *p == name))
+                    .collect()
+            }
         };
         indices.sort_unstable();
         indices.dedup();

@@ -29,6 +29,8 @@ impl GribEngine {
             ));
         }
         let catalog = self.catalog();
+        let requested = requested_parameters(&catalog, parameters)?;
+        let parameters = requested.as_deref();
         let run = resolve_run(&catalog, reference_time, datetime, &named(parameters))?;
         let levels = self.selected_levels(&catalog, run.reference_time, z)?;
         let keys = catalog
@@ -160,9 +162,12 @@ impl GribEngine {
     }
 
     /// The parameters a point-sampling query (position, trajectory) returns:
-    /// the requested ones (checked against the run on level views), else
-    /// [`Self::default_parameters`] of the selected steps. `steps` empty is a
-    /// 404, no parameter on a vertical view a 400.
+    /// the requested ones, already matched against every advertised
+    /// parameter in the catalog's spelling ([`requested_parameters`], so an
+    /// unknown name is a 400 on every layout, #1493) and checked against
+    /// the run on level views, else [`Self::default_parameters`] of the
+    /// selected steps. `steps` empty is a 404, no parameter on a vertical
+    /// view a 400.
     pub(crate) fn position_parameters(
         &self,
         parameters: Option<&[String]>,
@@ -531,11 +536,13 @@ mod tests {
             ),
             Err(DataServerError::InvalidParameter(_))
         ));
+        // 2 steps × 1 level × 500 001 points × 1 parameter: a name repeated
+        // counts once (#1493), so the points make the batch too large.
         assert!(matches!(
             engine.query_positions(
-                &["POINT(0 0)".into(), "POINT(1 1)".into()],
+                &vec!["POINT(0 0)".into(); 500_001],
                 None,
-                Some(&vec!["TMP".into(); 250001]),
+                Some(&["TMP".into()]),
                 None,
                 None,
                 &mut emit,

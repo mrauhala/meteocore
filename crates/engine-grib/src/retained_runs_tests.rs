@@ -329,6 +329,14 @@ fn edr_queries_naming_an_older_runs_parameter_read_that_run() {
     let (t, ranges) = series(&engine, None, Some(&["RH"]), None);
     assert_eq!(t, [at(0), at(3), at(6)]);
     assert_eq!(rounded(&ranges["RH"]), [Some(50.0), Some(53.0), Some(56.0)]);
+    // A case variant is the advertised name before the run is chosen
+    // (#1493): the older run too, under the advertised spelling.
+    let variant = series(&engine, None, Some(&["tcdc_AVG_6h"]), None);
+    assert_eq!(
+        variant,
+        series(&engine, None, Some(&["TCDC_avg_6h"]), None),
+        "{variant:?}"
+    );
     // With a parameter both runs have: the run that has them all.
     let (t, ranges) = series(&engine, None, Some(&["TMP", "TMAX"]), None);
     assert_eq!(t, [at(0), at(3), at(6)]);

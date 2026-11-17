@@ -134,6 +134,61 @@ fn grib_area_query_masks_outside_the_polygon() {
     );
 }
 
+/// #1493 on the committed fixture, the legacy layout without
+/// `level_types`: `Q` answers `q`'s values under the name `q`, and `NOPE`
+/// is a 400 listing `q`, on position, trajectory and area alike. Position
+/// and trajectory used to answer both with a range of nulls under the name
+/// as sent, and area a 400 for `Q`.
+#[test]
+fn parameter_name_matches_case_insensitively_and_rejects_unknown_names() {
+    use ds_core::error::DataServerError;
+    use ds_core::model::CoverageResponse;
+    let engine = GribEngine::new("grib-local-test", &local_config()).expect("engine builds");
+    assert_eq!(engine.get_parameters(), ["q"]);
+    let query = |kind: &str, name: &str| {
+        let names = [name.to_string()];
+        let names = Some(&names[..]);
+        let response = match kind {
+            "position" => engine.query_position("POINT(25 60)", None, names, None, None),
+            "trajectory" => {
+                engine.query_trajectory("LINESTRING(24 60, 26 60)", None, names, None, None)
+            }
+            "area" => engine.query_area(
+                "POLYGON((24 59,26 59,26 61,24 61,24 59))",
+                None,
+                names,
+                None,
+                None,
+            ),
+            other => panic!("no query type {other}"),
+        }?;
+        let CoverageResponse::Single(result) = response else {
+            panic!("{kind}: expected one coverage");
+        };
+        let ranges: Vec<_> = result.ranges.into_iter().collect();
+        Ok::<_, DataServerError>(ranges)
+    };
+    for kind in ["position", "trajectory", "area"] {
+        let exact = query(kind, "q").unwrap();
+        assert_eq!(exact.len(), 1, "{kind}");
+        assert_eq!(exact[0].0, "q", "{kind}");
+        assert!(exact[0].1.values.iter().any(Option::is_some), "{kind}");
+        let variant = query(kind, "Q").unwrap();
+        assert_eq!(variant.len(), 1, "{kind}");
+        assert_eq!(
+            variant[0].0, "q",
+            "{kind}: answered under the advertised name"
+        );
+        assert_eq!(variant[0].1.values, exact[0].1.values, "{kind}");
+        match query(kind, "NOPE") {
+            Err(DataServerError::InvalidParameter(message)) => {
+                assert_eq!(message, "Unknown parameter 'NOPE'; available: q", "{kind}")
+            }
+            other => panic!("{kind}: expected a 400, got {other:?}"),
+        }
+    }
+}
+
 /// Discovery settings the poll would reject are load errors: an invalid
 /// `time_window` (the poll used to skip its filter silently), a
 /// `prefix_pattern` with an unknown or hour specifier (the run hour is `{run}`),
