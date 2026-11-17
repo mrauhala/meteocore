@@ -69,6 +69,16 @@ Derivation rules (hard-won from production timeouts):
   lacks `sslmode=require`. Reach the DB over private network/VPN/loopback.
 - Every identifier: `ds_core::config::is_valid_sql_identifier` at load +
   `security::quote_ident` at emit. Every value: `$N` bind.
+- **An area polygon is parsed before any SQL (#1494).** Every mode reads
+  `coords` with `ds_core::feature::parse_area_coords`, so a polygon it
+  refuses is its 400, with its length and vertex caps; the events and
+  stations-only statements bind `polygon_wkt` of the parsed polygon, never
+  the client's text. PostGIS would refuse what the parser takes (an open
+  ring, three pairs, `-0` against `0`) with an error the API hides as a
+  500, so `ring_wkt` closes each ring bytewise and pads it to four points.
+  The bbox form across the antimeridian is written as its two halves, a
+  `MULTIPOLYGON`, as `footprint_wkt` writes a pick across it. Never map
+  PostGIS's `XX000` to a 400: it also covers real server faults.
   `stations.where_clause` is config-time only, validated against a
   blocklist (DML/DDL verbs, `UNION`/`EXECUTE`/`CALL`/`PERFORM`, `;`,
   comments) — for richer filtering, create a SQL VIEW.
@@ -510,6 +520,13 @@ in step when changing this lifecycle.
   the cap, and a window holding exactly the cap is answered whole, newest
   first. A request's statement reads one row past
   `MAX_AREA_POINT_COVERAGES`, and the same window is answered whole.
+- `events_area_polygons_are_parsed_first` (#1494, `mc1494_events`): the
+  keyword in any case, standard spacing, an open ring, the bbox form and a
+  radius answer as the canonical polygon; a three-pair ring is an answer;
+  what the parser refuses (`POLYGON Z`, `EMPTY`, a bad number, out of
+  range, too long) is its own 400; the 170,10,-170,20 seam box finds the
+  events on both sides of ±180 only. `check_shape` checks the same
+  spellings and refusals for every station shape.
 - `events_features_shape` (#503, `mc503_events`): Features on a naive-UTC
   table keyed `(time, id)`. Paging two at a time visits every event once
   with a boundary inside a three-way tie whose ids order differently as

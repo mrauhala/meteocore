@@ -30,7 +30,7 @@ use ds_core::config::{
 };
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
-use ds_core::feature::MAX_AREA_POINT_COVERAGES;
+use ds_core::feature::{parse_area_coords, MAX_AREA_POINT_COVERAGES};
 use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
 use engine_postgis::engine::AreaPath;
 use engine_postgis::pool::PoolRegistry;
@@ -470,6 +470,10 @@ fn expected_at_t0(shape: Shape, n: i64) -> Vec<(String, Vec<Option<f64>>)> {
 ///    the fixture's values;
 /// 2. the same request over a week: the 400 that names the value budget;
 /// 3. the set-based and fan-out paths: the same values in the same order.
+///
+/// And of #1494: 4. the polygon is the shared parser's in every mode, so
+/// each spelling it reads answers as the canonical one, and what it refuses
+/// is its 400.
 async fn check_shape(engine: &Arc<PostgisEngine>, shape: Shape) {
     let both: &[&str] = &["t2m", "rh"];
     let locations: HashSet<(u64, u64)> = engine
@@ -593,6 +597,49 @@ async fn check_shape(engine: &Arc<PostgisEngine>, shape: Shape) {
     .await
     .unwrap();
     assert!(skipping.len() < 2_500, "{} stations", skipping.len());
+
+    check_area_polygons(engine, shape).await;
+}
+
+/// The area polygon is read by the shared parser in every mode (#1494):
+/// stations-only mode, whose `ST_Within` PostGIS evaluates, used to pass a
+/// `POLYGON` to the database as written. Every spelling the parser reads
+/// answers as [`BLOCK`] does, and what it refuses is its own 400. No
+/// statement runs for that: a database error is never `InvalidParameter`.
+async fn check_area_polygons(engine: &Arc<PostgisEngine>, shape: Shape) {
+    let instant = Some((t0(), t0()));
+    let block = comparable(&area(engine, None, BLOCK, instant, None).await.unwrap());
+    assert_eq!(block.len(), 2_500, "{shape:?}: the block");
+    for spelling in [
+        "polygon((0.95 40.95,5.95 40.95,5.95 45.95,0.95 45.95,0.95 40.95))",
+        "POLYGON ((0.95 40.95, 5.95 40.95, 5.95 45.95, 0.95 45.95, 0.95 40.95))",
+        // An open ring is read closed, as every engine reads it.
+        "Polygon ( ( 0.95 40.95 , 5.95 40.95 , 5.95 45.95 , 0.95 45.95 ) )",
+        "0.95,40.95,5.95,45.95",
+    ] {
+        let answer = area(engine, None, spelling, instant, None)
+            .await
+            .unwrap_or_else(|e| panic!("{shape:?}, {spelling}: {e:?}"));
+        assert_eq!(comparable(&answer), block, "{shape:?}, {spelling}");
+    }
+    for bad in [
+        "POLYGON((0.95 40.95, 5.95 x, 5.95 45.95, 0.95 40.95))",
+        "POLYGON((0.95 40.95, 5.95 40.95, 5.95 45.95, 0.95 40.95)",
+        "POLYGON Z((0.95 40.95 0, 5.95 40.95 0, 5.95 45.95 0, 0.95 40.95 0))",
+        "POLYGON EMPTY",
+        "POLYGON((0.95 40.95, 5.95 40.95, 5.95 95, 0.95 40.95))",
+    ] {
+        let err = area(engine, None, bad, instant, None).await.unwrap_err();
+        assert!(
+            matches!(err, DataServerError::InvalidParameter(_)),
+            "{shape:?}, {bad}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            parse_area_coords(bad).unwrap_err().to_string(),
+            "{shape:?}, {bad}"
+        );
+    }
 }
 
 async fn run_shape(schema: &str, shape: Shape, shape_sql: &str, cfg: fn(&str) -> PostgisConfig) {
@@ -1546,6 +1593,151 @@ async fn events_area_answers_are_bounded_by_events() {
         .expect("a request's events answer");
     assert_eq!(events.len(), held);
     assert_eq!(time(&events[0]), Some(after(held)));
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
+/// Four events in an hour: one in Finland, one on each side of the
+/// antimeridian at 15° N, and one on the Greenwich meridian.
+const AREA_EVENTS: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.strikes (
+    id bigint PRIMARY KEY,
+    time timestamptz NOT NULL,
+    geom geometry(Point, 4326) NOT NULL,
+    peak_current real
+);
+INSERT INTO __S__.strikes VALUES
+    (1, '2026-01-01 05:10:00+00', ST_SetSRID(ST_MakePoint(24.7, 60.2), 4326), 10),
+    (2, '2026-01-01 05:20:00+00', ST_SetSRID(ST_MakePoint(175, 15), 4326), 20),
+    (3, '2026-01-01 05:30:00+00', ST_SetSRID(ST_MakePoint(-175, 15), 4326), 30),
+    (4, '2026-01-01 05:40:00+00', ST_SetSRID(ST_MakePoint(0, 15), 4326), 40);
+CREATE INDEX ON __S__.strikes (time);
+ANALYZE;
+";
+
+/// #1494 on the events shape: the area polygon is read by the shared parser
+/// before the statement, which binds it written out again.
+///
+/// - Every spelling the parser reads answers as the canonical one: the
+///   keyword in any case, standard spacing, an open ring (the issue's
+///   triangle, which PostGIS refused as a 500), the bbox form, and a radius.
+/// - A ring of three pairs that closes itself, which PostGIS refuses
+///   as too short, is an answer.
+/// - What the parser refuses is its 400 with its message, `POLYGON Z`
+///   included, and no statement runs: a database error is never
+///   `InvalidParameter`.
+/// - The bbox form across the antimeridian finds the events on both sides
+///   of it, not the one on the other side of the Earth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_area_polygons_are_parsed_first() {
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc1494_events";
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, AREA_EVENTS).await;
+    }
+    let mut cfg = config(
+        None,
+        PostgisObservationsConfig {
+            table: Some(format!("{schema}.strikes")),
+            time_col: Some("time".into()),
+            geom_col: Some("geom".into()),
+            id_col: Some("id".into()),
+            extent_bbox: Some([-180.0, -90.0, 180.0, 90.0]),
+            ..observations("events")
+        },
+    );
+    cfg.parameters = vec![PostgisParameterConfig {
+        name: "peak_current".into(),
+        label: "Peak current".into(),
+        unit: "kA".into(),
+        observed_property: None,
+        source_key: None,
+        valid_range: None,
+        missing_values: vec![],
+    }];
+    let engine = engine(schema, &cfg).await;
+    let window = Some((on_jan_1("05:00"), on_jan_1("06:00")));
+    let places = |events: &[QueryResult]| -> Vec<(f64, f64)> {
+        events
+            .iter()
+            .map(|c| match &c.domain {
+                DomainDescription::Point { x, y, .. } => (*x, *y),
+                other => panic!("an event is a Point, got {other:?}"),
+            })
+            .collect()
+    };
+
+    let finland = vec![(24.7, 60.2)];
+    for spelling in [
+        "POLYGON((24 60,25 60,25 61,24 61,24 60))",
+        "POLYGON ((24 60, 25 60, 25 61, 24 61, 24 60))",
+        "polygon((24 60,25 60,25 61,24 61,24 60))",
+        "POLYGON((24 60, 25 60, 25 61))",
+        "24,60,25,61",
+    ] {
+        let events = area(&engine, None, spelling, window, None)
+            .await
+            .unwrap_or_else(|e| panic!("{spelling}: {e:?}"));
+        assert_eq!(places(&events), finland, "{spelling}");
+    }
+    let engine_for_radius = Arc::clone(&engine);
+    let radius = tokio::task::spawn_blocking(move || {
+        engine_for_radius.query_radius("POINT(24.7 60.2)", 10_000.0, window, None, None, None)
+    })
+    .await
+    .expect("radius task")
+    .expect("a radius around the Finnish event");
+    let CoverageResponse::Collection(radius) = radius else {
+        panic!("an events answer is a collection");
+    };
+    assert_eq!(places(&radius), finland, "radius");
+
+    let collapsed = area(
+        &engine,
+        None,
+        "POLYGON((24 60, 25 61, 24 60))",
+        window,
+        None,
+    )
+    .await
+    .expect("a ring of three pairs is an answer, not a database error");
+    assert!(places(&collapsed).is_empty(), "{:?}", places(&collapsed));
+
+    let too_long = format!("POLYGON((24 60,{}25 61,24 60))", " ".repeat(10_240));
+    for bad in [
+        "POLYGON((24 60, 25 x, 25 61, 24 60))",
+        "POLYGON((24 60, 25 60, 25 61, 24 60)",
+        "POLYGON Z((24 60 0, 25 60 0, 25 61 0, 24 60 0))",
+        "POLYGON EMPTY",
+        "POLYGON((24 60, 25 60, 25 91, 24 60))",
+        too_long.as_str(),
+    ] {
+        let err = area(&engine, None, bad, window, None).await.unwrap_err();
+        assert!(
+            matches!(err, DataServerError::InvalidParameter(_)),
+            "{bad:.60}: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            parse_area_coords(bad).unwrap_err().to_string(),
+            "{bad:.60}"
+        );
+    }
+
+    let seam = area(&engine, None, "170,10,-170,20", window, None)
+        .await
+        .expect("a box across the antimeridian");
+    assert_eq!(
+        places(&seam),
+        vec![(-175.0, 15.0), (175.0, 15.0)],
+        "newest first"
+    );
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
 
