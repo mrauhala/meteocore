@@ -321,6 +321,10 @@ column's index probe.
 - `position` picks the nearest station within 25 km. An instant `datetime`
   matches that timestamp exactly.
 - `radius` runs as an area query over a circle polygon.
+- An area polygon is read as every engine reads it before any statement
+  runs, so what that refuses is a 400 (`POLYGON Z`, `M` and `EMPTY`
+  included), and PostGIS gets it written out again as a bind. A
+  `west,south,east,north` box across the antimeridian covers both sides.
 - Without `datetime`, station queries read full history and event queries
   the `default_datetime` window ending now. Events come newest first.
 - No data in the window: 404 for `locations`/`position`; the station is left
