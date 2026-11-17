@@ -233,10 +233,13 @@ pub struct ErrorTile {
 /// Every [`ErrorTile::reason`], a bounded label set: the data a request
 /// named is gone (`not_found`), the engine refused the request
 /// (`invalid_request`, such as a source read over its pixel cap), a source
-/// read failed (`storage`), or anything else (`internal`). The first two a
-/// client's request causes; the last two are exactly the errors of
-/// [`ErrorClass::Internal`], the server-side failures the `WmsErrorTiles`
-/// alert counts (`docker/prometheus/rules/meteocore.yml`, #1476).
+/// read failed (`storage`), or anything else (`internal`). The last two are
+/// exactly the errors of [`ErrorClass::Internal`], which the
+/// `WmsErrorTiles` alert counts (`docker/prometheus/rules/meteocore.yml`,
+/// #1476). The first two are mostly a client's request, but some engines
+/// report a data fault with them too, such as a GRIB message missing from
+/// its step or a GeoTIFF source over its pixel cap; the alert misses those
+/// (#FOLLOWUP).
 pub const ERROR_TILE_REASONS: [&str; 4] = ["not_found", "invalid_request", "storage", "internal"];
 
 impl ErrorTile {
@@ -1933,10 +1936,9 @@ mod tests {
 
     /// #1375: an error tile's metrics label names why the render failed,
     /// from a bounded set, and the bottom layer's collection. #1476: the
-    /// `WmsErrorTiles` alert counts `storage` and `internal` as server-side
-    /// failures, so those two are exactly the errors of class `Internal`;
-    /// `not_found` and `invalid_request` are a client's request. Every
-    /// variant that reaches a tile (none transient) is listed.
+    /// `WmsErrorTiles` alert counts `storage` and `internal`, so those two
+    /// are exactly the errors of class `Internal`. Every variant that
+    /// reaches a tile (none transient) is listed.
     #[test]
     fn error_tile_reasons_are_a_bounded_set() {
         use DataServerError as E;
@@ -1960,7 +1962,7 @@ mod tests {
             assert_eq!(
                 matches!(reason, "storage" | "internal"),
                 error.class() == ErrorClass::Internal,
-                "{error}: the alert counts a server-side failure, never a client's request"
+                "{error}: the alert counts exactly the class-Internal errors"
             );
             let tile = ErrorTile::new("radar", &error);
             assert_eq!(

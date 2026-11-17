@@ -23020,7 +23020,7 @@
         "spec": {
           "id": 152,
           "title": "WMS error tiles",
-          "description": "WMS GetMaps answered with the red error tile per second, by collection and reason (wms_error_tiles_total). They are HTTP 200, so the status code panels never count them. reason: not_found = the data the request named was gone, invalid_request = the engine refused the request (such as a source read over its pixel cap), storage = a source read failed, internal = any other. The WmsErrorTiles alert counts only storage and internal: the other two a client's request causes. The server log has each render error.",
+          "description": "WMS GetMaps answered with the red error tile per second, by collection and reason (wms_error_tiles_total). They are HTTP 200, so the status code panels never count them. reason: not_found = the data the request named was gone, invalid_request = the engine refused the request (such as a source read over its pixel cap), storage = a source read failed, internal = any other. The WmsErrorTiles alert counts only storage and internal; the other two are mostly a client's request, though some engines report a data fault with them, which only this panel shows. The server log has each render error.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -23126,7 +23126,7 @@
         "spec": {
           "id": 153,
           "title": "WMS server error-tile ratio by collection",
-          "description": "The share of each collection's GetMap responses that are the red error tile of a server-side failure, the ratio the WmsErrorTiles alert counts: error tiles with reason storage or internal over every error tile plus served renders (render_duration_seconds, api wms). Tiles a client's request caused, reason not_found or invalid_request, count only as GetMaps served; WMS error tiles shows every reason. The red line is the alert's 5 %, which fires once it has held for 10 min.",
+          "description": "The share of each collection's GetMap responses that are the red error tile of a server-class error, the ratio the WmsErrorTiles alert counts: error tiles with reason storage or internal over every error tile plus served renders (render_duration_seconds, api wms). Tiles with reason not_found or invalid_request, mostly a client's request, count only as GetMaps served; WMS error tiles shows every reason. The red line is the alert's 5 %, which fires once it has held for 10 min.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

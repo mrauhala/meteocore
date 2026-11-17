@@ -3692,7 +3692,7 @@ normal CI without the review credential.
 | `CollectionEmpty` | `collection_has_data == 0`: the collection never loaded data, or all of it aged out; not for radar sites | 15m | warning |
 | `CollectionsFailed` | `collections_failed > 0` | 5m | warning |
 | `HighServerErrorRate` | 5xx responses above 5 % of an API's requests, per API (routes without an API, such as `/health`, are left out) | 10m | warning |
-| `WmsErrorTiles` | server-side error tiles above 5 % of a collection's GetMap responses: `wms_error_tiles_total` with `reason` `storage` or `internal`, over every error tile plus `render_duration_seconds_count{api="wms"}`. Tiles a client's request caused (`not_found`, `invalid_request`) count only as GetMaps served | 10m | warning |
+| `WmsErrorTiles` | server-class error tiles above 5 % of a collection's GetMap responses: `wms_error_tiles_total` with `reason` `storage` or `internal`, over every error tile plus `render_duration_seconds_count{api="wms"}`. Tiles with `not_found` or `invalid_request`, mostly a client's request, count only as GetMaps served; some engines report a data fault with them too, which the alert misses (#FOLLOWUP) | 10m | warning |
 | `RequestsShed` | admission rejections and deadline expiries (`render_queue_rejected_total`, `render_budget_rejected_total{reason="oversize"}`, `render_deadline_exceeded_total` and each read budget's `*_rejected_total`) above 1 % of requests | 10m | warning |
 | `UpstreamThrottled` | `storage_host_throttled_total` rising: a remote host answers 429 | 15m | info |
 | `MemoryHigh` | `process_resident_memory_bytes` above the memory plan's total, `memory_plan_total_bytes` (#1312); no series, and so quiet, on a server without that gauge | 15m | warning |

@@ -524,13 +524,22 @@ tests:
   # Per minute: radar 10 error tiles and 90 renders (10 %); broken only
   # error tiles (100 %), so no render series at all; fine 1 in 100 (1 %),
   # its renders split over outcomes; a Maps render is not a GetMap.
-  # Tiles a client's request caused count as GetMaps served, never as
-  # failures (#1476): client 40 of 100 such tiles and 2 internal (2 %);
-  # refused only such tiles, no render series; mixed 6 storage tiles of
-  # 100 GetMaps, 14 of them refused requests (6 %, not 6 of 86).
+  # Tiles with reason not_found or invalid_request count as GetMaps
+  # served, never as failures (#1476): client 40 of 100 such tiles and 2
+  # internal (2 %); refused only such tiles, no render series; mixed 6
+  # storage tiles of 100 GetMaps, 14 of them refused requests (6 %, not 6
+  # of 86). edge pins the threshold: 3 internal tiles of 60 GetMaps, 7 of
+  # them refused, is 5 % exactly from 5m on and just under it before, so
+  # `> 0.05` stays quiet while `>= 0.05` or any lower threshold fires.
   - name: WmsErrorTiles
     interval: 1m
     input_series:
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="edge", reason="internal"}'
+        values: '0+3x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="edge", reason="invalid_request"}'
+        values: '0+7x30'
+      - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="wms", collection="edge", outcome="cold"}'
+        values: '0+50x30'
       - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="client", reason="invalid_request"}'
         values: '0+30x30'
       - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="client", reason="not_found"}'

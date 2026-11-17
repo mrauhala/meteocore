@@ -713,8 +713,10 @@ need no reload pruning.
   `metrics_middleware` counts it as `wms_error_tiles_total{collection,reason}`
   and `prune_render_duration` drops a removed WMS collection's series.
   The `WmsErrorTiles` alert counts only `reason=~"storage|internal"`, the
-  class-`Internal` errors: a tile a client's request caused (`not_found`,
-  `invalid_request`) is no server fault (#1476). A new reason goes in the
+  class-`Internal` errors (#1476). `not_found` and `invalid_request` are
+  mostly a client's request; some engines report a data fault with them
+  too (a GRIB message missing from its step, a GeoTIFF source over its
+  pixel cap), which the alert misses (#FOLLOWUP). A new reason goes in the
   rule, its test and the dashboard's ratio panel when it is server-side.
 
 ## Operational notes
