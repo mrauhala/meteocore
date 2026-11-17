@@ -22,6 +22,8 @@ mod metadata;
 #[cfg(test)]
 mod moisture_tests;
 #[cfg(test)]
+mod parameter_name_tests;
+#[cfg(test)]
 mod parameter_times_tests;
 #[cfg(test)]
 mod point_fetch_tests;
@@ -1919,6 +1921,32 @@ fn preferring_runs_with<'a>(
 /// The catalog has no run: [`pinned_run`] answers this before any selection.
 fn no_forecast_data() -> DataServerError {
     DataServerError::Engine("No forecast data available".to_string())
+}
+
+/// A query's `parameter-name` in the catalog's spelling (#1493), the one
+/// rule of position, trajectory, area, radius and cube on every layout:
+/// each name matched case-insensitively against every advertised parameter
+/// (`get_parameters`), in request order, each once
+/// ([`ds_core::edr_engine::select_parameters`]). An unknown name is that
+/// rule's 400 listing them, before a run is chosen, so run selection
+/// ([`named`]) sees the canonical names. A known name the chosen run lacks
+/// stays as it was: [`GribEngine::validate_parameters`]' 400 on area, cube
+/// and level views, a range of nulls on a legacy-layout position or
+/// trajectory. `None` stays `None`, the query's defaults. A catalog without
+/// runs keeps the names as sent: its run selection answers first.
+fn requested_parameters(
+    catalog: &Catalog,
+    parameters: Option<&[String]>,
+) -> Result<Option<Vec<String>>, DataServerError> {
+    let Some(requested) = parameters else {
+        return Ok(None);
+    };
+    if catalog.runs.is_empty() {
+        return Ok(Some(requested.to_vec()));
+    }
+    let available: Vec<&str> = catalog.param_names().iter().map(String::as_str).collect();
+    let selected = ds_core::edr_engine::select_parameters(Some(requested), &available)?;
+    Ok(Some(selected.into_iter().map(str::to_owned).collect()))
 }
 
 /// The names a query's `parameter-name` lists: the runs having them are

@@ -26,6 +26,8 @@ impl GribEngine {
             polygon.bbox.north,
         ];
         let catalog = self.catalog();
+        let requested = requested_parameters(&catalog, parameters)?;
+        let parameters = requested.as_deref();
         let names = named(parameters);
         let run = resolve_run(&catalog, reference_time, datetime, &names)?;
         // An interval reads every step valid inside it, an instant only the

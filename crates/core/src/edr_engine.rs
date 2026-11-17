@@ -427,10 +427,13 @@ pub enum TrajectoryShape {
 /// Resolve an EDR `parameter-name` selection against the parameters a
 /// collection serves, the one rule every engine applies (#666). `None`
 /// selects every available name, in their order. Otherwise each requested
-/// name must be available (matched case-insensitively), repeats collapse,
-/// and the canonical spellings come back in request order. An unknown name,
-/// or an empty list, is an `InvalidParameter` (400) listing the valid
-/// names — never silently narrowed to the names that do exist.
+/// name must be available, repeats collapse, and the canonical spellings
+/// come back in request order. A name matches its exact spelling first,
+/// else the first available name equal to it ignoring ASCII case: where a
+/// collection serves `T` and `t` (PostGIS only rejects exact duplicates),
+/// each names its own. An unknown name, or an empty list, is an
+/// `InvalidParameter` (400) listing the valid names — never silently
+/// narrowed to the names that do exist.
 pub fn select_parameters<'a>(
     requested: Option<&[String]>,
     available: &[&'a str],
@@ -447,7 +450,9 @@ pub fn select_parameters<'a>(
     }
     let mut selected: Vec<&'a str> = Vec::with_capacity(requested.len());
     for name in requested {
-        let Some(&found) = available.iter().find(|a| a.eq_ignore_ascii_case(name)) else {
+        let exact = || available.iter().find(|a| **a == name.as_str());
+        let folded = || available.iter().find(|a| a.eq_ignore_ascii_case(name));
+        let Some(&found) = exact().or_else(folded) else {
             return Err(DataServerError::InvalidParameter(format!(
                 "Unknown parameter '{name}'; available: {}",
                 valid()
@@ -483,5 +488,25 @@ mod tests {
             "{err}"
         );
         assert!(select_parameters(Some(&[]), &available).is_err());
+    }
+
+    /// Names that differ only in case each select their own parameter: an
+    /// exact spelling wins over an earlier case-insensitive match (#1493).
+    /// Only a name with no exact match folds case, to the first such name.
+    #[test]
+    fn an_exact_spelling_wins_over_a_case_insensitive_match() {
+        let available = ["T", "t", "Td"];
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let select = |v: &[&str]| select_parameters(Some(&names(v)), &available).unwrap();
+        assert_eq!(select(&["t"]), ["t"]);
+        assert_eq!(select(&["T"]), ["T"]);
+        assert_eq!(select(&["t", "T", "t"]), ["t", "T"]);
+        assert_eq!(select(&["TD"]), ["Td"]);
+        // No exact match: the first case-insensitive one.
+        let available = ["Rh", "RH"];
+        assert_eq!(
+            select_parameters(Some(&names(&["rh"])), &available).unwrap(),
+            ["Rh"]
+        );
     }
 }

@@ -28,6 +28,8 @@ impl GribEngine {
         ds_core::deadline::check()?;
         let path = TrajectoryPath::parse(coords)?;
         let catalog = self.catalog();
+        let requested = requested_parameters(&catalog, parameters)?;
+        let parameters = requested.as_deref();
         // An M path's samples snap to the run's nearest step, so its run
         // only has to cover the path's first time, as a map `TIME` does; a
         // 2-D or Z path selects by `datetime`, like position. Both prefer

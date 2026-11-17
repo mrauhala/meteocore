@@ -3564,15 +3564,9 @@ fn derive_site_meta(nod: &str, list: &[VolumeEntry]) -> Option<SiteMeta> {
     // (`resolve_quantities` unions across sweeps) and renderable by WMS
     // (`polar_sample` searches every sweep that carries the quantity), so
     // the advertised list must include it — otherwise EDR and WMS would
-    // report contradictory parameter sets for the same collection.
-    let mut quantities: Vec<String> = latest
-        .volume
-        .sweeps
-        .iter()
-        .flat_map(|s| s.moments.iter().map(|m| m.quantity.clone()))
-        .collect();
-    quantities.sort();
-    quantities.dedup();
+    // report contradictory parameter sets for the same collection. EDR
+    // judges `parameter-name` against this list (`resolve_quantities`).
+    let quantities = quantities_of([&*latest.volume]);
     // A volume with sweep structs but no moment datasets in any of them
     // (a malformed file) yields no quantities. Exclude such a site rather
     // than register a zero-parameter collection whose default WMS layer is
@@ -4540,43 +4534,67 @@ fn quantity_description(quantity: &str) -> ParameterDescription {
     }
 }
 
-/// Resolve the quantity set for a PVOL site query: the union of every
-/// sweep's moments across **all** selected volumes — a profile samples all
-/// sweeps, a quantity may be present only on higher elevations (e.g.
-/// dual-PRF `VRADH`/`WRADH`), and a quantity may drop out of the newest
-/// scan (firmware change / reduced strategy) while earlier volumes in the
-/// window still carry it — intersected with the optional `parameters`
-/// filter. `sample_profile`/`level_series` map a missing moment in any one
-/// timestep to `None`, so unioning here never fabricates data; it only
-/// keeps a quantity queryable for the timesteps that actually have it.
+/// The distinct quantities any sweep of `volumes` carries, sorted. A site
+/// advertises its latest volume's ([`derive_site_meta`]).
+fn quantities_of<'v>(volumes: impl IntoIterator<Item = &'v PolarVolume>) -> Vec<String> {
+    let mut quantities: Vec<String> = volumes
+        .into_iter()
+        .flat_map(|volume| &volume.sweeps)
+        .flat_map(|s| s.moments.iter().map(|m| m.quantity.clone()))
+        .collect();
+    quantities.sort();
+    quantities.dedup();
+    quantities
+}
+
+/// Resolve the quantity set for a PVOL site query over `site`, the site's
+/// volumes oldest first, of which the query reads `selected`.
+///
+/// Without `parameters`: the union of every sweep's moments across **all**
+/// selected volumes — a profile samples all sweeps, a quantity may be
+/// present only on higher elevations (e.g. dual-PRF `VRADH`/`WRADH`), and
+/// a quantity may drop out of the newest scan (firmware change / reduced
+/// strategy) while earlier volumes in the window still carry it.
+///
+/// With `parameters`, the shared EDR rule (`select_parameters`, #1493):
+/// each name matched case-insensitively against the site's advertised
+/// quantities (its latest volume's, as `get_parameters` lists them), then
+/// any other the selected volumes carry. A name in neither is a 400
+/// listing them. A known quantity the selected volumes lack stays, under
+/// its own name, and reads null: an instant of a `datetime` list whose
+/// volume lacks it does not fail the list.
+///
+/// The quantities come back sorted, as the union is. `sample_profile`,
+/// `level_series` and `sample_section` map a missing moment to `None`, so
+/// this never fabricates data; it only keeps a quantity queryable for the
+/// timesteps that actually have it.
 fn resolve_quantities(
+    site: &[VolumeEntry],
     selected: &[&VolumeEntry],
     parameters: Option<&[String]>,
 ) -> Result<Vec<String>, DataServerError> {
-    let mut available: Vec<String> = selected
-        .iter()
-        .flat_map(|e| {
-            e.volume
-                .sweeps
-                .iter()
-                .flat_map(|s| s.moments.iter().map(|m| m.quantity.clone()))
-        })
-        .collect();
-    available.sort();
-    available.dedup();
-    let quantities: Vec<String> = match parameters {
-        Some(req) => available
-            .into_iter()
-            .filter(|q| req.iter().any(|p| p == q))
-            .collect(),
-        None => available,
-    };
-    if quantities.is_empty() {
+    let available = quantities_of(selected.iter().map(|e| &*e.volume));
+    if available.is_empty() {
         return Err(DataServerError::InvalidParameter(
             "No requested parameter is available at this PVOL site".into(),
         ));
     }
-    Ok(quantities)
+    if parameters.is_none() {
+        return Ok(available);
+    }
+    let mut known = quantities_of(site.last().map(|e| &*e.volume));
+    for quantity in available {
+        if !known.contains(&quantity) {
+            known.push(quantity);
+        }
+    }
+    let names: Vec<&str> = known.iter().map(String::as_str).collect();
+    let mut chosen: Vec<String> = ds_core::edr_engine::select_parameters(parameters, &names)?
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    chosen.sort();
+    Ok(chosen)
 }
 
 /// How far (degrees) a requested elevation angle may lie from an advertised
@@ -5565,7 +5583,7 @@ fn site_coverages(
         ));
     }
 
-    let quantities = resolve_quantities(&selected, parameters)?;
+    let quantities = resolve_quantities(volumes, &selected, parameters)?;
 
     match levels {
         // `flatten` drops volumes that produced no plottable profile (every
@@ -5715,7 +5733,7 @@ fn site_trajectory(
         ));
     }
 
-    let quantities = resolve_quantities(&selected, parameters)?;
+    let quantities = resolve_quantities(volumes, &selected, parameters)?;
 
     // The selected sweep angles bound the angle window; derive it and the
     // matching height axis from the most recent volume. Selected angles
@@ -12952,9 +12970,225 @@ mod tests {
         let selected: Vec<&VolumeEntry> = owned.iter().collect();
 
         // VRADH is absent from the newest volume but present in the union.
-        let q = resolve_quantities(&selected, Some(&["VRADH".to_string()]))
+        let q = resolve_quantities(&owned, &selected, Some(&["VRADH".to_string()]))
             .expect("VRADH is available in the window's union");
         assert_eq!(q, vec!["VRADH".to_string()]);
+    }
+
+    /// `parameter-name` follows the shared EDR rule (#1493): a name is
+    /// matched case-insensitively and served under the quantity's own
+    /// spelling, and a name the site does not have is a 400 listing the
+    /// ones it has. `DBZH,NOPE` used to answer DBZH alone, and `dbzh` was a
+    /// 400.
+    #[test]
+    fn resolve_quantities_follows_the_shared_parameter_rule() {
+        let mut volume = synthetic_volume(25.0, 60.0);
+        let mut vradh = volume.sweeps[0].moments[0].clone();
+        vradh.quantity = "VRADH".to_string();
+        volume.sweeps[0].moments.push(vradh);
+        let owned = [entry(volume, "a")];
+        let selected: Vec<&VolumeEntry> = owned.iter().collect();
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            resolve_quantities(&owned, &selected, Some(&names(&["dbzh"]))).unwrap(),
+            ["DBZH"]
+        );
+        // Sorted, as the union is, each quantity once, whatever the
+        // request's order.
+        assert_eq!(
+            resolve_quantities(&owned, &selected, Some(&names(&["vradh", "DBZH", "Dbzh"])))
+                .unwrap(),
+            ["DBZH", "VRADH"]
+        );
+        assert_eq!(
+            resolve_quantities(&owned, &selected, None).unwrap(),
+            ["DBZH", "VRADH"]
+        );
+        match resolve_quantities(&owned, &selected, Some(&names(&["DBZH", "NOPE"]))) {
+            Err(DataServerError::InvalidParameter(m)) => assert_eq!(
+                m, "Unknown parameter 'NOPE'; available: DBZH, VRADH",
+                "the shared rule's message, which the HTML error page recognises"
+            ),
+            other => panic!("expected a 400, got {other:?}"),
+        }
+    }
+
+    /// The per-site queries all resolve `parameter-name` through
+    /// [`resolve_quantities`] (#1493): `dbzh` answers DBZH under its own
+    /// name, and `DBZH,NOPE` is a 400 on position, location, area and the
+    /// cross-section, never DBZH alone.
+    #[test]
+    fn site_view_parameter_name_is_case_insensitive_and_exhaustive() {
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert(
+            "fivih".to_string(),
+            vec![entry(synthetic_volume(25.0, 60.0), "v")],
+        );
+        let view = site_view_for(by_site, "fivih");
+        let point = "POINT(25.0 60.1)";
+
+        // The one profile a single volume answers, whichever wrapping.
+        let profile = |names: &[String]| {
+            let coverages =
+                match EdrEngine::query_position(&view, point, None, Some(names), None, None)
+                    .unwrap()
+                {
+                    CoverageResponse::Single(cov) => vec![cov],
+                    CoverageResponse::Collection(covs) => covs,
+                };
+            assert_eq!(coverages.len(), 1, "one volume, one profile");
+            coverages.into_iter().next().unwrap()
+        };
+        let cov = profile(&["dbzh".to_string()]);
+        assert_eq!(cov.ranges.keys().collect::<Vec<_>>(), ["DBZH"]);
+        assert_eq!(cov.parameters.keys().collect::<Vec<_>>(), ["DBZH"]);
+        let advertised = profile(&["DBZH".to_string()]);
+        // A case variant answers exactly what the advertised name does.
+        assert_eq!(cov.ranges["DBZH"].values, advertised.ranges["DBZH"].values);
+        assert!(cov.ranges["DBZH"].values.iter().any(Option::is_some));
+        assert_eq!(
+            format!("{:?}", cov.domain),
+            format!("{:?}", advertised.domain)
+        );
+
+        let unknown = ["DBZH".to_string(), "NOPE".to_string()];
+        for (query, result) in [
+            (
+                "position",
+                EdrEngine::query_position(&view, point, None, Some(&unknown), None, None),
+            ),
+            (
+                "location",
+                EdrEngine::query_location(&view, "fivih", None, Some(&unknown), None, None),
+            ),
+            (
+                "area",
+                EdrEngine::query_area(
+                    &view,
+                    "POLYGON((24 59, 26 59, 26 61, 24 61, 24 59))",
+                    None,
+                    Some(&unknown),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "trajectory",
+                EdrEngine::query_trajectory(
+                    &view,
+                    "LINESTRING(24.5 60.3, 24.5 60.9)",
+                    None,
+                    Some(&unknown),
+                    None,
+                    None,
+                ),
+            ),
+        ] {
+            match result {
+                Err(DataServerError::InvalidParameter(m)) => assert!(
+                    m.contains("'NOPE'") && m.ends_with("available: DBZH"),
+                    "{query}: {m}"
+                ),
+                other => panic!("{query}: expected a 400, got {other:?}"),
+            }
+        }
+    }
+
+    /// A quantity the site advertises (its latest volume carries VRADH)
+    /// but the volumes a `datetime` selects lack (the older one carries
+    /// DBZH only) is known (#1493): it keeps its name and reads null, so an
+    /// instant of a `datetime` list does not fail the whole list. Before
+    /// #1493 it was dropped from the answer; judged against the selected
+    /// volumes alone it would be a 400.
+    #[test]
+    fn an_advertised_quantity_the_selected_volumes_lack_reads_null() {
+        let t0 = "2026-11-17T12:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let t1 = t0 + chrono::Duration::minutes(5);
+        let mut older = synthetic_volume(25.0, 60.0); // DBZH only
+        older.time = t0;
+        let mut newer = synthetic_volume(25.0, 60.0);
+        let mut vradh = newer.sweeps[0].moments[0].clone();
+        vradh.quantity = "VRADH".to_string();
+        newer.sweeps[0].moments.push(vradh);
+        newer.time = t1;
+        let owned = [entry(older, "lack-old"), entry(newer, "lack-new")];
+
+        // The rule alone: the older volume selected, VRADH still known.
+        let selected = [&owned[0]];
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resolve_quantities(&owned, &selected, Some(&names(&["vradh", "DBZH"]))).unwrap(),
+            ["DBZH", "VRADH"]
+        );
+        assert_eq!(
+            resolve_quantities(&owned, &selected, None).unwrap(),
+            ["DBZH"],
+            "without parameter-name, what the selected volumes carry"
+        );
+        match resolve_quantities(&owned, &selected, Some(&names(&["NOPE"]))) {
+            Err(DataServerError::InvalidParameter(m)) => {
+                assert_eq!(m, "Unknown parameter 'NOPE'; available: DBZH, VRADH")
+            }
+            other => panic!("expected a 400, got {other:?}"),
+        }
+
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".to_string(), owned.to_vec());
+        let view = site_view_for(by_site, "fivih");
+        assert_eq!(EdrEngine::get_parameters(&view), ["DBZH", "VRADH"]);
+        let point = "POINT(25.0 60.1)";
+        let both = names(&["DBZH", "VRADH"]);
+        let only_old = Some((t0, t0));
+
+        // A profile at the older volume: DBZH sampled, VRADH all null.
+        let coverages =
+            match EdrEngine::query_position(&view, point, only_old, Some(&both), None, None)
+                .unwrap()
+            {
+                CoverageResponse::Single(cov) => vec![cov],
+                CoverageResponse::Collection(covs) => covs,
+            };
+        assert_eq!(coverages.len(), 1, "one volume, one profile");
+        let profile = &coverages[0];
+        assert!(profile.ranges["DBZH"].values.iter().any(Option::is_some));
+        let vradh = &profile.ranges["VRADH"];
+        assert_eq!(vradh.shape, profile.ranges["DBZH"].shape);
+        assert!(vradh.values.iter().all(Option::is_none), "{vradh:?}");
+        assert_eq!(
+            profile.parameters["VRADH"].label,
+            quantity_description("VRADH").label
+        );
+
+        // A series at the sweep over both volumes: VRADH null where the
+        // older volume lacks it, sampled where the newer carries it.
+        let series =
+            EdrEngine::query_position(&view, point, None, Some(&both), Some(&[0.5]), None).unwrap();
+        let CoverageResponse::Single(series) = series else {
+            panic!("one level is a single PointSeries, got {series:?}");
+        };
+        let DomainDescription::PointSeries { t, .. } = &series.domain else {
+            panic!("expected a PointSeries, got {:?}", series.domain);
+        };
+        assert_eq!(t, &[t0, t1]);
+        let vradh = &series.ranges["VRADH"].values;
+        assert!(vradh[0].is_none() && vradh[1].is_some(), "{vradh:?}");
+
+        // The cross-section at the older volume: VRADH null throughout.
+        let section = EdrEngine::query_trajectory(
+            &view,
+            "LINESTRING(24.9 60.05, 25.1 60.05)",
+            only_old,
+            Some(&both),
+            None,
+            None,
+        )
+        .unwrap();
+        let CoverageResponse::Single(section) = section else {
+            panic!("one volume is one section, got {section:?}");
+        };
+        assert!(section.ranges["DBZH"].values.iter().any(Option::is_some));
+        assert!(section.ranges["VRADH"].values.iter().all(Option::is_none));
     }
 
     /// A position query for a point clearly outside the radar's coverage

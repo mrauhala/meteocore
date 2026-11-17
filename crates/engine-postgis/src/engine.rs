@@ -1436,6 +1436,10 @@ fn reject_station_query_on_events(cfg: &PostgisEngineConfig) -> Result<(), DataS
     Ok(())
 }
 
+/// The source keys an EDR query reads, in request order. The names follow
+/// the shared rule (`select_parameters`, #1493): matched case-insensitively
+/// against the configured names, each once, and an unknown one is a 400
+/// listing them.
 fn resolve_source_keys(
     cfg: &PostgisEngineConfig,
     parameters: Option<&[String]>,
@@ -1449,18 +1453,13 @@ fn resolve_source_keys(
             .map(|p| p.source_key.clone())
             .collect());
     }
-    let mut out = Vec::with_capacity(requested.len());
-    for name in requested {
-        let p = cfg
-            .parameters
-            .iter()
-            .find(|p| &p.name == name)
-            .ok_or_else(|| {
-                DataServerError::InvalidParameter(format!("unknown parameter: {name}"))
-            })?;
-        out.push(p.source_key.clone());
-    }
-    Ok(out)
+    let names: Vec<&str> = cfg.parameters.iter().map(|p| p.name.as_str()).collect();
+    let selected = ds_core::edr_engine::select_parameters(Some(requested), &names)?;
+    Ok(selected
+        .into_iter()
+        .filter_map(|name| cfg.parameters.iter().find(|p| p.name == name))
+        .map(|p| p.source_key.clone())
+        .collect())
 }
 
 fn source_key_to_param_name(cfg: &PostgisEngineConfig, key: &str) -> String {
@@ -2660,6 +2659,19 @@ mod tests {
         assert_eq!(keys, vec!["TEMP"]);
 
         assert!(resolve_source_keys(&cfg, Some(&["unknown".into()])).is_err());
+
+        // The shared EDR rule (#1493): a case variant names the configured
+        // parameter (it used to be a 400), in request order, each once, and
+        // an unknown name is a 400 listing the configured ones.
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let keys = resolve_source_keys(&cfg, Some(&names(&["WS", "T2M", "ws"]))).unwrap();
+        assert_eq!(keys, ["WIND", "TEMP"]);
+        match resolve_source_keys(&cfg, Some(&names(&["t2m", "unknown"]))) {
+            Err(DataServerError::InvalidParameter(m)) => {
+                assert_eq!(m, "Unknown parameter 'unknown'; available: t2m, ws")
+            }
+            other => panic!("expected a 400, got {other:?}"),
+        }
     }
 
     /// Build a full engine (lazy pool — no DB I/O until a query needs a

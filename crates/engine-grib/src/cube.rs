@@ -40,6 +40,8 @@ impl GribEngine {
             )));
         }
         let catalog = self.catalog();
+        let requested = requested_parameters(&catalog, parameters)?;
+        let parameters = requested.as_deref();
         // No datetime is the run's last step carrying the named parameters,
         // as an area query answers; an instant the step valid at it, an
         // interval every step inside it.
@@ -56,14 +58,10 @@ impl GribEngine {
             .flatten()
             .collect();
         // Every parameter of the collection by default, like a vertical
-        // position query; repeats collapse in request order.
+        // position query; the named ones in request order, each once
+        // (`requested_parameters`).
         let params: Vec<String> = match parameters {
-            Some(names) => names.iter().fold(Vec::new(), |mut unique, name| {
-                if !unique.contains(name) {
-                    unique.push(name.clone());
-                }
-                unique
-            }),
+            Some(names) => names.to_vec(),
             None => self.default_parameters(steps.iter().map(|(_, file)| *file), &keys),
         };
         self.validate_parameters(&keys, &params)?;
