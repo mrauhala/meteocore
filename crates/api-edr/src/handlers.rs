@@ -3775,13 +3775,8 @@ pub async fn trajectory_query(
     });
     let engine = engine.clone();
     let coords = params.coords.clone();
-    // What the executor hands back: a written body, or the result the plot
-    // is drawn from.
-    enum Rendered {
-        Body(Response),
-        Plot(CoverageResponse),
-    }
-    let rendered = execute_query(blocking, move |budget| {
+    let (width, height) = (params.width, params.height);
+    let response = execute_query(blocking, move |budget| {
         // A `datetime` list runs one query per instant and merges them
         // (one coverage per instant for an along-path 2-D or Z path; an M
         // path never gets here with a `datetime`).
@@ -3800,73 +3795,69 @@ pub async fn trajectory_query(
         )
         .map_err(|e| map_query_error(&e, "Trajectory"))?;
         let result = limit_coverages(result, limit);
-        Ok(match (format, page) {
+        // Every body, the cross-section PNG included, is written here on
+        // the executor, within the query's slot and deadline, never on the
+        // request runtime after the `.await` (#1498).
+        match (format, page) {
             (EdrFormat::CoverageJson, _) => {
-                Rendered::Body(coverage_json_response(&result, "Trajectory", &|| {
-                    budget.expired()
-                })?)
+                coverage_json_response(&result, "Trajectory", &|| budget.expired())
             }
-            (EdrFormat::Html, Some(page)) => Rendered::Body(
+            (EdrFormat::Html, Some(page)) => {
                 crate::html::coverage_page(&result, &page.html_page(&result), None, &|| {
                     budget.expired()
                 })
                 .map(crate::html::response)
-                .map_err(|failure| response_budget_error(Some(failure), || ()))?,
-            ),
-            _ => Rendered::Plot(result),
-        })
+                .map_err(|failure| response_budget_error(Some(failure), || ()))
+            }
+            (EdrFormat::Png, _) => render_section_png(&result, &state.styles, &id, width, height),
+            // `query_formats` never offers GeoJSON or CSV for a trajectory,
+            // and the HTML page is built whenever HTML was negotiated.
+            (format, _) => {
+                tracing::error!(
+                    "EDR trajectory: {} negotiated but not rendered",
+                    format.name()
+                );
+                Err(server_error())
+            }
+        }
     })
     .await?;
-    let result = match rendered {
-        Rendered::Body(body) => {
-            return Ok(with_format_vary(
-                with_data_cache_control(body, window),
-                negotiated,
-            ))
-        }
-        Rendered::Plot(result) => result,
-    };
+    Ok(with_format_vary(
+        with_data_cache_control(response, window),
+        negotiated,
+    ))
+}
 
-    let response = match format {
-        // Written on the executor above; `query_formats` never offers
-        // GeoJSON or CSV for a trajectory.
-        EdrFormat::CoverageJson | EdrFormat::Html | EdrFormat::GeoJson | EdrFormat::Csv => {
-            tracing::error!(
-                "EDR trajectory: {} negotiated but not rendered",
-                format.name()
-            );
-            return Err(server_error());
-        }
-        EdrFormat::Png => {
-            // Render the cross-section as colour-mapped heatmaps, each
-            // parameter with its own style: its `{collection}/{parameter}`
-            // layer's default, the one WMS, Maps and Tiles draw it with,
-            // else the collection's (#1159), or a data-scaled viridis
-            // fallback when the collection has none.
-            // A failure here is an internal inconsistency (the engine
-            // already returned a Section for this trajectory query), not
-            // a client mistake — log it and return a generic 500 rather
-            // than leaking the internal message in a 400.
-            let heatmaps =
-                section_response_to_heatmaps(&result, &state.styles, &id).map_err(|e| {
-                    tracing::error!("Trajectory PNG section conversion error: {e}");
-                    server_error()
-                })?;
-            // One panel per parameter: the default height grows with them,
-            // and a height they cannot fit is a 400 naming `parameter-name`.
-            let (w, h) = section_plot_dimensions(params.width, params.height, heatmaps.len())
-                .map_err(|e| bad_request(&e))?;
-            let png = render_heatmap(&heatmaps, w, h).map_err(|e| {
-                tracing::error!("Trajectory PNG render error: {e}");
-                server_error()
-            })?;
-            with_data_cache_control(
-                ([(header::CONTENT_TYPE, "image/png")], png).into_response(),
-                window,
-            )
-        }
-    };
-    Ok(with_format_vary(response, negotiated))
+/// Draw a radar cross-section as a PNG: one colour-mapped heatmap panel
+/// per parameter, each with its own style: its `{collection}/{parameter}`
+/// layer's default, the one WMS, Maps and Tiles draw it with, else the
+/// collection's (#1159), or a data-scaled viridis fallback when the
+/// collection has none. Called on the query executor, after the query
+/// (#1498). Like the other plots it is not admitted by the response budget.
+fn render_section_png(
+    result: &CoverageResponse,
+    styles: &HashMap<String, HashMap<String, ds_render::StyleInfo>>,
+    collection_id: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<Response, HandlerError> {
+    // A failure here is an internal inconsistency (the engine already
+    // returned a Section for this trajectory query), not a client mistake:
+    // log it and return a generic 500 rather than leaking the internal
+    // message in a 400.
+    let heatmaps = section_response_to_heatmaps(result, styles, collection_id).map_err(|e| {
+        tracing::error!("Trajectory PNG section conversion error: {e}");
+        server_error()
+    })?;
+    // One panel per parameter: the default height grows with them, and a
+    // height they cannot fit is a 400 naming `parameter-name`.
+    let (w, h) =
+        section_plot_dimensions(width, height, heatmaps.len()).map_err(|e| bad_request(&e))?;
+    let png = render_heatmap(&heatmaps, w, h).map_err(|e| {
+        tracing::error!("Trajectory PNG render error: {e}");
+        server_error()
+    })?;
+    Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
 }
 
 /// The data queries with an `/instances/{instanceId}/…` route, so the only
