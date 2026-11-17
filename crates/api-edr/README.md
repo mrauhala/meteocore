@@ -28,8 +28,9 @@ GeoJSON, CSV, a PNG plot or an HTML page.
   worker (2 to 8, from the CPU count), 32 more waiting, and a 30-second
   deadline that includes the wait. A full queue answers 503 at once; a
   missed deadline answers 504. Radar cross-sections run on the same
-  runtime's blocking pool. Response bodies are encoded there too, under
-  the response memory budget (see [Responses and limits](#responses-and-limits)).
+  runtime's blocking pool. Response bodies are encoded there too, PNG
+  plots included, and all but the plots under the response memory budget
+  (see [Responses and limits](#responses-and-limits)).
 - `params::query_formats` is the one list of formats each query offers. The
   handlers negotiate over it and `data_queries` advertises it, so the two
   agree.
