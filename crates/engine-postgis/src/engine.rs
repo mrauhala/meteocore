@@ -567,7 +567,7 @@ impl PostgisEngine {
     ) -> Result<(BuiltQuery, Vec<String>), DataServerError> {
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
-        let polygon_wkt = normalize_area_wkt(coords)?;
+        let polygon_wkt = area_wkt(coords)?;
 
         // No `datetime` never means full history — fall back to the
         // configured window ending "now", as Features does (#503).
@@ -1244,12 +1244,14 @@ impl PostgisEngine {
         let source_keys = resolve_source_keys(&self.config, parameters)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
 
+        // Every mode reads the polygon with the shared parser first, so a
+        // polygon it refuses is its 400 before any statement runs (#1494).
         // Observations-derived modes (A/B) select stations in-memory from the
         // cached set with an exact point-in-polygon test (the bbox prefilter
         // is inside `QueryPolygon::contains`; #671). Stations-only mode keeps
-        // the live `ST_Within` prefilter.
+        // the live `ST_Within` prefilter, over the polygon written out again.
+        let polygon = parse_area_coords(coords)?;
         let stations = if self.config.location_source.uses_observations() {
-            let polygon = parse_area_coords(coords)?;
             let meta = self.load_meta();
             // Same cells × vertices bound the gridded engines apply: every
             // cached station is ray-cast against the ring before `take` can
@@ -1257,8 +1259,7 @@ impl PostgisEngine {
             check_mask_budget(meta.locations.len(), &polygon)?;
             stations_in_polygon(&meta.locations, &polygon)
         } else {
-            let polygon_wkt = normalize_area_wkt(coords)?;
-            run_stations_in_polygon_sync(self, &self.config, &polygon_wkt)?
+            run_stations_in_polygon_sync(self, &self.config, &polygon_wkt(&polygon))?
         };
         if stations.is_empty() {
             return Ok(CoverageResponse::Collection(vec![]));
@@ -2425,33 +2426,79 @@ where
     }
 }
 
-// ─── area-query WKT normalization ──────────────────────────────────────────
+// ─── area polygons for PostGIS ─────────────────────────────────────────────
 
-/// Accept either a WKT POLYGON directly (pass-through after light trim)
-/// or a `west,south,east,north` bbox string (converted to a closed
-/// POLYGON). Everything goes into `ST_GeomFromText` as a bind so no
-/// request data reaches SQL as text.
-fn normalize_area_wkt(coords: &str) -> Result<String, DataServerError> {
-    let s = coords.trim();
-    if s.starts_with("POLYGON") {
-        return Ok(s.to_string());
+/// An area's `coords` as the WKT PostGIS tests events against, a bind of
+/// `ST_GeomFromText(.., 4326)`, never SQL text. The shared
+/// [`parse_area_coords`] reads it first, so a polygon it refuses is its 400,
+/// with the length and vertex caps every engine applies, before any
+/// statement runs (#1494): PostGIS never sees text it could fail to parse,
+/// which it would answer with an error the API hides as a 500. The polygon
+/// is then written out again by [`polygon_wkt`].
+fn area_wkt(coords: &str) -> Result<String, DataServerError> {
+    parse_area_coords(coords).map(|polygon| polygon_wkt(&polygon))
+}
+
+/// A polygon of [`parse_area_coords`] as WKT PostGIS reads: `POLYGON((x
+/// y,…),(…))`, each ring by [`ring_wkt`], the numbers as Rust writes an
+/// `f64` (the shortest text that reads back as the same value, without an
+/// exponent).
+///
+/// The `west,south,east,north` form across the antimeridian (`west >
+/// east`) is its box's two halves, a `MULTIPOLYGON` on either side of ±180,
+/// as [`footprint_wkt`] writes a pick across it: PostGIS compares
+/// longitudes as plane numbers, so the ring itself would be the box the
+/// other way round the Earth. It is the only polygon the parser returns
+/// across the seam, since a WKT ring's box is its own least and greatest
+/// longitude.
+fn polygon_wkt(polygon: &QueryPolygon) -> String {
+    let bbox = &polygon.bbox;
+    if bbox.crosses_antimeridian() {
+        let half = |west: f64, east: f64| {
+            ring_wkt(&[
+                [west, bbox.south],
+                [east, bbox.south],
+                [east, bbox.north],
+                [west, bbox.north],
+            ])
+        };
+        return format!(
+            "MULTIPOLYGON(({}),({}))",
+            half(bbox.west, 180.0),
+            half(-180.0, bbox.east)
+        );
     }
-    let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() == 4 {
-        let vals: Result<Vec<f64>, _> = parts.iter().map(|p| p.trim().parse::<f64>()).collect();
-        if let Ok(v) = vals {
-            return Ok(format!(
-                "POLYGON(({w} {s_},{e} {s_},{e} {n},{w} {n},{w} {s_}))",
-                w = v[0],
-                s_ = v[1],
-                e = v[2],
-                n = v[3]
-            ));
-        }
+    let rings: Vec<String> = std::iter::once(&polygon.exterior)
+        .chain(&polygon.holes)
+        .map(|ring| ring_wkt(ring))
+        .collect();
+    format!("POLYGON({})", rings.join(","))
+}
+
+/// One ring, `(x y,…)`, as PostGIS takes it: closed, and of at least four
+/// points. The shared parser takes a ring of three pairs or more, closed or
+/// not, and every engine reads it closed. So the first point is written
+/// again at the end unless the last one is the same value, bit for bit
+/// (PostGIS compares the two bytewise, so `-0` does not close a ring opened
+/// at `0`), and once more while the ring is short of four points: the same
+/// point set either way.
+fn ring_wkt(ring: &[[f64; 2]]) -> String {
+    // The parser's rings hold three points or more; an empty one is
+    // written empty rather than panicking.
+    let Some(&first) = ring.first() else {
+        return "()".to_string();
+    };
+    let is_first =
+        |p: &[f64; 2]| p[0].to_bits() == first[0].to_bits() && p[1].to_bits() == first[1].to_bits();
+    let mut points = ring.to_vec();
+    if !ring.last().is_some_and(is_first) {
+        points.push(first);
     }
-    Err(DataServerError::InvalidParameter(format!(
-        "cannot parse area coordinates: {s}"
-    )))
+    while points.len() < 4 {
+        points.push(first);
+    }
+    let text: Vec<String> = points.iter().map(|[x, y]| format!("{x} {y}")).collect();
+    format!("({})", text.join(","))
 }
 
 // ─── coord parsing (WKT POINT or "lon,lat") ────────────────────────────────
@@ -2502,18 +2549,180 @@ mod tests {
         assert_eq!(parse_coords("POINT(-180 -90)").unwrap(), (-180.0, -90.0));
     }
 
+    // ---- #1494: area polygons are parsed before PostGIS sees them --------
+
+    /// Every spelling the shared parser reads is written out in one: the
+    /// keyword in capitals, no spaces but between a point's numbers, each
+    /// ring closed, holes kept, the bbox form as its closed rectangle.
     #[test]
-    fn normalize_area_wkt_passes_polygon_through() {
-        let wkt = "POLYGON((0 0,10 0,10 10,0 10,0 0))";
-        assert_eq!(normalize_area_wkt(wkt).unwrap(), wkt);
+    fn area_wkt_writes_the_parsed_polygon() {
+        let canonical = "POLYGON((24 60,25 60,25 61,24 61,24 60))";
+        for spelling in [
+            canonical,
+            "POLYGON((24 60, 25 60, 25 61, 24 61, 24 60))",
+            "POLYGON ((24 60, 25 60, 25 61, 24 61, 24 60))",
+            "polygon((24 60,25 60,25 61,24 61,24 60))",
+            "Polygon ( ( 24 60 , 25 60 , 25 61 , 24 61 , 24 60 ) )",
+            "  POLYGON((24.0 60.0,25 60,25 61,24 61,24 60))  ",
+            // Open: every engine reads a ring closed.
+            "POLYGON((24 60, 25 60, 25 61, 24 61))",
+        ] {
+            assert_eq!(area_wkt(spelling).unwrap(), canonical, "{spelling}");
+        }
+        assert_eq!(
+            area_wkt("POLYGON ((0 0, 20 0, 20 20, 0 20, 0 0), (5 5, 15 5, 15 15, 5 15))").unwrap(),
+            "POLYGON((0 0,20 0,20 20,0 20,0 0),(5 5,15 5,15 15,5 15,5 5))"
+        );
+        assert_eq!(
+            area_wkt("0,0,10,10").unwrap(),
+            "POLYGON((0 0,10 0,10 10,0 10,0 0))"
+        );
+        // Numbers read back as the same value: shortest text, no exponent.
+        assert_eq!(
+            area_wkt("POLYGON((24.1 60, 1e-5 60, 25 6.1e1))").unwrap(),
+            "POLYGON((24.1 60,0.00001 60,25 61,24.1 60))"
+        );
     }
 
+    /// PostGIS refuses a ring that is not closed bytewise, or holds fewer
+    /// than four points, where the shared parser reads one: the writer closes
+    /// it so PostGIS reads the same point set.
     #[test]
-    fn normalize_area_wkt_converts_bbox_to_closed_polygon() {
-        let out = normalize_area_wkt("0,0,10,10").unwrap();
-        assert!(out.starts_with("POLYGON(("));
-        // 5 points: 4 corners + closing repeat.
-        assert_eq!(out.matches(',').count(), 4);
+    fn area_wkt_writes_rings_postgis_reads() {
+        // Three pairs, closed: the first point once more.
+        assert_eq!(
+            area_wkt("POLYGON((24 60, 25 61, 24 60))").unwrap(),
+            "POLYGON((24 60,25 61,24 60,24 60))"
+        );
+        // Three pairs, open: closed, four points.
+        assert_eq!(
+            area_wkt("POLYGON((24 60, 25 60, 25 61))").unwrap(),
+            "POLYGON((24 60,25 60,25 61,24 60))"
+        );
+        // `-0` equals `0` but is not the same bytes, so it does not close a
+        // ring opened at `0`.
+        assert_eq!(
+            area_wkt("POLYGON((0 0, 1 0, 1 1, -0 0))").unwrap(),
+            "POLYGON((0 0,1 0,1 1,-0 0,0 0))"
+        );
+    }
+
+    /// The bbox form across the antimeridian is its two halves, one on each
+    /// side of ±180, so PostGIS finds what the in-memory test finds.
+    #[test]
+    fn area_wkt_splits_a_box_across_the_antimeridian() {
+        assert_eq!(
+            area_wkt("170,10,-170,20").unwrap(),
+            "MULTIPOLYGON(((170 10,180 10,180 20,170 20,170 10)),\
+             ((-180 10,-170 10,-170 20,-180 20,-180 10)))"
+        );
+        // A polygon ring never crosses: its box is its own least and greatest
+        // longitude, as `QueryPolygon::contains` reads it.
+        assert_eq!(
+            area_wkt("POLYGON((170 10, -170 10, -170 20, 170 20, 170 10))").unwrap(),
+            "POLYGON((170 10,-170 10,-170 20,170 20,170 10))"
+        );
+    }
+
+    /// What the shared parser refuses is refused with its own message,
+    /// a 400: malformed text, Z and M coordinates, an empty polygon, a
+    /// multipolygon, coordinates out of range, and text past the length or
+    /// vertex caps.
+    #[test]
+    fn area_wkt_refuses_what_the_shared_parser_refuses() {
+        // Past the vertex cap inside the length cap: empty pairs count.
+        let too_many = format!("POLYGON(({}))", ",".repeat(10_001));
+        let too_long = format!("POLYGON((24 60,{}25 61,24 60))", " ".repeat(10_240));
+        for bad in [
+            "not-coords",
+            "1,2,3",
+            "POLYGON((24 60, 25 x, 25 61, 24 60))",
+            "POLYGON((24 60, 25 60, 25 61, 24 60)",
+            "POLYGON((24 60, 25 60))",
+            "POLYGON Z((24 60 0, 25 60 0, 25 61 0, 24 60 0))",
+            "POLYGON M((24 60 0, 25 60 0, 25 61 0, 24 60 0))",
+            "POLYGON ZM((24 60 0 0, 25 60 0 0, 25 61 0 0, 24 60 0 0))",
+            "POLYGON((24 60 0, 25 60 0, 25 61 0, 24 60 0))",
+            "POLYGON EMPTY",
+            "MULTIPOLYGON(((24 60, 25 60, 25 61, 24 60)))",
+            "POLYGON((24 60, 25 60, 25 91, 24 60))",
+            "POLYGON((24 60, 181 60, 25 61, 24 60))",
+            "POLYGON((24 60, 25 NaN, 25 61, 24 60))",
+            "0,0,200,10",
+            too_many.as_str(),
+            too_long.as_str(),
+        ] {
+            let ours = area_wkt(bad).unwrap_err();
+            let shared = parse_area_coords(bad).unwrap_err();
+            assert_eq!(ours.to_string(), shared.to_string(), "{bad:.80}");
+            assert_eq!(
+                ours.class(),
+                ds_core::error::ErrorClass::BadRequest,
+                "{bad:.80}"
+            );
+        }
+    }
+
+    /// The events statement binds the written polygon, never its text, and
+    /// keeps its `LIMIT` one row past the event budget (#1487); a polygon
+    /// the parser refuses builds no statement.
+    #[test]
+    fn events_area_statement_binds_the_parsed_polygon() {
+        let engine = engine_with(events_engine_config());
+        let built = engine
+            .events_area_statement("polygon ((24 60, 25 60, 25 61, 24 61))", None, None)
+            .unwrap();
+        use crate::query::SqlParam;
+        assert_eq!(
+            built.params[2],
+            SqlParam::Text("POLYGON((24 60,25 60,25 61,24 61,24 60))".into())
+        );
+        assert!(built.sql.contains("ST_GeomFromText($3, 4326)"));
+        assert!(!built.sql.contains("24 60"), "{}", built.sql);
+        assert_eq!(built.row_limit(), Some(MAX_AREA_POINT_COVERAGES + 1));
+        assert_eq!(
+            built.params[3],
+            SqlParam::Int(MAX_AREA_POINT_COVERAGES as i64 + 1)
+        );
+        for bad in [
+            "POLYGON((24 60, 25 x, 25 61, 24 60))",
+            "POLYGON Z((24 60 0, 25 60 0, 25 61 0, 24 60 0))",
+        ] {
+            assert!(
+                matches!(
+                    engine.events_area_statement(bad, None, None),
+                    Err(DataServerError::InvalidParameter(_))
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// Events and stations-only areas refuse a polygon the parser refuses
+    /// before reaching the pool: its database is unreachable, so a statement
+    /// would fail with an `Engine` error instead of the parser's 400.
+    #[test]
+    fn sql_areas_refuse_a_bad_polygon_before_any_statement() {
+        let mut stations = stations_engine_config(&[]);
+        stations.parameters = events_engine_config().parameters;
+        stations.parameters[0].source_key = "TEMP".into();
+        for config in [events_engine_config(), stations] {
+            let engine = engine_with(config);
+            engine.schema_state.store(SCHEMA_VALID, Ordering::Release);
+            for bad in [
+                "POLYGON((24 60, 25 x, 25 61, 24 60))",
+                "POLYGON Z((24 60 0, 25 60 0, 25 61 0, 24 60 0))",
+                "POLYGON EMPTY",
+            ] {
+                let err = engine.query_area(bad, None, None, None, None).unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    parse_area_coords(bad).unwrap_err().to_string(),
+                    "{bad}"
+                );
+                assert!(matches!(err, DataServerError::InvalidParameter(_)), "{bad}");
+            }
+        }
     }
 
     /// #1446: a pick keeps the bare id and every property Features reports,
@@ -2609,12 +2818,6 @@ mod tests {
         );
         assert_eq!(strike_type(Some(2.0)), PropertyValue::Float(2.0));
         assert_eq!(strike_type(None), PropertyValue::Null);
-    }
-
-    #[test]
-    fn normalize_area_wkt_rejects_garbage() {
-        assert!(normalize_area_wkt("not-coords").is_err());
-        assert!(normalize_area_wkt("1,2,3").is_err()); // wrong arity
     }
 
     #[test]

@@ -1850,7 +1850,7 @@ A single `odim-volume` source scans a directory / S3 prefix of `.h5` **polar vol
 - **Per-quantity WMS colormaps** via `[[wms.parameters]]` (with the bare quantity as `name`) on the source config — every per-site collection inherits them, so reflectivity, velocity, and dual-pol moments each get a fitting palette instead of one stretched over all of them.
 - **Vertical dimension = elevation angle.** EDR `z` (and WMS `ELEVATION`) selects the sweep.
 - **EDR** supports `position`, `locations` (the radar site), `area`, and **`trajectory`** — vertical cross-sections (RHI-like `Section` coverages, with `z` = height above the antenna via the 4/3-Earth beam model). `MapEngine` renders each quantity to WMS / Maps / Tiles.
-- New radar sites that appear in the source surface as new collections on the next `POST /admin/collections/reload`.
+- A radar site that appears in the source after the load, local or remote, becomes a new collection within about 30 s of the poll that finds it, with no reload, also when the source held no sites at load. A site whose volumes leave the source keeps its collection, which then has no data, until the next `POST /admin/collections/reload`.
 
 ```toml
 [[collections]]
@@ -3426,7 +3426,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `http_requests_total` | counter | method, path, status, api | Total HTTP requests |
 | `http_request_duration_seconds` | histogram | method, path, api | Request latency histogram |
 | `http_response_bytes_total` | counter | method, path, api | Response body bytes sent |
-| `wms_error_tiles_total` | counter | collection, reason | WMS GetMaps answered with the red error tile and HTTP 200, which no status code counts. `collection` is the bottom layer's; `reason`: `not_found` (the data the request named was gone), `invalid_request` (the engine refused the request, such as a source read over its pixel cap), `storage` (a source read failed), `internal` (any other) |
+| `wms_error_tiles_total` | counter | collection, reason | WMS GetMaps answered with the red error tile and HTTP 200, which no status code counts. `collection` is the bottom layer's; `reason`: `not_found` (the data the request named was gone), `invalid_request` (the engine refused the request, such as a source read over its pixel cap), `storage` (a source read failed), `internal` (any other); the `WmsErrorTiles` alert counts `storage` and `internal` only |
 
 **Collections & health:**
 
@@ -3692,7 +3692,7 @@ normal CI without the review credential.
 | `CollectionEmpty` | `collection_has_data == 0`: the collection never loaded data, or all of it aged out; not for radar sites | 15m | warning |
 | `CollectionsFailed` | `collections_failed > 0` | 5m | warning |
 | `HighServerErrorRate` | 5xx responses above 5 % of an API's requests, per API (routes without an API, such as `/health`, are left out) | 10m | warning |
-| `WmsErrorTiles` | error tiles above 5 % of a collection's GetMap responses (`wms_error_tiles_total` over itself plus `render_duration_seconds_count{api="wms"}`) | 10m | warning |
+| `WmsErrorTiles` | server-class error tiles above 5 % of a collection's GetMap responses: `wms_error_tiles_total` with `reason` `storage` or `internal`, over every error tile plus `render_duration_seconds_count{api="wms"}`. Tiles with `not_found` or `invalid_request`, mostly a client's request, count only as GetMaps served; some engines report a data fault with them too, which the alert misses (#1506) | 10m | warning |
 | `RequestsShed` | admission rejections and deadline expiries (`render_queue_rejected_total`, `render_budget_rejected_total{reason="oversize"}`, `render_deadline_exceeded_total` and each read budget's `*_rejected_total`) above 1 % of requests | 10m | warning |
 | `UpstreamThrottled` | `storage_host_throttled_total` rising: a remote host answers 429 | 15m | info |
 | `MemoryHigh` | `process_resident_memory_bytes` above the memory plan's total, `memory_plan_total_bytes` (#1312); no series, and so quiet, on a server without that gauge | 15m | warning |

@@ -560,3 +560,79 @@ async fn section_png_parameter_without_a_layer_uses_the_collection_style() {
         "Q1 draws the collection's green: {q1:?}"
     );
 }
+
+/// Where a colormap was asked for a colour: the thread, its name, and
+/// whether a query deadline was installed there.
+#[derive(Debug)]
+struct Drawn {
+    thread: std::thread::ThreadId,
+    name: Option<String>,
+    in_query: bool,
+}
+
+/// A colormap painting every value red that records each distinct place
+/// it is drawn from.
+#[derive(Default)]
+struct ProbeColorMap(std::sync::Mutex<Vec<Drawn>>);
+
+impl ds_render::ColorMap for ProbeColorMap {
+    fn color(&self, _value: Option<f64>) -> [u8; 4] {
+        let thread = std::thread::current();
+        let in_query = ds_core::deadline::current().is_some();
+        let mut seen = self.0.lock().unwrap();
+        if !seen
+            .iter()
+            .any(|d| d.thread == thread.id() && d.in_query == in_query)
+        {
+            seen.push(Drawn {
+                thread: thread.id(),
+                name: thread.name().map(str::to_owned),
+                in_query,
+            });
+        }
+        [0xff, 0x00, 0x00, 0xff]
+    }
+}
+
+/// #1498: the cross-section PNG is drawn on the query executor, on the
+/// query runtime's blocking pool and under the query's deadline, which the
+/// executor installs only while the query holds its slot, as every other
+/// body is. It was drawn on the request runtime after the query returned,
+/// blocking it for the whole render (about 30 ms for 16 panels at
+/// 2000 × 2000 in a release build). The request runtime here is a
+/// current-thread one, so it is blocked exactly when the render runs on the
+/// test's own thread.
+#[tokio::test(flavor = "current_thread")]
+async fn section_png_is_drawn_on_the_query_executor() {
+    let request_thread = std::thread::current().id();
+    let probe = Arc::new(ProbeColorMap::default());
+    let mut style = solid_style(RED);
+    style.colormap = probe.clone();
+    let styles = HashMap::from([(
+        "c".to_string(),
+        HashMap::from([("default".to_string(), style)]),
+    )]);
+    let (status, ct, body) = request_styled(
+        Arc::new(SectionEngine { params: 1 }),
+        styles,
+        &format!("{SECTION}&width=400&height=300"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(ct, "image/png");
+    assert_eq!(png_size(&body), (400, 300));
+    let drawn = probe.0.lock().unwrap();
+    assert!(!drawn.is_empty(), "the panel is drawn with its style");
+    for place in drawn.iter() {
+        assert_ne!(
+            place.thread, request_thread,
+            "drawn on the request runtime: {place:?}"
+        );
+        assert_eq!(
+            place.name.as_deref(),
+            Some(ds_executor::QUERY_THREAD_NAME),
+            "{place:?}"
+        );
+        assert!(place.in_query, "drawn outside the query: {place:?}");
+    }
+}

@@ -1312,6 +1312,7 @@ mod tests {
             netcdf_parameters: RwLock::new(HashMap::new()),
             odim_engines: RwLock::new(Vec::new()),
             odim_volume_engines: RwLock::new(Vec::new()),
+            pvol_sites: RwLock::new(HashMap::new()),
             cap_engines: RwLock::new(Vec::new()),
             bufr_engines: RwLock::new(Vec::new()),
             postgis_engines: RwLock::new(Vec::new()),

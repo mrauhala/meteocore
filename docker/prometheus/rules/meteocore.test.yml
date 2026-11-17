@@ -524,9 +524,38 @@ tests:
   # Per minute: radar 10 error tiles and 90 renders (10 %); broken only
   # error tiles (100 %), so no render series at all; fine 1 in 100 (1 %),
   # its renders split over outcomes; a Maps render is not a GetMap.
+  # Tiles with reason not_found or invalid_request count as GetMaps
+  # served, never as failures (#1476): client 40 of 100 such tiles and 2
+  # internal (2 %); refused only such tiles, no render series; mixed 6
+  # storage tiles of 100 GetMaps, 14 of them refused requests (6 %, not 6
+  # of 86). edge pins the threshold: 3 internal tiles of 60 GetMaps, 7 of
+  # them refused, is 5 % exactly from 5m on and just under it before, so
+  # `> 0.05` stays quiet while `>= 0.05` or any lower threshold fires.
   - name: WmsErrorTiles
     interval: 1m
     input_series:
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="edge", reason="internal"}'
+        values: '0+3x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="edge", reason="invalid_request"}'
+        values: '0+7x30'
+      - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="wms", collection="edge", outcome="cold"}'
+        values: '0+50x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="client", reason="invalid_request"}'
+        values: '0+30x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="client", reason="not_found"}'
+        values: '0+10x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="client", reason="internal"}'
+        values: '0+2x30'
+      - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="wms", collection="client", outcome="cold"}'
+        values: '0+58x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="refused", reason="invalid_request"}'
+        values: '0+3x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="mixed", reason="storage"}'
+        values: '0+6x30'
+      - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="mixed", reason="invalid_request"}'
+        values: '0+14x30'
+      - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="wms", collection="mixed", outcome="cold"}'
+        values: '0+80x30'
       - series: 'wms_error_tiles_total{job="meteocore", instance="a:8000", collection="radar", reason="storage"}'
         values: '0+10x30'
       - series: 'render_duration_seconds_count{job="meteocore", instance="a:8000", api="wms", collection="radar", outcome="cold"}'
@@ -555,7 +584,7 @@ tests:
               collection: radar
             exp_annotations:
               summary: "WMS serves error tiles for radar"
-              description: "10% of GetMap responses for radar on a:8000 are the red error tile; the server log has the render errors."
+              description: "10% of GetMap responses for radar on a:8000 are the red error tile of a failed source read or render; the server log has the render errors."
           - exp_labels:
               severity: warning
               job: meteocore
@@ -563,7 +592,15 @@ tests:
               collection: broken
             exp_annotations:
               summary: "WMS serves error tiles for broken"
-              description: "100% of GetMap responses for broken on a:8000 are the red error tile; the server log has the render errors."
+              description: "100% of GetMap responses for broken on a:8000 are the red error tile of a failed source read or render; the server log has the render errors."
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+              collection: mixed
+            exp_annotations:
+              summary: "WMS serves error tiles for mixed"
+              description: "6% of GetMap responses for mixed on a:8000 are the red error tile of a failed source read or render; the server log has the render errors."
 
   # 1000 requests a minute on each instance.
   #   a: queue 3, GeoTIFF decode 4 and Zarr read 4 rejections (1.1 %).

@@ -35,9 +35,11 @@ around `ds-storage` calls (Critical Rules 6–7).
   `"odim-volume"` arm): build the engine once, enumerate `engine.sites()`
   (`(nod, label)` pairs), register one view per site (cloning the base
   `CollectionConfig` with per-site id/title). Site discovery is a scan
-  snapshot — sites added later surface on the next reload. An initially
-  empty remote source is re-expanded automatically by server startup recovery
-  once its poll finds sites (#190).
+  snapshot. The server's recovery loop registers a site a later poll finds,
+  local or remote, an initially empty source included, within 30 s of that
+  poll, reusing the engine (#1462, `crates/server/CLAUDE.md`). A site whose
+  volumes leave the catalog keeps its collection, which answers with no
+  data, until an explicit reload.
 - `catalog_bytes()` (#1307) is computed in `derive_catalog`: each
   catalogued volume's parsed metadata once (the parse cache shares the
   `Arc`s), the parse cache's table and keys, its `left_out` memory, and
@@ -109,10 +111,23 @@ around `ds-storage` calls (Critical Rules 6–7).
   `COMPOSITE_CACHE`, `[memory.caches] odim_composite`), shared by renders and
   EDR. A request waits for another's fill until its deadline
   (`get_or_insert_with_until`, #1399), then `DeadlineExceeded`; the fill
-  lands for later requests, and none starts past the deadline. A fetch's
-  own deadline stays `DeadlineExceeded`, never an `Engine` error. COMP EDR
-  position/area leave a gap for an unreadable file but fail the query on a
-  deadline (504), never a gap for it. Pinned by
+  lands for later requests, and none starts past the deadline.
+- **A COMP read that fails fails the request (#1496).** `fetch_bytes`
+  returns a `FetchError`, and `FetchError::into_request_error` maps it:
+  the fetch's own deadline stays `DeadlineExceeded`; a store that kept
+  answering 429/502/503/504 stays `Unavailable` through
+  `with_storage_context` (503, `Retry-After: 10`); any other failed read,
+  a 401/403 refusal and a local read error other than `NotFound` included,
+  is `ResourceExhausted` (503), its detail logged at WARN. All three are
+  `ErrorClass::is_transient`, and EDR position/area fail the query on a
+  transient error, never a null timestep that the answer's caches would
+  keep; the map path propagates it, so WMS answers 503, not the error
+  tile. Only a file gone since the scan (a typed 404 from
+  `DataStore::head_or_refusal`/`get_or_refusal`, a local `NotFound`),
+  grown past `MAX_REMOTE_FILE_SIZE` or whose bytes do not decode is an
+  `Engine` error: a null timestep in EDR, an error for a map, as before.
+  Never tell them apart by error text. Nothing failed enters
+  `COMPOSITE_CACHE`. Pinned by `composite_read_failure_tests` and
   `a_wait_for_another_composite_fetch_ends_at_the_deadline`.
 - **The sweep a map draws is `drawn_sweep`**: among the sweeps carrying the
   quantity, the one nearest `z`, else the lowest. `polar_sample` and the
@@ -662,6 +677,9 @@ not guarantee monotonic improvement. This baseline does not enable #642.
 
 COMP/PVOL constructors still report scan/configuration errors; poll failures
 still preserve the last good catalog. The server retries failed remote startup
-construction with backoff and re-registers per-site APIs when an initially empty
-remote catalog becomes populated. This recovery reuses accepted configuration
-and existing healthy engines; it does not turn scan errors into empty catalogs.
+construction with backoff and registers per-site APIs for every site a poll
+adds to a PVOL catalog, local or remote (#1462). This recovery reuses accepted
+configuration and existing healthy engines; it does not turn scan errors into
+empty catalogs. A local `data_path` that is missing still fails the load: an
+empty directory is a `Degraded` source whose poll keeps scanning, a missing one
+a configuration error.

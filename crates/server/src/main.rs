@@ -810,6 +810,7 @@ async fn serve(cli: CliArgs) {
         netcdf_parameters: RwLock::new(result.netcdf_parameters),
         odim_engines: RwLock::new(result.odim_engines),
         odim_volume_engines: RwLock::new(result.odim_volume_engines),
+        pvol_sites: RwLock::new(result.pvol_sites),
         cap_engines: RwLock::new(result.cap_engines),
         bufr_engines: RwLock::new(result.bufr_engines),
         postgis_engines: RwLock::new(result.postgis_engines),

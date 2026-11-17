@@ -108,8 +108,11 @@ default lapse rate reads it, #1206); a config entry's free-text
 `observed_property` states none.
 `[[bufr.parameters]]` replaces by name or appends; `builtin_parameters =
 false` serves only the config entries. Column order = table order; the
-store row is a dense `Box<[f32]>` (`NaN` = missing); output widens through
-`round_stored` so `16.97` stays `16.97`.
+store row is a dense `Box<[f32]>` (`NaN` = missing). EDR widens it exactly
+and tags every range `ValuePrecision::F32` (#1341, #1497), so CoverageJSON,
+GeoJSON, CSV and HTML write the shortest `f32` text: `1013.4`, never
+`1013.40002`. Rounding to a decimal is no substitute for the tag:
+above about 100 an `f32`'s error exceeds 1e-5, which an `F64` tag writes.
 
 **Units are source-driven, then mechanically converted for display.**
 Every entry (built-in or config) names the **BUFR Table B unit** the
@@ -347,7 +350,8 @@ at boot and ignores the state store.
   axis here. One layer per table parameter with its display unit.
 - A frame iterates the SNAPSHOT's stations (sorted by id, its positions)
   and reads each station's rows under the store read lock: reverse range
-  walk from `TIME`, first finite value wins (`round_stored`, as EDR),
+  walk from `TIME`, first finite value wins (`round_stored`: to 1e-5, so
+  a value at a step palette's decimal stop colours in its class),
   `MAX_FRAME_ROWS` scanned rows at most (`QueryTooLarge` naming
   `[bufr.map] max_age`).
 - `content_version` = the snapshot `version` (`.max(1)`): it moves at the

@@ -341,13 +341,14 @@ impl OdimEngine {
                         composite.undetect,
                     ));
                 }
-                // The request's time is up (#1399): no gap stands in for it.
-                Err(DataServerError::DeadlineExceeded) => {
-                    return Err(DataServerError::DeadlineExceeded)
-                }
+                // The request's time is up (#1399), or the read failed
+                // (#1496): no gap stands in for it, since a null would be
+                // kept as "no data" by every cache of the answer.
+                Err(e) if e.class().is_transient() => return Err(e),
                 Err(e) => {
-                    // A single unreadable file shouldn't fail the
-                    // whole series — emit a gap and carry on.
+                    // A file gone since the scan or whose bytes do not
+                    // decode shouldn't fail the whole series: emit a gap
+                    // and carry on.
                     tracing::warn!(
                         "[{}] EDR position query: failed to load `{}`: {e}",
                         self.collection_id,
@@ -432,9 +433,10 @@ impl OdimEngine {
             times.push(entry.time);
             let composite = match self.load_composite(&entry.location) {
                 Ok(c) => c,
-                Err(DataServerError::DeadlineExceeded) => {
-                    return Err(DataServerError::DeadlineExceeded)
-                }
+                // The deadline or a failed read (#1399, #1496), as in
+                // `query_point`: the query fails, never a timestep of nulls.
+                Err(e) if e.class().is_transient() => return Err(e),
+                // Gone since the scan, or bytes that do not decode.
                 Err(e) => {
                     tracing::warn!(
                         "[{}] EDR area query: failed to load `{}`: {e}",

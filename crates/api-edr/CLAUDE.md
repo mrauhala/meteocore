@@ -196,7 +196,10 @@ it:
   never per sample.
 - `CrossSection` (ODIM PVOL sites): the coords go to the engine unparsed
   (its own 2-D parser), PNG heatmaps are offered, and it runs on the
-  blocking pool (`blocking_pixel_handle` needs a blocking thread).
+  blocking pool (`blocking_pixel_handle` needs a blocking thread). Its PNG
+  is drawn there too, inside `execute_query` (`render_section_png`), never
+  after the `.await` (#1498, `png_plot_tests`'
+  `section_png_is_drawn_on_the_query_executor`).
 
 The `Trajectory` domain's composite tuples must be unique (`uniqueItems`):
 the plan drops a repeated node, which reads the same field at the same place.

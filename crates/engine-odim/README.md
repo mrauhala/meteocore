@@ -94,8 +94,13 @@ available.
   `/metrics` counts the reads that read as no data in
   `pvol_pixel_read_failures_total` and those that failed their request in
   `pvol_pixel_read_aborts_total{reason="deadline"|"storage"}`. A
-  composite that fails to load is a gap in an EDR series and an error for
-  a map.
+  composite whose bytes do not decode, or that is gone since the scan, is
+  a null timestep in EDR and an error for a map. A composite read that
+  fails fails the request in both, and nothing is cached for it: a store
+  that kept answering 429, 502, 503 or 504 through its retries is a 503
+  with `Retry-After: 10`, any other failure, a 401/403 or a local file the
+  server may not read included, a 503 with `Retry-After: 1`, and the
+  deadline as for volumes.
 - **Maps** find each output pixel's source cell through a coarse
   projection grid, never a projection per pixel.
 
@@ -257,8 +262,10 @@ discovery), `radar-fi-volume-s3-h5` (polar volumes on public S3). The
   with no slant-range correction. Rays are assumed evenly spaced from
   north, so sector scans are not supported.
 - Each radar is its own collection; there is no multi-radar mosaic. A
-  radar that appears after load becomes a collection on the next reload.
-  A remote source that found no radar at load is retried in the background.
+  radar that appears after load, in a local or a remote source, becomes a
+  collection within about 30 s of the poll that finds it, with no reload,
+  also when the source held no radar at load. A radar whose volumes leave
+  the source keeps its collection, which then has no data, until a reload.
 
 ## Testing
 

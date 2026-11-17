@@ -827,11 +827,15 @@ impl BufrEngine {
         let mut descs = HashMap::with_capacity(params.len());
         for &pi in params {
             let p = &self.table.params[pi];
+            // The store's `f32`, widened exactly and tagged `F32` (#1341,
+            // #1497): every body writes it as its shortest `f32` text,
+            // `1013.4`, where an `f64` tag would write the binary expansion
+            // (`1013.40002` after rounding to 1e-5).
             let values: Vec<Option<f64>> = rows
                 .iter()
                 .map(|(_, r)| {
                     let v = r[pi];
-                    (!v.is_nan()).then_some(round_stored(v))
+                    (!v.is_nan()).then_some(f64::from(v))
                 })
                 .collect();
             ranges.insert(
@@ -840,7 +844,7 @@ impl BufrEngine {
                     shape: vec![times.len()],
                     axis_names: vec!["t".to_string()],
                     values,
-                    precision: ValuePrecision::F64,
+                    precision: ValuePrecision::F32,
                 },
             );
             descs.insert(
@@ -919,13 +923,6 @@ fn has_report_in(store: &ObsStore, station: &StationInfo, interval: &DatetimeInt
             let hi = interval.end.map_or(Bound::Unbounded, Bound::Included);
             series.rows.range((lo, hi)).next().is_some()
         })
-}
-
-/// Rows are `f32` (BUFR values carry at most ~7 significant digits); widen
-/// back to the decimal the producer encoded rather than the binary
-/// expansion (`290.12`, not `290.1199951171875`).
-pub(crate) fn round_stored(v: f32) -> f64 {
-    ((v as f64) * 1e5).round() / 1e5
 }
 
 // ---------------------------------------------------------------------------

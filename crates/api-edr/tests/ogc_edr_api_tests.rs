@@ -1634,6 +1634,23 @@ mod unimplemented_queries {
         assert_eq!(json["code"], "BadRequest");
     }
 
+    /// `é` (`%C3%A9`) covering the byte after the keyword once panicked the
+    /// handler, and the client got no response at all (#1492).
+    #[tokio::test]
+    async fn position_query_with_a_multi_byte_character_in_the_keyword_is_400() {
+        for coords in ["POIN%C3%A9(25%2060)", "MULTIPOIN%C3%A9((25%2060))"] {
+            let (status, json) =
+                get(&format!("/collections/weather/position?coords={coords}")).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{coords}: {json}");
+            assert_eq!(json["code"], "BadRequest", "{coords}: {json}");
+            let description = json["description"].as_str().unwrap();
+            assert!(
+                description.contains("Expected WKT POINT or MULTIPOINT geometry"),
+                "{coords}: {description}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn radius_query() {
         // 10 km around Helsinki: matches Helsinki, not Tampere (~160 km away).
@@ -1774,6 +1791,56 @@ mod unimplemented_queries {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// #1491: the WKT spellings of Simple Feature Access (a space after
+    /// the keyword, any case, `), (` between rings) reach the engine's
+    /// shared parser through the route and answer like the compact form;
+    /// malformed text is still the JSON 400.
+    #[tokio::test]
+    async fn area_query_accepts_standard_wkt_spacing() {
+        let area = |wkt: &str| {
+            format!(
+                "/collections/weather/area?coords={}",
+                wkt.replace(' ', "%20")
+            )
+        };
+        let ring = "24.5 60.0, 25.5 60.0, 25.5 60.5, 24.5 60.5, 24.5 60.0";
+        let (status, compact) = get(&area(&format!("POLYGON(({ring}))"))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(compact["coverages"].as_array().unwrap().len(), 1);
+        for uri in [
+            area(&format!("POLYGON (({ring}))")),
+            area(&format!("polygon ( ( {ring} ) )")),
+            // A form-encoded space.
+            area(&format!("POLYGON (({ring}))")).replace("%20", "+"),
+        ] {
+            let (status, json) = get(&uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(json["coverages"], compact["coverages"], "{uri}");
+        }
+
+        // A hole around Helsinki leaves no station inside, written either
+        // way: the hole is read, not dropped.
+        let hole = "24.8 60.1, 25.0 60.1, 25.0 60.2, 24.8 60.2, 24.8 60.1";
+        for wkt in [
+            format!("POLYGON(({ring}),({hole}))"),
+            format!("POLYGON (({ring}), ({hole}))"),
+            format!("POLYGON (({ring}) , ({hole}))"),
+        ] {
+            let (status, _) = get_status(&area(&wkt)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{wkt}");
+        }
+
+        for wkt in [
+            format!("POLYGON (({ring})"),
+            format!("POLYGON (({ring}) ({hole}))"),
+            format!("POLYGON (({ring}),)"),
+        ] {
+            let (status, json) = get_status(&area(&wkt)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{wkt}");
+            assert_eq!(json.expect("a JSON body")["code"], "BadRequest", "{wkt}");
+        }
     }
 
     #[tokio::test]
