@@ -3027,6 +3027,9 @@ pub struct ServerState {
     pub netcdf_parameters: RwLock<NetcdfParameters>,
     pub odim_engines: RwLock<Vec<Arc<engine_odim::OdimEngine>>>,
     pub odim_volume_engines: RwLock<Vec<Arc<engine_odim::PolarVolumeEngine>>>,
+    /// The radar sites each PVOL source's collections were registered for
+    /// ([`LoadResult::pvol_sites`]).
+    pub pvol_sites: RwLock<PvolSites>,
     pub cap_engines: RwLock<Vec<Arc<engine_cap::CapEngine>>>,
     pub bufr_engines: RwLock<Vec<Arc<engine_bufr::BufrEngine>>>,
     pub postgis_engines: RwLock<Vec<Arc<engine_postgis::PostgisEngine>>>,
@@ -3103,6 +3106,12 @@ pub struct LoadResult {
     pub netcdf_parameters: NetcdfParameters,
     pub odim_engines: Vec<Arc<engine_odim::OdimEngine>>,
     pub odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>>,
+    /// The radar sites each PVOL source registered a collection for, a
+    /// site whose id collided with another collection included. A poll
+    /// finds sites the load could not see; the recovery loop registers the
+    /// source again once its catalog holds a site missing here
+    /// ([`pvol_registration_changed`], #1462).
+    pub pvol_sites: PvolSites,
     pub cap_engines: Vec<Arc<engine_cap::CapEngine>>,
     pub bufr_engines: Vec<Arc<engine_bufr::BufrEngine>>,
     pub postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>>,
@@ -3134,6 +3143,23 @@ pub type WindHandles = HashMap<String, HashMap<String, Arc<ds_core::derive::Deri
 
 /// Parameters by NetCDF collection id ([`LoadResult::netcdf_parameters`]).
 pub type NetcdfParameters = HashMap<String, Vec<ds_core::map_engine::ParameterInfo>>;
+
+/// The radar sites a load registered per-site collections for, by PVOL
+/// source (base) collection id, then by site `nod`
+/// ([`LoadResult::pvol_sites`], #1462).
+pub type PvolSites = HashMap<String, std::collections::BTreeMap<String, RegisteredSite>>;
+
+/// What a radar site's per-site collection was registered with (#1462): a
+/// recovery pass registers it again with these while the catalog no longer
+/// holds the site, so its title and layer styles stay as they were.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegisteredSite {
+    /// The site's place name, else its `nod`, as its collection's title
+    /// names it.
+    pub label: String,
+    /// The quantities its layer styles were resolved for.
+    pub parameters: Vec<ds_core::map_engine::ParameterInfo>,
+}
 
 impl LoadResult {
     /// Staging a load must not mutate live engines: call only after the reload
@@ -3414,6 +3440,13 @@ pub struct EngineReuse {
     /// takes the sizes its config pins, and each other cache keeps its
     /// live size for the plan fitted after the reload to move.
     pub plan_sized: bool,
+    /// The radar sites the live registry holds for those engines' PVOL
+    /// sources. A recovery pass fills it (#1462): a reused source then
+    /// registers each of them again, as it was registered, even when its
+    /// catalog no longer holds the site, so the pass adds sites and never
+    /// drops one. Empty for an explicit reload, which registers the sites
+    /// the catalog holds.
+    pub pvol_sites: PvolSites,
 }
 
 macro_rules! reuse_take {
@@ -3792,6 +3825,7 @@ pub fn load_collections(
     let mut netcdf_parameters: NetcdfParameters = HashMap::new();
     let mut odim_engines: Vec<Arc<engine_odim::OdimEngine>> = Vec::new();
     let mut odim_volume_engines: Vec<Arc<engine_odim::PolarVolumeEngine>> = Vec::new();
+    let mut pvol_sites: PvolSites = HashMap::new();
     let mut cap_engines: Vec<Arc<engine_cap::CapEngine>> = Vec::new();
     let mut bufr_engines: Vec<Arc<engine_bufr::BufrEngine>> = Vec::new();
     let mut postgis_engines: Vec<Arc<engine_postgis::PostgisEngine>> = Vec::new();
@@ -5172,12 +5206,19 @@ pub fn load_collections(
                 // re-parse of every retained volume); the per-site expansion
                 // below still re-runs against the live catalog, so radar sites
                 // that appeared since the last load surface on this reload.
+                // A recovery pass also hands over the sites the live registry
+                // holds, to register again (#1462).
+                let mut kept = std::collections::BTreeMap::new();
                 let engine = match engine_reuse.take_odim_volume(&collection.id) {
                     Some(e) => {
                         info!(
                             "Collection '{}': config unchanged — reusing live engine",
                             collection.id
                         );
+                        kept = engine_reuse
+                            .pvol_sites
+                            .remove(&collection.id)
+                            .unwrap_or_default();
                         e
                     }
                     None => match engine_odim::PolarVolumeEngine::new(
@@ -5214,14 +5255,36 @@ pub fn load_collections(
                 // quantity. The owning engine keeps the single scan, parse
                 // cache, and poll loop; each site gets a cheap
                 // `PolarVolumeSiteView` over the shared catalog. The site
-                // set is the catalog snapshot taken by `new`'s synchronous
-                // scan; sites that appear later surface on the next reload
-                // (which re-runs this expansion).
+                // set is the catalog snapshot this load reads; a site a
+                // later poll finds is registered by the recovery loop
+                // (`pvol_registration_changed`, #1462), which re-runs this
+                // expansion with the engine reused.
                 // `(nod, label)` from one snapshot — enumerates only sites
                 // with usable metadata, so no empty/broken collection is
                 // registered, and the id+title stay consistent if a poll
-                // swaps the catalog mid-registration.
-                let sites = engine.sites();
+                // swaps the catalog mid-registration. The third member is
+                // `None` for a site of the catalog, whose quantities its
+                // view reports, and a kept site's registered quantities.
+                let mut sites: Vec<(
+                    String,
+                    String,
+                    Option<Vec<ds_core::map_engine::ParameterInfo>>,
+                )> = engine
+                    .sites()
+                    .into_iter()
+                    .map(|(nod, label)| (nod, label, None))
+                    .collect();
+                // A recovery pass never drops a site (#1462): one the live
+                // registry holds that the catalog no longer does, its
+                // volumes aged out during an outage, is registered again as
+                // it was. An explicit reload hands over none.
+                for (nod, site) in kept {
+                    if !sites.iter().any(|(known, ..)| *known == nod) {
+                        sites.push((nod, site.label, Some(site.parameters)));
+                    }
+                }
+                sites.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut registered = std::collections::BTreeMap::new();
                 if sites.is_empty() {
                     // No sites yet (empty/not-yet-populated source). Register
                     // nothing but DO push a `Degraded` health entry so the
@@ -5235,7 +5298,8 @@ pub fn load_collections(
                     // a working registry — see `reload_handler`.
                     tracing::warn!(
                         "Collection '{}': PVOL source has no radar sites yet — no per-site \
-                         collections registered. Remote sources retry registration automatically; local sources require reload.",
+                         collections registered. Each site is registered automatically once \
+                         a poll finds its volumes.",
                         collection.id
                     );
                     health.push(CollectionHealth {
@@ -5245,7 +5309,7 @@ pub fn load_collections(
                         error: Some("no radar sites found yet (waiting for .h5 files)".into()),
                     });
                 }
-                for (nod, label) in &sites {
+                for (nod, label, kept_parameters) in &sites {
                     let site_id = format!("{}-{}", collection.id, nod);
 
                     // Defence-in-depth against a derived-id collision. NODs
@@ -5271,6 +5335,15 @@ pub fn load_collections(
                              already-registered collection — skipping this site",
                             collection.id
                         );
+                        // Counted as registered, so the recovery loop does
+                        // not register the source again for it every pass.
+                        registered.insert(
+                            nod.clone(),
+                            RegisteredSite {
+                                label: label.clone(),
+                                parameters: kept_parameters.clone().unwrap_or_default(),
+                            },
+                        );
                         health.push(CollectionHealth {
                             id: site_id,
                             engine_type: "odim-volume".into(),
@@ -5293,8 +5366,21 @@ pub fn load_collections(
                         format!("{} (radar site {label} / {nod})", collection.description);
 
                     // Per-site, multi-parameter: one layer per bare quantity.
-                    let raster_info = ds_core::map_engine::MapEngine::raster_info(view.as_ref());
-                    let raster_params = raster_info.parameters;
+                    // A kept site, which the catalog no longer holds, keeps
+                    // the layers it was registered with.
+                    let raster_params = match kept_parameters {
+                        Some(parameters) => parameters.clone(),
+                        None => {
+                            ds_core::map_engine::MapEngine::raster_info(view.as_ref()).parameters
+                        }
+                    };
+                    registered.insert(
+                        nod.clone(),
+                        RegisteredSite {
+                            label: label.clone(),
+                            parameters: raster_params.clone(),
+                        },
+                    );
 
                     if collection.apis.contains(&"edr".to_string()) {
                         edr_engines.insert(
@@ -5395,10 +5481,18 @@ pub fn load_collections(
                         }
                     }
 
-                    info!(
-                        "Collection '{}': wired per-site radar collection '{site_id}' ({label})",
-                        collection.id
-                    );
+                    if kept_parameters.is_some() {
+                        info!(
+                            "Collection '{}': kept per-site radar collection '{site_id}' \
+                             ({label}), whose volumes the catalog no longer holds",
+                            collection.id
+                        );
+                    } else {
+                        info!(
+                            "Collection '{}': wired per-site radar collection '{site_id}' ({label})",
+                            collection.id
+                        );
+                    }
                     health.push(CollectionHealth {
                         id: site_id,
                         engine_type: "odim-volume".into(),
@@ -5406,6 +5500,7 @@ pub fn load_collections(
                         error: None,
                     });
                 }
+                pvol_sites.insert(collection.id.clone(), registered);
 
                 // Network site inventory as an OGC API - Features collection
                 // under the (model-B-freed) base id: the owning engine — not
@@ -6777,6 +6872,7 @@ pub fn load_collections(
         netcdf_parameters,
         odim_engines,
         odim_volume_engines,
+        pvol_sites,
         cap_engines,
         bufr_engines,
         postgis_engines,
@@ -7854,8 +7950,9 @@ data_path = "/missing/weather.csv"
     }
 }
 
-/// Retry failed startup scans and register newly discovered PVOL sites / GRIB
-/// level families. The loader wires routes and dependent nowcasts as well.
+/// Retry failed startup scans and register newly discovered PVOL sites (local
+/// or remote, #1462) / GRIB level families / NetCDF layers. The loader wires
+/// routes and dependent nowcasts as well.
 /// Run only on the background runtime, serialized with manual/watcher reloads.
 pub(crate) async fn radar_recovery_loop(state: AdminState) {
     let mut delay = std::time::Duration::from_secs(30);
@@ -7904,6 +8001,7 @@ pub(crate) fn recover_radar_once(state: &AdminState) -> Result<RecoveryOutcome, 
         &state.health.read().unwrap_or_else(|e| e.into_inner()),
     ) && !grib_registration_changed(state, &inputs.collections)
         && !netcdf_registration_changed(state)
+        && !pvol_registration_changed(state)
     {
         return Ok(RecoveryOutcome::Idle);
     }
@@ -7965,6 +8063,29 @@ fn netcdf_registration_changed(state: &AdminState) -> bool {
                 use ds_core::map_engine::MapEngine;
                 *params != engine.raster_info_shared().parameters
             })
+    })
+}
+
+/// A PVOL source's poll keeps its catalog current, local or remote: once
+/// the catalog holds a radar site the source registered no collection for
+/// (an empty drop directory filling after an outage, or a radar that starts
+/// reporting), the source is registered again with the accepted config and
+/// its engine reused (#1462). Only an added site counts: one whose volumes
+/// left the catalog keeps its collection, and the recovery pass registers
+/// it again as it was ([`EngineReuse::pvol_sites`]), so an outage never
+/// removes collections one by one.
+fn pvol_registration_changed(state: &AdminState) -> bool {
+    let engines = state
+        .odim_volume_engines
+        .read()
+        .unwrap_or_else(|e| e.into_inner());
+    let registered = state.pvol_sites.read().unwrap_or_else(|e| e.into_inner());
+    engines.iter().any(|engine| {
+        let known = registered.get(engine.collection_id());
+        engine
+            .sites()
+            .iter()
+            .any(|(nod, _)| !known.is_some_and(|sites| sites.contains_key(nod)))
     })
 }
 
@@ -8045,6 +8166,20 @@ fn apply_load(
             .map(|(id, w)| (id.clone(), w.clone()))
             .collect(),
         plan_sized: config.plans_sizes(),
+        // A recovery pass adds radar sites and never drops one (#1462); an
+        // explicit reload registers what each catalog holds.
+        pvol_sites: if recovery {
+            state
+                .pvol_sites
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|(id, _)| reusable.contains(id.as_str()))
+                .map(|(id, sites)| (id.clone(), sites.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        },
     };
     info!(
         "Incremental reload: {} of {} configured collection(s) unchanged — reusing their live engines",
@@ -8418,6 +8553,7 @@ fn apply_load(
         .odim_volume_engines
         .write()
         .unwrap_or_else(|e| e.into_inner()) = result.odim_volume_engines;
+    *state.pvol_sites.write().unwrap_or_else(|e| e.into_inner()) = result.pvol_sites;
     *state.cap_engines.write().unwrap_or_else(|e| e.into_inner()) = result.cap_engines;
     *state
         .bufr_engines
@@ -10849,6 +10985,7 @@ mod tests {
                 engines: result.engines_by_id.clone(),
                 wind: result.wind_by_id.clone(),
                 plan_sized: false,
+                pvol_sites: HashMap::new(),
             },
         );
         let ptr = |e: &Arc<dyn ds_core::map_engine::MapEngine>| Arc::as_ptr(e) as *const ();
@@ -11384,6 +11521,7 @@ mod tests {
             engines: result.engines_by_id.clone(),
             wind: result.wind_by_id.clone(),
             plan_sized: false,
+            pvol_sites: HashMap::new(),
         });
         assert!(Arc::ptr_eq(
             &reused.grib_engines[0],
@@ -12511,6 +12649,7 @@ prewarm_sweeps = 0
                 .collect(),
             wind: HashMap::new(),
             plan_sized: false,
+            pvol_sites: HashMap::new(),
         }
     }
 
@@ -16643,6 +16782,11 @@ mod station_grid_corrections_tests;
 #[cfg(test)]
 #[path = "pvol_metrics_tests.rs"]
 mod pvol_metrics_tests;
+
+/// PVOL sites registered after the load (#1462), in a file of its own.
+#[cfg(test)]
+#[path = "pvol_registration_tests.rs"]
+mod pvol_registration_tests;
 
 /// The reload lock's lifetime (#1402), in a file of its own.
 #[cfg(test)]

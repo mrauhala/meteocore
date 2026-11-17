@@ -1850,7 +1850,7 @@ A single `odim-volume` source scans a directory / S3 prefix of `.h5` **polar vol
 - **Per-quantity WMS colormaps** via `[[wms.parameters]]` (with the bare quantity as `name`) on the source config — every per-site collection inherits them, so reflectivity, velocity, and dual-pol moments each get a fitting palette instead of one stretched over all of them.
 - **Vertical dimension = elevation angle.** EDR `z` (and WMS `ELEVATION`) selects the sweep.
 - **EDR** supports `position`, `locations` (the radar site), `area`, and **`trajectory`** — vertical cross-sections (RHI-like `Section` coverages, with `z` = height above the antenna via the 4/3-Earth beam model). `MapEngine` renders each quantity to WMS / Maps / Tiles.
-- New radar sites that appear in the source surface as new collections on the next `POST /admin/collections/reload`.
+- A radar site that appears in the source after the load, local or remote, becomes a new collection within about 30 s of the poll that finds it, with no reload, also when the source held no sites at load. A site whose volumes leave the source keeps its collection, which then has no data, until the next `POST /admin/collections/reload`.
 
 ```toml
 [[collections]]

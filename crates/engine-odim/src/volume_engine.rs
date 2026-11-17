@@ -5824,9 +5824,10 @@ impl PolarVolumeEngine {
     /// registering it would yield a collection with no parameters/extent
     /// (every WMS GetMap then 400s). Returning `(nod, label)` from a single
     /// snapshot also keeps the registered id and title consistent even if a
-    /// background poll swaps the catalog mid-registration. Snapshot — sites
-    /// appearing or disappearing between polls surface on the next admin
-    /// reload, which re-runs the expansion.
+    /// background poll swaps the catalog mid-registration. Snapshot — the
+    /// server's recovery loop compares it with the sites it registered and
+    /// re-runs the expansion once a poll brings a new one (#1462); a site
+    /// that leaves the catalog keeps its collection until an admin reload.
     pub fn sites(&self) -> Vec<(String, String)> {
         let catalog = self.catalog.load();
         let mut sites: Vec<(String, String)> = catalog
