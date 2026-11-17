@@ -302,9 +302,13 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   least an hour ago gets `public, max-age=86400`.
 - **Value budgets.** Most answers are capped at 1 million values
   (timesteps × levels × cells × parameters), BUFR and PostGIS at 500 000
-  values per response. On most gridded engines, masking a polygon that is
-  not a rectangle is also capped at 20 million cell × vertex tests. Over a
-  cap is a 400 that says how to narrow the query.
+  values per response. An answer of one `Point` coverage per item, a
+  PostGIS events collection's area or radius, is capped at 100 000
+  coverages (`MAX_AREA_POINT_COVERAGES`), about five 1 million-value grid
+  answers as CoverageJSON; the HTML page of an answer that large may not
+  fit the response budget (see Response memory below). On most gridded engines, masking a polygon that is not a
+  rectangle is also capped at 20 million cell × vertex tests. Over a cap
+  is a 400 that says how to narrow the query.
 - **Area resolution.** An `area` or `radius` answer of QueryData, Zarr,
   ODIM composites, Satellite, NetCDF, station grids and period products is
   a CRS84 grid at
@@ -329,12 +333,21 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   every `/locations` list is admitted by one process-wide budget,
   `[memory.caches] edr_response` (default 512 MiB). A body is charged for
   each buffer before it is allocated: CoverageJSON is serialised straight
-  into it, CSV is counted first, and an HTML page reserves its estimated
-  size before it renders. It stays charged until the client has read it
+  into it, CSV is counted first, and an HTML page is admitted once, before
+  anything is built, for all it holds at once: its CoverageJSON and the
+  document it lays out, parsed from that, at a bound counted from the
+  CoverageJSON's structure, and the page at its estimated size. A refused
+  page builds nothing, and one admitted is sure to finish, so two large
+  pages at once are one page and one 503, never two documents and two
+  503s. It stays charged until the client has read it
   or gone away. A body that does not fit is a 503 `ServerBusy` with
-  `Retry-After: 1`. An area answer at the 1 M-value budget is about 9 MB
+  `Retry-After: 1`. An HTML page that the budget could not hold even idle
+  is a 400 instead, before anything is built, saying to request
+  `f=CoverageJSON` or narrow the query: no retry would admit it, and it is
+  not counted among the budget's rejected admissions. An area answer at the 1 M-value budget is about 9 MB
   of CoverageJSON and two to three times that as HTML, so the default
-  holds about 57 of them in flight; size the budget for the largest
+  holds about 57 of them in flight; an HTML page also holds its document,
+  so far fewer pages fit. Size the budget for the largest
   bodies slow clients may hold at once. PNG plots are not counted. `/locations` lists are also
   capped at `MC_EDR_LOCATIONS_MAX_BYTES` (default 16 MiB) each: a list over
   it is a 503 `ResponseLimit` suggesting `limit`. A body is never
@@ -498,7 +511,7 @@ need no engine code of their own; items serve the engine's own
 | NetCDF | CRS84 grid at the source's mean cell size, coarsened evenly past the value budget, over lat/lon or CF Lambert conformal conic, geostationary, polar and oblique stereographic, Lambert azimuthal equal-area and transverse Mercator grids, each on the earth figure it states, projected x/y in metres or kilometres, and curvilinear grids of 2-D latitude/longitude, each point placed by an inverse lookup over the nodes (a polar grid's extent reaches its pole, one across the antimeridian is `west > east`); pressure levels through `z`. Trajectory and cube sample each point like position; an M path reads the run that covers its earliest time; a cube has a `t` axis and, on pressure levels, a `z` axis, and its native cells are the area's, never coarsened. Before any read, a query is held to `MC_NETCDF_EDR_QUERY_MB` (default 544 MiB) of what its reads decode, a whole field its size and a window its cells, and to `MC_NETCDF_EDR_QUERY_READS` (default 200) reads, counting only the fields it reads: a trajectory's planned (step, level) fields, a cube's steps × the levels its positions take. Through OPeNDAP a query reads only the window of each field its points or cells sample, or the whole field when the window passes half of it, the levels it asks of a variable at one step in one request over the stored levels between them, while that reads at most half of what they hold whole (a Z path's levels, sampled at different cells, often read one by one), and the windows of a step's variables in one request of up to 16 planes (variables × levels), which the read cap counts once; the values are the whole field's. A 13-level position series over a 67-lead MEPS run is 67 requests and fits both caps, as does a six-variable surface meteogram (67 requests, not 402); read whole, the 13-level series is 871 fields and past the bytes |
 | ODIM PVOL site | polar sampling of each volume; `/locations` lists the site; trajectory is a vertical cross-section. A query over several volumes reads up to four at once, each the byte ranges of the moments it samples, or the whole file when those are most of it. What a query reads and the moments it decodes are admitted by `[memory.caches] pvol_read` (default 1024 MiB); a volume that does not fit is a 503 `ServerBusy`. A read the deadline cuts off goes on in the background and caches the moments it was for, so a retry does not read them again. A volume the store refuses (401/403) is a 503 and is not read again for a minute |
 | PostGIS stations | stations inside the polygon, one series each; `/locations` holds at most `max_locations` stations (default 200 000); a value outside its parameter's `valid_range` or equal to one of its `missing_values` is a null, its time kept; see [engine-postgis](../engine-postgis/README.md) |
-| PostGIS events | events inside the polygon as `Point` coverages, with the same `valid_range` and `missing_values` nulls |
+| PostGIS events | events inside the polygon as `Point` coverages, newest first, with the same `valid_range` and `missing_values` nulls; at most 100 000 events an answer, and a window holding more is a 400 read no further than one event past it |
 | BUFR | stations inside the polygon over the in-memory retention window; position is the nearest station within `position_radius_km` (default 25 km) |
 | Nowcast | the motion field (`motion_u`, `motion_v` in m/s, `motion_quality`) over the polygon's bbox; generations are instances; items are tracked cells |
 | Station grid | the analysis grid the map draws (each station's latest valid value within `[station_grid] max_age`, interpolated onto a CRS84 grid), read at the cell under each point; without `datetime` the latest analysis; an instant must be an analysis time; at most 96 analyses (times × parameters) per query; an analysis still computing at the deadline is a 503, and its computation goes on for a retry. With a terrain, lapse-rate corrected values; with a land/sea mask, null outside it; no analysis time (404) until both are sampled |
@@ -513,7 +526,10 @@ Each engine crate documents its own query details.
 - Every data query answers `f=html`, or a browser's `Accept`, with a page of
   its response: a summary, the PNG plot where the query offers one, every
   value in tables, the request as an editable form, and the full metadata
-  folded below. Nothing is truncated; the value caps bound the page.
+  folded below. Nothing is truncated; the value caps bound the page. The
+  page of an answer too large for the response budget is a 400 naming the
+  CoverageJSON alternative, `f=CoverageJSON`, and a 503 to retry while the
+  budget is busy with other bodies.
 - An HTML request to position, area, radius, trajectory or cube without
   coordinates (`coords`, or a cube's `bbox`) gets the query's form,
   prefilled with an example inside the collection's extent, instead of a

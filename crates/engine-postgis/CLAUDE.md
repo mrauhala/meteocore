@@ -263,6 +263,18 @@ in step when changing this lifecycle.
   `MAX_AREA_QUERIES` 20k statements (stations × params for `per_parameter`),
   **fan-out path only**; locations `LIMIT max_locations + 1` (above);
   nearest-station `LIMIT 1`.
+- **An events area is bounded by events, not values.** Each event is a
+  `Point` coverage of its own, so the value budget does not bound it:
+  `events_area_allowed(values_per_row, cap)` is the cap, for every request
+  `ds_core::feature::MAX_AREA_POINT_COVERAGES` (100 000), or the value
+  budget's quotient where an event carries enough parameters to bind
+  first. `build_events_area`'s `LIMIT $4` is that plus one, so a window
+  holding more reads one row past it and is the 400
+  (`events_budget_exceeded`, naming the event budget), checked before any
+  row is decoded. The cap is a parameter only so the DB test can bound by
+  a small one: `events_area_within` and `events_area_statement_within`
+  are doc-hidden test hooks; `EdrEngine::query_area` and
+  `events_area_statement` always pass `MAX_AREA_POINT_COVERAGES`.
 - **Two area paths (#1062), one result** but for the two edge cases
   below. `query_area` picks with
   `area_path`: **set-based** for a `datetime` window of at most
@@ -491,6 +503,13 @@ in step when changing this lifecycle.
   the station without one; without filters the same rows read back as
   stored. `value_filters_events_shape`: a `real` peak current, out of range
   or the sentinel, is null on its event.
+- `events_area_answers_are_bounded_by_events` (`mc_events_bound`), bounded
+  by a cap of 100 (`EVENTS_CAP`) so it holds few rows: a window holding
+  more events is the 400 naming the event budget, the statement the
+  engine runs for it (`events_area_statement_within`) returns one row past
+  the cap, and a window holding exactly the cap is answered whole, newest
+  first. A request's statement reads one row past
+  `MAX_AREA_POINT_COVERAGES`, and the same window is answered whole.
 - `events_features_shape` (#503, `mc503_events`): Features on a naive-UTC
   table keyed `(time, id)`. Paging two at a time visits every event once
   with a boundary inside a three-way tie whose ids order differently as

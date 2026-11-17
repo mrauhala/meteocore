@@ -73,6 +73,13 @@ pub(crate) enum Failure {
     Limit,
     /// The query's deadline passed, or its client went away.
     Cancelled,
+    /// The body could not be built for a reason of its own, logged where
+    /// it failed: a 500.
+    Internal,
+    /// What the body holds at once exceeds the whole budget, so no retry
+    /// can admit it: a 400 naming a smaller form (an HTML page only,
+    /// [`reserve_toward`]).
+    Oversize,
 }
 
 struct Allocation {
@@ -193,6 +200,28 @@ pub(crate) fn reserve(bytes: usize) -> Result<Reservation, Failure> {
     reserve_from(&BUDGET, bytes)
 }
 
+/// Reserve `bytes`, one part of a body whose parts held at once total
+/// `whole`: [`Failure::Oversize`] when `whole` exceeds the whole budget,
+/// which an idle budget cannot admit either, else as [`reserve`], whose
+/// [`Failure::Memory`] is worth a retry. An oversize body is the client's
+/// request, answered 400, not admission turning work away: it is not
+/// counted among the budget's rejected admissions, which `/metrics`
+/// exports as `edr_response_rejected_total` for the shed-requests alert.
+pub(crate) fn reserve_toward(bytes: usize, whole: usize) -> Result<Reservation, Failure> {
+    reserve_toward_from(&BUDGET, bytes, whole)
+}
+
+fn reserve_toward_from(
+    budget: &Arc<ByteBudget>,
+    bytes: usize,
+    whole: usize,
+) -> Result<Reservation, Failure> {
+    if u64::try_from(whole).map_or(true, |whole| whole > budget.capacity()) {
+        return Err(Failure::Oversize);
+    }
+    reserve_from(budget, bytes)
+}
+
 fn reserve_from(budget: &Arc<ByteBudget>, bytes: usize) -> Result<Reservation, Failure> {
     let permit = u64::try_from(bytes)
         .ok()
@@ -206,6 +235,25 @@ fn reserve_from(budget: &Arc<ByteBudget>, bytes: usize) -> Result<Reservation, F
 }
 
 impl Reservation {
+    /// The bytes this reservation holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Move `bytes` of this reservation, at most all it holds, into one of
+    /// their own, without touching the budget: a body that reserved every
+    /// part of its work up front hands each part over this way, never
+    /// reserving more mid-way.
+    pub(crate) fn split(&mut self, bytes: usize) -> Reservation {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        Reservation {
+            budget: self.budget.clone(),
+            permit: self.permit.split(bytes as u64),
+            bytes,
+        }
+    }
+
     /// The body built in `data`, charged until its last clone drops. A
     /// buffer that outgrew the reservation is charged its whole capacity
     /// instead, or fails.
@@ -300,6 +348,45 @@ mod tests {
         expired.set(true);
         assert!(writer.write_all(b"x").is_err());
         assert_eq!(writer.failure, Some(Failure::Cancelled));
+    }
+
+    /// A part of a body over the whole budget is `Oversize`, never worth a
+    /// retry, and not counted as a rejected admission; one that would fit
+    /// an idle budget but not now is `Memory`, and is.
+    #[test]
+    fn a_body_over_the_whole_budget_is_oversize() {
+        let budget = Arc::new(ByteBudget::new(100));
+        assert_eq!(
+            reserve_toward_from(&budget, 10, 101).err(),
+            Some(Failure::Oversize)
+        );
+        assert_eq!(budget.metrics().2, 0, "an oversize request is not shed");
+        let held = reserve_toward_from(&budget, 60, 100).unwrap();
+        assert_eq!(
+            reserve_toward_from(&budget, 60, 100).err(),
+            Some(Failure::Memory)
+        );
+        assert_eq!(budget.metrics().2, 1, "a busy budget sheds it");
+        drop(held);
+        assert!(reserve_toward_from(&budget, 60, 100).is_ok());
+        assert_eq!(used(&budget), 0);
+    }
+
+    /// A split reservation's parts are charged until each drops, and hand
+    /// the part a body keeps over to it.
+    #[test]
+    fn a_split_reservation_hands_its_parts_over() {
+        let budget = Arc::new(ByteBudget::new(100));
+        let mut whole = reserve_from(&budget, 90).unwrap();
+        let page = whole.split(40);
+        assert_eq!((whole.bytes(), page.bytes()), (50, 40));
+        drop(whole.split(30));
+        assert_eq!(used(&budget), 60);
+        let body = page.into_bytes(Vec::with_capacity(40)).unwrap();
+        drop(whole);
+        assert_eq!(used(&budget), 40, "the body keeps its part");
+        drop(body);
+        assert_eq!(used(&budget), 0);
     }
 
     #[test]

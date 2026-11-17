@@ -387,6 +387,27 @@ pub struct BytePermit {
     bytes: u64,
 }
 
+impl BytePermit {
+    /// The bytes this permit holds.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Move `bytes` of this permit, at most all it holds, into a permit of
+    /// their own, without touching the budget: what one reservation
+    /// admitted at once, two now hold, each released when it drops. A
+    /// caller that reserved every part of its work up front hands each part
+    /// over this way, never reserving more mid-way.
+    pub fn split(&mut self, bytes: u64) -> BytePermit {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        BytePermit {
+            budget: self.budget.clone(),
+            bytes,
+        }
+    }
+}
+
 impl Drop for BytePermit {
     fn drop(&mut self) {
         self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
@@ -779,5 +800,23 @@ mod tests {
             .expect("the release woke the waiter")
             .unwrap();
         assert!(admitted.is_some());
+    }
+
+    /// A split permit holds what the reservation admitted, in two parts,
+    /// each released when it drops; the budget never sees the split.
+    #[test]
+    fn a_split_permit_releases_each_part_when_it_drops() {
+        let budget = Arc::new(ByteBudget::new(100));
+        let mut whole = budget.reserve(80).unwrap();
+        let part = whole.split(30);
+        assert_eq!((whole.bytes(), part.bytes()), (50, 30));
+        assert_eq!(budget.metrics().0, 80);
+        drop(whole);
+        assert_eq!(budget.metrics().0, 30);
+        let mut part = part;
+        assert_eq!(part.split(1000).bytes(), 30, "at most what it holds");
+        assert_eq!(budget.metrics().0, 0);
+        drop(part);
+        assert_eq!(budget.metrics().0, 0);
     }
 }

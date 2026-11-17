@@ -30,6 +30,7 @@ use ds_core::config::{
 };
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
+use ds_core::feature::MAX_AREA_POINT_COVERAGES;
 use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
 use engine_postgis::engine::AreaPath;
 use engine_postgis::pool::PoolRegistry;
@@ -1396,6 +1397,155 @@ async fn value_filters_events_shape() {
         ],
         "newest first; out of range, sentinel and NULL are all null"
     );
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
+/// An events table, filled by [`BOUNDED_EVENTS_ROWS`].
+const BOUNDED_EVENTS: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.strikes (
+    id bigint PRIMARY KEY,
+    time timestamptz NOT NULL,
+    geom geometry(Point, 4326) NOT NULL,
+    peak_current real
+);
+CREATE INDEX ON __S__.strikes (time);
+";
+
+/// `$1` events, event `g` at `2026-01-01T00:00:00Z` plus `g` seconds, on a
+/// 100-column grid of points 0.001° apart from (1°, 1°).
+const BOUNDED_EVENTS_ROWS: &str = "
+INSERT INTO __S__.strikes
+SELECT g,
+       '2026-01-01 00:00:00+00'::timestamptz + g * interval '1 second',
+       ST_SetSRID(ST_MakePoint(1 + (g % 100) * 0.001, 1 + (g / 100) * 0.001), 4326),
+       g % 50
+FROM generate_series(1, $1::bigint) AS g
+";
+
+/// The events cap these tests bound an area by: a request's is
+/// `MAX_AREA_POINT_COVERAGES`, the same code with a smaller cap, so a window
+/// past it holds few rows.
+const EVENTS_CAP: usize = 100;
+
+/// The events area query bounded by `cap`, on a blocking thread as the EDR
+/// executor runs it.
+async fn events_area_within(
+    engine: &Arc<PostgisEngine>,
+    coords: &str,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    cap: usize,
+) -> Result<Vec<QueryResult>, DataServerError> {
+    let engine = Arc::clone(engine);
+    let coords = coords.to_string();
+    tokio::task::spawn_blocking(move || {
+        match engine.events_area_within(&coords, window, None, cap)? {
+            CoverageResponse::Collection(coverages) => Ok(coverages),
+            CoverageResponse::Single(coverage) => Ok(vec![coverage]),
+        }
+    })
+    .await
+    .expect("events area task")
+}
+
+/// An events area answer is bounded by events, one `Point` coverage each,
+/// here by [`EVENTS_CAP`]. A window holding more is the 400 naming the
+/// event budget, and the statement the engine runs for it returns one row
+/// past the cap, not every event in the window; a window holding exactly
+/// the cap is answered whole, newest first. A request's statement reads one
+/// row past `MAX_AREA_POINT_COVERAGES`, and under it the same window is
+/// answered whole. A radius query is the area query over its circle, so it
+/// is bounded the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_area_answers_are_bounded_by_events() {
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc_events_bound";
+    let held = EVENTS_CAP + 10;
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, BOUNDED_EVENTS).await;
+        let insert = BOUNDED_EVENTS_ROWS.replace("__S__", &quote_ident(schema).unwrap());
+        let inserted = client
+            .execute(insert.as_str(), &[&(held as i64)])
+            .await
+            .expect("insert the events");
+        assert_eq!(inserted, held as u64);
+        exec(&client, schema, "ANALYZE __S__.strikes;").await;
+    }
+    let mut cfg = config(
+        None,
+        PostgisObservationsConfig {
+            table: Some(format!("{schema}.strikes")),
+            time_col: Some("time".into()),
+            geom_col: Some("geom".into()),
+            id_col: Some("id".into()),
+            extent_bbox: Some([0.0, 0.0, 10.0, 10.0]),
+            ..observations("events")
+        },
+    );
+    cfg.parameters = vec![PostgisParameterConfig {
+        name: "peak_current".into(),
+        label: "Peak current".into(),
+        unit: "kA".into(),
+        observed_property: None,
+        source_key: None,
+        valid_range: None,
+        missing_values: vec![],
+    }];
+    let engine = engine(schema, &cfg).await;
+    let polygon = "POLYGON((0 0,10 0,10 10,0 10,0 0))";
+    let start: DateTime<Utc> = "2026-01-01T00:00:00Z".parse().unwrap();
+    let after = |events: usize| start + TimeDelta::seconds(events as i64);
+    let time = |c: &QueryResult| match &c.domain {
+        DomainDescription::Point { t, .. } => *t,
+        other => panic!("an event is a Point, got {other:?}"),
+    };
+
+    // Every event: past the cap, refused.
+    let every = Some((after(1), after(held)));
+    let refused = events_area_within(&engine, polygon, every, EVENTS_CAP)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&refused, DataServerError::QueryTooLarge(m)
+            if m.contains(&format!("{EVENTS_CAP}-event budget"))),
+        "{refused:?}"
+    );
+    // The statement it ran reads one row past the cap.
+    let statement = engine
+        .events_area_statement_within(polygon, every, None, EVENTS_CAP)
+        .expect("the events statement");
+    let rows = client
+        .query(statement.sql.as_str(), &params_as_refs(&statement.params))
+        .await
+        .expect("run the events statement");
+    assert_eq!(rows.len(), EVENTS_CAP + 1);
+
+    // Exactly the cap: answered whole, newest first.
+    let at_cap = Some((after(1), after(EVENTS_CAP)));
+    let events = events_area_within(&engine, polygon, at_cap, EVENTS_CAP)
+        .await
+        .expect("an answer at the cap");
+    assert_eq!(events.len(), EVENTS_CAP);
+    assert_eq!(time(&events[0]), Some(after(EVENTS_CAP)));
+    assert_eq!(time(&events[events.len() - 1]), Some(after(1)));
+
+    // A request: bounded by `MAX_AREA_POINT_COVERAGES`, so every event is
+    // answered, newest first.
+    let request = engine
+        .events_area_statement(polygon, every, None)
+        .expect("a request's events statement");
+    assert_eq!(request.row_limit(), Some(MAX_AREA_POINT_COVERAGES + 1));
+    let events = area(&engine, None, polygon, every, None)
+        .await
+        .expect("a request's events answer");
+    assert_eq!(events.len(), held);
+    assert_eq!(time(&events[0]), Some(after(held)));
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
 

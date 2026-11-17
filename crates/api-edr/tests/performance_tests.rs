@@ -563,9 +563,10 @@ fn in_child(test: &str, env: &[(&str, &str)], body: impl FnOnce()) {
 }
 
 /// With an EDR response budget smaller than one million-value response,
-/// its CoverageJSON and its HTML page are both a 503 to retry, the HTML
-/// before it renders; a small response is still served, and every
-/// reservation is released once its body drops (#1041).
+/// its CoverageJSON is a 503 to retry, and its HTML page, which no idle
+/// budget could hold either, a 400 naming the CoverageJSON before anything
+/// is built; a small response is still served, and every reservation is
+/// released once its body drops (#1041).
 #[test]
 fn large_bodies_over_the_response_budget_are_503() {
     in_child(
@@ -591,12 +592,21 @@ fn large_bodies_over_the_response_budget_are_503() {
                         "/collections/weather/locations/big?f=html",
                     ] {
                         let response = get(uri).await;
-                        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
-                        assert_eq!(response.headers()["retry-after"], "1", "{uri}");
-                        if !uri.ends_with("html") {
-                            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-                                .await
-                                .unwrap();
+                        let html = uri.ends_with("html");
+                        if html {
+                            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+                            assert!(response.headers().get("retry-after").is_none(), "{uri}");
+                        } else {
+                            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+                            assert_eq!(response.headers()["retry-after"], "1", "{uri}");
+                        }
+                        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                            .await
+                            .unwrap();
+                        if html {
+                            let page = String::from_utf8_lossy(&bytes);
+                            assert!(page.contains("f=CoverageJSON"), "{page}");
+                        } else {
                             let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                             assert_eq!(error["code"], "ServerBusy");
                         }
@@ -604,7 +614,9 @@ fn large_bodies_over_the_response_budget_are_503() {
                     }
                     let (_, capacity, rejected) = api_edr::response_budget_metrics();
                     assert_eq!(capacity, 4 << 20);
-                    assert_eq!(rejected, 2);
+                    // The CoverageJSON was shed; the oversize page is the
+                    // client's 400, not counted among shed requests.
+                    assert_eq!(rejected, 1);
                     for uri in [
                         "/collections/weather/locations/small",
                         "/collections/weather/locations/small?f=html",

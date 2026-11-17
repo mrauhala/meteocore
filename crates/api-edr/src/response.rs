@@ -287,33 +287,67 @@ impl Serialize for CoverageJson<'_> {
             collection.serialize_entry("coverages", &[] as &[Value])?;
             return collection.end();
         }
-
-        // Hoist parameters to collection level — the union across
-        // every coverage, so a (hypothetical) mixed-parameter
-        // collection still advertises them all rather than only the
-        // first coverage's. Each coverage's domain keeps its own
-        // `referencing`, so a collection may mix domain shapes safely.
-        let mut parameters = Map::new();
-        for qr in coverages {
-            parameters.append(&mut build_parameters(qr));
-        }
-
-        // A collection-level `domainType` is only emitted when every
-        // coverage agrees (it is an optional hint). A heterogeneous
-        // collection omits it rather than emitting a type that
-        // mismatches some coverages — each coverage's domain still
-        // carries its own `domainType`.
-        let first_type = domain_type_name(&coverages[0].domain);
-        let homogeneous = coverages
-            .iter()
-            .all(|c| domain_type_name(&c.domain) == first_type);
-        if homogeneous {
-            collection.serialize_entry("domainType", first_type)?;
+        let (domain_type, parameters) = collection_head(coverages);
+        if let Some(domain_type) = domain_type {
+            collection.serialize_entry("domainType", domain_type)?;
         }
         collection.serialize_entry("parameters", &parameters)?;
         collection.serialize_entry("coverages", &Coverages(coverages))?;
         collection.end()
     }
+}
+
+/// A non-empty CoverageCollection's `domainType`, when every coverage
+/// agrees, and its hoisted `parameters`.
+///
+/// Parameters are hoisted to collection level, the union across every
+/// coverage, so a (hypothetical) mixed-parameter collection still
+/// advertises them all rather than only the first coverage's. Each
+/// coverage's domain keeps its own `referencing`, so a collection may mix
+/// domain shapes safely. A collection-level `domainType` is only emitted
+/// when every coverage agrees (it is an optional hint): a heterogeneous
+/// collection omits it rather than emitting a type that mismatches some
+/// coverages, and each coverage's domain still carries its own.
+fn collection_head(coverages: &[QueryResult]) -> (Option<&'static str>, Map<String, Value>) {
+    let mut parameters = Map::new();
+    for qr in coverages {
+        parameters.append(&mut build_parameters(qr));
+    }
+    let first_type = coverages.first().map(|c| domain_type_name(&c.domain));
+    let homogeneous = coverages
+        .iter()
+        .all(|c| Some(domain_type_name(&c.domain)) == first_type);
+    (first_type.filter(|_| homogeneous), parameters)
+}
+
+/// The members of `result`'s CoverageJSON document besides its coverages,
+/// domain and ranges: its `type`, a collection's `domainType`, and its
+/// `parameters`. Small beside the document: what the HTML page estimates
+/// from before the document is built.
+pub(crate) fn document_head(result: &CoverageResponse) -> Value {
+    let mut head = Map::new();
+    match result {
+        CoverageResponse::Single(q) => {
+            head.insert("type".into(), Value::String("Coverage".into()));
+            head.insert("parameters".into(), Value::Object(build_parameters(q)));
+        }
+        CoverageResponse::Collection(coverages) => {
+            head.insert("type".into(), Value::String("CoverageCollection".into()));
+            if !coverages.is_empty() {
+                let (domain_type, parameters) = collection_head(coverages);
+                if let Some(domain_type) = domain_type {
+                    head.insert("domainType".into(), Value::String(domain_type.into()));
+                }
+                head.insert("parameters".into(), Value::Object(parameters));
+            }
+        }
+    }
+    Value::Object(head)
+}
+
+/// A coverage's CoverageJSON `domain`, as its document writes it.
+pub(crate) fn domain_json(desc: &DomainDescription) -> Value {
+    build_domain(desc)
 }
 
 /// A CoverageCollection's coverages, without their hoisted parameters.
@@ -361,6 +395,249 @@ fn domain_type_name(domain: &DomainDescription) -> &'static str {
 /// coverages, a `CoverageCollection` — as a `Value` (see [`to_value`]).
 pub fn coverage_response_to_json(result: &CoverageResponse) -> Value {
     to_value(CoverageJson(result))
+}
+
+/// The heap `serde_json` takes at most to parse a JSON text into a
+/// [`Value`]: what an HTML data page admits for the CoverageJSON body it
+/// parses back before it parses it ([`DocumentScan`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DocumentBound {
+    /// Held by the parsed document: every array and map at the capacity it
+    /// grows to, and every key and string.
+    pub retained: usize,
+    /// Held besides while it is parsed, and released by the end of the
+    /// parse: the old buffer of the largest growth, as the array or map
+    /// moves, and `serde_json`'s scratch for a string with escapes.
+    pub transient: usize,
+}
+
+impl DocumentBound {
+    /// The high-water mark of the parse.
+    pub fn peak(&self) -> usize {
+        self.retained.saturating_add(self.transient)
+    }
+}
+
+/// [`DocumentBound`] of the JSON text `json`: [`DocumentScan`] over it.
+pub fn parsed_document_bound(json: &[u8]) -> DocumentBound {
+    let mut scan = DocumentScan::default();
+    scan.feed(json);
+    scan.bound()
+}
+
+/// An open array or object: its separating commas, and whether it holds
+/// anything.
+#[derive(Debug, Clone, Copy)]
+struct Frame {
+    array: bool,
+    commas: usize,
+    any: bool,
+}
+
+/// [`DocumentBound`] counted from the text's structure as it streams past,
+/// with no copy of it: the HTML page runs it over the CoverageJSON body
+/// before writing the body down.
+///
+/// It models how `serde_json` builds a [`Value`], never a size per byte:
+/// - An array of `n` elements is a `Vec` grown by doubling from four
+///   slots, `next_power_of_two(max(n, 4))` `Value`s; as it last grows it
+///   briefly also holds the half as large buffer it moves from.
+/// - An object of `m` members is, with `preserve_order`, an index map:
+///   entries of hash, key and `Value` at the capacity of its hash table of
+///   `usize` slots, each with a control byte; it grows and moves likewise.
+///   Without, a B-tree: one leaf of eleven keys and values, or past eleven
+///   members nodes at least five-elevenths full.
+/// - Keys and strings take their text's bytes; a string with escapes is
+///   assembled in a scratch buffer of up to twice the longest.
+///
+/// It holds for the documents this crate writes, the CoverageJSON bodies
+/// of data queries, with `preserve_order` on and off, pinned against the
+/// heap a parse takes by `tests/html_admission_tests.rs`, and carries a
+/// margin of an eighth for the allocator's rounding ([`Self::margin`]). It is not a
+/// bound for any JSON: one that `serde_json`'s growth or its allocator
+/// treats otherwise, or a map with duplicate keys, may take more.
+#[derive(Debug, Default)]
+pub(crate) struct DocumentScan {
+    len: usize,
+    frames: Vec<Frame>,
+    in_string: bool,
+    escaped: bool,
+    string_len: usize,
+    longest_string: usize,
+    strings: usize,
+    containers: usize,
+    largest_move: usize,
+}
+
+impl DocumentScan {
+    const VALUE: usize = std::mem::size_of::<Value>();
+    const KEY: usize = std::mem::size_of::<String>();
+    const WORD: usize = std::mem::size_of::<usize>();
+    /// `serde_json`'s map is a B-tree unless `preserve_order` makes it an
+    /// index map, which is larger than a B-tree's root.
+    const INDEXED: bool = std::mem::size_of::<Map<String, Value>>()
+        > std::mem::size_of::<std::collections::BTreeMap<String, Value>>();
+    /// An index map entry: its hash, key and value.
+    const ENTRY: usize = Self::WORD + Self::KEY + Self::VALUE;
+    /// A B-tree leaf: eleven keys and values, its parent and two counts.
+    const LEAF: usize = 11 * (Self::KEY + Self::VALUE) + 2 * Self::WORD;
+    /// A B-tree internal node: a leaf and its twelve edges.
+    const INTERNAL: usize = Self::LEAF + 12 * Self::WORD;
+    /// The control bytes a hash table keeps past its slots.
+    const GROUP: usize = 16;
+
+    /// The bytes written so far.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Scan `bytes`, the next part of the text.
+    pub(crate) fn feed(&mut self, bytes: &[u8]) {
+        self.len = self.len.saturating_add(bytes.len());
+        for &byte in bytes {
+            if self.in_string {
+                match byte {
+                    _ if self.escaped => self.escaped = false,
+                    b'\\' => self.escaped = true,
+                    b'"' => {
+                        self.in_string = false;
+                        self.strings = self.strings.saturating_add(self.string_len);
+                        self.longest_string = self.longest_string.max(self.string_len);
+                        continue;
+                    }
+                    _ => {}
+                }
+                self.string_len += 1;
+                continue;
+            }
+            match byte {
+                b' ' | b'\n' | b'\r' | b'\t' => {}
+                b']' | b'}' => {
+                    if let Some(frame) = self.frames.pop() {
+                        self.close(frame);
+                    }
+                }
+                _ => {
+                    if let Some(frame) = self.frames.last_mut() {
+                        frame.any = true;
+                        if byte == b',' {
+                            frame.commas += 1;
+                        }
+                    }
+                    match byte {
+                        b'"' => {
+                            self.in_string = true;
+                            self.string_len = 0;
+                        }
+                        b'[' | b'{' => self.frames.push(Frame {
+                            array: byte == b'[',
+                            commas: 0,
+                            any: false,
+                        }),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Charge a closed array or object.
+    fn close(&mut self, frame: Frame) {
+        let n = if frame.any { frame.commas + 1 } else { 0 };
+        let (held, moved) = if frame.array {
+            Self::array(n)
+        } else {
+            Self::object(n)
+        };
+        self.containers = self.containers.saturating_add(held);
+        self.largest_move = self.largest_move.max(moved);
+    }
+
+    /// An array of `n` elements: its `Vec`, and the buffer it last moved
+    /// from.
+    fn array(n: usize) -> (usize, usize) {
+        if n == 0 {
+            return (0, 0);
+        }
+        let slots = n.max(4).checked_next_power_of_two().unwrap_or(usize::MAX);
+        let held = slots.saturating_mul(Self::VALUE);
+        (held, if slots > 4 { held / 2 } else { 0 })
+    }
+
+    /// An object of `m` members: its map, and what it last moved from.
+    fn object(m: usize) -> (usize, usize) {
+        if m == 0 {
+            return (0, 0);
+        }
+        if !Self::INDEXED {
+            if m <= 11 {
+                return (Self::LEAF, 0);
+            }
+            return ((m / 5 + 2).saturating_mul(Self::INTERNAL), Self::INTERNAL);
+        }
+        let buckets = Self::buckets(m);
+        let held = Self::index_map(buckets);
+        (
+            held,
+            if buckets > 4 {
+                Self::index_map(buckets / 2)
+            } else {
+                0
+            },
+        )
+    }
+
+    /// The buckets of a hash table holding `m` entries: four up to three,
+    /// eight up to seven, else the power of two whose seven-eighths hold
+    /// them.
+    fn buckets(m: usize) -> usize {
+        match m {
+            0..=3 => 4,
+            4..=7 => 8,
+            _ => m
+                .saturating_mul(8)
+                .div_ceil(7)
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX),
+        }
+    }
+
+    /// An index map whose table has `buckets` buckets: its entries at the
+    /// table's capacity, and the table.
+    fn index_map(buckets: usize) -> usize {
+        let capacity = if buckets < 8 {
+            buckets - 1
+        } else {
+            buckets / 8 * 7
+        };
+        let table = buckets
+            .saturating_mul(Self::WORD + 1)
+            .saturating_add(Self::GROUP);
+        capacity.saturating_mul(Self::ENTRY).saturating_add(table)
+    }
+
+    /// The bound of the text scanned so far, every container closed, with
+    /// [`Self::margin`].
+    pub(crate) fn bound(&self) -> DocumentBound {
+        DocumentBound {
+            retained: Self::margin(self.containers.saturating_add(self.strings)),
+            transient: Self::margin(
+                self.largest_move
+                    .saturating_add(self.longest_string.saturating_mul(2)),
+            ),
+        }
+    }
+
+    /// `bytes` and an eighth more. The model counts the bytes `serde_json`
+    /// asks its allocator for, to within a few hundred over a document,
+    /// while the allocator hands out size classes a little larger than
+    /// asked; and a dependency bump that changes how an array or map grows
+    /// takes effect before the pinning test reports it. The eighth covers
+    /// both, and stays under the test's check that the bound is not far
+    /// past the peak.
+    fn margin(bytes: usize) -> usize {
+        bytes.saturating_add(bytes / 8)
+    }
 }
 
 fn build_domain(desc: &DomainDescription) -> Value {
@@ -819,6 +1096,34 @@ mod coverage_tests {
             serde_json::to_string(&CoverageJson(&empty)).unwrap(),
             r#"{"type":"CoverageCollection","coverages":[]}"#
         );
+    }
+
+    /// The document bound counts structure outside strings only: brackets,
+    /// commas and colons inside a string, escaped quotes included, are
+    /// text. Commas in an object separate members, not array elements. It
+    /// holds with serde_json's `preserve_order` on or off: the workspace
+    /// build turns it on.
+    #[test]
+    fn the_document_bound_counts_structure_outside_strings() {
+        let bound = |text: &[u8]| parsed_document_bound(text).peak();
+        let text = br#"["a\"[{,:]}\\"]"#;
+        let plain = br#"["aaaaaaaaaaa"]"#;
+        assert_eq!(text.len(), plain.len());
+        assert_eq!(parsed_document_bound(text), parsed_document_bound(plain));
+        // Two members are charged more than two array elements of the same
+        // text length: an object its table.
+        let members = br#"{"a":1,"b":2}"#;
+        let elements = br#"[1    ,    2]"#;
+        assert_eq!(members.len(), elements.len());
+        assert!(bound(members) > bound(elements));
+        // An array holds four slots at least, then doubles: a fifth element
+        // doubles it and adds the buffer it moved from.
+        assert_eq!(bound(b"[1]"), bound(b"[1,2,3,4]"));
+        assert!(bound(b"[1,2,3,4,5]") > bound(b"[1,2,3,4]"));
+        assert_eq!(bound(b"[1,2,3,4,5,6,7,8]"), bound(b"[1,2,3,4,5]      "));
+        // Empty containers take nothing; nesting charges each level.
+        assert_eq!(bound(b"[]"), DocumentBound::default().peak());
+        assert!(bound(b"[[[1]]]") > bound(b"[[1]]  "));
     }
 }
 
