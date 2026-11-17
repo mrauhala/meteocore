@@ -420,23 +420,26 @@ through `response_budget::Writer`, which reserves each buffer before
 allocating it and stops at the query deadline; CoverageJSON range values
 are written straight from the result, never through a `Value` tree. CSV
 reserves its counted size before it allocates (`csv::write_station_series`'
-`admit`). An HTML data page (`html::coverage_page`) is admitted at every
-step, each before it allocates. A first pass serialises the CoverageJSON
+`admit`). An HTML data page (`html::coverage_page`) is admitted once,
+before anything is built. A first pass serialises the CoverageJSON
 into `response::DocumentScan`, which keeps nothing: the body's length and
 the `DocumentBound` of parsing it. The page is estimated from the result
 (`html::result_estimate`, each coverage's domain built alone), the same
 `Estimate` arithmetic as the document's, pinned equal by
-`the_page_estimate_of_a_result_is_its_documents`. The larger of what the
-parse holds at once (body, document, transient part) and what the render
-does (document, page) is checked against the whole budget before anything
-is built: over it, no retry can admit the page, and it is
-`Failure::Oversize`, a 400 naming `f=CoverageJSON`
-(`response_budget::reserve_toward`), not counted among rejected
-admissions, so it never feeds the shed-requests alert. Then the body, the
-document and the transient part are reserved, the body is written and
-parsed, the body and the transient part are released, and the page is
-reserved beside the document. A step the budget cannot hold now is the
-503 `ServerBusy`, and nothing past it is built. The bound models how serde_json builds
+`the_page_estimate_of_a_result_is_its_documents`. The document and,
+beside it, the larger of the body with the parse's transient part and
+the page are reserved in ONE reservation (`response_budget::reserve_toward`).
+Over the whole budget, no retry can admit the page: `Failure::Oversize`,
+a 400 naming `f=CoverageJSON`, not counted among rejected admissions, so
+it never feeds the shed-requests alert. Over what is free now, the 503
+`ServerBusy`. Either way nothing is built. The reservation is then handed
+over part by part (`Reservation::split`, over `BytePermit::split`): the
+page's part to its buffer, what the body and the transient part held
+released after the parse, the document's part at the end. Never reserve
+more mid-way: two pages that each reserved only their document would
+build both documents and then starve each other of the page, both 503
+after the work (`html_admission_tests`'
+`two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503`). The bound models how serde_json builds
 a `Value`, never a size per byte: an array's `Vec` from four slots by
 doubling, plus the half-size buffer its last growth moves from; with
 `preserve_order` an index map's entries at its hash table's capacity, else

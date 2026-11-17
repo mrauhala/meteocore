@@ -6,9 +6,10 @@
 //!   the document holds its retained part.
 //! - A page that cannot fit the response budget even idle is a 400 naming
 //!   its CoverageJSON, refused before anything is built and not counted
-//!   among shed requests; one that cannot fit it now is a 503 to retry; a
-//!   full grid's page is served on a modest budget, and the answers that
-//!   fit are unchanged.
+//!   among shed requests; one that cannot fit it now is a 503 to retry,
+//!   also before anything is built, so two pages at once never both build a
+//!   document; a full grid's page is served on a modest budget, and the
+//!   answers that fit are unchanged.
 //! - [`MAX_AREA_POINT_COVERAGES`] `Point` coverages write about five grid
 //!   answers at [`MAX_AREA_VALUES`] as CoverageJSON.
 //!
@@ -241,7 +242,12 @@ fn body(result: &CoverageResponse) -> Vec<u8> {
 // A router over one collection whose area answer is fixed
 // ---------------------------------------------------------------------------
 
-struct Fixed(fn() -> CoverageResponse);
+/// An engine whose area answer is fixed. With `together`, every query
+/// waits at the barrier first, so two queries reach their answers at once.
+struct Fixed {
+    answer: fn() -> CoverageResponse,
+    together: Option<Arc<std::sync::Barrier>>,
+}
 
 impl EdrEngine for Fixed {
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
@@ -277,11 +283,21 @@ impl EdrEngine for Fixed {
         _: Option<&[f64]>,
         _: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
-        Ok((self.0)())
+        if let Some(together) = &self.together {
+            together.wait();
+        }
+        Ok((self.answer)())
     }
 }
 
 fn app(answer: fn() -> CoverageResponse) -> axum::Router {
+    app_with(Fixed {
+        answer,
+        together: None,
+    })
+}
+
+fn app_with(engine: Fixed) -> axum::Router {
     let config = CollectionConfig {
         id: "c".into(),
         title: "Answers".into(),
@@ -314,10 +330,7 @@ fn app(answer: fn() -> CoverageResponse) -> axum::Router {
         expected_interval: None,
     };
     api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {
-        engines: HashMap::from([(
-            "c".to_string(),
-            Arc::new(Fixed(answer)) as Arc<dyn EdrEngine>,
-        )]),
+        engines: HashMap::from([("c".to_string(), Arc::new(engine) as Arc<dyn EdrEngine>)]),
         feature_engines: HashMap::new(),
         collections: HashMap::from([("c".to_string(), config)]),
         styles: HashMap::new(),
@@ -539,8 +552,8 @@ fn a_page_whose_render_cannot_fit_is_refused_before_its_document_is_built() {
 }
 
 /// A page that fits an idle budget but not one other bodies hold is the
-/// 503 `ServerBusy` to retry, at the first step that does not fit, and is
-/// served once they are released.
+/// 503 `ServerBusy` to retry, before anything is built, and is served once
+/// they are released.
 #[test]
 fn an_html_page_that_fits_an_idle_budget_is_a_503_while_it_is_busy() {
     in_child(
@@ -568,6 +581,134 @@ fn an_html_page_that_fits_an_idle_budget_is_a_503_while_it_is_busy() {
             drop(held);
             let (status, _, _) = rt.block_on(get(app(page), &html));
             assert_eq!(status, StatusCode::OK, "served once they are released");
+            assert_eq!(api_edr::response_budget_metrics().0, 0);
+        },
+    );
+}
+
+/// What a page of `answer` reserves, measured at the default budget: the
+/// document's part and the larger of the body with the parse's transient
+/// part and the page; and the page's part, which its unread response
+/// keeps. As bytes of the document's part, the body with the transient
+/// part, and the page's part.
+fn page_reservation(answer: fn() -> CoverageResponse) -> (usize, usize, usize) {
+    let _serial = serial();
+    let json = body(&answer());
+    let bound = parsed_document_bound(&json);
+    let rt = runtime();
+    let response = rt.block_on(respond(app(answer), &format!("{AREA}&f=html")));
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = api_edr::response_budget_metrics().0 as usize;
+    drop(response);
+    (bound.retained, json.len() + bound.transient, page)
+}
+
+/// The engine result and the document of a page of `answer`, as the heap
+/// counts them.
+fn engine_and_document(answer: fn() -> CoverageResponse) -> (usize, usize) {
+    let before = live();
+    let result = answer();
+    let engine = (live() - before) as usize;
+    drop(result);
+    let json = body(&answer());
+    let before = live();
+    let document: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let document_bytes = (live() - before) as usize;
+    drop(document);
+    (engine, document_bytes)
+}
+
+fn three_thousand_points() -> CoverageResponse {
+    points(3_000)
+}
+
+/// A page the budget holds alone, asked for while another page's body is
+/// held unread, is the 503 to retry, refused before it builds anything:
+/// its heap stays near its engine result. The budget fits one page and not
+/// one beside another's page.
+#[test]
+fn a_page_beside_a_held_page_is_refused_before_it_builds() {
+    const MIB: usize = 1 << 20;
+    let (document, parse, page) = page_reservation(three_thousand_points);
+    let whole = document + parse.max(page);
+    assert!(page > MIB, "a page's part {page} B outweighs the rounding");
+    let budget = whole.div_ceil(MIB).to_string();
+    in_child(
+        "a_page_beside_a_held_page_is_refused_before_it_builds",
+        &[("MC_EDR_RESPONSE_MEMORY_MB", &budget)],
+        || {
+            let _serial = serial();
+            let (engine, document_bytes) = engine_and_document(three_thousand_points);
+            let html = format!("{AREA}&f=html");
+            let rt = runtime();
+            let first = rt.block_on(respond(app(three_thousand_points), &html));
+            assert_eq!(first.status(), StatusCode::OK);
+            let before = reset_peak();
+            let (status, retry_after, _) = rt.block_on(get(app(three_thousand_points), &html));
+            let request = (peak() - before) as usize;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(retry_after.as_deref(), Some("1"));
+            println!(
+                "refused beside a page: request peak {request} B, engine result {engine} B, \
+                 document {document_bytes} B"
+            );
+            assert!(
+                request < engine + document_bytes / 8,
+                "the refused page built its document: request peak {request} B"
+            );
+            drop(first);
+            assert_eq!(api_edr::response_budget_metrics().0, 0);
+        },
+    );
+}
+
+/// Two pages at once on a budget that holds both documents with their
+/// bodies, but not both documents with a page beside them: each would build
+/// its document and then find no room for its page, both a 503 after the
+/// work. A page reserves all it holds up front instead, so the one that
+/// reserves first is served and the other is the 503 before it builds:
+/// one document is built, never two. The engine releases both answers at
+/// once, so both pages are in flight together.
+#[test]
+fn two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503() {
+    const MIB: usize = 1 << 20;
+    let (document, parse, page) = page_reservation(three_thousand_points);
+    // Both documents and bodies fit; both documents and a page do not.
+    let both_parsed = 2 * (document + parse);
+    let both_rendering = 2 * document + page;
+    assert!(
+        both_rendering > both_parsed + 2 * MIB,
+        "no budget sits between {both_parsed} B and {both_rendering} B"
+    );
+    let budget = ((both_parsed + both_rendering) / 2)
+        .div_ceil(MIB)
+        .to_string();
+    in_child(
+        "two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503",
+        &[("MC_EDR_RESPONSE_MEMORY_MB", &budget)],
+        || {
+            let _serial = serial();
+            let (_, document_bytes) = engine_and_document(three_thousand_points);
+            let html = format!("{AREA}&f=html");
+            let app = app_with(Fixed {
+                answer: three_thousand_points,
+                together: Some(Arc::new(std::sync::Barrier::new(2))),
+            });
+            let rt = runtime();
+            let before = reset_peak();
+            let (a, b) = rt.block_on(async {
+                tokio::join!(respond(app.clone(), &html), respond(app.clone(), &html))
+            });
+            let pair = (peak() - before) as usize;
+            let mut statuses = [a.status().as_u16(), b.status().as_u16()];
+            statuses.sort_unstable();
+            assert_eq!(statuses, [200, 503]);
+            println!("two at once: heap peak {pair} B, one document {document_bytes} B");
+            assert!(
+                pair < 2 * document_bytes,
+                "both pages built a document: heap peak {pair} B"
+            );
+            drop((a, b));
             assert_eq!(api_edr::response_budget_metrics().0, 0);
         },
     );

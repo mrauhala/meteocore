@@ -235,6 +235,25 @@ fn reserve_from(budget: &Arc<ByteBudget>, bytes: usize) -> Result<Reservation, F
 }
 
 impl Reservation {
+    /// The bytes this reservation holds.
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Move `bytes` of this reservation, at most all it holds, into one of
+    /// their own, without touching the budget: a body that reserved every
+    /// part of its work up front hands each part over this way, never
+    /// reserving more mid-way.
+    pub(crate) fn split(&mut self, bytes: usize) -> Reservation {
+        let bytes = bytes.min(self.bytes);
+        self.bytes -= bytes;
+        Reservation {
+            budget: self.budget.clone(),
+            permit: self.permit.split(bytes as u64),
+            bytes,
+        }
+    }
+
     /// The body built in `data`, charged until its last clone drops. A
     /// buffer that outgrew the reservation is charged its whole capacity
     /// instead, or fails.
@@ -350,6 +369,23 @@ mod tests {
         assert_eq!(budget.metrics().2, 1, "a busy budget sheds it");
         drop(held);
         assert!(reserve_toward_from(&budget, 60, 100).is_ok());
+        assert_eq!(used(&budget), 0);
+    }
+
+    /// A split reservation's parts are charged until each drops, and hand
+    /// the part a body keeps over to it.
+    #[test]
+    fn a_split_reservation_hands_its_parts_over() {
+        let budget = Arc::new(ByteBudget::new(100));
+        let mut whole = reserve_from(&budget, 90).unwrap();
+        let page = whole.split(40);
+        assert_eq!((whole.bytes(), page.bytes()), (50, 40));
+        drop(whole.split(30));
+        assert_eq!(used(&budget), 60);
+        let body = page.into_bytes(Vec::with_capacity(40)).unwrap();
+        drop(whole);
+        assert_eq!(used(&budget), 40, "the body keeps its part");
+        drop(body);
         assert_eq!(used(&budget), 0);
     }
 

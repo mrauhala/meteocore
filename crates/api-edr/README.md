@@ -333,11 +333,13 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   every `/locations` list is admitted by one process-wide budget,
   `[memory.caches] edr_response` (default 512 MiB). A body is charged for
   each buffer before it is allocated: CoverageJSON is serialised straight
-  into it, CSV is counted first, and an HTML page is admitted at each step
-  before it takes it: its CoverageJSON and the document it lays out,
-  parsed from that, at a bound counted from the CoverageJSON's structure,
-  then the page at its estimated size before it renders. A page refused at
-  any step builds nothing past it. It stays charged until the client has read it
+  into it, CSV is counted first, and an HTML page is admitted once, before
+  anything is built, for all it holds at once: its CoverageJSON and the
+  document it lays out, parsed from that, at a bound counted from the
+  CoverageJSON's structure, and the page at its estimated size. A refused
+  page builds nothing, and one admitted is sure to finish, so two large
+  pages at once are one page and one 503, never two documents and two
+  503s. It stays charged until the client has read it
   or gone away. A body that does not fit is a 503 `ServerBusy` with
   `Retry-After: 1`. An HTML page that the budget could not hold even idle
   is a 400 instead, before anything is built, saying to request

@@ -20,10 +20,10 @@
 //! of itself or regrows by doubling. Everything a data page holds is
 //! admitted by the EDR response budget before it is allocated (#1041,
 //! [`coverage_page`]): the CoverageJSON body and the document parsed from
-//! it, at a bound counted from the body's structure, then the page's
-//! buffer at its estimate beside the document, both estimated before
-//! anything is built. A page that cannot fit even an idle budget is a 400
-//! naming its CoverageJSON, before anything is built. The `/locations` list and
+//! it, at a bound counted from the body's structure, and the page's buffer
+//! at its estimate, in one reservation before anything is built, handed
+//! over part by part. A page that cannot fit even an idle budget is a 400
+//! naming its CoverageJSON. The `/locations` list and
 //! `items` render their GeoJSON as a feature table, the list through the
 //! same budgeted writer as its GeoJSON.
 //!
@@ -205,23 +205,27 @@ pub(crate) struct Locations {
 /// The HTML page of a data query's result: its CoverageJSON, all of it,
 /// and on a station collection which location each coverage is.
 ///
-/// Admitted by the EDR response budget before each allocation (#1041):
+/// Admitted by the EDR response budget once, before anything is built
+/// (#1041):
 /// 1. The CoverageJSON body is scanned as it is serialised, without being
 ///    kept: its length and the
 ///    [`DocumentBound`](crate::response::DocumentBound) of its parse. The
 ///    page's size is estimated from the result ([`result_estimate`]).
-/// 2. What the page holds at once at its largest, the body, the document
-///    and the parse's transient part, or the document and the page, is
-///    checked against the whole budget: over it, no retry can admit the
-///    page, and it is [`Failure::Oversize`], a 400 naming the
-///    CoverageJSON, before anything is built.
-/// 3. The body, the document and the transient part are reserved; the
-///    body is written, parsed, and dropped with the transient part.
-/// 4. The page is reserved beside the document, then rendered.
+/// 2. What the page holds at once at its largest is reserved in one
+///    reservation: the document, and beside it the larger of the body with
+///    the parse's transient part and the page. Over the whole budget, no
+///    retry can admit it, and it is [`Failure::Oversize`], a 400 naming the
+///    CoverageJSON; over what the budget holds free now, [`Failure::Memory`],
+///    a 503 to retry.
+/// 3. The body is written, parsed, and dropped with the transient part,
+///    and what they held beyond the document is released.
+/// 4. The page's part of the reservation is handed over to its buffer,
+///    which keeps it until the body is delivered or dropped.
 ///
-/// A step the budget cannot hold now is [`Failure::Memory`], a 503 to
-/// retry, and nothing past it is built. `expired`, the query's deadline,
-/// stops the scan.
+/// A page that starts building is sure to finish: it never reserves more
+/// mid-way, so concurrent pages cannot each build a document and then
+/// starve one another of the page. `expired`, the query's deadline, stops
+/// the scan.
 pub(crate) fn coverage_page(
     result: &CoverageResponse,
     page: &DataPage,
@@ -244,13 +248,13 @@ pub(crate) fn coverage_page(
         .saturating_add(result_estimate(result, page))
         .saturating_add(locations.map_or(0, locations_len))
         .saturating_add(tail.len());
-    let parse = len.saturating_add(bound.peak());
-    let render = bound.retained.saturating_add(capacity);
-    let whole = parse.max(render);
-    // The document is held until the page is written; the body and the
-    // parse's transient part until the parse ends.
-    let _document = crate::response_budget::reserve_toward(bound.retained, whole)?;
-    let parsing = crate::response_budget::reserve_toward(len + bound.transient, whole)?;
+    let whole = bound
+        .retained
+        .saturating_add(len.saturating_add(bound.transient).max(capacity));
+    // The document's part is held until the page is written, the page's
+    // until its body is delivered.
+    let mut reserved = crate::response_budget::reserve_toward(whole, whole)?;
+    let page_part = reserved.split(capacity);
     let mut json = Vec::with_capacity(len);
     if let Err(e) = serde_json::to_writer(&mut json, &CoverageJson(result)) {
         tracing::error!("EDR HTML page: CoverageJSON serialise error: {e}");
@@ -261,10 +265,11 @@ pub(crate) fn coverage_page(
         Failure::Internal
     })?;
     drop(json);
-    drop(parsing);
-    let reservation = crate::response_budget::reserve_toward(capacity, whole)?;
+    // The body and the parse's transient part are gone: release what they
+    // held beyond the document.
+    drop(reserved.split(reserved.bytes().saturating_sub(bound.retained)));
     let coverages = coverage_list(&doc);
-    reservation.into_bytes(
+    page_part.into_bytes(
         fill(&head, &tail, capacity, |body| {
             coverage_body(body, &doc, coverages, page, locations)
         })

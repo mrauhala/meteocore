@@ -127,6 +127,10 @@ rejection; `try_reserve`, a batch's probe for one more slot, and
 one. It checks no deadline and reads no environment: the engine owns its
 static, env var, default, deadline checks and planning, and exports
 `metrics()` (used, capacity, rejected) to `/metrics` unchanged.
+`BytePermit::split` moves part of a permit into one of its own without
+touching the budget: a caller that reserves all its work up front hands
+each part over that way, never reserving more mid-way (api-edr's HTML
+pages).
 Both budgets' capacities are atomic and `resize` in place (#1311): granted
 reservations stay, so a shrink below them admits nothing until they are
 released. `RenderBudget::resize` wakes every waiter: one that now fits is
