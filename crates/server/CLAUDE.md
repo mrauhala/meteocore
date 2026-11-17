@@ -712,6 +712,12 @@ need no reload pruning.
 - WMS GetMap's red error tile (HTTP 200, #280) carries an `api_wms::ErrorTile`;
   `metrics_middleware` counts it as `wms_error_tiles_total{collection,reason}`
   and `prune_render_duration` drops a removed WMS collection's series.
+  The `WmsErrorTiles` alert counts only `reason=~"storage|internal"`, the
+  class-`Internal` errors (#1476). `not_found` and `invalid_request` are
+  mostly a client's request; some engines report a data fault with them
+  too (a GRIB message missing from its step, a GeoTIFF source over its
+  pixel cap), which the alert misses (#1506). A new reason goes in the
+  rule, its test and the dashboard's ratio panel when it is server-side.
 
 ## Operational notes
 

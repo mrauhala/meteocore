@@ -138,12 +138,21 @@ groups:
           description: "More than 5 % of {{ $labels.api }} requests on {{ $labels.instance }} failed with a 5xx status for 10 minutes."
 
       # GetMap answers a failed render with a red tile and HTTP 200, so the
-      # 5xx rule never sees it. Served GetMaps are the error tiles plus the
-      # renders in render_duration_seconds; a collection that serves only
-      # error tiles has no render series, hence the `or`.
+      # 5xx rule never sees it. Only server-class errors count: a source
+      # read that failed (`storage`) or any other render error (`internal`)
+      # (#1476). The other two reasons are mostly a client's request: the
+      # data it named gone (`not_found`) or a request the engine refused
+      # (`invalid_request`, such as an elevation the layer does not have).
+      # Some engines report a data fault with them too, such as a GRIB
+      # message missing from its step or a GeoTIFF source over its pixel
+      # cap; this rule misses those (#1506). Served GetMaps are every
+      # error tile plus the renders in render_duration_seconds; a collection
+      # that serves only error tiles has no render series, hence the `or`.
       - alert: WmsErrorTiles
         expr: |
-          sum by (job, instance, collection) (rate(wms_error_tiles_total{job="meteocore"}[5m]))
+          sum by (job, instance, collection) (
+            rate(wms_error_tiles_total{job="meteocore", reason=~"storage|internal"}[5m])
+          )
           /
           (
               sum by (job, instance, collection) (rate(wms_error_tiles_total{job="meteocore"}[5m]))
@@ -162,7 +171,7 @@ groups:
           severity: warning
         annotations:
           summary: "WMS serves error tiles for {{ $labels.collection }}"
-          description: "{{ $value | humanizePercentage }} of GetMap responses for {{ $labels.collection }} on {{ $labels.instance }} are the red error tile; the server log has the render errors."
+          description: "{{ $value | humanizePercentage }} of GetMap responses for {{ $labels.collection }} on {{ $labels.instance }} are the red error tile of a failed source read or render; the server log has the render errors."
 
       # Requests answered 503 by admission: a full render queue, a render too
       # large for memory, an expired render deadline, and each read budget.

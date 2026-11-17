@@ -23020,7 +23020,7 @@
         "spec": {
           "id": 152,
           "title": "WMS error tiles",
-          "description": "WMS GetMaps answered with the red error tile per second, by collection and reason (wms_error_tiles_total). They are HTTP 200, so the status code panels never count them. reason: not_found = the data the request named was gone, invalid_request = the engine refused the request (such as a source read over its pixel cap), storage = a source read failed, internal = any other. The server log has each render error.",
+          "description": "WMS GetMaps answered with the red error tile per second, by collection and reason (wms_error_tiles_total). They are HTTP 200, so the status code panels never count them. reason: not_found = the data the request named was gone, invalid_request = the engine refused the request (such as a source read over its pixel cap), storage = a source read failed, internal = any other. The WmsErrorTiles alert counts only storage and internal; the other two are mostly a client's request, though some engines report a data fault with them, which only this panel shows. The server log has each render error.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -23125,8 +23125,8 @@
         "kind": "Panel",
         "spec": {
           "id": 153,
-          "title": "WMS error-tile ratio by collection",
-          "description": "The share of each collection's GetMap responses that are the red error tile: error tiles over error tiles plus served renders (render_duration_seconds, api wms). The red line is the WmsErrorTiles alert's 5 %, which fires once it has held for 10 min.",
+          "title": "WMS server error-tile ratio by collection",
+          "description": "The share of each collection's GetMap responses that are the red error tile of a server-class error, the ratio the WmsErrorTiles alert counts: error tiles with reason storage or internal over every error tile plus served renders (render_duration_seconds, api wms). Tiles with reason not_found or invalid_request, mostly a client's request, count only as GetMaps served; WMS error tiles shows every reason. The red line is the alert's 5 %, which fires once it has held for 10 min.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -23145,7 +23145,7 @@
                         "name": "${DS_PROMETHEUS}"
                       },
                       "spec": {
-                        "expr": "sum by (collection) (rate(wms_error_tiles_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval])) / (sum by (collection) (rate(wms_error_tiles_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval])) + (sum by (collection) (rate(render_duration_seconds_count{job=~\"$job\", api=\"wms\", collection=~\"$collection\"}[$__rate_interval])) or sum by (collection) (rate(wms_error_tiles_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval])) * 0))",
+                        "expr": "sum by (collection) (rate(wms_error_tiles_total{job=~\"$job\", collection=~\"$collection\", reason=~\"storage|internal\"}[$__rate_interval])) / (sum by (collection) (rate(wms_error_tiles_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval])) + (sum by (collection) (rate(render_duration_seconds_count{job=~\"$job\", api=\"wms\", collection=~\"$collection\"}[$__rate_interval])) or sum by (collection) (rate(wms_error_tiles_total{job=~\"$job\", collection=~\"$collection\"}[$__rate_interval])) * 0))",
                         "legendFormat": "{{collection}}",
                         "range": true,
                         "instant": false,
