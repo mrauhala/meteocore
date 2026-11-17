@@ -109,10 +109,23 @@ around `ds-storage` calls (Critical Rules 6–7).
   `COMPOSITE_CACHE`, `[memory.caches] odim_composite`), shared by renders and
   EDR. A request waits for another's fill until its deadline
   (`get_or_insert_with_until`, #1399), then `DeadlineExceeded`; the fill
-  lands for later requests, and none starts past the deadline. A fetch's
-  own deadline stays `DeadlineExceeded`, never an `Engine` error. COMP EDR
-  position/area leave a gap for an unreadable file but fail the query on a
-  deadline (504), never a gap for it. Pinned by
+  lands for later requests, and none starts past the deadline.
+- **A COMP read that fails fails the request (#1496).** `fetch_bytes`
+  returns a `FetchError`, and `FetchError::into_request_error` maps it:
+  the fetch's own deadline stays `DeadlineExceeded`; a store that kept
+  answering 429/502/503/504 stays `Unavailable` through
+  `with_storage_context` (503, `Retry-After: 10`); any other failed read,
+  a 401/403 refusal and a local read error other than `NotFound` included,
+  is `ResourceExhausted` (503), its detail logged at WARN. All three are
+  `ErrorClass::is_transient`, and EDR position/area fail the query on a
+  transient error, never a null timestep that the answer's caches would
+  keep; the map path propagates it, so WMS answers 503, not the error
+  tile. Only a file gone since the scan (a typed 404 from
+  `DataStore::head_or_refusal`/`get_or_refusal`, a local `NotFound`),
+  grown past `MAX_REMOTE_FILE_SIZE` or whose bytes do not decode is an
+  `Engine` error: a null timestep in EDR, an error for a map, as before.
+  Never tell them apart by error text. Nothing failed enters
+  `COMPOSITE_CACHE`. Pinned by `composite_read_failure_tests` and
   `a_wait_for_another_composite_fetch_ends_at_the_deadline`.
 - **The sweep a map draws is `drawn_sweep`**: among the sweeps carrying the
   quantity, the one nearest `z`, else the lowest. `polar_sample` and the

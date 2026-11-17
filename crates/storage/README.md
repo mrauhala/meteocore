@@ -225,9 +225,12 @@ tell a gone object from a failed read.
 `get_or_refusal` (and `_on`) reads a whole object the same way (#1046): a
 404 is `NotFound` and a 401 or 403 `Forbidden`, which S3 also answers for a
 missing key when the caller may not list the bucket. The PVOL engine tells
-a gone volume from one its credentials may not read with it. `get_opt`,
-for Zarr, keeps a missing object `Ok(None)` and every other failure an
-`Err`.
+a gone volume from one its credentials may not read with it.
+`head_or_refusal` answers a HEAD's refusals the same way, with the
+object's metadata otherwise: the ODIM composite engine checks a file's
+size with it before reading the file, and tells a file gone since the scan
+from a failed read (#1496). `get_opt`, for Zarr, keeps a missing object
+`Ok(None)` and every other failure an `Err`.
 
 `get_ranges_or_refusal` (and `_on`) reads several byte ranges of one object
 under the request budget: one GET per range, up to ten at once, through
