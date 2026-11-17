@@ -28,7 +28,7 @@ use ds_core::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, Raste
 use ds_core::station_map::MAX_FRAME_ROWS;
 use ds_render::station_symbols::{Marker, StationLayers};
 
-use crate::engine::{round_stored, BufrEngine};
+use crate::engine::BufrEngine;
 use crate::metadata::Snapshot;
 use crate::params::ParameterTable;
 
@@ -128,6 +128,15 @@ impl BufrEngine {
         }
         Ok(markers)
     }
+}
+
+/// A store row's `f32` as a marker's colour value: rounded to 1e-5, the
+/// decimal the producer encoded for a value under about 100, so one encoded
+/// at a step palette's stop is coloured in that stop's class (`0.7` mm, not
+/// the `f32`'s `0.699999988` below it). EDR widens exactly and writes the
+/// shortest `f32` text instead (#1497).
+fn round_stored(v: f32) -> f64 {
+    (f64::from(v) * 1e5).round() / 1e5
 }
 
 /// The content version a snapshot stands for: its version, never `0`

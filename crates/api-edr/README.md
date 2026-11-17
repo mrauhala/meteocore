@@ -369,9 +369,9 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   | Engine | Precision |
   |---|---|
   | GRIB | `f32`: every packing the engine reads decodes to `f32`; template 5.4 IEEE fields are not readable |
-  | QueryData, NetCDF, ODIM composite and PVOL, Station grid, Period | `f32`: QueryData stores `f32`, NetCDF decodes every stored type to `f32`, ODIM's raws are 8- or 16-bit or `f32`, the analysis and window grids are `f32` |
+  | QueryData, NetCDF, ODIM composite and PVOL, BUFR, Station grid, Period | `f32`: QueryData stores `f32`, NetCDF decodes every stored type to `f32`, ODIM's raws are 8- or 16-bit or `f32`, BUFR's report store holds `f32` in display units, the analysis and window grids are `f32` |
   | Zarr, GeoTIFF | the array's or file's data type: `float32` is `f32`; `float64`, and integers, whose unpacked type is not stated, are `f64` |
-  | CSV, BUFR, PostGIS, Satellite, Nowcast | `f64` |
+  | CSV, PostGIS, Satellite, Nowcast | `f64` |
 
 ## Parameter metadata
 

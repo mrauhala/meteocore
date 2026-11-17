@@ -394,6 +394,60 @@ async fn station_series_as_csv() {
     }
 }
 
+/// BUFR's report store holds `f32` (#1497): CoverageJSON, GeoJSON and CSV
+/// write each value as its shortest `f32` text, `1013.4`, never the `f64`
+/// noise `1013.40002` its station and sea-level pressures, which `f32` does
+/// not hold exactly, were written as. Pressures are encoded to 10 Pa, so
+/// each is at most one decimal in hPa. The GeoJSON values are every
+/// station's location series; the others one area answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn bufr_values_are_written_as_their_shortest_f32_text() {
+    let app = app();
+    let query = "/collections/synop/area?coords=POLYGON((-180%20-90,180%20-90,180%2090,\
+                 -180%2090,-180%20-90))&parameter-name=pressure,pressure_msl";
+    let coverage: std::collections::BTreeSet<String> =
+        coverage_cells(&app, &format!("{query}&f=CoverageJSON"))
+            .await
+            .into_values()
+            .map(|(value, _)| value)
+            .filter(|value| !value.is_empty())
+            .collect();
+    // EDR GeoJSON has no area form: each station's location query.
+    let mut geojson_values = std::collections::BTreeSet::new();
+    let locations = geojson(&app, "/collections/synop/locations").await;
+    for station in locations["features"].as_array().unwrap() {
+        let endpoint = station["properties"]["edrqueryendpoint"].as_str().unwrap();
+        let path = endpoint.strip_prefix("https://example.org/edr").unwrap();
+        let series = geojson(
+            &app,
+            &format!("{path}?parameter-name=pressure,pressure_msl&f=GeoJSON"),
+        )
+        .await;
+        for f in series["features"].as_array().unwrap() {
+            for name in ["pressure", "pressure_msl"] {
+                let values = f["properties"][name].as_array().unwrap();
+                geojson_values.extend(values.iter().filter(|v| !v.is_null()).map(Value::to_string));
+            }
+        }
+    }
+    let csv: std::collections::BTreeSet<String> = csv(&app, &format!("{query}&f=CSV"))
+        .await
+        .split_terminator("\r\n")
+        .skip(1)
+        .map(|line| line.split(',').nth(6).unwrap().to_string())
+        .filter(|value| !value.is_empty())
+        .collect();
+    for expected in ["1006.4", "1011.6", "1011.8", "1012.6", "1013.4", "1024.4"] {
+        assert!(coverage.contains(expected), "{expected}: {coverage:?}");
+    }
+    for value in &coverage {
+        let decimals = value.split_once('.').map_or(0, |(_, d)| d.len());
+        assert!(decimals <= 1, "{value}: {coverage:?}");
+    }
+    assert_eq!(geojson_values, coverage);
+    assert_eq!(csv, coverage);
+}
+
 /// `/req/edr-geojson/content` A on `/items`, `/items/{itemId}` and
 /// `/locations`: EDR GeoJSON whose every feature is a station of the
 /// collection's locations, carrying the same members as its `/locations`
