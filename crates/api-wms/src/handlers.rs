@@ -233,7 +233,10 @@ pub struct ErrorTile {
 /// Every [`ErrorTile::reason`], a bounded label set: the data a request
 /// named is gone (`not_found`), the engine refused the request
 /// (`invalid_request`, such as a source read over its pixel cap), a source
-/// read failed (`storage`), or anything else (`internal`).
+/// read failed (`storage`), or anything else (`internal`). The first two a
+/// client's request causes; the last two are exactly the errors of
+/// [`ErrorClass::Internal`], the server-side failures the `WmsErrorTiles`
+/// alert counts (`docker/prometheus/rules/meteocore.yml`, #1476).
 pub const ERROR_TILE_REASONS: [&str; 4] = ["not_found", "invalid_request", "storage", "internal"];
 
 impl ErrorTile {
@@ -1929,21 +1932,36 @@ mod tests {
     }
 
     /// #1375: an error tile's metrics label names why the render failed,
-    /// from a bounded set, and the bottom layer's collection.
+    /// from a bounded set, and the bottom layer's collection. #1476: the
+    /// `WmsErrorTiles` alert counts `storage` and `internal` as server-side
+    /// failures, so those two are exactly the errors of class `Internal`;
+    /// `not_found` and `invalid_request` are a client's request. Every
+    /// variant that reaches a tile (none transient) is listed.
     #[test]
     fn error_tile_reasons_are_a_bounded_set() {
         use DataServerError as E;
         let cases = [
             (E::ReferenceTimeNotFound("run".into()), "not_found"),
             (E::CollectionNotFound("gone".into()), "not_found"),
+            (E::LocationNotFound("site".into()), "not_found"),
+            (E::FeatureNotFound("cell".into()), "not_found"),
             (E::InvalidParameter("source area".into()), "invalid_request"),
+            (E::InvalidDatetime("time".into()), "invalid_request"),
+            (E::InvalidBbox("bbox".into()), "invalid_request"),
             (E::QueryTooLarge("cells".into()), "invalid_request"),
             (E::Storage("reset".into()), "storage"),
             (E::Io(std::io::Error::other("eof")), "storage"),
             (E::Engine("decode".into()), "internal"),
+            (E::Config("style".into()), "internal"),
             (E::Render("encode".into()), "internal"),
         ];
         for (error, reason) in cases {
+            assert!(!error.class().is_transient(), "{error}: the 503, no tile");
+            assert_eq!(
+                matches!(reason, "storage" | "internal"),
+                error.class() == ErrorClass::Internal,
+                "{error}: the alert counts a server-side failure, never a client's request"
+            );
             let tile = ErrorTile::new("radar", &error);
             assert_eq!(
                 tile,
