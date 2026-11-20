@@ -1898,8 +1898,9 @@ fn site_collection_config(id: &str) -> CollectionConfig {
     }
 }
 
-/// Mock engine advertising a fixed spatial extent, for the capabilities bbox.
-struct ExtentMockMapEngine([f64; 4]);
+/// Mock engine advertising a fixed spatial extent, for the capabilities bbox,
+/// or none: an engine before its first scan finds data.
+struct ExtentMockMapEngine(Option<[f64; 4]>);
 
 impl MapEngine for ExtentMockMapEngine {
     fn get_raster_tile(
@@ -1923,7 +1924,7 @@ impl MapEngine for ExtentMockMapEngine {
     fn raster_info(&self) -> RasterInfo {
         RasterInfo {
             native_crs: "CRS:84".into(),
-            spatial_extent: Some(self.0),
+            spatial_extent: self.0,
             times: Vec::new(),
             parameter: "t2m".into(),
             unit: "K".into(),
@@ -1941,12 +1942,16 @@ impl MapEngine for ExtentMockMapEngine {
 /// global 0.25° grid's cell edges reach past both and become the whole globe;
 /// an extent that is still the empty-accumulator sentinel emits no box at all
 /// rather than ±1.8e308. An antimeridian crossing keeps west > east in the
-/// ISO box only.
+/// ISO box only. Each check reads the `grid` layer alone: the root layer
+/// states the whole globe too (#1480).
 #[test]
 fn capabilities_bbox_stays_in_the_crs84_domain() {
     let capabilities = |extent: [f64; 4]| {
         let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
-        engines.insert("grid".to_string(), Arc::new(ExtentMockMapEngine(extent)));
+        engines.insert(
+            "grid".to_string(),
+            Arc::new(ExtentMockMapEngine(Some(extent))),
+        );
         let collections = HashMap::from([("grid".to_string(), site_collection_config("grid"))]);
         let styles: HashMap<String, HashMap<String, StyleInfo>> = HashMap::new();
         let xml = api_wms::capabilities::get_capabilities_xml(
@@ -1956,7 +1961,8 @@ fn capabilities_bbox_stays_in_the_crs84_domain() {
             &HashMap::new(),
             "",
         );
-        String::from_utf8(xml).expect("capabilities XML is UTF-8")
+        let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+        child_layer_section(&xml, "grid").to_string()
     };
 
     let xml = capabilities([-180.125, -90.125, 179.875, 90.125]);
@@ -1994,8 +2000,85 @@ fn capabilities_bbox_stays_in_the_crs84_domain() {
     let xml = capabilities([f64::MAX, f64::MAX, f64::MIN, f64::MIN]);
     assert!(
         !xml.contains("EX_GeographicBoundingBox") && !xml.contains("<BoundingBox"),
-        "a sentinel extent must emit no bounding box; got:\n{xml}"
+        "a sentinel extent must emit no bounding box on its layer; got:\n{xml}"
     );
+}
+
+/// Every named layer has an `EX_GeographicBoundingBox` and a `BoundingBox`,
+/// stated or inherited from a parent (WMS 1.3.0 §7.2.4.6.6, §7.2.4.6.8;
+/// #1480). A collection whose engine knows no extent yet, before its first
+/// scan finds data or while its source is empty, states none, so the root
+/// layer states the whole globe, after its `CRS` elements as the schema's
+/// sequence has it. A layer with an extent states its own, which replaces
+/// the root's.
+#[test]
+fn root_layer_states_the_globe_for_layers_without_an_extent() {
+    let mut engines: HashMap<String, Arc<dyn MapEngine>> = HashMap::new();
+    engines.insert("empty".to_string(), Arc::new(ExtentMockMapEngine(None)));
+    engines.insert(
+        "grid".to_string(),
+        Arc::new(ExtentMockMapEngine(Some([20.0, 58.0, 28.0, 62.0]))),
+    );
+    let collections = HashMap::from([
+        ("empty".to_string(), site_collection_config("empty")),
+        ("grid".to_string(), site_collection_config("grid")),
+    ]);
+    let xml = api_wms::capabilities::get_capabilities_xml(
+        &engines,
+        &collections,
+        &HashMap::new(),
+        &HashMap::new(),
+        "",
+    );
+    let xml = String::from_utf8(xml).expect("capabilities XML is UTF-8");
+
+    let mut root: Vec<String> = element_children(&xml, "Layer")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    root.dedup();
+    assert_eq!(
+        root,
+        [
+            "Title",
+            "CRS",
+            "EX_GeographicBoundingBox",
+            "BoundingBox",
+            "Layer"
+        ],
+        "the root layer's children, in schema order; got:\n{xml}"
+    );
+    let root_start = xml.find("<Layer>").expect("a root layer");
+    let root_head = &xml[root_start..root_start + xml[root_start..].find("<Layer ").unwrap()];
+    assert!(
+        root_head.contains(
+            "<EX_GeographicBoundingBox>\
+             <westBoundLongitude>-180.000000</westBoundLongitude>\
+             <eastBoundLongitude>180.000000</eastBoundLongitude>\
+             <southBoundLatitude>-90.000000</southBoundLatitude>\
+             <northBoundLatitude>90.000000</northBoundLatitude>\
+             </EX_GeographicBoundingBox>\
+             <BoundingBox CRS=\"CRS:84\" minx=\"-180.000000\" miny=\"-90.000000\" \
+             maxx=\"180.000000\" maxy=\"90.000000\"/>"
+        ),
+        "the root layer states the globe; got:\n{root_head}"
+    );
+
+    let empty = child_layer_section(&xml, "empty");
+    assert!(
+        !empty.contains("EX_GeographicBoundingBox") && !empty.contains("<BoundingBox"),
+        "a layer without an extent inherits the root's boxes; got:\n{empty}"
+    );
+    let grid = child_layer_section(&xml, "grid");
+    for element in [
+        "<westBoundLongitude>20.000000</westBoundLongitude>",
+        "<eastBoundLongitude>28.000000</eastBoundLongitude>",
+        "<southBoundLatitude>58.000000</southBoundLatitude>",
+        "<northBoundLatitude>62.000000</northBoundLatitude>",
+        r#"<BoundingBox CRS="CRS:84" minx="20.000000" miny="58.000000" maxx="28.000000" maxy="62.000000"/>"#,
+    ] {
+        assert!(grid.contains(element), "missing {element}; got:\n{grid}");
+    }
 }
 
 /// A multi-parameter (PVOL site) collection emits, per WMS spec, a
@@ -2058,7 +2141,7 @@ fn capabilities_list_layers_in_collection_id_order() {
         let engine: Arc<dyn MapEngine> = if id == "grid-07" {
             Arc::new(SiteMockMapEngine)
         } else {
-            Arc::new(ExtentMockMapEngine([20.0, 58.0, 28.0, 62.0]))
+            Arc::new(ExtentMockMapEngine(Some([20.0, 58.0, 28.0, 62.0])))
         };
         engines.insert(id.clone(), engine);
         collections.insert(id.clone(), site_collection_config(id));
@@ -2127,12 +2210,16 @@ fn capabilities_emit_keywords_and_attribution() {
     // WMS 1.3.0 order: Abstract → KeywordList → (CRS/bbox), and
     // Dimension → Attribution. Anchor on the *layer's own* Abstract content
     // (not a bare `<Abstract>`, which also matches the service-level Abstract
-    // earlier in the document), and on EX_GeographicBoundingBox as the lower
-    // boundary (a root <CRS> appears earlier).
+    // earlier in the document), and on the layer's EX_GeographicBoundingBox
+    // as the lower boundary (the root layer's <CRS> and box appear earlier).
     let layer_abstract = xml.find("<Abstract>PVOL radar site</Abstract>").unwrap();
     let kw = xml.find("<KeywordList>").unwrap();
+    let layer_box = layer_abstract
+        + xml[layer_abstract..]
+            .find("<EX_GeographicBoundingBox>")
+            .unwrap();
     assert!(
-        layer_abstract < kw && kw < xml.find("<EX_GeographicBoundingBox>").unwrap(),
+        layer_abstract < kw && kw < layer_box,
         "KeywordList must sit between the layer Abstract and the bounding box; got:\n{xml}"
     );
     assert!(
@@ -2222,8 +2309,13 @@ fn capabilities_single_param_layer_emits_keywords_and_attribution() {
         .find("<Abstract>Single-param fixture</Abstract>")
         .unwrap();
     let kw = xml.find("<KeywordList>").unwrap();
+    // The layer's own box, after the root layer's (#1480).
+    let layer_box = layer_abstract
+        + xml[layer_abstract..]
+            .find("<EX_GeographicBoundingBox>")
+            .unwrap();
     assert!(
-        layer_abstract < kw && kw < xml.find("<EX_GeographicBoundingBox>").unwrap(),
+        layer_abstract < kw && kw < layer_box,
         "KeywordList must sit between the layer Abstract and the bounding box; got:\n{xml}"
     );
     assert!(
@@ -4031,6 +4123,122 @@ fn capabilities_legend_url_carries_the_full_layer_name() {
         "LegendURL must keep the /param segment (the key GetLegendGraphic \
          resolves); got:\n{vradh}"
     );
+}
+
+/// Each `<Style>`'s name and its LegendURL's href, both unescaped, in
+/// document order.
+fn style_legend_hrefs(xml: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    // The open elements' names, outermost first.
+    let mut path: Vec<String> = Vec::new();
+    let mut style = String::new();
+    let mut urls = Vec::new();
+    loop {
+        match reader.read_event().expect("capabilities XML parses") {
+            Event::Start(e)
+                if e.name().as_ref() == "Name" && path.last().is_some_and(|p| p == "Style") =>
+            {
+                // The raw text, unescaped whole: a Text event stops at the
+                // first entity reference, such as `a&amp;b`'s.
+                let raw = reader.read_text(e.name()).expect("a style name");
+                style = quick_xml::escape::unescape(&raw)
+                    .expect("text unescapes")
+                    .into_owned();
+            }
+            Event::Start(e) => path.push(e.name().as_ref().to_owned()),
+            Event::End(_) => {
+                path.pop();
+            }
+            Event::Empty(e) if path.last().is_some_and(|p| p == "LegendURL") => {
+                let href = e
+                    .try_get_attribute("xlink:href")
+                    .expect("attributes parse")
+                    .expect("a LegendURL OnlineResource has an href")
+                    .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                    .expect("href unescapes")
+                    .into_owned();
+                urls.push((style.clone(), href));
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    urls
+}
+
+/// Every LegendURL GetCapabilities advertises answers with its legend
+/// (#1481), whatever the style is called: the href percent-encodes the
+/// layer and style names, so a `+` (read back as a space), an `&` (which
+/// splits the parameter) or a space (no URL at all) reaches
+/// GetLegendGraphic as the name capabilities wrote. The styles come from
+/// `[[wms.styles]]`, as the server builds them.
+#[tokio::test]
+async fn every_advertised_legend_url_answers_with_its_legend() {
+    const BASE: &str = "https://example.test";
+    const NAMES: [&str; 3] = ["fmi+dbz", "a&b", "a b"];
+    let config: CollectionConfig = serde_json::from_value(serde_json::json!({
+        "id": "radar",
+        "title": "Radar",
+        "description": "Style names with reserved characters",
+        "apis": ["wms"],
+        "engine_type": "geotiff",
+        "wms": {
+            "colormap": "radar_dbz",
+            "styles": NAMES.map(|name| serde_json::json!({"name": name, "colormap": "radar_fmi"})),
+        },
+    }))
+    .unwrap();
+    let styles = ds_render::StyleContext::with_builtins()
+        .collection_styles(&config, None)
+        .unwrap();
+    let engine: Arc<dyn MapEngine> = Arc::new(PopulatedMockMapEngine);
+    let state = Arc::new(ArcSwap::from_pointee(WmsState {
+        engines: HashMap::from([("radar".to_string(), engine)]),
+        collections: HashMap::from([("radar".to_string(), config)]),
+        styles: HashMap::from([("radar".to_string(), styles)]),
+        point_engines: HashMap::new(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
+        base_url: BASE.to_string(),
+        trust_proxy_headers: false,
+    }));
+    let app = axum::Router::new().nest(api_common::mounts::WMS, api_wms::router(state));
+
+    let reply = fetch(&app, "/wms?SERVICE=WMS&REQUEST=GetCapabilities").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let urls = style_legend_hrefs(&reply.text());
+    let mut advertised: Vec<&str> = urls.iter().map(|(style, _)| style.as_str()).collect();
+    advertised.sort_unstable();
+    let mut expected = vec!["default"];
+    expected.extend(NAMES);
+    expected.sort_unstable();
+    assert_eq!(advertised, expected, "one LegendURL per style: {urls:?}");
+
+    let mut broken = Vec::new();
+    for (style, href) in &urls {
+        let path = href
+            .strip_prefix(BASE)
+            .unwrap_or_else(|| panic!("{style:?}: {href} is not under {BASE}"));
+        if let Err(e) = path.parse::<axum::http::Uri>() {
+            broken.push(format!("{style:?}: {href} is no URI: {e}"));
+            continue;
+        }
+        let reply = fetch(&app, path).await;
+        let is_png =
+            reply.content_type == "image/png" && reply.body.starts_with(&[0x89, b'P', b'N', b'G']);
+        if reply.status != StatusCode::OK || !is_png {
+            broken.push(format!(
+                "{style:?}: {href} answers {} {}: {}",
+                reply.status,
+                reply.content_type,
+                reply.text()
+            ));
+        }
+    }
+    assert!(broken.is_empty(), "{broken:#?}");
 }
 
 /// #1133: the root layer of a multi-parameter collection draws the engine's

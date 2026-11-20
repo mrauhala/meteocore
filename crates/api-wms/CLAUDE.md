@@ -440,10 +440,18 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
   fails the suite), and `EXCEPTIONS` is ignored. Honouring
   `INIMAGE`/`BLANK` is open (#1027); add a format there only together with
   the code that serves it.
+- The root `Layer` states an `EX_GeographicBoundingBox` and a `CRS:84`
+  `BoundingBox` of the whole globe after its `CRS`s (#1480): every named
+  layer needs both, stated or inherited, and a collection whose engine has
+  no extent yet states none. A layer with an extent states its own, which
+  replace the root's; both go through `write_bounding_boxes`.
 - `<LegendURL width height>` holds `<Format>` then `<OnlineResource>`. Its
   size is `params::legend_size(None, None)`, the function GetLegendGraphic
   sizes a legend with, so the advertised size is the size the link returns;
-  never hard-code it.
+  never hard-code it. Its href comes from `capabilities::legend_url`, which
+  percent-encodes each query value (#1481): style names are free text and
+  layer names carry parameter names from the data. A new href with a name
+  in it encodes it the same way.
 - Collection `keywords` → `<KeywordList>` (after `<Abstract>`, WMS 1.3.0
   schema order); license → `<Attribution>` (after `<Dimension>` elements).
 - ODIM per-site layers: `<Title>` is prefixed with the site place name via
