@@ -384,7 +384,7 @@ impl Catalog {
             let aabb = AABB::from_corners([west, bbox.south], [east, bbox.north]);
             idx.extend(
                 self.tree
-                    .locate_in_envelope_intersecting(&aabb)
+                    .locate_in_envelope_intersecting(aabb)
                     .map(|e| e.index),
             );
         }
@@ -402,7 +402,7 @@ impl Catalog {
             .into_iter()
             .flat_map(|k| {
                 self.tree
-                    .locate_in_envelope_intersecting(&AABB::from_point([lon - k, lat]))
+                    .locate_in_envelope_intersecting(AABB::from_point([lon - k, lat]))
                     .map(|e| e.index)
             })
             .collect();

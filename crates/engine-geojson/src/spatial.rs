@@ -50,7 +50,7 @@ impl SpatialIndex {
             .flat_map(|&(west, east)| {
                 let query_aabb = AABB::from_corners([west, bbox.south], [east, bbox.north]);
                 self.tree
-                    .locate_in_envelope_intersecting(&query_aabb)
+                    .locate_in_envelope_intersecting(query_aabb)
                     .map(|entry| entry.index)
                     .collect::<Vec<_>>()
             })
