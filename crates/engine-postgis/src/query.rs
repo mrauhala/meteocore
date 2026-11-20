@@ -57,20 +57,23 @@ pub fn events_area_allowed(values_per_row: usize, cap: usize) -> usize {
     (MAX_RESPONSE_VALUES / values_per_row.max(1)).min(cap)
 }
 
-/// Memory guard on the stations an area polygon matches: a ceiling of
-/// 200 000, one past it here because the prefilter fetches one extra row to
-/// detect the breach. NOT the gate on a request's size —
-/// [`MAX_RESPONSE_VALUES`] is (#1062) — but the value budget does not bound
-/// per-station memory, since one value a station still makes a coverage a
-/// station. Before any row, a request holds about 300 bytes a station: the
-/// prefilter's `Location` and, on the set-based path, the id list, its
-/// index and a series slot. That is ≈ 60 MB at this ceiling. The response
-/// then holds a coverage for each station with data, of the order of a
-/// kilobyte each before serialisation, so a request at the ceiling is a
-/// few hundred MB. Well above any station network (national networks hold
-/// thousands, global SYNOP about 20 000); the same figure as the default
-/// `[postgis] max_locations`.
-pub const MAX_STATIONS_IN_POLYGON: usize = 200_000 + 1;
+/// Rows the stations-in-polygon prefilter fetches, in SQL and in memory:
+/// one past [`ds_core::feature::MAX_AREA_POINT_COVERAGES`] (100 000), so a
+/// polygon matching more stations is refused before any observation is
+/// read (`check_area_station_count`, #1501). An area answers a
+/// `PointSeries` coverage per station with data, and an instant leaves each
+/// one value, so [`MAX_RESPONSE_VALUES`] alone would not bound it: the
+/// station count is bounded by coverages, as an events area is by its
+/// events. Counting matched stations, data or not, refuses some answers
+/// that would have fit, but reads nothing first. Before any row, a request
+/// holds about 300 bytes a station: the prefilter's `Location` and, on the
+/// set-based path, the id list, its index and a series slot, ≈ 30 MB at the
+/// cap; the response then holds a coverage for each station with data, of
+/// the order of a kilobyte each before serialisation. Well above any
+/// station network (national networks hold thousands, global SYNOP about
+/// 20 000). Area queries only: `/locations` is bounded by
+/// `[postgis] max_locations` (default 200 000).
+pub const MAX_STATIONS_IN_POLYGON: usize = ds_core::feature::MAX_AREA_POINT_COVERAGES + 1;
 
 /// Ceiling on SQL queries one area **fan-out** may run (stations ×
 /// requested parameters for the `per_parameter` shape; stations × 1 for
@@ -499,8 +502,9 @@ pub fn build_position(
 /// Returned stations become the area query's station set: the set-based
 /// path binds their ids to one statement per observation table
 /// ([`build_area_set`]); the fan-out runs one [`build_location`] per station.
-/// Fetches at most [`MAX_STATIONS_IN_POLYGON`] rows, one past the memory
-/// guard, so the caller can tell a breach.
+/// Fetches at most [`MAX_STATIONS_IN_POLYGON`] rows, one past the coverage
+/// cap, so the caller can tell a breach. The `LIMIT` is an integer literal
+/// from that constant, never a bind or request data.
 pub fn build_stations_in_polygon(
     cfg: &PostgisEngineConfig,
     polygon_wkt: &str,
@@ -2508,12 +2512,20 @@ mod tests {
     }
 
     #[test]
-    fn stations_in_polygon_fetches_one_past_the_memory_guard() {
-        // #1062: the prefilter is a memory guard at 200 000 stations, far
-        // above station networks, not the old 10 001-station ceiling.
-        assert_eq!(MAX_STATIONS_IN_POLYGON, 200_001);
+    fn stations_in_polygon_fetches_one_past_the_coverage_cap() {
+        // #1501: an area answers a coverage per station, so the prefilter
+        // stops one past `MAX_AREA_POINT_COVERAGES`, as the events
+        // statement does; no longer #1062's 200 000-station memory guard.
+        assert_eq!(MAX_STATIONS_IN_POLYGON, 100_001);
+        assert_eq!(
+            MAX_STATIONS_IN_POLYGON,
+            ds_core::feature::MAX_AREA_POINT_COVERAGES + 1
+        );
         let q = build_stations_in_polygon(&long_cfg(), "POLYGON((0 0,1 0,1 1,0 1,0 0))").unwrap();
-        assert!(q.sql.ends_with(" LIMIT 200001"), "{}", q.sql);
+        // An integer literal, not a bind: the polygon is the only parameter.
+        assert!(q.sql.ends_with(" LIMIT 100001"), "{}", q.sql);
+        assert_eq!(q.params.len(), 1);
+        assert!(!q.sql.contains("$2"), "{}", q.sql);
     }
 
     // ---- value filters (#1210) ---------------------------------------------

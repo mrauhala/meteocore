@@ -24,8 +24,9 @@ the root `CLAUDE.md` first — Critical Rules 5–7 and 9–10 apply.
   `missing_values` reject into nulls (#1210), so a missing-value code never
   reaches a slice; do not filter again here. That is
   the set-based "every station at one time" read (#1062). CSV caps an area
-  query at 500 stations — a demo source; BUFR and PostGIS have no station
-  ceiling, only their value budgets.
+  query at 500 stations — a demo source; BUFR and PostGIS at 100 000
+  (`ds_core::feature::MAX_AREA_POINT_COVERAGES`, counted inside the
+  polygon before any observation is read, #1501), and their value budgets.
 - Analysis times: every `cadence`, or without one the source's
   `EdrEngine::observation_instants` (#1206): CSV and BUFR list every
   distinct instant from their in-memory snapshots, off-hour reports

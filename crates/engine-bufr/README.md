@@ -207,9 +207,10 @@ curl 'localhost:8000/features/collections/obs-bufr-local/items?bbox=10,55,30,70'
 - Ships are keyed by call sign and placed at their newest report. Vessels
   reporting the anonymised call sign `SHIP` share one station.
 - A 400 answers a response over 500 000 values (stations × times ×
-  parameters), a non-rectangular polygon over 20 million station × vertex
-  tests, and a `radius` circle that crosses the antimeridian or contains a
-  pole.
+  parameters), an `area` or `radius` holding more than 100 000 stations
+  (with reports in the window or not), a non-rectangular polygon over 20
+  million station × vertex tests, and a `radius` circle that crosses the
+  antimeridian or contains a pole.
 - `data_path` considers at most 50 000 listed objects per scan and skips
   files over 16 MiB.
 - WIS2 has no backfill: reports published while the server was down are

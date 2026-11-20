@@ -13,8 +13,8 @@ use ds_core::config::{BufrConfig, Wis2Config};
 use ds_core::datetime::parse_iso8601_duration;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
-    check_mask_budget, parse_area_coords, parse_point_coords, sort_features, DatetimeInterval,
-    Feature, FeaturePage, FeatureQuery,
+    check_area_station_count, check_mask_budget, parse_area_coords, parse_point_coords,
+    sort_features, DatetimeInterval, Feature, FeaturePage, FeatureQuery, MAX_AREA_POINT_COVERAGES,
 };
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::geo::great_circle_distance_m;
@@ -39,10 +39,12 @@ use crate::wis2::{WarmupClock, Wis2Source};
 use ds_core::station_map::StationMapSettings;
 use ds_render::station_symbols::{StationLayers, StationSymbols};
 
-/// Values (stations × parameters × timesteps) one response may carry. The
-/// only bound on an `area` query's size (#1062): the stations it may touch
-/// are those of the in-memory store, itself bounded by `max_stations`, so a
-/// whole-network instant fits however many stations report.
+/// Values (stations × parameters × timesteps) one response may carry. An
+/// `area` query is bounded by this and by its stations: a polygon matching
+/// more than `ds_core::feature::MAX_AREA_POINT_COVERAGES` (100 000) is
+/// refused before any coverage is built (#1501), since each station's
+/// coverage may hold a single value. A whole-network instant of a
+/// 20 000-station network fits both (#1062).
 pub const MAX_RESPONSE_VALUES: usize = 500_000;
 /// How often the metadata snapshot is rebuilt when the store changed.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(10);
@@ -1018,12 +1020,18 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
         let polygon = parse_area_coords(coords)?;
         let snap = self.snapshot.load();
         check_mask_budget(snap.stations.len(), &polygon)?;
+        // A coverage per station: more stations inside the polygon than an
+        // answer may hold coverages is the 400 before any is built (#1501).
+        // Every matched station counts, reports in the window or not, and
+        // the count stops one past the cap.
         let inside: Vec<&str> = snap
             .stations
             .iter()
             .filter(|s| polygon.contains(s.lon, s.lat))
             .map(|s| &*s.id)
+            .take(MAX_AREA_POINT_COVERAGES + 1)
             .collect();
+        check_area_station_count(inside.len())?;
         let params = self.selected_params(parameters)?;
         let store = self.store.read().unwrap_or_else(|e| e.into_inner());
         let mut budget = MAX_RESPONSE_VALUES;
@@ -1357,19 +1365,29 @@ mod tests {
         assert!(e.store_memory().store_bytes < held.store_bytes);
     }
 
-    // ---- area: the value budget is the only bound (#1062) ------------------
+    // ---- area: the value budget and the coverage cap (#1062, #1501) -------
 
     /// 20 000 stations on a 200 × 100 grid (in the South Pacific, clear of
     /// the fixtures), each reporting air temperature and station pressure at
     /// `times`, in an engine whose `data_path` is an empty directory.
     fn network(times: &[DateTime<Utc>]) -> (BufrEngine, tempfile::TempDir) {
+        network_of(20_000, 0.1, times)
+    }
+
+    /// `stations` stations on a grid of 200 columns `step` degrees apart from
+    /// (170° W, 60° S), northwards, reporting as [`network`]'s do.
+    fn network_of(
+        stations: u32,
+        step: f64,
+        times: &[DateTime<Utc>],
+    ) -> (BufrEngine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let cfg = BufrConfig {
             data_path: Some(dir.path().to_string_lossy().into_owned()),
             wis2: None,
             poll_interval_secs: 60,
             retention: "P36500D".to_string(),
-            max_stations: 50_000,
+            max_stations: (stations as usize).max(50_000),
             stale_after: "PT2H".to_string(),
             position_radius_km: 25.0,
             builtin_parameters: true,
@@ -1379,11 +1397,11 @@ mod tests {
         let e = BufrEngine::new(&cfg, "bufr-network").unwrap();
         {
             let mut store = e.store.write().unwrap();
-            for n in 0..20_000u32 {
+            for n in 0..stations {
                 for &time in times {
                     let report = crate::decode::ObsReport {
-                        lon: -170.0 + f64::from(n % 200) * 0.1,
-                        lat: -60.0 + f64::from(n / 200) * 0.1,
+                        lon: -170.0 + f64::from(n % 200) * step,
+                        lat: -60.0 + f64::from(n / 200) * step,
                         elements: vec![
                             crate::decode::Element {
                                 xy: crate::decode::XY { x: 12, y: 101 },
@@ -1450,6 +1468,70 @@ mod tests {
             }
             other => panic!("expected the value budget's QueryTooLarge, got {other:?}"),
         }
+    }
+
+    /// #1501: an area answers a coverage per station, so a polygon matching
+    /// more stations than `MAX_AREA_POINT_COVERAGES` is the 400 naming the
+    /// cap before any coverage is built, whatever the window holds; one
+    /// matching exactly the cap is answered. A radius query is the area
+    /// query over its circle, so it is bounded the same way.
+    #[test]
+    fn area_over_the_coverage_cap_of_stations_is_a_400_naming_it() {
+        let t0 = Utc.with_ymd_and_hms(2026, 9, 12, 6, 0, 0).unwrap();
+        let t1 = Utc.with_ymd_and_hms(2026, 9, 12, 7, 0, 0).unwrap();
+        // Ten stations past the cap: rows 0..=499 of the 0.01° grid hold
+        // the cap, the ten of row 500 lie at 55° S.
+        let held = MAX_AREA_POINT_COVERAGES as u32 + 10;
+        let (e, _dir) = network_of(held, 0.01, &[t0]);
+        // A second report at `t1` from every 10 000th station, so a window
+        // over `t1` answers ten coverages however many stations match.
+        {
+            let mut store = e.store.write().unwrap();
+            for n in (0..MAX_AREA_POINT_COVERAGES as u32).step_by(10_000) {
+                let report = crate::decode::ObsReport {
+                    lon: -170.0 + f64::from(n % 200) * 0.01,
+                    lat: -60.0 + f64::from(n / 200) * 0.01,
+                    ..report(&format!("0-20000-0-{n:05}"), t1)
+                };
+                assert_ne!(store.ingest(&report, &e.table, t1), Ingest::OutOfWindow);
+            }
+        }
+        e.rebuild_snapshot();
+        let params = ["air_temperature".to_string()];
+        let refused = |result: Result<CoverageResponse, DataServerError>| match result {
+            Err(DataServerError::QueryTooLarge(msg)) => {
+                assert!(msg.contains("100000 stations"), "message: {msg}");
+                assert!(msg.contains("narrow the polygon"), "message: {msg}");
+            }
+            Err(other) => panic!("expected the coverage cap's QueryTooLarge, got {other:?}"),
+            Ok(_) => panic!("expected the coverage cap's QueryTooLarge, got an answer"),
+        };
+
+        let every = "POLYGON((-170.005 -60.005,-167.995 -60.005,-167.995 -54.995,\
+                     -170.005 -54.995,-170.005 -60.005))";
+        refused(e.query_area(every, Some((t1, t1)), Some(&params), None, None));
+        refused(e.query_area(every, Some((t0, t0)), Some(&params), None, None));
+        // A circle around every station.
+        refused(e.query_radius(
+            "POINT(-169 -57.5)",
+            300_000.0,
+            Some((t1, t1)),
+            Some(&params),
+            None,
+            None,
+        ));
+
+        // Without row 500: exactly the cap, answered with the stations that
+        // report in the window.
+        let at_cap = "POLYGON((-170.005 -60.005,-167.995 -60.005,-167.995 -55.005,\
+                      -170.005 -55.005,-170.005 -60.005))";
+        let CoverageResponse::Collection(coverages) = e
+            .query_area(at_cap, Some((t1, t1)), Some(&params), None, None)
+            .unwrap()
+        else {
+            panic!("an area query answers a collection");
+        };
+        assert_eq!(coverages.len(), 10);
     }
 
     // ---- state snapshots and warm-up (#1002) -----------------------------
