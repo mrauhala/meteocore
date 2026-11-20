@@ -38,8 +38,17 @@ around `ds-storage` calls (Critical Rules 6–7).
   snapshot. The server's recovery loop registers a site a later poll finds,
   local or remote, an initially empty source included, within 30 s of that
   poll, reusing the engine (#1462, `crates/server/CLAUDE.md`). A site whose
-  volumes leave the catalog keeps its collection, which answers with no
-  data, until an explicit reload.
+  volumes leave the catalog keeps its collection until an explicit reload,
+  `Degraded` in `/health` (#1511). Its view then has no `by_site_meta`
+  entry, so it serves this until its volumes return:
+  - WMS lists one layer under the site's id, with the default style, no
+    quantity children and no dimensions.
+  - GetMap draws the error tile: `get_raster_tile` answers
+    `InvalidParameter` with no quantity named and `LocationNotFound` with
+    one.
+  - Maps and Tiles answer 400.
+  - EDR answers 404 for `position` and the site's location, and lists no
+    location.
 - `catalog_bytes()` (#1307) is computed in `derive_catalog`: each
   catalogued volume's parsed metadata once (the parse cache shares the
   `Arc`s), the parse cache's table and keys, its `left_out` memory, and

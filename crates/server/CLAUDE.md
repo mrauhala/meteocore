@@ -939,10 +939,44 @@ outage would remove collections one by one at whatever pass came next. The
 pass hands the live `pvol_sites` to `load_collections`
 (`EngineReuse::pvol_sites`), which registers a reused source's sites that
 left the catalog again with their recorded label and quantities, so titles
-and layer styles stay; they stay `Ready` with `collection_has_data` 0. An
-explicit reload or the watcher hands none over: it registers what the
-catalog holds and lists a vanished site `Degraded`, as before, and the loop
-registers the site again once it returns.
+and layer styles stay. An explicit reload or the watcher hands none over:
+it registers what the catalog holds and lists a vanished site `Degraded`,
+as before, and the loop registers the site again once it returns.
+
+A site the catalog does not hold is `Degraded` in `/health` with one
+message, `RADAR_SITE_ABSENT`, on every path (#1511):
+
+- Kept, with or without a pass: `effective_health` demotes its `Ready`
+  entry live, from the engine's `sites()` and `pvol_sites`, and it is
+  `Ready` again as soon as a poll finds its volumes, with no pass.
+- Dropped by an explicit reload: `apply_load` lists it with the same
+  entry, `absent_radar_site`. Recovery passes carry that entry until one
+  serves the site again; the next explicit reload drops it.
+- The load snapshot keeps a kept site `Ready`, so the zero-`Ready` reload
+  guard never counts it. The loop's back-off (`RecoveryOutcome::Pending`)
+  skips absent-site entries (`is_absent_radar_site`): a poll brings the
+  site back, and backing off would only delay the next site's pass.
+  `has_pending_radar` matches configured source ids only, so the site
+  starts no pass.
+- No alert changes: none reads `collections_degraded`, radar sites'
+  series are `alerting="false"`, and the site stays out of
+  `collections_failed`.
+
+Until its volumes return, a kept site serves this, pinned by
+`a_kept_site_serves_one_layer_until_its_volumes_return`:
+
+- WMS: one layer named after the site, with the default style only, no
+  bounding box, no dimensions and no quantity children (`…/DBZH`,
+  `…/CELLS`). GetMap of it, or of a quantity child's name, draws the red
+  error tile (HTTP 200, `x-cache: ERROR`).
+- Maps and Tiles: 400 for its map and map tiles, since the view has no
+  quantity to render.
+- EDR: its metadata and an empty `/locations`; `position` and
+  `/locations/{nod}` are 404.
+- `collection_has_data` 0.
+
+Its quantity layers, their time dimension and its data come back with its
+volumes.
 
 ## GRIB level collections
 

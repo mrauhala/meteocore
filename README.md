@@ -1850,7 +1850,7 @@ A single `odim-volume` source scans a directory / S3 prefix of `.h5` **polar vol
 - **Per-quantity WMS colormaps** via `[[wms.parameters]]` (with the bare quantity as `name`) on the source config — every per-site collection inherits them, so reflectivity, velocity, and dual-pol moments each get a fitting palette instead of one stretched over all of them.
 - **Vertical dimension = elevation angle.** EDR `z` (and WMS `ELEVATION`) selects the sweep.
 - **EDR** supports `position`, `locations` (the radar site), `area`, and **`trajectory`** — vertical cross-sections (RHI-like `Section` coverages, with `z` = height above the antenna via the 4/3-Earth beam model). `MapEngine` renders each quantity to WMS / Maps / Tiles.
-- A radar site that appears in the source after the load, local or remote, becomes a new collection within about 30 s of the poll that finds it, with no reload, also when the source held no sites at load. A site whose volumes leave the source keeps its collection, which then has no data, until the next `POST /admin/collections/reload`.
+- A radar site that appears in the source after the load, local or remote, becomes a new collection within about 30 s of the poll that finds it, with no reload, also when the source held no sites at load. A site whose volumes leave the source keeps its collection until the next `POST /admin/collections/reload`, and `/health` lists it `degraded` ("site no longer present in the latest scan"), as a reload lists a site it drops. Until its volumes return it has no data: WMS lists it as one layer with the default style and no quantity layers or time dimension, and its maps are an error (WMS draws the error tile, Maps and Tiles answer 400). EDR answers 404 for its data. It is `ready` again, with its quantity layers, as soon as a poll finds its volumes.
 
 ```toml
 [[collections]]
@@ -3403,7 +3403,7 @@ The Memory & admission tab stacks RSS less the caches into the stores, the heap 
 | Status | Meaning |
 |--------|---------|
 | `ready` | Engine loaded and has data |
-| `degraded` | Engine loaded but no data yet |
+| `degraded` | Engine loaded but no data yet, or none now: a radar site whose volumes left its source |
 | `failed` | Engine failed to load (error message included) |
 
 Returns HTTP 503 only when all collections have failed.
