@@ -35,6 +35,10 @@ const EXCEPTION_FORMATS: &[&str] = &["XML"];
 /// The image format every LegendURL links to and names in its `<Format>`.
 const LEGEND_URL_FORMAT: &str = "image/png";
 
+/// The root layer's extent, `[west, south, east, north]`: the whole globe,
+/// which a layer whose collection has no extent yet inherits (#1480).
+const ROOT_LAYER_EXTENT: [f64; 4] = [-180.0, -90.0, 180.0, 90.0];
+
 /// Generate WMS 1.3.0 GetCapabilities XML.
 ///
 /// `point_engines` are the collections whose engine answers position
@@ -84,6 +88,14 @@ pub fn get_capabilities_xml(
     for crs in params::supported_crs_list() {
         write_text_element(&mut writer, "CRS", crs);
     }
+
+    // Every named layer has an EX_GeographicBoundingBox and a BoundingBox,
+    // stated or inherited (WMS 1.3.0 §7.2.4.6.6, §7.2.4.6.8). A collection
+    // whose engine reports no extent, before its first scan finds data or
+    // while its source is empty, states neither, so the root states the
+    // whole globe for it to inherit (#1480). A layer with an extent states
+    // its own boxes, which replace these.
+    write_bounding_boxes(&mut writer, ROOT_LAYER_EXTENT);
 
     // Individual layers (one per collection), in collection-id order, as the
     // OGC API `/collections` list. The registry is a HashMap, whose order
@@ -492,33 +504,10 @@ fn write_layer_metadata(
 
     // Geographic bounding box, normalised to the CRS84 domain the schema's
     // longitude/latitude types allow: a global grid's cell edges reach past
-    // ±180°/±90°, and an extent that never saw a point is no extent.
-    if let Some([west, south, east, north]) =
-        info.spatial_extent.and_then(ds_core::geo::crs84_extent)
-    {
-        let _ = writer.write_event(Event::Start(BytesStart::new("EX_GeographicBoundingBox")));
-        write_text_element(writer, "westBoundLongitude", &format!("{west:.6}"));
-        write_text_element(writer, "eastBoundLongitude", &format!("{east:.6}"));
-        write_text_element(writer, "southBoundLatitude", &format!("{south:.6}"));
-        write_text_element(writer, "northBoundLatitude", &format!("{north:.6}"));
-        let _ = writer.write_event(Event::End(BytesEnd::new("EX_GeographicBoundingBox")));
-
-        // `EX_GeographicBoundingBox` is an ISO 19115 box: west > east crosses
-        // the antimeridian (GOES-West, Himawari). A CRS `BoundingBox` is a
-        // min/max envelope with no wrap, so a crossing extent spans every
-        // longitude there.
-        let (min_x, max_x) = if west > east {
-            (-180.0, 180.0)
-        } else {
-            (west, east)
-        };
-        let mut bb = BytesStart::new("BoundingBox");
-        bb.push_attribute(("CRS", "CRS:84"));
-        bb.push_attribute(("minx", format!("{min_x:.6}").as_str()));
-        bb.push_attribute(("miny", format!("{south:.6}").as_str()));
-        bb.push_attribute(("maxx", format!("{max_x:.6}").as_str()));
-        bb.push_attribute(("maxy", format!("{north:.6}").as_str()));
-        let _ = writer.write_event(Event::Empty(bb));
+    // ±180°/±90°, and an extent that never saw a point is no extent. Without
+    // one the layer inherits the root layer's.
+    if let Some(extent) = info.spatial_extent.and_then(ds_core::geo::crs84_extent) {
+        write_bounding_boxes(writer, extent);
     }
 
     // Time dimension
@@ -569,6 +558,35 @@ fn write_layer_metadata(
 
         let _ = writer.write_event(Event::End(BytesEnd::new("Dimension")));
     }
+}
+
+/// Write a layer's `EX_GeographicBoundingBox` and its `CRS:84`
+/// `BoundingBox` for `[west, south, east, north]`, a CRS84 extent, in the
+/// schema's order: after the `CRS` elements, before the `Dimension`s.
+fn write_bounding_boxes(writer: &mut Writer<Vec<u8>>, [west, south, east, north]: [f64; 4]) {
+    let _ = writer.write_event(Event::Start(BytesStart::new("EX_GeographicBoundingBox")));
+    write_text_element(writer, "westBoundLongitude", &format!("{west:.6}"));
+    write_text_element(writer, "eastBoundLongitude", &format!("{east:.6}"));
+    write_text_element(writer, "southBoundLatitude", &format!("{south:.6}"));
+    write_text_element(writer, "northBoundLatitude", &format!("{north:.6}"));
+    let _ = writer.write_event(Event::End(BytesEnd::new("EX_GeographicBoundingBox")));
+
+    // `EX_GeographicBoundingBox` is an ISO 19115 box: west > east crosses
+    // the antimeridian (GOES-West, Himawari). A CRS `BoundingBox` is a
+    // min/max envelope with no wrap, so a crossing extent spans every
+    // longitude there.
+    let (min_x, max_x) = if west > east {
+        (-180.0, 180.0)
+    } else {
+        (west, east)
+    };
+    let mut bb = BytesStart::new("BoundingBox");
+    bb.push_attribute(("CRS", "CRS:84"));
+    bb.push_attribute(("minx", format!("{min_x:.6}").as_str()));
+    bb.push_attribute(("miny", format!("{south:.6}").as_str()));
+    bb.push_attribute(("maxx", format!("{max_x:.6}").as_str()));
+    bb.push_attribute(("maxy", format!("{north:.6}").as_str()));
+    let _ = writer.write_event(Event::Empty(bb));
 }
 
 /// Write style elements for a layer.
@@ -630,9 +648,7 @@ fn write_style(
     legend.push_attribute(("height", height.to_string().as_str()));
     let _ = writer.write_event(Event::Start(legend));
     write_format(writer, LEGEND_URL_FORMAT);
-    let legend_url = format!(
-        "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={layer_name}&STYLE={name}&FORMAT={LEGEND_URL_FORMAT}"
-    );
+    let legend_url = legend_url(base_url, layer_name, name);
     let mut or = BytesStart::new("OnlineResource");
     or.push_attribute(("xlink:type", "simple"));
     or.push_attribute(("xlink:href", legend_url.as_str()));
@@ -640,6 +656,22 @@ fn write_style(
     let _ = writer.write_event(Event::End(BytesEnd::new("LegendURL")));
 
     let _ = writer.write_event(Event::End(BytesEnd::new("Style")));
+}
+
+/// The GetLegendGraphic URL of `layer_name` in style `style`, each query
+/// value percent-encoded (#1481): a `+` in a name would be read back as a
+/// space, an `&` would split the parameter, and a space or a `#` is no URL.
+/// Unreserved characters, `/`, `:` and `,` stay as they are, as RFC 3986
+/// allows in a query, so a `collection/parameter` name reads as before.
+/// The XML writer then escapes the URL as an attribute value.
+fn legend_url(base_url: &str, layer_name: &str, style: &str) -> String {
+    use ds_core::collection_search::encode_query_value as encode;
+    format!(
+        "{base_url}/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER={}&STYLE={}&FORMAT={}",
+        encode(layer_name),
+        encode(style),
+        encode(LEGEND_URL_FORMAT),
+    )
 }
 
 /// Write a simple text element using quick-xml (auto-escapes content).
@@ -680,4 +712,30 @@ fn write_attribution(writer: &mut Writer<Vec<u8>>, license: Option<&LicenseConfi
         let _ = writer.write_event(Event::Empty(or));
     }
     let _ = writer.write_event(Event::End(BytesEnd::new("Attribution")));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A name of unreserved characters, `/`, `:` and `,` keeps the href it
+    /// had before #1481, byte for byte; every other character is
+    /// percent-encoded, as UTF-8 bytes.
+    #[test]
+    fn legend_url_encodes_only_what_a_query_value_must() {
+        assert_eq!(
+            legend_url(
+                "https://example.test/prefix",
+                "radar-1.a_b~c/DBZH:x",
+                "default"
+            ),
+            "https://example.test/prefix/wms?SERVICE=WMS&REQUEST=GetLegendGraphic\
+             &LAYER=radar-1.a_b~c/DBZH:x&STYLE=default&FORMAT=image/png"
+        );
+        assert_eq!(
+            legend_url("", "radar/a b", "fmi+dbz&x=1#y%z°"),
+            "/wms?SERVICE=WMS&REQUEST=GetLegendGraphic&LAYER=radar/a%20b\
+             &STYLE=fmi%2Bdbz%26x%3D1%23y%25z%C2%B0&FORMAT=image/png"
+        );
+    }
 }

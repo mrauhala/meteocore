@@ -67,11 +67,15 @@ validator finds both: GetLegendGraphic is listed as
 `sld:GetLegendGraphic`, an SLD extended operation. `<Service>` advertises
 `LayerLimit` 5 and `MaxWidth` / `MaxHeight` 8000, the limits GetMap
 enforces. `<Exception>` offers `XML` only. Layers come in collection-id
-order. A collection's layer carries the five CRSs, an
-`EX_GeographicBoundingBox` and a `CRS:84` `BoundingBox` when its extent is
-known, its dimensions, a `<KeywordList>` from `keywords` and an
+order. The root layer carries the five CRSs and an
+`EX_GeographicBoundingBox` and `CRS:84` `BoundingBox` of the whole globe. A
+collection's layer carries the five CRSs, its own
+`EX_GeographicBoundingBox` and `CRS:84` `BoundingBox` when its extent is
+known, which replace the root's (a collection without data yet inherits
+them), its dimensions, a `<KeywordList>` from `keywords` and an
 `<Attribution>` from `[collections.license]`. Each named layer lists its
-styles, each with a PNG `LegendURL` of 180 × 300 pixels. Absolute links
+styles, each with a PNG `LegendURL` of 180 × 300 pixels, its layer and
+style names percent-encoded in the link. Absolute links
 use the `BASE_URL` environment variable, else `[server] base_url`, else
 `http://{host}:{port}`; with `[server] trust_proxy_headers = true` they
 follow the request's forwarding headers.
