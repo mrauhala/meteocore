@@ -227,8 +227,29 @@ error images never are. Measured on a day of a live deployment's GetMaps
   #1005) and snaps with `resolve_parameter_time`, so the caches key the
   parameter's own run and timestep.
 - **ELEVATION** — advertised when the collection has a vertical extent
-  (`RasterInfo.vertical`); rejected with 400 `InvalidDimensionValue`
-  otherwise.
+  (`RasterInfo.vertical`), `nearestValue="1"`; rejected with 400
+  `InvalidDimensionValue` otherwise. **Nearest, resolved by the engine
+  (#1477)**, the level-axis twin of #507: `resolve_layer` asks
+  `MapEngine::resolve_elevation(parameter, ELEVATION, time, run)` after
+  the run and time, for every layer with the axis, `ELEVATION` or not,
+  and `ResolvedLayer::elevation` is that level: passed to
+  `get_raster_tile(s)` (direct, meta-tile, contour and composite paths
+  alike) and `content_version_for`, and keyed as `CacheKey.z` and
+  `TileKeyPrefix.z`. So every `ELEVATION` drawing one level, and the
+  default, share one rendered entry and its meta-tiles. Maps and Tiles
+  resolve `elevation` the same way (`api_common::subset::resolve_frame`),
+  so a WMS view and a Maps map whose keys match still share an entry. Never snap onto
+  `RasterInfo.vertical.levels` here: what is drawable is the engine's
+  (GRIB: the parameter's own levels in the selected run; ODIM PVOL: the
+  sweeps carrying the quantity; a derived parameter: its first input's
+  level, which every input must have). The tie rule (midway: the level nearer the ground) is
+  `ds_core::vertical::nearest`'s, which the engines share. An `ELEVATION`
+  the engine resolves to `None` (no level to draw) is
+  `InvalidDimensionValue` in GetMap and GetFeatureInfo, before any read,
+  never the red tile. No `Warning: 99` header (RFC 9111 obsoletes it).
+  Pinned by `tests/elevation.rs` (counting mock: one render for 850 and
+  851, meta-tiles shared, layer lists, the exception) and
+  `crates/server/tests/wms_elevation.rs` (NetCDF, GRIB, PVOL).
 - **`reference_time` (forecast model run, #337/#345):** forecast layers
   (non-empty `RasterInfo.reference_times`) advertise a custom
   `<Dimension name="reference_time">` alongside `time`, defaulting to the
@@ -253,8 +274,8 @@ error images never are. Measured on a day of a live deployment's GetMaps
 - **Content version.** Both keys also carry the frame's
   `MapEngine::content_version_for(parameter, time, reference_time,
   elevation)` (`CacheKey.content_version`, `TileKeyPrefix.content_version`),
-  read in `resolve_layer` right after the time and run resolved, with the
-  arguments the render gets. It is `0` for immutable-timestep engines (the
+  read in `resolve_layer` right after the time, run and level resolved,
+  with the arguments the render gets. It is `0` for immutable-timestep engines (the
   default forwards `content_version()`); an engine whose content for a
   fixed instant is revised in place (engine-cap) bumps it, so an explicit
   `TIME=` render can't be served stale forever from the no-TTL caches.
@@ -277,7 +298,9 @@ error images never are. Measured on a day of a live deployment's GetMaps
   compared as `DateTime<Utc>` so `...+02:00` naming a step stays pinned, AND
   `api_common::subset::is_fixed_run(info.reference_times,
   DIM_REFERENCE_TIME, resolve_parameter_reference_time(..))`: a layer
-  without runs, or one drawing the run the request named. A snapped `TIME`
+  without runs, or one drawing the run the request named; AND an
+  `ELEVATION`, if any, drawn exactly (#1477): one drawn at the nearest
+  level revalidates, as a GRIB run still filling in may gain the level. A snapped `TIME`
   keeps its frame but gets the short header: its URL draws another frame
   once one lands or the window slides. So does a `TIME` on a layer with runs
   and no `DIM_REFERENCE_TIME`: a newer run or nowcast generation re-covers
@@ -532,13 +555,14 @@ compares them). Never unwrap it to `f64` on the way out.
   the image, negative or non-integer is
   `InvalidPoint`.
 - **Dimensions.** The resolved time as `datetime` `(t, t)`, the resolved run
-  as `reference_time`, and as `z` the level GetMap draws:
-  `MapEngine::resolve_elevation(parameter, ELEVATION, time, run)`, with the
-  `ELEVATION` the layer takes (`ResolvedLayer::elevation`), from the
-  parameter, time and run GetMap passes `get_raster_tile`. Never pass
-  `ELEVATION` or `vertical.levels[0]` as such: GRIB draws the run's own
-  first level, and an ODIM volume the nearest sweep carrying the quantity,
-  where the position query matches `z` to one sweep exactly. The response
+  as `reference_time`, and as `z` the level GetMap draws,
+  `ResolvedLayer::elevation`: `resolve_layers` resolved it through
+  `MapEngine::resolve_elevation(parameter, ELEVATION, time, run)` (#1477),
+  and GetFeatureInfo never resolves it a second way. A feature pick gets
+  the same level. Never pass `ELEVATION` or `vertical.levels[0]` as such:
+  an `ELEVATION` between levels reads the nearest, GRIB draws the run's
+  own first level, and an ODIM volume the nearest sweep carrying the
+  quantity, where the position query matches `z` to one sweep exactly. The response
   reports the time, the run and the level when the layer has them.
 - **Execution.** `RenderJob::acquire_feature_info` (the render slots and
   queue GetMap uses, no memory reservation: one point) and `job.run_query`,

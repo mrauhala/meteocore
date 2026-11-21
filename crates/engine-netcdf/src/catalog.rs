@@ -232,29 +232,27 @@ impl Layout {
     }
 
     /// The level a map draws, as an index into the vertical axis's levels:
-    /// `z` (WMS `ELEVATION`, Maps/Tiles `elevation`), which must be one of
-    /// them exactly, else the first, the bottom level. 0 without a vertical
-    /// axis, where the API layers refuse a `z` before it gets here.
+    /// the one nearest `z` (WMS `ELEVATION`, Maps/Tiles `elevation`), else
+    /// the first, the bottom level (#1477). WMS declares the dimension
+    /// `nearestValue="1"`; a `z` midway between two levels draws the lower
+    /// one, nearer the ground, by `ds_core::vertical::nearest`'s tie rule.
+    /// 0 without a vertical axis, where the API layers refuse a `z` before
+    /// it gets here.
     ///
-    /// The render's one level selection, so the default
-    /// `MapEngine::resolve_elevation` (`z`, else the first advertised level)
-    /// names the level drawn: GetFeatureInfo queries that level, and the
-    /// rendered caches, which key on the requested `z`, hold one level per
-    /// key.
+    /// The render's one level selection, and the engine's
+    /// `MapEngine::resolve_elevation`, so the level WMS keys its caches on
+    /// and GetFeatureInfo queries is the level drawn. Only a `z` that is not
+    /// finite selects none.
     pub(crate) fn map_level(&self, z: Option<f64>) -> Result<usize, DataServerError> {
         let (Some(vertical), Some(z)) = (&self.vertical, z) else {
             return Ok(0);
         };
-        vertical
-            .levels
-            .iter()
-            .position(|&level| level == z)
-            .ok_or_else(|| {
-                DataServerError::InvalidParameter(format!(
-                    "Level {z} is not one of this collection's pressure levels: {} hPa",
-                    crate::ingest::list_levels(&vertical.levels)
-                ))
-            })
+        ds_core::vertical::nearest_level(&vertical.levels, z).ok_or_else(|| {
+            DataServerError::InvalidParameter(format!(
+                "Level {z} selects none of this collection's pressure levels: {} hPa",
+                crate::ingest::list_levels(&vertical.levels)
+            ))
+        })
     }
 
     /// The levels an EDR query reads, as indices into the vertical axis's

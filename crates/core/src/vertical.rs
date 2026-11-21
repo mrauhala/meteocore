@@ -184,6 +184,67 @@ pub fn in_axis_order(requested: &[f64], axis: &[f64]) -> Vec<f64> {
     levels
 }
 
+/// The candidate whose level is nearest `z`, the one rule every map render
+/// selects a level by (#1477): WMS capabilities declare each elevation
+/// dimension `nearestValue="1"`, and WMS 1.3.0 C.4.3 makes the server
+/// "compute and send the nearest available value", "rounded, not merely
+/// truncated".
+///
+/// **Ties.** A value exactly between two levels takes the first of them in
+/// `candidates`' order. Given in a [`VerticalDimension`]'s order, bottom
+/// first, that is the level nearer the ground: 925 between 1000 and
+/// 850 hPa draws 1000 hPa, 1.0° between the 0.5° and 1.5° sweeps the 0.5°
+/// one. One rule on every axis, whichever way its values run.
+///
+/// Two distances within [`TIE_TOLERANCE`] × max(1, |level|) of each other
+/// are a tie, scaled by the candidate's level, never by `z`, so a value far
+/// outside the axis still draws its end: decimal levels are not exact in binary, so 0.5 between the 0.3°
+/// and 0.7° sweeps is 0.19999999999999998 from one and 0.19999999999999996
+/// from the other, and without the tolerance the upper sweep would win.
+///
+/// `None` when there is no candidate, or `z` is not finite. A candidate
+/// whose level is NaN is never nearer than one with a finite level.
+pub fn nearest<T>(
+    candidates: impl IntoIterator<Item = T>,
+    z: f64,
+    level: impl Fn(&T) -> f64,
+) -> Option<T> {
+    if !z.is_finite() {
+        return None;
+    }
+    let mut nearest: Option<(T, f64)> = None;
+    for candidate in candidates {
+        let at = level(&candidate);
+        let tolerance = TIE_TOLERANCE * at.abs().max(1.0);
+        // A NaN level is infinitely far.
+        let distance = (at - z).abs();
+        let distance = if distance.is_nan() {
+            f64::INFINITY
+        } else {
+            distance
+        };
+        // A later candidate replaces the nearest so far only when it is
+        // nearer by more than the tolerance: of tied ones, the first stays.
+        match &nearest {
+            Some((_, best)) if distance >= best - tolerance => {}
+            _ => nearest = Some((candidate, distance)),
+        }
+    }
+    nearest.map(|(candidate, _)| candidate)
+}
+
+/// The relative tolerance within which [`nearest`] takes two distances to
+/// be equal: far below any spacing of real levels, far above the error of
+/// decimal levels in binary.
+pub const TIE_TOLERANCE: f64 = 1e-9;
+
+/// The index of the level of `levels` nearest `z` ([`nearest`], whose tie
+/// rule takes the first of two equally near levels: bottom first, the one
+/// nearer the ground). `None` when `levels` is empty or `z` not finite.
+pub fn nearest_level(levels: &[f64], z: f64) -> Option<usize> {
+    nearest(levels.iter().enumerate(), z, |&(_, &level)| level).map(|(i, _)| i)
+}
+
 impl VerticalDimension {
     /// Build a descriptor for `kind` over the given `levels`.
     pub fn new(kind: VerticalKind, levels: Vec<f64>) -> Self {
@@ -238,5 +299,79 @@ mod tests {
         for axis in [&[][..], &[850.0]] {
             assert_eq!(in_axis_order(&[850.0, 500.0], axis), [500.0, 850.0]);
         }
+    }
+
+    /// #1477: the nearest level, rounded rather than truncated, on a
+    /// descending pressure axis and an ascending angle axis alike; a value
+    /// exactly between two levels takes the first in axis order, the one
+    /// nearer the ground.
+    #[test]
+    fn nearest_level_rounds_and_ties_towards_the_ground() {
+        let pressure = [1000.0, 850.0, 500.0, 300.0];
+        let level = |z| nearest_level(&pressure, z).map(|i| pressure[i]);
+        assert_eq!(level(850.0), Some(850.0));
+        assert_eq!(level(851.0), Some(850.0));
+        // Rounded, not truncated: 924 is nearer 850 than 1000, 926 not.
+        assert_eq!(level(924.0), Some(850.0));
+        assert_eq!(level(926.0), Some(1000.0));
+        // The ties: midway is the level nearer the ground.
+        assert_eq!(level(925.0), Some(1000.0));
+        assert_eq!(level(400.0), Some(500.0));
+        // Outside the axis: its end.
+        assert_eq!(level(1100.0), Some(1000.0));
+        assert_eq!(level(1.0), Some(300.0));
+        // However far outside: the tolerance scales with the levels, not z.
+        assert_eq!(level(1e12), Some(1000.0));
+        assert_eq!(level(-1e12), Some(300.0));
+
+        let angles = [0.5, 1.5, 2.5];
+        let angle = |z| nearest_level(&angles, z).map(|i| angles[i]);
+        assert_eq!(angle(1.0), Some(0.5), "the tie on an ascending axis");
+        assert_eq!(angle(1.01), Some(1.5));
+        assert_eq!(angle(-3.0), Some(0.5));
+        assert_eq!(angle(1e12), Some(2.5));
+
+        assert_eq!(nearest_level(&[], 850.0), None);
+        for z in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(nearest_level(&pressure, z), None);
+        }
+        // A NaN level is never the nearest.
+        assert_eq!(nearest_level(&[f64::NAN, 500.0], 1000.0), Some(1));
+        assert_eq!(nearest_level(&[500.0, f64::NAN], 1000.0), Some(0));
+        assert_eq!(nearest_level(&[f64::NAN, f64::NAN], 1000.0), Some(0));
+    }
+
+    /// Decimal levels are inexact in binary: a value midway between two
+    /// FMI-like sweeps is a tie all the same, which the lower sweep wins,
+    /// whatever float error leaves one distance a few ulps short.
+    #[test]
+    fn decimal_levels_tie_within_float_error() {
+        let sweeps = [0.3, 0.5, 0.7, 1.5];
+        let sweep = |z| nearest_level(&sweeps, z).map(|i| sweeps[i]);
+        // In binary 0.7 - 0.5 < 0.5 - 0.3: without the tolerance 0.5
+        // between 0.3 and 0.7 would draw 0.7.
+        let (below, above) = (std::hint::black_box(0.3_f64), 0.7_f64);
+        assert!(above - 0.5 < 0.5 - below);
+        for (z, lower) in [(0.4, 0.3), (0.6, 0.5), (1.1, 0.7)] {
+            assert_eq!(sweep(z), Some(lower), "{z}");
+        }
+        assert_eq!(nearest_level(&[0.3, 0.7], 0.5), Some(0));
+        assert_eq!(nearest_level(&[0.5, 0.7], 0.6), Some(0));
+        for (z, angle) in [
+            (0.3, 0.3),
+            (0.41, 0.5),
+            (0.59, 0.5),
+            (0.61, 0.7),
+            (1.11, 1.5),
+        ] {
+            assert_eq!(sweep(z), Some(angle), "{z}");
+        }
+        // A list in the other order: its first of the tied pair wins.
+        let descending = [1.5, 0.7, 0.5, 0.3];
+        assert_eq!(nearest_level(&descending, 0.6), Some(1));
+        // A large value's float error scales with it.
+        let heights = [10_000.1, 10_000.3];
+        assert_eq!(nearest_level(&heights, 10_000.2), Some(0));
+        assert_eq!(nearest_level(&heights, 10_000.2 + 1e-3), Some(1));
     }
 }

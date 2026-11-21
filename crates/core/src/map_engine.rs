@@ -1087,8 +1087,12 @@ pub trait MapEngine: Send + Sync {
     /// `parameter`, `time`, `reference_time` and `z` can change. The API
     /// layers pass the arguments they render with, the time and run
     /// resolved by [`Self::resolve_parameter_time`] and
-    /// [`Self::resolve_parameter_reference_time`] and the requested `z`, and
-    /// key the rendered and meta-tile caches on the result.
+    /// [`Self::resolve_parameter_reference_time`], and the `z` they render
+    /// with, the level [`Self::resolve_elevation`] names (#1477; as sent
+    /// when it names none), and key the rendered and meta-tile caches on the
+    /// result. An engine that versions per frame selects the level with the
+    /// render's own nearest-level helper, so a `z` between levels versions
+    /// the message it draws.
     ///
     /// An engine whose collection-wide version moves with every catalog
     /// change, while most frames keep their pixels, overrides this so that
@@ -1337,17 +1341,37 @@ pub trait MapEngine: Send + Sync {
     /// `time` and `reference_time` the render is passed, those
     /// [`Self::resolve_parameter_time`] and
     /// [`Self::resolve_parameter_reference_time`] resolved. One of
-    /// [`RasterInfo::vertical`]'s levels; `None` for a layer without one.
+    /// [`RasterInfo::vertical`]'s levels; `None` for a layer without one,
+    /// and for a `z` the engine has no level to draw at (a run without
+    /// levels, a radar volume none of whose sweeps carries the quantity).
+    /// A failed run or time selection echoes `z`: the render fails the
+    /// same way, with its own error.
     ///
-    /// WMS GetFeatureInfo passes this level to the collection's position
-    /// query and reports it (#1064), so the value it answers is one the map
-    /// shows. An engine whose render draws another level than `z`, or than
-    /// the first advertised level when `z` is `None`, MUST override this
-    /// with the selection `get_raster_tile` uses, through a shared helper so
-    /// the two cannot drift. GRIB draws the selected run's own first level;
-    /// a radar volume draws the sweep nearest `z`, or the lowest, among
-    /// those carrying the quantity. Default: `z`, else the first advertised
-    /// level. From a snapshot, no I/O.
+    /// The level-axis cache-key authority (#1477), as
+    /// [`Self::resolve_parameter_time`] is the time axis's (#507): WMS, and
+    /// Maps and Tiles through `api_common::subset::resolve_frame`, resolve
+    /// every layer's level through it, after its run and time, pass that
+    /// level to [`Self::get_raster_tile`] and [`Self::content_version_for`]
+    /// and key the rendered and meta-tile caches on it, so the values that
+    /// draw one level share one entry. Drawing the returned level is
+    /// drawing `z`: the selection is idempotent. A `z` resolving to `None`
+    /// is WMS's `InvalidDimensionValue`; Maps and Tiles then render the `z`
+    /// as sent, which fails as it did. GetFeatureInfo passes the level to the
+    /// collection's position query and reports it (#1064), so the value it
+    /// answers is one the map shows.
+    ///
+    /// WMS declares every elevation dimension `nearestValue="1"`, so a
+    /// render passed a `z` between levels draws the nearest level it can
+    /// draw, through [`crate::vertical::nearest`] (its tie rule: the level
+    /// nearer the ground). An engine whose render draws another level than
+    /// `z`, or than the first advertised level when `z` is `None`, MUST
+    /// override this with the selection `get_raster_tile` uses, through a
+    /// shared helper so the two cannot drift: NetCDF and GRIB the nearest
+    /// level (GRIB of the parameter's own levels in the selected run, and
+    /// without `z` its first), a radar volume the nearest sweep, or the lowest, among those
+    /// carrying the quantity. Default, for an engine drawing exactly `z`:
+    /// `z`, else the first advertised level. From a snapshot, no I/O: it
+    /// runs on the render path before the cache lookup.
     fn resolve_elevation(
         &self,
         parameter: Option<&str>,

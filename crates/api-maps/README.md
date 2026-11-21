@@ -94,7 +94,7 @@ tiles, with the Scaling and Background parameters.
 | `f` | `image/png` (default; 8-bit indexed at up to 256 colours, else RGBA), `image/jpeg` or `image/webp`. |
 | `quality` | 1–100 for JPEG (default 85) and WebP (100 is lossless; default `[wms] webp_quality`, else lossless). A 400 with PNG. |
 | `parameter-name` | A parameter or RGB composite from `parameter_names`. An unknown name is a 400 listing the valid ones; a collection without a parameter list ignores it. |
-| `elevation` | One vertical level. A 400 on a collection without a vertical dimension. |
+| `elevation` | One vertical level: a value between levels draws the nearest level the engine can draw, midway the one nearer the ground, and shares that level's cached map; such a map is not `immutable` (#1477). Without it, the engine's default level. A 400 on a collection without a vertical dimension. |
 | `bgcolor` | Background colour: `0xRRGGBB`, `#RRGGBB` or a W3C web colour name, any case. Default white. |
 | `transparent` | `true` or `false`, any case. Default `true` without `bgcolor`, else `false`. |
 | `void-color`, `void-transparent` | The same for the parts of the map outside its CRS. Default `bgcolor` and `transparent`. |

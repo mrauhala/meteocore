@@ -415,6 +415,11 @@ pub struct Catalog {
     pub families: BTreeMap<GribLevelType, Arc<Catalog>>,
     /// Per-run level union, also precomputed for vertical query selection.
     pub levels: BTreeMap<DateTime<Utc>, Vec<f64>>,
+    /// Per run, each parameter's own levels, bottom first (#1477): those
+    /// some step of the run carries it at, of which a map draws the
+    /// nearest, so a map never picks a level only other parameters have.
+    /// Built with `levels` on the scan path.
+    parameter_levels: BTreeMap<DateTime<Utc>, HashMap<String, Vec<f64>>>,
     pub vertical_levels: Vec<f64>,
     valid_times: Vec<DateTime<Utc>>,
     param_names: Vec<String>,
@@ -444,6 +449,16 @@ struct RunTimes {
 impl Catalog {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `parameter`'s own levels in `run`, bottom first (#1477); empty for a
+    /// parameter the run does not carry at any level. From the snapshot.
+    pub(crate) fn parameter_levels(&self, run: &DateTime<Utc>, parameter: &str) -> &[f64] {
+        self.parameter_levels
+            .get(run)
+            .and_then(|levels| levels.get(parameter))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
     }
 
     /// Get the latest (most recent) forecast run.
@@ -750,6 +765,8 @@ impl Catalog {
             for (&rt, run) in &self.runs {
                 let mut steps = BTreeMap::new();
                 let mut levels = std::collections::BTreeSet::new();
+                let mut by_parameter: HashMap<&str, std::collections::BTreeSet<u32>> =
+                    HashMap::new();
                 for (&step, file) in &run.steps {
                     let messages: Vec<_> = file
                         .messages
@@ -762,6 +779,15 @@ impl Catalog {
                     }
                     if family != GribLevelType::Single {
                         levels.extend(messages.iter().filter_map(|m| m.level));
+                        for m in file
+                            .messages
+                            .iter()
+                            .filter(|m| m.level_type() == Some(family))
+                        {
+                            if let Some(level) = m.level {
+                                by_parameter.entry(&m.param).or_default().insert(level);
+                            }
+                        }
                     }
                     steps.insert(
                         step,
@@ -782,6 +808,14 @@ impl Catalog {
                     // Bottom first: largest pressure / largest model level.
                     let levels: Vec<_> = levels.into_iter().rev().map(f64::from).collect();
                     catalog.levels.insert(rt, levels);
+                    let by_parameter = by_parameter
+                        .into_iter()
+                        .map(|(name, levels)| {
+                            let levels = levels.into_iter().rev().map(f64::from).collect();
+                            (name.to_string(), levels)
+                        })
+                        .collect();
+                    catalog.parameter_levels.insert(rt, by_parameter);
                 }
             }
             let levels: std::collections::BTreeSet<_> = catalog

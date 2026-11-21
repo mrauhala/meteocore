@@ -632,21 +632,26 @@ pub(crate) struct ResolvedLayer {
     /// takes it (a `TIME` was sent, and the layer has a time dimension or no
     /// listed layer has one, #1181) and the engine did not snap it; and from
     /// a fixed run ([`api_common::subset::is_fixed_run`], #1421), so its
-    /// engine retains no runs, or it draws the `DIM_REFERENCE_TIME` it takes.
-    /// Only such a layer can be `immutable`. The request's, never a cached
-    /// entry's.
+    /// engine retains no runs, or it draws the `DIM_REFERENCE_TIME` it takes;
+    /// and at the `ELEVATION` it takes, if any, not at the nearest level
+    /// to it (#1477). Only such a layer can be `immutable`. The request's,
+    /// never a cached entry's.
     pub pinned: bool,
     /// The timestep drawn: `TIME`, or the layer's default, snapped by the
     /// engine (#507). `None` when the engine has nothing to draw.
     pub time: Option<DateTime<Utc>>,
     /// The model run drawn (#521); `None` for an engine without runs.
     pub reference_time: Option<DateTime<Utc>>,
-    /// The `ELEVATION` the layer is drawn at: the request's, for a layer
-    /// with an elevation dimension; `None` for one without, which ignores it
-    /// (#1181), and when none was sent.
+    /// The level drawn, for a layer with an elevation dimension: the one
+    /// the engine draws for the layer's `ELEVATION`, or without one its
+    /// default ([`MapEngine::resolve_elevation`], #1477), resolved after
+    /// the run and time. The render is passed it and every cache keys on
+    /// it, so `ELEVATION` values drawing one level share their entries.
+    /// `None` for a layer without the dimension, which ignores `ELEVATION`
+    /// (#1181), and for one whose engine names no default level.
     pub elevation: Option<f64>,
     /// [`MapEngine::content_version_for`] the frame drawn, read right after
-    /// the time resolved.
+    /// the time, run and level resolved.
     pub content_version: u64,
 }
 
@@ -666,10 +671,12 @@ pub(crate) struct ResolvedLayer {
 ///
 /// `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` each apply to the listed
 /// layers that have that dimension, and the others ignore it (#1181). A
-/// value a layer with the dimension cannot take is that layer's error; a
-/// dimension no listed layer has is the request's, as for one layer:
-/// `ELEVATION` and `DIM_REFERENCE_TIME` are `InvalidDimensionValue`, while a
-/// `TIME` goes to every layer, as it always went to a layer without times.
+/// value a layer with the dimension cannot take is that layer's error (an
+/// `ELEVATION` its engine has no level to draw at is
+/// `InvalidDimensionValue`, #1477); a dimension no listed layer has is the
+/// request's, as for one layer: `ELEVATION` and `DIM_REFERENCE_TIME` are
+/// `InvalidDimensionValue`, while a `TIME` goes to every layer, as it
+/// always went to a layer without times.
 pub(crate) fn resolve_layers(
     state: &WmsState,
     params: &GetMapParams,
@@ -750,7 +757,7 @@ pub(crate) fn resolve_layers(
     // advertises on it, or on the parent its child layer inherits it from.
     let has_time = |m: &MapLayer| !m.info.times.is_empty();
     let any_time = layers.iter().any(|(_, m)| has_time(m));
-    Ok(layers
+    layers
         .into_iter()
         .map(|(layer, m)| {
             let time = params.time.filter(|_| !any_time || has_time(&m));
@@ -760,7 +767,7 @@ pub(crate) fn resolve_layers(
                 .filter(|_| !m.info.reference_times.is_empty());
             resolve_layer(layer, m, time, elevation, run)
         })
-        .collect())
+        .collect()
 }
 
 /// The `InvalidDimensionValue` message for a `dimension` no layer of
@@ -779,16 +786,17 @@ fn no_dimension(layers: &[(&str, MapLayer)], dimension: &str) -> String {
     }
 }
 
-/// The timestep, model run and content version GetMap draws one layer at,
-/// from the `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` it takes
-/// ([`resolve_layers`]).
+/// The timestep, model run, level and content version GetMap draws one
+/// layer at, from the `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` it takes
+/// ([`resolve_layers`]). An `ELEVATION` the engine has no level to draw at
+/// is `InvalidDimensionValue` (#1477).
 fn resolve_layer(
     layer: &str,
     map_layer: MapLayer,
     requested_time: Option<DateTime<Utc>>,
-    elevation: Option<f64>,
+    requested_elevation: Option<f64>,
     requested_reference_time: Option<DateTime<Utc>>,
-) -> ResolvedLayer {
+) -> Result<ResolvedLayer, WmsError> {
     let MapLayer {
         collection_id,
         style_layer,
@@ -853,6 +861,48 @@ fn resolve_layer(
     // engines keep the identity default; a parameter with its own
     // time axis snaps on that axis.
     let time = engine.resolve_parameter_time(parameter.as_deref(), time, reference_time);
+    // #1477: the level the engine draws for that frame, the level-axis
+    // mirror of #507. Capabilities declare every elevation dimension
+    // `nearestValue="1"`, so an ELEVATION between levels draws the nearest
+    // level the engine can draw (WMS 1.3.0 C.4.3), which only the engine
+    // knows: GRIB's are the parameter's own in its run, a radar volume's
+    // the sweeps carrying the quantity. Resolved after the run and time it depends
+    // on, before any key is built, and drawn as resolved, so every
+    // ELEVATION drawing one level shares its rendered image and meta-tiles,
+    // and the default (no ELEVATION) shares them with its level. An
+    // ELEVATION the engine has no level for is the exception, never the
+    // error tile.
+    let elevation = info.vertical.as_ref().and_then(|_| {
+        engine.resolve_elevation(
+            parameter.as_deref(),
+            requested_elevation,
+            time,
+            reference_time,
+        )
+    });
+    if let (Some(requested), None) = (requested_elevation, elevation) {
+        // What has no level: the parameter, at the frame drawn. A radar
+        // volume of that time may lack the quantity at every sweep.
+        let what = parameter
+            .as_deref()
+            .map_or_else(|| "the layer".to_string(), |p| format!("'{p}'"));
+        let when = match (time, reference_time) {
+            (Some(t), Some(run)) => format!(
+                " at {} in model run {}",
+                t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                run.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+            (Some(t), None) => format!(
+                " at {}",
+                t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ),
+            _ => String::new(),
+        };
+        return Err(WmsError::InvalidDimensionValue(format!(
+            "Layer '{layer}' has no level to draw at ELEVATION {requested}: \
+             {what} has none{when}"
+        )));
+    }
     // Content revised in place under the same instant (a push-fed
     // alert set, a late GRIB file that changes the message a frame draws)
     // must not hit a stale entry: the version of the frame drawn, at the
@@ -863,14 +913,17 @@ fn resolve_layer(
         engine.content_version_for(parameter.as_deref(), time, reference_time, elevation);
     // The run as named, not normalised: a named latest run the engine draws
     // is as fixed as an older one, and one it falls back from is not (#1421).
+    // An ELEVATION drawn at another level is no more fixed than a snapped
+    // TIME (#1477): a GRIB run still filling in gains the level asked for.
     let pinned = api_common::subset::is_exact_time(requested_time, time)
         && api_common::subset::is_fixed_run(
             &info.reference_times,
             requested_reference_time,
             reference_time,
-        );
+        )
+        && requested_elevation.is_none_or(|z| elevation == Some(z));
 
-    ResolvedLayer {
+    Ok(ResolvedLayer {
         layer: layer.to_string(),
         collection_id,
         engine,
@@ -884,7 +937,7 @@ fn resolve_layer(
         reference_time,
         elevation,
         content_version,
-    }
+    })
 }
 
 /// Main WMS handler — dispatches on REQUEST parameter. `WmsQuery` keys the
@@ -1453,7 +1506,8 @@ struct LayerRender {
     /// version are the ones the engine draws: the key of the layer drawn
     /// alone, so a layer list shares its layers' cached tiles.
     prefix: ds_render::TileKeyPrefix,
-    /// The `ELEVATION` it is drawn at (the prefix holds it quantized).
+    /// The level it is drawn at, [`ResolvedLayer::elevation`] (the prefix
+    /// holds it quantized).
     elevation: Option<f64>,
 }
 

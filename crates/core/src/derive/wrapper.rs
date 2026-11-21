@@ -42,7 +42,11 @@ type TimeAndRun = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 ///   humidity, dew point), as extra `RasterInfo::parameters`. A derived
 ///   tile is its input tiles of the same request (bbox, size, time, z,
 ///   run), combined per pixel: no second projection, and the engine's own
-///   sampling. A formula that reads the level's pressure
+///   sampling. The level is first resolved, `z` or the default, to the
+///   one the engine draws the first input at
+///   ([`MapEngine::resolve_elevation`]), and every input is drawn at that
+///   one level; an input that cannot draw it leaves no level to draw,
+///   never each input at a nearest level of its own (#1477). A formula that reads the level's pressure
 ///   ([`super::Formula::reads_level_pressure`]) takes the isobaric level
 ///   the engine draws its first input at ([`MapEngine::resolve_elevation`]).
 /// - **EDR**: every derived parameter in `parameter_names` and every
@@ -192,6 +196,7 @@ impl Derived {
     ) -> Result<RasterTile, DataServerError> {
         let names: Vec<&str> = d.inputs.iter().map(String::as_str).collect();
         let (time, reference_time) = self.input_frame(d, &names, time, reference_time)?;
+        let z = self.input_level(d, &names, z, time, reference_time)?;
         // The pressure of the level the inputs are drawn at, in Pa.
         let pressure = if d.formula.reads_level_pressure() {
             Some(self.level_pressure(d, names[0], z, time, reference_time)?)
@@ -301,6 +306,62 @@ impl Derived {
             time
         };
         Ok((time, reference_time))
+    }
+
+    /// The one level every input of a derived parameter is drawn at for `z`
+    /// (#1477): the level the engine draws the first of `names` at
+    /// ([`MapEngine::resolve_elevation`]), for `z` or, without one, by
+    /// default, which every other input must draw as itself. Inputs drawn
+    /// from one request share one level even where the engine would pick
+    /// a nearest level for each on its own. `Ok(None)` when the engine
+    /// names no level for the first input (no vertical axis, or none to
+    /// draw); `Err` with the input that cannot draw the first's level:
+    /// then there is no level to draw, never inputs at different levels.
+    fn shared_level<'n>(
+        &self,
+        names: &[&'n str],
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Option<f64>, &'n str> {
+        let Some((&first, others)) = names.split_first() else {
+            return Ok(None);
+        };
+        let Some(level) = self
+            .map
+            .resolve_elevation(Some(first), z, time, reference_time)
+        else {
+            return Ok(None);
+        };
+        match others.iter().find(|&&other| {
+            self.map
+                .resolve_elevation(Some(other), Some(level), time, reference_time)
+                != Some(level)
+        }) {
+            None => Ok(Some(level)),
+            Some(&other) => Err(other),
+        }
+    }
+
+    /// The `z` every input of `d` is drawn at: [`Self::shared_level`], else
+    /// `z` itself when the engine names no level for the first input, so
+    /// the inputs fail as the engine fails, or have no levels. An input
+    /// that cannot draw the first input's level is the error.
+    fn input_level(
+        &self,
+        d: &DerivedParameter,
+        names: &[&str],
+        z: Option<f64>,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<Option<f64>, DataServerError> {
+        match self.shared_level(names, z, time, reference_time) {
+            Ok(level) => Ok(level.or(z)),
+            Err(other) => Err(DataServerError::InvalidParameter(format!(
+                "'{}' has no level to draw: '{other}' is not at the level '{}' is drawn at",
+                d.name, names[0]
+            ))),
+        }
     }
 
     /// The pressure, in Pa, of the isobaric level the engine draws `input`
@@ -999,8 +1060,15 @@ impl MapEngine for Derived {
                 .content_version_for(parameter, time, reference_time, z);
         };
         let names: Vec<&str> = d.inputs.iter().map(String::as_str).collect();
-        match self.input_frame(d, &names, time, reference_time) {
-            Ok((time, reference_time)) => combined_version(names.iter().map(|&input| {
+        // The one frame and level `derived_tile` draws every input at.
+        let frame =
+            self.input_frame(d, &names, time, reference_time)
+                .and_then(|(time, reference_time)| {
+                    let z = self.input_level(d, &names, z, time, reference_time)?;
+                    Ok((time, reference_time, z))
+                });
+        match frame {
+            Ok((time, reference_time, z)) => combined_version(names.iter().map(|&input| {
                 self.map
                     .content_version_for(Some(input), time, reference_time, z)
             })),
@@ -1106,9 +1174,12 @@ impl MapEngine for Derived {
         self.map.pick_features(pick)
     }
 
-    /// A derived parameter is drawn from its inputs at the `z` it is passed,
-    /// so it is drawn at the level the wrapped engine draws its first input
-    /// (u, geopotential) at; every other layer is the wrapped engine's.
+    /// A derived parameter is drawn at the level the wrapped engine draws
+    /// its first input (u, geopotential) at, which every other input must
+    /// draw too ([`Derived::shared_level`], #1477): `None`, no level to
+    /// draw, when one cannot, never inputs at different levels. At the
+    /// frame `derived_tile` draws; a frame that fails echoes `z`, as the
+    /// render then fails. Every other layer is the wrapped engine's.
     fn resolve_elevation(
         &self,
         parameter: Option<&str>,
@@ -1117,12 +1188,19 @@ impl MapEngine for Derived {
         reference_time: Option<DateTime<Utc>>,
     ) -> Option<f64> {
         let plan = self.plan();
-        let parameter = match parameter.and_then(|p| plan.get(p)) {
-            Some(d) => d.inputs.first().map(String::as_str),
-            None => parameter,
+        let Some(d) = parameter.and_then(|p| plan.get(p)) else {
+            return self
+                .map
+                .resolve_elevation(parameter, z, time, reference_time);
         };
-        self.map
-            .resolve_elevation(parameter, z, time, reference_time)
+        let names: Vec<&str> = d.inputs.iter().map(String::as_str).collect();
+        match self.input_frame(d, &names, time, reference_time) {
+            Ok((time, reference_time)) => self
+                .shared_level(&names, z, time, reference_time)
+                .ok()
+                .flatten(),
+            Err(_) => z,
+        }
     }
 }
 

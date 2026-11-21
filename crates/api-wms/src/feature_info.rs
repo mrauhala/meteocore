@@ -22,10 +22,12 @@
 //!   them, all counted.
 //!
 //! The map part resolves through [`resolve_layers`], GetMap's own
-//! resolution, so each query layer's reported time and run are the ones
-//! GetMap draws it at and keys its caches on, and the level through
-//! [`MapEngine::resolve_elevation`], the one GetMap draws. A request with
-//! several `QUERY_LAYERS` answers for each, in `QUERY_LAYERS` order.
+//! resolution, so each query layer's reported time, run and level are the
+//! ones GetMap draws it at and keys its caches on: the level through
+//! [`MapEngine::resolve_elevation`], the nearest the engine draws to
+//! `ELEVATION` (#1477), and an `ELEVATION` it has no level for the same
+//! `InvalidDimensionValue` GetMap answers. A request with several
+//! `QUERY_LAYERS` answers for each, in `QUERY_LAYERS` order.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -308,10 +310,12 @@ struct Query {
     pinned: bool,
     time: Option<DateTime<Utc>>,
     reference_time: Option<DateTime<Utc>>,
-    /// The level GetMap draws, for a layer with an `ELEVATION` dimension.
+    /// The level GetMap draws a value at, for a layer with an `ELEVATION`
+    /// dimension; `None` for features.
     elevation: Option<f64>,
-    /// The `ELEVATION` the layer takes, which a feature pick is given.
-    requested_elevation: Option<f64>,
+    /// The level GetMap draws the layer at, which a feature pick is given:
+    /// [`ResolvedLayer::elevation`].
+    drawn_elevation: Option<f64>,
     content_version: u64,
 }
 
@@ -382,22 +386,17 @@ impl Query {
 
         let (time, reference_time) = (resolved.time, resolved.reference_time);
         // The level GetMap draws for this layer's ELEVATION, or without one,
-        // as the engine selects it (`MapEngine::resolve_elevation`), from
-        // the same parameter, time and run GetMap passes it. It need not be
-        // ELEVATION or the first advertised level: GRIB draws the run's own
-        // first level, a radar volume the nearest sweep carrying the
+        // as `resolve_layers` resolved it through the engine
+        // (`MapEngine::resolve_elevation`, #1477), from the parameter, time
+        // and run GetMap draws: never resolved a second way. It need not be
+        // ELEVATION or the first advertised level: the nearest level the
+        // engine draws, GRIB's of its run, and without ELEVATION the run's
+        // own first level, a radar volume the nearest sweep carrying the
         // quantity. Only a layer with an ELEVATION dimension has one, and
         // only a value has a level: features are picked as drawn.
         let elevation = match read {
             Read::Features(_) => None,
-            _ => resolved.info.vertical.as_ref().and_then(|_| {
-                resolved.engine.resolve_elevation(
-                    resolved.parameter.as_deref(),
-                    resolved.elevation,
-                    time,
-                    reference_time,
-                )
-            }),
+            _ => resolved.elevation,
         };
         Ok(Self {
             layer: resolved.layer.clone(),
@@ -408,7 +407,7 @@ impl Query {
             time,
             reference_time,
             elevation,
-            requested_elevation: resolved.elevation,
+            drawn_elevation: resolved.elevation,
             content_version: resolved.content_version,
         })
     }
@@ -458,7 +457,7 @@ impl Query {
                     point: pixel.point,
                     time: self.time,
                     reference_time: self.reference_time,
-                    z: self.requested_elevation,
+                    z: self.drawn_elevation,
                     limit: pixel.limit.max(1),
                 })
                 .map(Reply::Picked),

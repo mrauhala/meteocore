@@ -329,15 +329,23 @@ pub fn named_run(
     }
 }
 
-/// The frame a map or map tile draws: the time step and model run the
-/// engine renders, which key the rendered caches, and whether the response
-/// may be pinned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The frame a map or map tile draws: the time step, model run and level
+/// the engine renders, which key the rendered caches, and whether the
+/// response may be pinned.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DrawnFrame {
     pub time: Option<DateTime<Utc>>,
     pub reference_time: Option<DateTime<Utc>>,
+    /// The level drawn (#1477), which the render is passed and the caches
+    /// key on: on a collection with a vertical axis, the one the engine
+    /// draws for the request's `elevation`, or without one its default
+    /// ([`MapEngine::resolve_elevation`]); else the `elevation` as sent,
+    /// which the API then refuses. An `elevation` the engine has no level
+    /// for stays as sent, and the render fails on it as before.
+    pub z: Option<f64>,
     /// An instant drawn exactly ([`is_exact_time`]) from a fixed run
-    /// ([`is_fixed_run`]).
+    /// ([`is_fixed_run`]), at the `elevation` sent, if any, not at the
+    /// nearest level to it.
     pub pinned: bool,
 }
 
@@ -360,6 +368,11 @@ pub struct DrawnFrame {
 /// 3. The time step: [`MapEngine::resolve_parameter_time`] in that run
 ///    (#507). A not-yet-ingested time then keys the step drawn, never its
 ///    own; a parameter with its own time axis snaps on that axis.
+/// 4. The level, on a collection with a vertical axis:
+///    [`MapEngine::resolve_elevation`] at that time and run (#1477). An
+///    `elevation` between levels draws the nearest level the engine can
+///    draw, so every value drawing one level, and the default, share one
+///    entry, with WMS's too, which resolves its `ELEVATION` the same way.
 ///
 /// WMS `DIM_REFERENCE_TIME` differs for the latest run named: it asks for
 /// `None`, since WMS clients echo the advertised default run on every
@@ -367,6 +380,7 @@ pub struct DrawnFrame {
 pub fn resolve_frame(
     requested: Option<&RequestedTime>,
     run: Option<DateTime<Utc>>,
+    elevation: Option<f64>,
     engine: &dyn MapEngine,
     info: &RasterInfo,
     parameter: Option<&str>,
@@ -377,13 +391,23 @@ pub fn resolve_frame(
     };
     let reference_time = engine.resolve_parameter_reference_time(parameter, time, run);
     let time = engine.resolve_parameter_time(parameter, time, reference_time);
+    let z = match info.vertical {
+        Some(_) => engine
+            .resolve_elevation(parameter, elevation, time, reference_time)
+            .or(elevation),
+        None => elevation,
+    };
     // Only an instant can pin the image: `*` and intervals follow new data.
+    // A level other than the one asked for may change too: a GRIB run still
+    // filling in gains the level asked for.
     let instant = requested.and_then(|t| t.selection.instant());
     Ok(DrawnFrame {
         time,
         reference_time,
+        z,
         pinned: is_exact_time(instant, time)
-            && is_fixed_run(&info.reference_times, run, reference_time),
+            && is_fixed_run(&info.reference_times, run, reference_time)
+            && elevation.is_none_or(|asked| z == Some(asked)),
     })
 }
 
@@ -1428,12 +1452,13 @@ mod tests {
             };
             let instant = |h| selected(TimeSelection::Instant(hour(h)), false);
             let frame = |time: Option<RequestedTime>, run: Option<u32>| {
-                resolve_frame(time.as_ref(), run.map(hour), &engine, &info, None)
+                resolve_frame(time.as_ref(), run.map(hour), None, &engine, &info, None)
             };
             let drawn = |time: u32, run: u32, pinned: bool| {
                 Ok(DrawnFrame {
                     time: Some(hour(time)),
                     reference_time: Some(hour(run)),
+                    z: None,
                     pinned,
                 })
             };
@@ -1479,6 +1504,88 @@ mod tests {
             assert_eq!(frame(Some(instant(9)), Some(6)), drawn(9, 6, true));
             assert_eq!(frame(Some(instant(3)), None), drawn(3, 0, false));
         }
+    }
+
+    /// Levels 1000, 850 and 500 hPa, drawing the nearest one, and none for
+    /// the parameter `none`. Without an `elevation`, the bottom one.
+    struct Levels;
+
+    impl MapEngine for Levels {
+        fn get_raster_tile(
+            &self,
+            _: [f64; 4],
+            _: u32,
+            _: u32,
+            _: Option<DateTime<Utc>>,
+            _: &ds_core::map_engine::OutputCrs,
+            _: Option<&str>,
+            _: Option<f64>,
+            _: Option<DateTime<Utc>>,
+        ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError> {
+            unreachable!("frame resolution never renders")
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                vertical: Some(ds_core::vertical::VerticalDimension::new(
+                    ds_core::vertical::VerticalKind::Pressure,
+                    LEVELS.to_vec(),
+                )),
+                ..Axis3.raster_info()
+            }
+        }
+
+        fn resolve_elevation(
+            &self,
+            parameter: Option<&str>,
+            z: Option<f64>,
+            _: Option<DateTime<Utc>>,
+            _: Option<DateTime<Utc>>,
+        ) -> Option<f64> {
+            if parameter == Some("none") {
+                return None;
+            }
+            match z {
+                None => Some(LEVELS[0]),
+                Some(z) => ds_core::vertical::nearest_level(&LEVELS, z).map(|i| LEVELS[i]),
+            }
+        }
+    }
+
+    const LEVELS: [f64; 3] = [1000.0, 850.0, 500.0];
+
+    /// #1477: Maps and map tiles draw and key the level the engine draws:
+    /// the nearest to `elevation`, midway the bottom one, the default
+    /// without one. Only a level drawn as asked pins. An `elevation` the
+    /// engine has no level for stays as sent, for the render to refuse, and
+    /// on a collection without levels as sent, for the API to refuse.
+    #[test]
+    fn resolve_frame_draws_the_level_the_engine_draws() {
+        let info = Levels.raster_info();
+        let instant = RequestedTime {
+            selection: TimeSelection::Instant(hour(1)),
+            from_subset: false,
+        };
+        let frame = |z: Option<f64>, parameter| {
+            resolve_frame(Some(&instant), None, z, &Levels, &info, parameter).unwrap()
+        };
+        for (z, drawn, pinned) in [
+            (None, 1000.0, true),
+            (Some(850.0), 850.0, true),
+            (Some(851.0), 850.0, false),
+            (Some(600.0), 500.0, false),
+            (Some(925.0), 1000.0, false),
+        ] {
+            let frame = frame(z, Some("t"));
+            assert_eq!(frame.z, Some(drawn), "{z:?}");
+            assert_eq!(frame.pinned, pinned, "{z:?}");
+            assert_eq!(frame.time, Some(hour(1)));
+        }
+        assert_eq!(frame(Some(851.0), Some("none")).z, Some(851.0));
+        assert_eq!(frame(None, Some("none")).z, None);
+        let flat = Axis3.raster_info();
+        let frame = resolve_frame(Some(&instant), None, Some(851.0), &Axis3, &flat, None).unwrap();
+        assert_eq!(frame.z, Some(851.0));
     }
 
     /// Without its own times for the run, an engine's run selects on the

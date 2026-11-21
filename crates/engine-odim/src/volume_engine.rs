@@ -4307,22 +4307,21 @@ fn nearest_sweep_index(volume: &PolarVolume, target: f64) -> Option<usize> {
 /// sweep carries it. A blind lowest or nearest pick would 400 on a quantity
 /// only higher sweeps carry (split-cut scan strategies), though it is
 /// advertised: the parameter list unions across sweeps. `sweeps` is sorted
-/// ascending by elangle (M1), so the first candidate is the lowest.
+/// ascending by elangle (M1), so the first candidate is the lowest, and a
+/// `z` midway between two sweeps draws the lower one: the shared rule of
+/// every map level, `ds_core::vertical::nearest` (#1477).
 ///
 /// Shared by [`polar_sample`] and the site view's
-/// `MapEngine::resolve_elevation`, so WMS GetFeatureInfo asks the position
-/// query for the sweep GetMap draws (#1064).
+/// `MapEngine::resolve_elevation`, so WMS keys its caches on and
+/// GetFeatureInfo asks the position query for the sweep GetMap draws
+/// (#1064).
 fn drawn_sweep<'v>(volume: &'v PolarVolume, quantity: &str, z: Option<f64>) -> Option<&'v Sweep> {
     let mut candidates = volume
         .sweeps
         .iter()
         .filter(|s| s.moments.iter().any(|m| m.quantity == quantity));
     match z {
-        Some(target) => candidates.min_by(|a, b| {
-            (a.elangle - target)
-                .abs()
-                .total_cmp(&(b.elangle - target).abs())
-        }),
+        Some(target) => ds_core::vertical::nearest(candidates, target, |sweep| sweep.elangle),
         None => candidates.next(),
     }
 }
@@ -6462,12 +6461,17 @@ impl MapEngine for PolarVolumeSiteView {
     /// The sweep angle `get_raster_tile` draws, through the SAME
     /// `select_volume_entry` and `drawn_sweep`, rounded as the advertised
     /// angles are: the sweep nearest `z`, else the lowest, among those that
-    /// carry the quantity. WMS GetFeatureInfo asks the position query for
-    /// it (#1064). The position query matches `z` to a sweep exactly and
-    /// reads only that one: on a split-cut scan whose lowest sweep lacks
-    /// the quantity, the advertised first angle has no value where the map
-    /// shows one, and an `ELEVATION` between sweeps would be a 400. CELLS
-    /// ignores `z`; a site without volumes echoes it.
+    /// carry the quantity. WMS keys its caches on it, so two `ELEVATION`s
+    /// drawing one sweep share their entries (#1477), and renders at it:
+    /// the rounded angle draws the same sweep, the advertised angles being
+    /// a tenth of a degree or more apart. GetFeatureInfo asks the position
+    /// query for it (#1064). The position query matches `z` to a sweep
+    /// exactly and reads only that one: on a split-cut scan whose lowest
+    /// sweep lacks the quantity, the advertised first angle has no value
+    /// where the map shows one, and an `ELEVATION` between sweeps would be
+    /// a 400. CELLS ignores `z`; a site without volumes echoes it, and a
+    /// volume none of whose sweeps carries the quantity has no sweep to
+    /// draw: `None`.
     fn resolve_elevation(
         &self,
         parameter: Option<&str>,
@@ -6485,15 +6489,18 @@ impl MapEngine for PolarVolumeSiteView {
                 .get(&self.nod)
                 .map(|m| m.volume_info.default_quantity.as_str())
         });
-        quantity
-            .zip(catalog.by_site.get(&self.nod))
-            .and_then(|(quantity, volumes)| {
-                let entry = select_volume_entry(volumes, time)?;
-                drawn_sweep(&entry.volume, quantity, z)
-            })
+        let Some((quantity, entry)) = quantity.zip(
+            catalog
+                .by_site
+                .get(&self.nod)
+                .and_then(|volumes| select_volume_entry(volumes, time)),
+        ) else {
+            // The render fails the same way.
+            return z;
+        };
+        drawn_sweep(&entry.volume, quantity, z)
             .map(|sweep| round_elevation(sweep.elangle))
             .filter(|angle| angle.is_finite())
-            .or(z)
     }
 }
 
@@ -12935,6 +12942,15 @@ mod tests {
             resolve(Some(crate::cells::CELLS_PARAMETER), Some(1.2)),
             Some(1.2)
         );
+        // No sweep carries the quantity: no level to draw (#1477), WMS's
+        // InvalidDimensionValue; a site without volumes echoes `z`.
+        assert_eq!(resolve(Some("TH"), Some(0.5)), None);
+        assert_eq!(resolve(Some("TH"), None), None);
+        let gone = site_view_for(HashMap::new(), "fivih");
+        assert_eq!(
+            MapEngine::resolve_elevation(&gone, Some("DBZH"), Some(0.7), time, None),
+            Some(0.7)
+        );
 
         let vradh = ["VRADH".to_string()];
         let position = |z: f64| {
@@ -12952,6 +12968,36 @@ mod tests {
             position(levels[0]),
             Err(DataServerError::LocationNotFound(_))
         ));
+    }
+
+    /// #1477: every `ELEVATION` that draws one sweep resolves to that
+    /// sweep's angle, so WMS keys them on one cache entry, and the angle
+    /// draws that same sweep again; midway between two sweeps the lower
+    /// is drawn, the shared tie rule of every map level.
+    #[test]
+    fn elevations_drawing_one_sweep_resolve_to_its_angle() {
+        let mut vol = synthetic_volume(25.0, 60.0);
+        let mut upper = vol.sweeps[0].clone();
+        upper.elangle = 1.5;
+        vol.sweeps.push(upper);
+        let by_site = HashMap::from([("fivih".to_string(), vec![entry(vol.clone(), "one-sweep")])]);
+        let view = site_view_for(by_site, "fivih");
+        let time = MapEngine::resolve_time(&view, None, None);
+        let resolve = |z| MapEngine::resolve_elevation(&view, Some("DBZH"), Some(z), time, None);
+        for (z, angle) in [
+            (0.3, 0.5),
+            (0.5, 0.5),
+            (0.9, 0.5),
+            (1.0, 0.5),
+            (1.01, 1.5),
+            (1.5, 1.5),
+            (4.0, 1.5),
+        ] {
+            assert_eq!(resolve(z), Some(angle), "{z}");
+            let drawn = drawn_sweep(&vol, "DBZH", Some(z)).unwrap();
+            let again = drawn_sweep(&vol, "DBZH", Some(angle)).unwrap();
+            assert!(std::ptr::eq(drawn, again), "{z}");
+        }
     }
 
     /// `resolve_quantities` unions moments across **all** selected volumes,

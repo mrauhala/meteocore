@@ -2638,9 +2638,10 @@ async fn render_tile(
     )
     .map_err(TilesError::from)?;
 
-    // The time step and run drawn, shared with Maps
+    // The time step, run and level drawn, shared with Maps
     // ([`subset::resolve_frame`]) and resolved BEFORE the cache key is built
-    // (#507, #521): omitted, the engine's default, else the parameter's
+    // (#507, #521, #1477; the level is the engine's nearest to `elevation`,
+    // else its default): omitted, the engine's default, else the parameter's
     // (else the collection's) latest time, or a named run's own latest; an
     // instant as given, snapped to a step; an interval, a partial date or
     // `*` the latest time step inside it. One that selects no time step is
@@ -2650,10 +2651,12 @@ async fn render_tile(
     let subset::DrawnFrame {
         time,
         reference_time,
+        z,
         pinned,
     } = match subset::resolve_frame(
         validated.time.as_ref(),
         run,
+        validated.z,
         engine.as_ref(),
         &raster_info,
         effective_parameter.as_deref(),
@@ -2699,7 +2702,9 @@ async fn render_tile(
         height,
         time,
         parameter: effective_parameter.clone(),
-        z: validated.z.map(ds_render::quantize_z),
+        // The level drawn (#1477): `elevation` values drawing one level, and
+        // the default, share one entry.
+        z: z.map(ds_render::quantize_z),
         // The run drawn, resolved above (#521): the one named, or the
         // engine's pick for the time when none is.
         reference_time,
@@ -2710,7 +2715,7 @@ async fn render_tile(
             effective_parameter.as_deref(),
             time,
             reference_time,
-            validated.z,
+            z,
         ),
         background,
     };
@@ -2805,7 +2810,7 @@ async fn render_tile(
     // The blocking closure returns Ok(None) for empty (all-nodata) tiles,
     // or Ok(Some(bytes)) for tiles with data.
     let render_parameter = effective_parameter;
-    let render_z = validated.z;
+    let render_z = z;
 
     // An all-nodata tile's image, in the requested format at its quality
     // like a populated tile (#1091), painted with its background (#894). A

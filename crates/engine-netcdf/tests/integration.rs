@@ -1766,11 +1766,13 @@ fn pressure_levels_are_the_vertical_axis() {
     assert_eq!(EdrEngine::get_vertical_extent(&surface), None);
 }
 
-/// `ELEVATION`/`elevation` select a level exactly: each draws its own
-/// stored field, a level the collection lacks is a 400 naming the levels,
-/// and several bands at one level sample that level. Each level is a field
-/// of its own in the field cache: two levels are two decodes, and drawing
-/// one again decodes nothing.
+/// `ELEVATION`/`elevation` select a level: each level draws its own stored
+/// field, a value between levels the nearest level's (#1477, WMS
+/// `nearestValue="1"`; midway, the lower one), only a value that is not
+/// finite is a 400 naming the levels, and several bands at one level
+/// sample that level. Each level is a field of its own in the field
+/// cache: two levels are two decodes, and drawing one again decodes
+/// nothing.
 #[test]
 fn each_pressure_level_draws_its_own_field() {
     let engine = meps_pl();
@@ -1791,11 +1793,31 @@ fn each_pressure_level_draws_its_own_field() {
         drawn.windows(2).all(|pair| pair[0] > pair[1]),
         "colder aloft: {drawn:?}"
     );
-    let missing = value_at_level(&engine, cell, "air_temperature_pl", ten, Some(600.0));
+    // Between levels, the nearest: rounded, not truncated; midway between
+    // 1000 and 850 hPa the bottom one; past the axis its end.
+    for (z, nearest) in [
+        (851.0, drawn[1]),
+        (600.0, drawn[2]),
+        (924.0, drawn[1]),
+        (925.0, drawn[0]),
+        (1050.0, drawn[0]),
+        (10.0, drawn[3]),
+    ] {
+        let value = value_at_level(&engine, cell, "air_temperature_pl", ten, Some(z)).unwrap();
+        assert_eq!(value, Some(nearest), "{z}");
+    }
+    let resolve =
+        |z| engine.resolve_elevation(Some("air_temperature_pl"), Some(z), Some(ten), None);
+    assert_eq!(
+        [851.0, 600.0, 924.0, 925.0, 1050.0, 10.0].map(resolve),
+        [850.0, 500.0, 850.0, 1000.0, 1000.0, 300.0].map(Some)
+    );
+    let missing = value_at_level(&engine, cell, "air_temperature_pl", ten, Some(f64::NAN));
     assert!(
         matches!(&missing, Err(DataServerError::InvalidParameter(m)) if m.contains("1000, 850, 500, 300 hPa")),
         "{missing:?}"
     );
+    assert_eq!(resolve(f64::NAN), None, "no level to draw");
     // Several bands at one level, from one output map.
     let bbox = [5.0, 55.0, 30.0, 70.0];
     let bands = engine
@@ -1840,8 +1862,8 @@ fn each_pressure_level_draws_its_own_field() {
 }
 
 /// A map without `ELEVATION` draws the first advertised level, the bottom
-/// one (1000 hPa), so the default `resolve_elevation` names the level drawn
-/// and GetFeatureInfo, which queries that level, reads what GetMap drew.
+/// one (1000 hPa), so `resolve_elevation` names the level drawn and
+/// GetFeatureInfo, which queries that level, reads what GetMap drew.
 #[test]
 fn a_map_without_elevation_draws_the_level_get_feature_info_queries() {
     let engine = meps_pl();
@@ -2133,7 +2155,8 @@ fn derived_wind_pairs_the_components_level_by_level() {
 }
 
 /// A pressure axis stored in Pa (`level`, 50000/85000/100000 Pa, top first)
-/// is served in hPa, bottom first, and selected in hPa. On a
+/// is served in hPa, bottom first, and selected in hPa: a map's `z` in Pa
+/// draws the level nearest that many hPa. On a
 /// latitude/longitude grid earth-relative u/v (`eastward_wind`/
 /// `northward_wind`) give speed and direction at every level.
 #[test]
@@ -2165,7 +2188,12 @@ fn pressure_in_pa_is_served_in_hpa_with_wind_direction_per_level() {
         (t_default - (251.0 - 273.15)).abs() < 1e-4,
         "1000 hPa: {t_default}"
     );
-    assert!(value_at_level(engine.as_ref(), cell, "t", six, Some(85000.0)).is_err());
+    // In hPa: 85000 is past the axis's bottom, so a map draws the nearest
+    // level, 1000 hPa (#1477), not 850.
+    assert_eq!(
+        value_at_level(engine.as_ref(), cell, "t", six, Some(85000.0)).unwrap(),
+        Some(t_default)
+    );
 
     let wind = DerivedWind::new(
         "pa",
