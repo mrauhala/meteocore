@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.16.0](https://github.com/mrauhala/meteocore/compare/v0.15.0...v0.16.0) (2026-11-21)
+
+
+### Features
+
+* **memory:** [memory.caches] as the one home for cache and budget sizes ([#1463](https://github.com/mrauhala/meteocore/issues/1463)) ([39103c3](https://github.com/mrauhala/meteocore/commit/39103c30b2cdb3ff479342054021617d7dfaa9d8))
+* **memory:** re-plan tick and memory pressure valve ([#1465](https://github.com/mrauhala/meteocore/issues/1465)) ([151577a](https://github.com/mrauhala/meteocore/commit/151577a0403ce9dc3a77ea6ac9ef3bb5fc579932))
+* **memory:** cache miss cost, ghost rings for every planned cache, value per byte ([#1467](https://github.com/mrauhala/meteocore/issues/1467)) ([43bb561](https://github.com/mrauhala/meteocore/commit/43bb5612285e3d2d7169483b44635cf5ab2212bd))
+* **memory:** elastic memory between caches, report only ([#1472](https://github.com/mrauhala/meteocore/issues/1472)) ([a4b1d77](https://github.com/mrauhala/meteocore/commit/a4b1d778effbb1a235db750b58df9a797d6ecbd6))
+* **memory:** apply elastic memory behind [memory] elastic ([#1473](https://github.com/mrauhala/meteocore/issues/1473)) ([858fbf9](https://github.com/mrauhala/meteocore/commit/858fbf9a119a5bbf183021f3b01cc3a856ebbfff))
+* **memory:** keep floors and tier-2 reclaim for elastic memory ([#1475](https://github.com/mrauhala/meteocore/issues/1475)) ([10072a6](https://github.com/mrauhala/meteocore/commit/10072a60575ee989da21f8c87f125f949b9565f4))
+* **tiles,maps:** serve the legends of a tiles-only raster collection at the shared root ([#1541](https://github.com/mrauhala/meteocore/issues/1541)) ([bad67f6](https://github.com/mrauhala/meteocore/commit/bad67f6a979b0f5e178dfb5a994a401593b7f265))
+* **edr:** route trajectory queries under a model run instance ([#1544](https://github.com/mrauhala/meteocore/issues/1544)) ([92a19b3](https://github.com/mrauhala/meteocore/commit/92a19b33774f673d3f07ae6e1cf7f92d866c4ee0))
+
+
+### Bug Fixes
+
+* **wms:** bound LAYERS and QUERY_LAYERS lists before resolving names ([#1486](https://github.com/mrauhala/meteocore/issues/1486)) ([136e368](https://github.com/mrauhala/meteocore/commit/136e3680233d952c57fd025fdf7a92755b07f152))
+* **edr:** bound events answers by coverages and admit HTML pages before building them ([#1487](https://github.com/mrauhala/meteocore/issues/1487)) ([07e738b](https://github.com/mrauhala/meteocore/commit/07e738b067cd7fa971852d9159777013c28079eb))
+* **edr:** answer a non-ASCII character in the position keyword with a 400, not a panic ([#1502](https://github.com/mrauhala/meteocore/issues/1502)) ([2ae6af2](https://github.com/mrauhala/meteocore/commit/2ae6af22e96f754835afb19accd1d34a230620c8))
+* **alerts:** count only server-side WMS error tiles in WmsErrorTiles ([#1503](https://github.com/mrauhala/meteocore/issues/1503)) ([dc1790d](https://github.com/mrauhala/meteocore/commit/dc1790d1ff4ccdaf7cc44c506e3c70e0752ac86a))
+* **edr:** accept standard WKT spacing in area polygons ([#1505](https://github.com/mrauhala/meteocore/issues/1505)) ([41cb2ab](https://github.com/mrauhala/meteocore/commit/41cb2abf4f509f8dad766aeae002cb13e51eee2b))
+* **engine-bufr:** write EDR values as their shortest f32 text ([#1507](https://github.com/mrauhala/meteocore/issues/1507)) ([0410574](https://github.com/mrauhala/meteocore/commit/041057440364d28fb67029feaf2196981d7b620c))
+* **server:** register PVOL radar sites that appear after load, local sources included ([#1508](https://github.com/mrauhala/meteocore/issues/1508)) ([526977c](https://github.com/mrauhala/meteocore/commit/526977c6f58afb7d5c6955e117678d1708e5a290))
+* **engine-odim:** fail ODIM composite requests on a failed store read, never a null timestep or the error tile ([#1510](https://github.com/mrauhala/meteocore/issues/1510)) ([9725f8c](https://github.com/mrauhala/meteocore/commit/9725f8cf681a3886429fcf95bb30893d24059d17))
+* **edr:** match parameter-name by the shared rule on GRIB, PVOL, PostGIS and Satellite ([#1509](https://github.com/mrauhala/meteocore/issues/1509)) ([20ebbce](https://github.com/mrauhala/meteocore/commit/20ebbce29b5ca83409cfeedef41961415c7b6c39))
+* **postgis:** parse area polygons before any SQL ([#1512](https://github.com/mrauhala/meteocore/issues/1512)) ([406ed3f](https://github.com/mrauhala/meteocore/commit/406ed3ff36b46b81b650f8c8eb07e0fc719532b1))
+* **edr:** answer a GRIB, Zarr or QueryData collection without data with 404, not 500 ([#1513](https://github.com/mrauhala/meteocore/issues/1513)) ([081b3ce](https://github.com/mrauhala/meteocore/commit/081b3cedaab950df03031065f36ba0b68b698563))
+* **server:** list a PVOL site whose volumes left the catalog as degraded in /health ([#1518](https://github.com/mrauhala/meteocore/issues/1518)) ([89a9976](https://github.com/mrauhala/meteocore/commit/89a99763aa04653b377b7cfa8c842d2b399dd219))
+* **wms:** give the root layer a whole-globe box and percent-encode LegendURL names ([#1519](https://github.com/mrauhala/meteocore/issues/1519)) ([2da6fa0](https://github.com/mrauhala/meteocore/commit/2da6fa0be7e0cc68c71561877c48f603475782f8))
+* **edr:** bound PostGIS stations and BUFR area answers by the 100 000-coverage cap ([#1514](https://github.com/mrauhala/meteocore/issues/1514)) ([8f218e0](https://github.com/mrauhala/meteocore/commit/8f218e0d22478c303d483b8971005bcc9bf1f36b))
+* **wms:** draw the nearest level for an ELEVATION between levels ([#1521](https://github.com/mrauhala/meteocore/issues/1521)) ([3f54a3b](https://github.com/mrauhala/meteocore/commit/3f54a3b53c1338a8415a1eb63470d8f53499a3f3))
+* **postgis:** read an unsettled lightning frame again when a refresh brings a newer strike ([#1524](https://github.com/mrauhala/meteocore/issues/1524)) ([e827ff3](https://github.com/mrauhala/meteocore/commit/e827ff36e318c7b80bdd4339631e06136211aa3c))
+* **wms:** log internal errors once and answer GRIB and ODIM map data faults as server errors ([#1526](https://github.com/mrauhala/meteocore/issues/1526)) ([cbe0d50](https://github.com/mrauhala/meteocore/commit/cbe0d50b0bd7af428ee232eec8326d2609d70df7))
+* **wms:** draw a DIM_REFERENCE_TIME run exactly, by the rule Maps and Tiles use ([#1529](https://github.com/mrauhala/meteocore/issues/1529)) ([1b79ff0](https://github.com/mrauhala/meteocore/commit/1b79ff060cd33bcb2e6bb9451b643b5f0e4571f4))
+* **geotiff:** answer a store that stays unavailable with 503 SourceUnavailable ([#1531](https://github.com/mrauhala/meteocore/issues/1531)) ([25bb1f4](https://github.com/mrauhala/meteocore/commit/25bb1f4ffdcdc1f5585c8cc58faaa073cbc2ad40))
+* **maps,tiles:** percent-encode style names and collection ids in style links ([#1533](https://github.com/mrauhala/meteocore/issues/1533)) ([c8fb919](https://github.com/mrauhala/meteocore/commit/c8fb9190810032893ce2a1767c3ea64a6f55fccc))
+* **maps:** size a center map from the native cell at the centre outside the storage CRS ([#1537](https://github.com/mrauhala/meteocore/issues/1537)) ([8df3c91](https://github.com/mrauhala/meteocore/commit/8df3c914d800c9af2513577f725164f97a76d779))
+* **render:** draw a style range given high to low as its palette reversed ([#1539](https://github.com/mrauhala/meteocore/issues/1539)) ([0e1b087](https://github.com/mrauhala/meteocore/commit/0e1b087b2d111d4ced2af9926dbe41692d200bcd))
+* **geotiff:** answer EDR areas and positions across the antimeridian ([#1543](https://github.com/mrauhala/meteocore/issues/1543)) ([fcfe9e8](https://github.com/mrauhala/meteocore/commit/fcfe9e82eb9a4a622d6ece59f24dacba661ac1de))
+
+
+### Performance Improvements
+
+* **edr:** draw the cross-section PNG on the query executor ([#1504](https://github.com/mrauhala/meteocore/issues/1504)) ([dba1058](https://github.com/mrauhala/meteocore/commit/dba105887e9e66a9c92962a88c439484db8822e7))
+* **odim,querydata:** keep RasterInfo as a snapshot built with the catalog ([#1525](https://github.com/mrauhala/meteocore/issues/1525)) ([aacfea9](https://github.com/mrauhala/meteocore/commit/aacfea9a34d83c6b242e436b409a43f363b5a52a))
+* **edr:** read GeoTIFF and ODIM composite frames a few at a time ([#1527](https://github.com/mrauhala/meteocore/issues/1527)) ([a1af6ce](https://github.com/mrauhala/meteocore/commit/a1af6ce9d8144a285f419dfaae34105632cd9e26))
+* **wms:** cache GetCapabilities per base URL and gzip it once ([#1535](https://github.com/mrauhala/meteocore/issues/1535)) ([b23b785](https://github.com/mrauhala/meteocore/commit/b23b7856c7aab06825e457ca4bdd13d7c9b82554))
+* **edr:** answer a datetime list's instants a few at a time ([#1536](https://github.com/mrauhala/meteocore/issues/1536)) ([3ab2486](https://github.com/mrauhala/meteocore/commit/3ab24864474dd1bba7219a3711ab18d29207849a))
+
 ## [0.15.0](https://github.com/mrauhala/meteocore/compare/v0.14.0...v0.15.0) (2026-11-11)
 
 
