@@ -103,7 +103,7 @@ async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Option<String>, Byte
 /// The acceptance case of #1522: eight instants, every read taking
 /// 250 ms, read four at a time (one fewer than EDR admits on a host of
 /// fewer than five CPUs: three, two, or on two CPUs one at a time) and
-/// answered in about two delays (three at two at a time), well under the
+/// answered in about two delays (four, two at a time), well under the
 /// eight of one instant after another; the answer is the window query's,
 /// byte for byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

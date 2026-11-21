@@ -385,12 +385,19 @@ and never under an instance.
   body, ETag and error never depend on timing: the first instant's error,
   or the budget's 400 at the instant passing it; an instant without an
   answer means the deadline passed (504). The scheduler's own
-  `DeadlineExceeded` falls through to that replay, so an earlier deciding
-  error stays the answer. Instants side by side compete for the engines'
-  process-wide fail-fast byte budgets (`pvol_read`, `netcdf_read`, …): a
-  `ResourceExhausted` while others ran is no answer, starts no more
-  instants beside it, and once the running ones finish, the instants
-  without an answer run one at a time in order until one decides the list.
+  `DeadlineExceeded` falls through to that replay, but no client sees the
+  difference: the executor's `timeout_at` answers a query still running at
+  its deadline with the 504 first. So a deciding error waits for its
+  running siblings, and the list is a 504 if one runs past the deadline.
+  Instants side by side compete for the engines' process-wide fail-fast
+  byte budgets (`pvol_read`, `netcdf_read`, …): a `ResourceExhausted`
+  while others ran is no answer, starts no more instants beside it, and
+  once the running ones finish, the instants without an answer run one at
+  a time in order until one decides the list. GeoTIFF, ODIM and NetCDF
+  also report a store read that failed after its retries as
+  `ResourceExhausted`, so a refused instant is asked again only when the
+  time left before the deadline covers the time its refusal took; else its
+  refusal is the answer (`a_refusal_without_time_for_another_attempt_is_the_answer`).
   Pinned by `answers_are_those_of_one_instant_after_another`,
   `the_first_instant_in_turn_decides_the_error`,
   `a_deciding_error_outlives_the_deadline_of_a_running_sibling`,

@@ -35,6 +35,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
@@ -144,17 +145,23 @@ type Outcome = Result<CoverageResponse, DataServerError>;
 /// instants' order, exactly as one after another were: the first instant
 /// whose error is not "no data", or whose answer takes the values past the
 /// budget, decides the error, and an instant without an answer means the
-/// time ran out first, the 504. A list past its deadline is that 504 only
-/// when no earlier instant decided it. So the outcome never depends on
-/// which answer arrived first, and `merge` sees the answers in the
-/// instants' order.
+/// time ran out first, the 504. Here a list past its deadline is that 504
+/// only when no earlier instant decided it, but the executor answers a
+/// query still running at its deadline with the 504 itself: a deciding
+/// error that waits for a sibling running past the deadline reaches the
+/// client as the 504. So the outcome never depends on which answer arrived
+/// first, and `merge` sees the answers in the instants' order.
 ///
 /// Instants side by side compete for the engines' process-wide fail-fast
 /// byte budgets, which one instant at a time never shared with itself. So
 /// an instant refused with `ResourceExhausted` while others ran is not an
 /// answer: no further instant starts beside it, and once those running
 /// finish, the instants without an answer are queried one at a time, in
-/// order, until one decides the list. A refusal then is the answer.
+/// order, until one decides the list. A refusal then is the answer. A
+/// refused instant is asked again only when the time left before the
+/// deadline covers the time its refusal took, since a store read that
+/// failed after its retries is `ResourceExhausted` too; otherwise its
+/// refusal is the answer as it is.
 ///
 /// An engine that fits an area grid to the value budget fits each
 /// instant's to its share of it ([`AreaShare::answers`], #1436, entered on
@@ -177,12 +184,16 @@ where
         let query = Arc::clone(query);
         move |(index, t): (usize, DateTime<Utc>)| {
             let _share = AreaShare::answers(answers);
-            Ok((index, query((t, t))))
+            let started = Instant::now();
+            let answer = query((t, t));
+            Ok((index, answer, started.elapsed()))
         }
     };
     let mut outcomes: Vec<Option<Outcome>> = Vec::new();
     outcomes.resize_with(answers, || None);
     let outcomes = Mutex::new(outcomes);
+    // How long each instant refused side by side took to be refused.
+    let mut refused: Vec<Option<Duration>> = vec![None; answers];
     let side_by_side = concurrency > 1;
 
     // Side by side. Both flags are read and written on the scheduler's
@@ -198,7 +209,7 @@ where
         concurrency,
         start,
         job(&query),
-        |(index, answer): (usize, Outcome)| {
+        |(index, answer, took): (usize, Outcome, Duration)| {
             match &answer {
                 Ok(response) => {
                     arrived = arrived.saturating_add(count_values(response));
@@ -209,6 +220,7 @@ where
                 Err(DataServerError::LocationNotFound(_)) => {}
                 Err(DataServerError::ResourceExhausted) if side_by_side => {
                     contended.store(true, Ordering::Relaxed);
+                    refused[index] = Some(took);
                     return Ok(());
                 }
                 Err(_) => decided.store(true, Ordering::Relaxed),
@@ -220,23 +232,39 @@ where
     let on_time = in_time(ran)?;
 
     // In turn, after a refusal side by side: the instants without an
-    // answer, in order, until the answers before the next one decide.
+    // answer, in order, until the answers before the next one decide. A
+    // refused instant is asked again only when the time left covers the
+    // time its refusal took: `ResourceExhausted` is also a store read that
+    // failed after its retries, which another attempt would only carry past
+    // the deadline. Without that time its refusal is the answer.
     if on_time && contended.load(Ordering::Relaxed) {
+        let deadline = ds_core::deadline::current();
+        let time_for = |took: Duration| {
+            deadline
+                .is_none_or(|deadline| deadline.saturating_duration_since(Instant::now()) >= took)
+        };
         let unanswered: Vec<(usize, DateTime<Utc>)> = instants
             .iter()
             .copied()
             .enumerate()
             .filter(|&(index, _)| lock(&outcomes)[index].is_none())
             .collect();
-        let next = unanswered.into_iter().take_while(|&(index, _)| {
-            !decides(&lock(&outcomes)[..index], values.max) && !expired()
-        });
+        let next = unanswered
+            .into_iter()
+            .take_while(|&(index, _)| !decides(&lock(&outcomes)[..index], values.max) && !expired())
+            .filter(|&(index, _)| match refused[index] {
+                Some(took) if !time_for(took) => {
+                    lock(&outcomes)[index] = Some(Err(DataServerError::ResourceExhausted));
+                    false
+                }
+                _ => true,
+            });
         let ran = ds_executor::field_jobs::run_field_jobs(
             ds_executor::query_runtime(),
             1,
             next,
             job(&query),
-            |(index, answer): (usize, Outcome)| {
+            |(index, answer, _): (usize, Outcome, Duration)| {
                 lock(&outcomes)[index] = Some(answer);
                 Ok(())
             },
@@ -1342,10 +1370,12 @@ mod tests {
         );
     }
 
-    /// A deciding error waits for the instants running beside it, and stays
-    /// the answer when one of them outlives the deadline: the first
-    /// instant's `Unavailable` at once, the second taking 300 ms past a
-    /// 150 ms deadline, is the 503 it is in turn, not a 504. With the slow
+    /// A deciding error waits for the instants running beside it. Here,
+    /// outside the executor, it stays the list's answer when one of them
+    /// outlives the deadline: the first instant's `Unavailable` at once, the
+    /// second taking 300 ms past a 150 ms deadline, is the 503 it is in
+    /// turn, not this function's 504. Through EDR the executor answers 504
+    /// at the deadline itself, before the sibling ends. With the slow
     /// instant first the list is the 504, as in turn: it ran out of time
     /// before the second instant.
     #[test]
@@ -1431,6 +1461,51 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, DataServerError::ResourceExhausted), "{err:?}");
         assert_eq!(calls.load(Ordering::SeqCst), INSTANT_CONCURRENCY + 1);
+    }
+
+    /// `ResourceExhausted` is also a store read that failed after its
+    /// retries (GeoTIFF, ODIM, NetCDF), each attempt as slow as the store:
+    /// a refused instant is asked again in turn only when the time left
+    /// covers the time its refusal took. Four instants whose reads fail
+    /// after 200 ms, a 300 ms deadline: side by side the refusal is the
+    /// 503 at about 200 ms, as in turn, with no fifth call and never a
+    /// retry's 504.
+    #[test]
+    fn a_refusal_without_time_for_another_attempt_is_the_answer() {
+        let instants: Vec<_> = (1..=4).map(at).collect();
+        let delay = Duration::from_millis(200);
+        for concurrency in [1, INSTANT_CONCURRENCY] {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            let _deadline = ds_core::deadline::enter(Some(deadline));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let started = Instant::now();
+            let err = query_instants(
+                &instants,
+                move || Instant::now() >= deadline,
+                concurrency,
+                LIST_BUDGET,
+                {
+                    let calls = calls.clone();
+                    move |_: Window| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::thread::sleep(delay);
+                        Err(DataServerError::ResourceExhausted)
+                    }
+                },
+            )
+            .unwrap_err();
+            let elapsed = started.elapsed();
+            assert!(
+                matches!(err, DataServerError::ResourceExhausted),
+                "{concurrency}: {err:?}"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                concurrency,
+                "no attempt after them"
+            );
+            assert!(elapsed < delay + delay / 2, "{concurrency}: {elapsed:?}");
+        }
     }
 
     /// An answer deciding the list stops it: no instant starts after it,
