@@ -277,22 +277,16 @@ pub(crate) fn collection_parts(
     let mut style_list = Vec::new();
     for offer in ds_render::collection_style_offers(styles, id, raster_info) {
         let s = offer.style;
+        let style = style_path(root, id, &s.name);
+        let query = parameter_query(offer.parameters.first().copied());
         let links = match layout {
-            Layout::PerApi => {
-                let query = parameter_query(offer.parameters.first().copied());
-                let legend = format!("{root}/collections/{id}/styles/{}/legend{query}", s.name);
-                json!([
-                    {"href": legend, "rel": rel::LEGEND, "type": "application/json"}
-                ])
-            }
+            Layout::PerApi => json!([
+                {"href": format!("{style}/legend{query}"), "rel": rel::LEGEND, "type": "application/json"}
+            ]),
             // The shared root's legend belongs to Maps; Tiles adds each
             // style's map tilesets (merged into the Maps style entry).
             Layout::Shared => json!([{
-                "href": format!(
-                    "{root}/collections/{id}/styles/{}/map/tiles{}",
-                    s.name,
-                    parameter_query(offer.parameters.first().copied())
-                ),
+                "href": format!("{style}/map/tiles{query}"),
                 "rel": rel::TILESETS_MAP,
                 "type": "application/json",
                 "title": "Map tilesets in this style"
@@ -1512,7 +1506,7 @@ impl<'a> TilesetList<'a> {
         parameter: Option<&str>,
     ) -> Self {
         Self {
-            url: format!("{root}/collections/{id}/styles/{style_id}/map/tiles"),
+            url: format!("{}/map/tiles", style_path(root, id, style_id)),
             vector_query: "",
             style: Some((style_id, style)),
             query: parameter_query(parameter),
@@ -1525,6 +1519,19 @@ impl<'a> TilesetList<'a> {
             "links": [{"href": format!("{}{}", self.url, self.query), "rel": "self", "type": "application/json"}]
         })
     }
+}
+
+/// `{root}/collections/{id}/styles/{style}`, the collection id and style
+/// name each a percent-encoded path segment (#1517): nothing restricts
+/// either, and a style named `a/b` or `a#b` would otherwise name another
+/// resource. Names of unreserved characters are their own segments.
+fn style_path(root: &str, id: &str, style: &str) -> String {
+    use api_common::workbench::path_segment;
+    format!(
+        "{root}/collections/{}/styles/{}",
+        path_segment(id),
+        path_segment(style)
+    )
 }
 
 /// `?parameter-name=<parameter>`, percent-encoded, or nothing.

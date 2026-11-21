@@ -89,25 +89,41 @@ type Registries = (
 );
 
 fn registries() -> Registries {
-    let config: CollectionConfig = serde_json::from_value(serde_json::json!({
-        "id": ID, "title": "NWP", "description": "A model",
-        "apis": ["maps", "tiles", "wms"], "engine_type": "grib",
-    }))
-    .unwrap();
-    let ctx = StyleContext::with_builtins();
-    let mut styles = ctx
-        .parameter_layer_styles(&config, None, &Model.raster_info().parameters, &|_, c| c)
-        .unwrap();
-    styles.insert(ID.into(), ctx.collection_styles(&config, None).unwrap());
-    (
-        HashMap::from([(ID.to_string(), config)]),
-        HashMap::from([(ID.to_string(), Arc::new(Model) as Arc<dyn MapEngine>)]),
-        styles,
-    )
+    registries_over(&[(ID, &[])])
 }
 
-fn maps_state() -> api_maps::AppState {
-    let (collections, engines, styles) = registries();
+/// Collections over [`Model`], each `(id, styles)` with its `styles` as
+/// `[[wms.styles]]` over a palette, and the style layers the server builds
+/// from them.
+fn registries_over(collections: &[(&str, &[&str])]) -> Registries {
+    let ctx = StyleContext::with_builtins();
+    let (mut configs, mut engines, mut styles) = (HashMap::new(), HashMap::new(), HashMap::new());
+    for &(id, named) in collections {
+        let mut config = serde_json::json!({
+            "id": id, "title": "NWP", "description": "A model",
+            "apis": ["maps", "tiles", "wms"], "engine_type": "grib",
+        });
+        if !named.is_empty() {
+            config["wms"] = serde_json::json!({
+                "styles": named
+                    .iter()
+                    .map(|name| serde_json::json!({"name": name, "colormap": "viridis"}))
+                    .collect::<Vec<_>>(),
+            });
+        }
+        let config: CollectionConfig = serde_json::from_value(config).unwrap();
+        styles.extend(
+            ctx.parameter_layer_styles(&config, None, &Model.raster_info().parameters, &|_, c| c)
+                .unwrap(),
+        );
+        styles.insert(id.into(), ctx.collection_styles(&config, None).unwrap());
+        engines.insert(id.to_string(), Arc::new(Model) as Arc<dyn MapEngine>);
+        configs.insert(id.to_string(), config);
+    }
+    (configs, engines, styles)
+}
+
+fn maps_state((collections, engines, styles): Registries) -> api_maps::AppState {
     Arc::new(ArcSwap::from_pointee(api_maps::MapsState {
         engines,
         map_tileset_ids: collections.keys().cloned().collect::<HashSet<_>>(),
@@ -121,8 +137,7 @@ fn maps_state() -> api_maps::AppState {
     }))
 }
 
-fn tiles_state() -> api_tiles::AppState {
-    let (collections, map_engines, styles) = registries();
+fn tiles_state((collections, map_engines, styles): Registries) -> api_tiles::AppState {
     Arc::new(ArcSwap::from_pointee(api_tiles::TilesState {
         map_engines,
         collections,
@@ -138,8 +153,7 @@ fn tiles_state() -> api_tiles::AppState {
     }))
 }
 
-fn wms_state() -> api_wms::AppState {
-    let (collections, engines, styles) = registries();
+fn wms_state((collections, engines, styles): Registries) -> api_wms::AppState {
     Arc::new(ArcSwap::from_pointee(api_wms::WmsState {
         engines,
         point_engines: HashMap::new(),
@@ -156,18 +170,32 @@ fn wms_state() -> api_wms::AppState {
 /// The shared root, and the per-API Maps, Tiles and WMS services at their
 /// mounts, as the server serves them.
 fn app() -> Router {
+    app_over(registries)
+}
+
+/// [`app`] over the collections `registries` builds, once per service.
+fn app_over(registries: impl Fn() -> Registries) -> Router {
     let shared = api_common::shared::SharedApi::new(
         "",
         vec![
-            Arc::new(api_maps::MapsBlock::new(maps_state())),
-            Arc::new(api_tiles::TilesBlock::new(tiles_state())),
+            Arc::new(api_maps::MapsBlock::new(maps_state(registries()))),
+            Arc::new(api_tiles::TilesBlock::new(tiles_state(registries()))),
         ],
         vec![],
     );
     Router::new()
-        .nest(api_common::mounts::MAPS, api_maps::router(maps_state()))
-        .nest(api_common::mounts::TILES, api_tiles::router(tiles_state()))
-        .nest(api_common::mounts::WMS, api_wms::router(wms_state()))
+        .nest(
+            api_common::mounts::MAPS,
+            api_maps::router(maps_state(registries())),
+        )
+        .nest(
+            api_common::mounts::TILES,
+            api_tiles::router(tiles_state(registries())),
+        )
+        .nest(
+            api_common::mounts::WMS,
+            api_wms::router(wms_state(registries())),
+        )
         .merge(api_common::shared::router(shared))
 }
 
@@ -377,4 +405,125 @@ async fn styled_tilesets_resolve_the_parameter_layer() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// Style names a path segment cannot carry as they are (#1517): every Maps
+/// and Tiles style link, on the shared root and the per-API services,
+/// percent-encodes the style name and the collection id, and every link it
+/// leads to answers 200. The `/` of `a/b` reaches its route inside one
+/// segment and draws that style; unencoded it names another resource. A
+/// name of unreserved characters keeps its links byte for byte.
+#[tokio::test]
+async fn style_links_encode_names_a_path_segment_cannot_carry() {
+    const PLAIN: &str = "Plain-1.0_x~y";
+    const NAMES: [&str; 4] = ["a b", "a#b", "a/b", PLAIN];
+    const SPACED: &str = "nwp eu";
+    let app = app_over(|| registries_over(&[(ID, &NAMES), (SPACED, &["a/b"])]));
+    fn segment(name: &str) -> &str {
+        match name {
+            "a b" => "a%20b",
+            "a#b" => "a%23b",
+            "a/b" => "a%2Fb",
+            "nwp eu" => "nwp%20eu",
+            plain => plain,
+        }
+    }
+    for (id, names) in [(ID, &NAMES[..]), (SPACED, &["a/b"])] {
+        let collection = segment(id);
+        for (root, description) in [
+            (BASE.to_string(), format!("{BASE}/collections/{collection}")),
+            (
+                format!("{BASE}/maps"),
+                format!("{BASE}/maps/collections/{collection}"),
+            ),
+            (
+                format!("{BASE}/maps"),
+                format!("{BASE}/maps/collections/{collection}/styles"),
+            ),
+            (
+                format!("{BASE}/tiles"),
+                format!("{BASE}/tiles/collections/{collection}"),
+            ),
+        ] {
+            let (status, body) = get(&app, &description).await;
+            assert_eq!(status, StatusCode::OK, "{description}");
+            let doc: Value = serde_json::from_slice(&body).unwrap();
+            let (mut seen, mut statuses) = (BTreeSet::new(), Vec::new());
+            for &name in names {
+                let style = doc["styles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["id"] == name)
+                    .unwrap_or_else(|| panic!("{description} lists {name:?}"));
+                let mut links = Vec::new();
+                collect_links(&style["links"], &mut links);
+                let prefix = format!("{root}/collections/{collection}/styles/{}/", segment(name));
+                assert!(
+                    !links.is_empty() && links.iter().all(|l| l.starts_with(&prefix)),
+                    "{description} {name:?}: {links:?} not below {prefix}"
+                );
+                for link in links {
+                    crawl(&app, link, 3, &mut seen, &mut statuses).await;
+                }
+            }
+            let broken: Vec<_> = statuses
+                .iter()
+                .filter(|(_, status)| !status.is_success())
+                .collect();
+            assert!(broken.is_empty(), "{description}: {broken:?}");
+        }
+    }
+
+    // The links of a plain name are the ones an unencoded name gave.
+    let (_, body) = get(&app, &format!("{BASE}/collections/{ID}")).await;
+    let doc: Value = serde_json::from_slice(&body).unwrap();
+    let plain = doc["styles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == PLAIN)
+        .unwrap();
+    let mut links = Vec::new();
+    collect_links(&plain["links"], &mut links);
+    links.sort();
+    let style = format!("{BASE}/collections/{ID}/styles/{PLAIN}");
+    assert_eq!(
+        links,
+        [
+            format!("{style}/legend"),
+            format!("{style}/map"),
+            format!("{style}/map/tiles"),
+        ]
+    );
+
+    // `a%2Fb` is one segment, the style `a/b`, down to its tiles; `a/b`
+    // unencoded is no style route at all.
+    let (status, body) = get(
+        &app,
+        &format!("{BASE}/collections/{ID}/styles/a%2Fb/map/tiles"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let doc: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(doc["tilesets"][0]["style"]["id"], "a/b");
+    let item = doc["tilesets"][0]["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|l| l["rel"] == "item")
+        .unwrap()["href"]
+        .as_str()
+        .unwrap();
+    assert!(
+        item.starts_with(&format!("{BASE}/collections/{ID}/styles/a%2Fb/map/tiles/")),
+        "{item}"
+    );
+    let (status, body) = get(&app, &tile(item)).await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert!(body.starts_with(b"\x89PNG"), "{item}: not a PNG");
+    for path in ["maps/collections", "tiles/collections", "collections"] {
+        let raw = format!("{BASE}/{path}/{ID}/styles/a/b/legend");
+        assert_eq!(get(&app, &raw).await.0, StatusCode::NOT_FOUND, "{raw}");
+    }
 }
