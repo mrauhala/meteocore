@@ -1017,6 +1017,8 @@ pub struct WmsConfig {
     #[serde(default)]
     pub color_stops: Vec<ColorStop>,
     /// Minimum value for the colormap range. Overrides the colormap's built-in range.
+    /// Above `max`, here or in any style or parameter range, the palette is
+    /// drawn reversed over the range (#872).
     pub min: Option<f64>,
     /// Maximum value for the colormap range. Overrides the colormap's built-in range.
     pub max: Option<f64>,

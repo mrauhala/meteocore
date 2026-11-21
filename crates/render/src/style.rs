@@ -17,7 +17,7 @@ use std::sync::Arc;
 use ds_core::config::{CollectionConfig, StyleBundle, WmsParameterConfig};
 
 use crate::colormap::{ColorMap, IntegerLutColorMap, LinearColorMap, LutColorMap};
-use crate::palette::{Interpolation, Palette, PaletteRegistry};
+use crate::palette::{ascending, Interpolation, Palette, PaletteRegistry};
 use crate::{parse_hex_color, ColorStop, ContourStyle, StyleInfo};
 
 /// The style-affecting fields of one config block — `[wms]` inline fields,
@@ -87,6 +87,13 @@ impl StyleContext {
     /// error (callers surface it at config load; a typo must not silently
     /// render viridis). No name at all falls back to viridis. `min`/`max`
     /// overrides default to the winning palette's first/last stop values.
+    ///
+    /// A range given high to low (`min > max`) draws the palette reversed
+    /// over it (#872), as an RGB composite's channel range inverts its
+    /// channel. The result's `min`/`max` are then the range low to high and
+    /// its `palette` the reversed stops, so every legend and colour bar
+    /// reads the reversal from the palette and samples the colormap over an
+    /// ordinary range.
     pub fn build_colormap(&self, spec: &StyleSpec) -> Result<ResolvedColormap, String> {
         // Inline custom stops take priority.
         if !spec.color_stops.is_empty() {
@@ -107,18 +114,14 @@ impl StyleContext {
                 let palette = Arc::new(Palette::new("custom", stops, Interpolation::Linear));
                 let (min, max) = range_for(&palette, spec.min, spec.max);
                 // Inline stops follow the named-palette rule below (#823).
-                let palette = match palette.fitted_to(min, max) {
-                    Some(fitted) => Arc::new(fitted),
-                    None => palette,
+                let source = fitted_low_to_high(palette, min, max);
+                let stops = source.stops.clone();
+                let colormap: Arc<dyn ColorMap> = if max < min {
+                    Arc::new(LinearColorMap::reversed_over(stops, max, min))
+                } else {
+                    Arc::new(LinearColorMap::new(stops))
                 };
-                let colormap: Arc<dyn ColorMap> =
-                    Arc::new(LinearColorMap::new(palette.stops.clone()));
-                return Ok(ResolvedColormap {
-                    colormap: wrap_if_integer_lut_keeps(colormap, &palette, min, max),
-                    palette,
-                    min,
-                    max,
-                });
+                return Ok(resolved(colormap, source, min, max));
             }
             // Every stop failed to hex-parse: fall through to the named /
             // default path (legacy behavior).
@@ -135,18 +138,12 @@ impl StyleContext {
         // normalized palette (viridis, grayscale: stops on 0..1) therefore
         // always spans the style's range, and a data-valued one is rescaled
         // only when the range lies entirely outside its stops. The fitted
-        // palette is also what the legend reads.
-        let palette = match palette.fitted_to(min, max) {
-            Some(fitted) => Arc::new(fitted),
-            None => palette,
-        };
-        let colormap: Arc<dyn ColorMap> = Arc::new(LutColorMap::from_palette(&palette, min, max));
-        Ok(ResolvedColormap {
-            colormap: wrap_if_integer_lut_keeps(colormap, &palette, min, max),
-            palette,
-            min,
-            max,
-        })
+        // palette, reversed for a range given high to low, is also what the
+        // legend reads.
+        let source = fitted_low_to_high(palette, min, max);
+        // `min > max` draws the source reversed.
+        let colormap: Arc<dyn ColorMap> = Arc::new(LutColorMap::from_palette(&source, min, max));
+        Ok(resolved(colormap, source, min, max))
     }
 
     /// The collection-level default colormap: the inline `[wms]` fields
@@ -639,6 +636,39 @@ fn range_for(
     (min, max)
 }
 
+/// The palette a style range samples, fitted as that range low to high
+/// ([`Palette::fitted_to`]): the colormap draws it reversed when
+/// `min > max`, and [`resolved`] reverses it for the legend.
+fn fitted_low_to_high(palette: Arc<Palette>, min: f64, max: f64) -> Arc<Palette> {
+    let (lo, hi) = ascending(min, max);
+    match palette.fitted_to(lo, hi) {
+        Some(fitted) => Arc::new(fitted),
+        None => palette,
+    }
+}
+
+/// A colormap drawn from `source` over the style range `min..max`, with
+/// the palette its legend shows and the range low to high (#872).
+fn resolved(
+    colormap: Arc<dyn ColorMap>,
+    source: Arc<Palette>,
+    min: f64,
+    max: f64,
+) -> ResolvedColormap {
+    let reversed = max < min;
+    let (min, max) = ascending(min, max);
+    ResolvedColormap {
+        colormap: wrap_if_integer_lut_keeps(colormap, &source, min, max),
+        palette: if reversed {
+            Arc::new(source.reversed_over(min, max))
+        } else {
+            source
+        },
+        min,
+        max,
+    }
+}
+
 /// [`maybe_wrap_integer_lut`], for a palette whose structure a whole-unit
 /// LUT keeps.
 fn wrap_if_integer_lut_keeps(
@@ -892,6 +922,142 @@ mod tests {
         ));
         let overlapping = resolve(5.0, 50.0);
         assert_eq!(overlapping.palette.stops.last().unwrap().value, 10.0);
+    }
+
+    /// A style over `min..max` built from a named palette or inline stops.
+    fn styled(ctx: &StyleContext, spec: StyleSpec, min: f64, max: f64) -> ResolvedColormap {
+        ctx.build_colormap(&StyleSpec {
+            min: Some(min),
+            max: Some(max),
+            ..spec
+        })
+        .unwrap()
+    }
+
+    /// A style range given high to low draws its palette reversed (#872),
+    /// whatever fit #823 gives the range low to high: a normalized palette
+    /// stretched, a data-valued one overlapping its stops sampled as is,
+    /// one entirely outside them rescaled, and inline stops either way.
+    /// Each value takes the colour the upright style gives its mirror
+    /// image; the result's range is low to high and its palette, the one the
+    /// legend shows, reversed. One colour for the whole layer was the bug.
+    #[test]
+    fn inverted_ranges_draw_the_palette_reversed() {
+        let ctx = StyleContext::with_builtins();
+        let inline = [
+            ConfigColorStop {
+                value: 0.0,
+                color: "#000000".into(),
+            },
+            ConfigColorStop {
+                value: 10.0,
+                color: "#FFFFFF".into(),
+            },
+        ];
+        let inline = StyleSpec {
+            color_stops: &inline,
+            ..StyleSpec::default()
+        };
+        let named = |name| StyleSpec {
+            colormap: Some(name),
+            ..StyleSpec::default()
+        };
+        let cases = [
+            (named("viridis"), 0.0, 100.0),
+            (named("temperature"), 0.0, 40.0),
+            (named("temperature"), 183.15, 323.15),
+            (named("wind_speed"), 0.0, 50.0),
+            (named("radar_dbz"), -10.0, 60.0),
+            (inline, 2.0, 8.0),
+            (inline, 100.0, 200.0),
+        ];
+        for (spec, lo, hi) in cases {
+            let upright = styled(&ctx, spec, lo, hi);
+            let inverted = styled(&ctx, spec, hi, lo);
+            let what = format!("{:?} {hi}..{lo}", spec.colormap);
+            assert_eq!((inverted.min, inverted.max), (lo, hi), "{what}");
+            let mut distinct = std::collections::HashSet::new();
+            // Off the half units, where a whole-unit LUT rounds a value and
+            // its mirror image to neighbouring entries.
+            for i in -4..=44 {
+                let v = lo + (hi - lo) * (i as f64 + 0.37) / 40.0;
+                let got = inverted.colormap.color(Some(v));
+                let want = upright.colormap.color(Some(lo + hi - v));
+                assert!(close(got, want), "{what} at {v}: {got:?} vs {want:?}");
+                distinct.insert(got);
+            }
+            assert!(distinct.len() > 5, "{what}: {distinct:?}");
+            // The legend's stops: ascending, the upright ends swapped.
+            let (up, down) = (
+                upright.palette.domain_stops(),
+                inverted.palette.domain_stops(),
+            );
+            assert!(down.windows(2).all(|w| w[0].value <= w[1].value), "{what}");
+            assert_eq!(down[0].color, up[up.len() - 1].color, "{what}");
+            assert_eq!(down[down.len() - 1].color, up[0].color, "{what}");
+            assert!((down[0].value - (lo + hi - up[up.len() - 1].value)).abs() < 1e-9);
+        }
+    }
+
+    /// A `.pal` display-threshold guard under a range given high to low
+    /// (#872): over the palette's own range and over a range entirely
+    /// outside it (#823's rescale), the threshold's colour ends the range at
+    /// its top, the values past it vanish, and the legend's stops leave the
+    /// guard out.
+    #[test]
+    fn inverted_pal_ranges_keep_the_display_threshold_at_its_stop() {
+        let mut reg = PaletteRegistry::with_builtins();
+        reg.insert(crate::parse_pal("x", "Color: 10 1 2 3\nColor: 50 4 5 6\n").unwrap())
+            .unwrap();
+        let ctx = StyleContext::new(reg);
+        let spec = StyleSpec {
+            colormap: Some("x"),
+            ..StyleSpec::default()
+        };
+        for (lo, hi) in [(10.0, 50.0), (100.0, 200.0)] {
+            let r = styled(&ctx, spec, hi, lo);
+            assert_eq!((r.min, r.max), (lo, hi));
+            assert_eq!(r.colormap.color(Some(hi)), [1, 2, 3, 255], "{hi}");
+            assert_eq!(r.colormap.color(Some(hi + 0.3)), [0, 0, 0, 0], "{hi}");
+            assert_eq!(r.colormap.color(Some(lo)), [4, 5, 6, 255], "{lo}");
+            assert_eq!(r.colormap.color(Some(lo - 5.0)), [4, 5, 6, 255], "{lo}");
+            assert_ne!(r.colormap.color(Some((lo + hi) / 2.0))[3], 0);
+            let stops = &r.palette.stops;
+            assert_eq!(stops.last().unwrap().value, hi.next_up());
+            assert_eq!(stops.last().unwrap().color, [0, 0, 0, 0]);
+            let domain = r.palette.domain_stops();
+            assert_eq!(domain.len(), 2);
+            assert_eq!((domain[0].value, domain[0].color), (lo, [4, 5, 6, 255]));
+            assert_eq!((domain[1].value, domain[1].color), (hi, [1, 2, 3, 255]));
+        }
+    }
+
+    /// A step palette under a range given high to low keeps its classes on
+    /// their mirrored bounds through the float LUT.
+    #[test]
+    fn inverted_step_classes_mirror_through_build_colormap() {
+        let mut reg = PaletteRegistry::with_builtins();
+        let classes: Vec<ColorStop> = (-20..=20)
+            .map(|v| ColorStop {
+                value: v as f64,
+                color: [(v + 100) as u8, 0, 0, 255],
+            })
+            .collect();
+        reg.insert(Palette::new("classes", classes, Interpolation::Step))
+            .unwrap();
+        let ctx = StyleContext::new(reg);
+        let spec = StyleSpec {
+            colormap: Some("classes"),
+            ..StyleSpec::default()
+        };
+        let r = styled(&ctx, spec, 20.0, -20.0);
+        // 0.6 mirrors to -0.6, in the -1…0 class; -7.5 to 7.5, class 7.
+        for (value, class) in [(0.6, -1), (-0.4, 0), (5.9, -6), (-7.5, 7)] {
+            let got = r.colormap.color(Some(value))[0];
+            assert_eq!(got, (class + 100) as u8, "{value} is in class {class}");
+        }
+        assert_eq!(r.palette.interpolation, Interpolation::Step);
+        assert_eq!(r.palette.stops[0].color[0], 120, "the top class first");
     }
 
     // CollectionConfig is deserialized from TOML in production (per-file
@@ -1451,6 +1617,60 @@ mod tests {
 
         // An explicit [[wms.parameters]] entry still wins over the default.
         assert_eq!(style("10u").palette.name, "wind_speed");
+    }
+
+    /// #872's fraction defaults, fixed by #1145: relative humidity and cloud
+    /// cover served as a fraction, in unit 1 or GRIB's `(0 - 1)`, take the
+    /// fraction twins of the percent palettes over 0..1. The percent
+    /// palettes would clip a 0..1 range to their bottom 1 %, nearly one
+    /// colour; the twins spread it, each fraction drawing the colour its
+    /// percentage draws on the percent palette.
+    #[test]
+    fn fraction_humidity_and_cloud_cover_render_with_spread() {
+        let ctx = StyleContext::with_builtins();
+        let c = coll("colormap = \"temperature\"\n");
+        let params = [
+            ("r", "Relative humidity", "1"),
+            ("2r", "2 metre relative humidity", "(0 - 1)"),
+            ("tcc", "Total cloud cover", "(0 - 1)"),
+            ("clct", "Total cloud cover", "1"),
+            ("rh_percent", "Relative humidity", "%"),
+            ("cloud_percent", "Total cloud cover", "%"),
+        ]
+        .map(|(name, title, unit)| ds_core::map_engine::ParameterInfo {
+            name: name.into(),
+            title: title.into(),
+            unit: unit.into(),
+        });
+        let maps = ctx
+            .parameter_layer_styles(&c, None, &params, &|_, cm| cm)
+            .unwrap();
+        let style = |name: &str| &maps[&format!("c1/{name}")]["default"];
+        for (name, palette, percent) in [
+            ("r", "humidity_fraction", "rh_percent"),
+            ("2r", "humidity_fraction", "rh_percent"),
+            ("tcc", "cloud_cover_fraction", "cloud_percent"),
+            ("clct", "cloud_cover_fraction", "cloud_percent"),
+        ] {
+            let (s, p) = (style(name), style(percent));
+            assert_eq!(s.palette.name, palette, "{name}");
+            assert_eq!((s.min, s.max), (0.0, 1.0), "{name}");
+            assert_eq!((p.min, p.max), (0.0, 100.0), "{percent}");
+            let fractions = [0.05, 0.3, 0.55, 0.8, 1.0];
+            let colors: Vec<[u8; 4]> = fractions
+                .iter()
+                .map(|f| s.colormap.color(Some(*f)))
+                .collect();
+            for (i, a) in colors.iter().enumerate() {
+                for b in &colors[i + 1..] {
+                    assert_ne!(a, b, "{name}: {fractions:?} rendered {colors:?}");
+                }
+            }
+            for (f, got) in fractions.iter().zip(&colors) {
+                let want = p.colormap.color(Some(f * 100.0));
+                assert!(close(*got, want), "{name} at {f}: {got:?} vs {want:?}");
+            }
+        }
     }
 
     /// #1067 PR 6: a NetCDF MEPS collection's layers, with the names,
