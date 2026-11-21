@@ -255,7 +255,8 @@ keep new link builders inside that crawl.
 
 **Security:** default false because forwarding headers are
 client-controllable. Even when enabled: host values are sanitised
-(whitespace/slashes/`@`/non-ASCII rejected), scheme restricted to
+(whitespace/slashes/`@`/non-ASCII rejected, at most `MAX_HOST_LEN`, 260
+bytes: a DNS name, a trailing dot and a port, #1532), scheme restricted to
 http/https; malformed headers fall through to the next source. Enable only
 when a trusted proxy sets/overwrites these headers, the proxy strips
 `Forwarded`/`X-Forwarded-*` on untrusted client requests, and clients cannot
