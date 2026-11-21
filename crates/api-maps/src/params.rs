@@ -20,6 +20,9 @@
 //!   from the scale — `scale-denominator`, else the collection's native
 //!   resolution — around the centre (default: the extent's); omitted ones
 //!   are the other's value, or [`map_frame::DEFAULT_MAP_SIZE`] for both.
+//!   The native resolution is the extent over the grid in the storage CRS,
+//!   and in another CRS one native cell measured at `center`
+//!   ([`native_resolution_at`]), the extent average where it cannot be.
 //!   `scale-denominator` with an area and no size derives the size from the
 //!   scale. Every size, given or derived, is held to [`MAX_MAP_DIMENSION`]
 //!   and [`MAX_MAP_PIXELS`].
@@ -686,7 +689,11 @@ fn square(width: Option<u32>, height: Option<u32>) -> (u32, u32) {
 }
 
 /// Plane units per pixel at the collection's native resolution: its extent
-/// frame over its grid, or over the default size when it has none.
+/// frame over its grid, or over the default size when it has none. In the
+/// storage CRS that frame is the grid's own, up to the envelope its
+/// longitude/latitude extent adds; in another CRS the pixel size varies
+/// across the extent and this average is right at no single point, so a
+/// map around a `center` measures the cell there ([`native_resolution_at`]).
 fn native_resolution(extent: &Frame, grid: Option<[u32; 2]>) -> (f64, f64) {
     let [x0, y0, x1, y1] = extent.plane();
     let (columns, rows) = match grid {
@@ -694,6 +701,75 @@ fn native_resolution(extent: &Frame, grid: Option<[u32; 2]>) -> (f64, f64) {
         _ => map_frame::size_for_aspect(extent.aspect(), None, None),
     };
     ((x1 - x0) / columns, (y1 - y0) / rows)
+}
+
+/// Plane units per pixel of `out` at the collection's native resolution at
+/// the map centre `(lon, lat)`, where `out` is not the storage CRS (#962).
+///
+/// One cell of the native grid ([`RasterInfo::native_grid`]) centred
+/// there: its four corners are taken through the projection once, never
+/// per output pixel (root CLAUDE.md Critical Rule 5). Along each output
+/// axis, a pixel spans the plane distance that crosses one cell: a step of
+/// one cell in the grid's indices. With the grid's axes along the output's
+/// that is the cell's side; turned, it is between its sides. The two can
+/// differ: a lat/lon cell at 60°N is twice as tall as wide in EPSG:3857,
+/// as the extent average's pixels already were.
+///
+/// A centre outside the grid is measured on the grid extended: its cells
+/// keep their size in the grid's CRS. `None`, for the extent average of
+/// [`native_resolution`], when `out` is the storage CRS (or both are
+/// geographic, one plane), without a native grid, and where the cell has
+/// no drawing in `out`: the centre or a corner has no coordinates in the
+/// grid's CRS or in `out`, or lies past a pole, past Web Mercator's square
+/// world (±[`web_mercator::LAT_LIMIT_DEG`], where its pixel heights grow
+/// without bound) or outside EPSG:3067's or EPSG:3035's valid area.
+fn native_resolution_at(
+    info: &RasterInfo,
+    out: MapCrs,
+    (lon, lat): (f64, f64),
+) -> Option<(f64, f64)> {
+    let storage = MapCrs::from_storage_label(&info.native_crs);
+    if storage.is_some_and(|s| s == out || (s.is_geographic() && out.is_geographic())) {
+        return None;
+    }
+    let grid = info.native_grid.as_ref()?;
+    let crs = grid.crs();
+    let (gx, gy) = crs.forward(lon, lat);
+    if !(gx.is_finite() && gy.is_finite()) {
+        return None;
+    }
+    let [dx, dy] = grid.spacing();
+    let lat_limit = if out == MapCrs::Epsg3857 {
+        web_mercator::LAT_LIMIT_DEG
+    } else {
+        90.0
+    };
+    let corner = |sx: f64, sy: f64| -> Option<(f64, f64)> {
+        let (corner_lon, corner_lat) = crs.inverse(gx + sx * dx / 2.0, gy + sy * dy / 2.0)?;
+        (corner_lat.abs() <= lat_limit).then_some(())?;
+        // On the centre's side of the antimeridian: a cell across it is
+        // one cell, not one spanning the world.
+        let corner_lon = lon + (corner_lon - lon + 180.0).rem_euclid(360.0) - 180.0;
+        let (x, y) = out.forward(corner_lon, corner_lat);
+        (x.is_finite() && y.is_finite() && out.inverse(x, y).is_some()).then_some((x, y))
+    };
+    let (bl, br) = (corner(-1.0, -1.0)?, corner(1.0, -1.0)?);
+    let (tl, tr) = (corner(-1.0, 1.0)?, corner(1.0, 1.0)?);
+    // The cell's sides along the grid's x and y, between its edges' midpoints.
+    let along_x = (
+        (br.0 + tr.0 - bl.0 - tl.0) / 2.0,
+        (br.1 + tr.1 - bl.1 - tl.1) / 2.0,
+    );
+    let along_y = (
+        (tl.0 + tr.0 - bl.0 - br.0) / 2.0,
+        (tl.1 + tr.1 - bl.1 - br.1) / 2.0,
+    );
+    // A plane step (r, 0) crosses r·|(y_y, −x_y)| / area cells and (0, r)
+    // r·|(−y_x, x_x)| / area, x and y the sides above: one cell at these r.
+    let area = (along_x.0 * along_y.1 - along_y.0 * along_x.1).abs();
+    let rx = area / along_x.1.hypot(along_y.1);
+    let ry = area / along_x.0.hypot(along_y.0);
+    (rx.is_finite() && ry.is_finite() && rx > 0.0 && ry > 0.0).then_some((rx, ry))
 }
 
 impl MapRequest {
@@ -742,21 +818,26 @@ impl MapRequest {
             };
             Ok((frame, width, height))
         };
-        // A frame the size sets, around a plane point of the output CRS.
-        let around = |(x, y): (f64, f64)| -> Result<(Frame, u32, u32), MapsError> {
-            let resolution = match self.scale_denominator {
-                Some(scale) => {
-                    map_frame::resolution_at(out, x, y, scale).ok_or_else(scale_error)?
-                }
-                None => native_resolution(&extent_frame(extent()?, out)?, info.grid_size),
+        // A frame the size sets, around a plane point of the output CRS:
+        // `center`'s, whose longitude/latitude is `at`, or the extent's.
+        let around =
+            |(x, y): (f64, f64), at: Option<(f64, f64)>| -> Result<(Frame, u32, u32), MapsError> {
+                let resolution = match self.scale_denominator {
+                    Some(scale) => {
+                        map_frame::resolution_at(out, x, y, scale).ok_or_else(scale_error)?
+                    }
+                    None => match at.and_then(|lonlat| native_resolution_at(info, out, lonlat)) {
+                        Some(resolution) => resolution,
+                        None => native_resolution(&extent_frame(extent()?, out)?, info.grid_size),
+                    },
+                };
+                let (width, height) = square(self.width, self.height);
+                Ok((
+                    map_frame::frame_around(out, (x, y), resolution, width, height),
+                    width,
+                    height,
+                ))
             };
-            let (width, height) = square(self.width, self.height);
-            Ok((
-                map_frame::frame_around(out, (x, y), resolution, width, height),
-                width,
-                height,
-            ))
-        };
 
         let (frame, width, height) = match &self.area {
             Area::Bbox { crs, plane } => {
@@ -788,10 +869,10 @@ impl MapRequest {
                 if !(x.is_finite() && y.is_finite()) {
                     return Err(bad(format!("center has no coordinates in {}", out.code())));
                 }
-                around((x, y))?
+                around((x, y), Some((lon, lat)))?
             }
             Area::Default => match self.scale_denominator {
-                Some(_) => around(extent_frame(extent()?, out)?.center())?,
+                Some(_) => around(extent_frame(extent()?, out)?.center(), None)?,
                 None => sized(extent_frame(extent()?, out)?)?,
             },
         };
@@ -899,6 +980,8 @@ fn subset_plane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ds_core::geo::Crs;
+    use ds_core::native_grid::NativeGrid;
 
     fn crs84(bbox: &str) -> Result<[f64; 4], MapsError> {
         parse_bbox(bbox, MapCrs::Crs84)
@@ -1722,6 +1805,278 @@ mod tests {
                 matches!(query.validate(&NONE), Err(MapsError::BadRequest(_))),
                 "{bad}"
             );
+        }
+    }
+
+    /// [`info`] with its native grid: 0.01° lat/lon cells.
+    fn lat_lon_info() -> RasterInfo {
+        RasterInfo {
+            native_grid: NativeGrid::from_edges(
+                Crs::Wgs84,
+                None,
+                [2000, 1500],
+                [10.0, 55.0, 30.0, 70.0],
+            ),
+            ..info()
+        }
+    }
+
+    /// A lat/lon grid of 0.25° cells over the world.
+    fn global_info() -> RasterInfo {
+        let world = [-180.0, -90.0, 180.0, 90.0];
+        RasterInfo {
+            spatial_extent: Some(world),
+            grid_size: Some([1440, 720]),
+            native_grid: NativeGrid::from_edges(Crs::Wgs84, None, [1440, 720], world),
+            ..info()
+        }
+    }
+
+    /// A TM35FIN grid of 1 km cells over Finland, stored in EPSG:3067.
+    fn tm_info() -> RasterInfo {
+        RasterInfo {
+            native_crs: "EPSG:3067".into(),
+            spatial_extent: Some([18.0, 59.0, 34.0, 71.0]),
+            grid_size: Some([700, 1200]),
+            native_grid: NativeGrid::new(
+                ds_core::geo::projected_output_crs("EPSG:3067").unwrap(),
+                Some(3067),
+                [700, 1200],
+                [50_000.0, 6_600_000.0],
+                [1000.0, 1000.0],
+            ),
+            ..info()
+        }
+    }
+
+    fn center_view(
+        info: &RasterInfo,
+        center: &str,
+        crs: &str,
+        (width, height): (u32, u32),
+    ) -> Result<MapView, MapsError> {
+        MapQueryParams {
+            center: Some(center.into()),
+            crs: Some(crs.into()),
+            width: Some(width.to_string()),
+            height: Some(height.to_string()),
+            ..Default::default()
+        }
+        .validate(&NONE)?
+        .view(info, "c")
+    }
+
+    /// The plane units per pixel of a map around `center` in `crs`.
+    fn center_resolution(info: &RasterInfo, center: &str, crs: &str) -> (f64, f64) {
+        let view = center_view(info, center, crs, (200, 100)).unwrap();
+        let [x0, y0, x1, y1] = view.frame.plane();
+        ((x1 - x0) / 200.0, (y1 - y0) / 100.0)
+    }
+
+    /// The same request without the native grid: the extent average.
+    fn extent_average(info: &RasterInfo, center: &str, crs: &str) -> (f64, f64) {
+        let info = RasterInfo {
+            native_grid: None,
+            ..info.clone()
+        };
+        center_resolution(&info, center, crs)
+    }
+
+    fn near(actual: (f64, f64), expected: (f64, f64), tolerance: f64, what: &str) {
+        assert!(
+            (actual.0 - expected.0).abs() <= tolerance
+                && (actual.1 - expected.1).abs() <= tolerance,
+            "{what}: {actual:?}, expected {expected:?}"
+        );
+    }
+
+    /// In a CRS other than the storage CRS, a map around `center` without
+    /// `scale-denominator` takes the native cell's size at the centre, not
+    /// the extent average (#962). Web Mercator stretches a lat/lon cell by
+    /// sec(latitude) along the meridian and keeps its longitude span
+    /// (R × Δλ): at 60°N a 0.01° cell is 1113.195 m × 2226.390 m; the
+    /// average over 55–70°N would be 2471 m tall. The centre may lie outside
+    /// the grid (the equator here): the grid's cells keep their size there.
+    #[test]
+    fn center_in_web_mercator_takes_the_cell_at_the_centre() {
+        let info = lat_lon_info();
+        let width = web_mercator::EARTH_RADIUS * 0.01_f64.to_radians();
+        for (lat, sec) in [(60.0, 2.0), (0.0, 1.0), (-30.0, 2.0 / 3.0_f64.sqrt())] {
+            let (rx, ry) = center_resolution(&info, &format!("20,{lat}"), "EPSG:3857");
+            assert!((rx / width - 1.0).abs() < 1e-9, "{lat}: {rx}");
+            assert!((ry / (width * sec) - 1.0).abs() < 1e-6, "{lat}: {ry}");
+        }
+        let (_, average) = extent_average(&info, "20,60", "EPSG:3857");
+        assert!((average / (2.0 * width) - 1.0).abs() > 0.1, "{average}");
+        // The map keeps its size and centre.
+        let view = center_view(&info, "20,60", "EPSG:3857", (200, 100)).unwrap();
+        assert_eq!((view.width, view.height), (200, 100));
+        let (x, y) = view.frame.center();
+        assert!((x - web_mercator::lon_to_x(20.0)).abs() < 1e-6, "{x}");
+        assert!((y - web_mercator::lat_to_y(60.0)).abs() < 1e-6, "{y}");
+    }
+
+    /// The same in EPSG:3067 and for a TM35FIN grid shown in EPSG:3857 and
+    /// CRS84, pinned to PROJ 9.8.1: the cell's corners from `cs2cs -f %.9f
+    /// +proj=longlat +datum=WGS84 +to +proj=tmerc +lat_0=0 +lon_0=27
+    /// +k=0.9996 +x_0=500000 +y_0=0 +datum=WGS84` (and that TM `+to
+    /// EPSG:3857`, or `+to +proj=longlat +datum=WGS84`), each pixel the
+    /// plane distance along its axis that crosses one cell. At 27°E the
+    /// cell lies along the axes; at 20°E it is turned by the grid's
+    /// convergence (6.1° for the lat/lon cell in TM, 6.4° for the TM cell
+    /// in Web Mercator), and a pixel lies between its sides: the lat/lon
+    /// cell at 20°E, 60°N is 558.817 m × 1115.754 m along its sides.
+    #[test]
+    fn center_in_a_projected_crs_matches_proj() {
+        let lat_lon = lat_lon_info();
+        let cases = [
+            (&lat_lon, "27,60", "EPSG:3067", (557.776814, 1113.677223)),
+            (&lat_lon, "20,60", "EPSG:3067", (561.172113, 1097.579308)),
+            (&tm_info(), "27,60", "EPSG:3857", (1995.771234, 1999.133800)),
+            (&tm_info(), "20,65", "EPSG:3857", (2357.494605, 2360.332271)),
+        ];
+        for (info, center, crs, expected) in cases {
+            near(
+                center_resolution(info, center, crs),
+                expected,
+                1e-3,
+                &format!("{center} in {crs}"),
+            );
+        }
+        near(
+            center_resolution(&tm_info(), "20,65", "CRS:84"),
+            (0.021177734, 0.008960870),
+            1e-8,
+            "20,65 in CRS:84",
+        );
+    }
+
+    /// In the storage CRS, or in the other geographic CRS, the native
+    /// resolution stays the extent over the grid, whatever the native grid
+    /// says: the requests are byte-identical to before #962.
+    #[test]
+    fn center_in_the_storage_crs_keeps_the_extent_average() {
+        // A native grid of 0.02° cells disagreeing with the 0.01° average.
+        let info = RasterInfo {
+            native_grid: NativeGrid::from_edges(
+                Crs::Wgs84,
+                None,
+                [1000, 750],
+                [10.0, 55.0, 30.0, 70.0],
+            ),
+            ..info()
+        };
+        for (center, crs) in [("20,60", "CRS:84"), ("20,60", "EPSG:4326")] {
+            let view = center_view(&info, center, crs, (200, 100)).unwrap();
+            assert_eq!(view.bbox, [19.0, 59.5, 21.0, 60.5], "{crs}");
+        }
+        let tm = tm_info();
+        for center in ["27,60", "20,65"] {
+            assert_eq!(
+                center_resolution(&tm, center, "EPSG:3067"),
+                extent_average(&tm, center, "EPSG:3067"),
+                "{center}"
+            );
+        }
+    }
+
+    /// A cell across the antimeridian is one cell on the centre's side.
+    /// Where the cell has no drawing in the output CRS, the native
+    /// resolution falls back to the extent average: past the square Web
+    /// Mercator world (±85.05°), past a pole, outside EPSG:3067's area.
+    #[test]
+    fn center_at_the_antimeridian_and_near_the_poles() {
+        let info = global_info();
+        let width = web_mercator::EARTH_RADIUS * 0.25_f64.to_radians();
+        for lon in ["179.99", "-179.99", "180"] {
+            let center = format!("{lon},0");
+            let (rx, ry) = center_resolution(&info, &center, "EPSG:3857");
+            assert!((rx / width - 1.0).abs() < 1e-9, "{lon}: {rx}");
+            assert!((ry / width - 1.0).abs() < 1e-5, "{lon}: {ry}");
+            let view = center_view(&info, &center, "EPSG:3857", (200, 100)).unwrap();
+            let lon: f64 = lon.parse().unwrap();
+            assert!((view.frame.center().0 - web_mercator::lon_to_x(lon)).abs() < 1e-6);
+        }
+        // A cell inside the square world, 84.675–84.925°N: sec(84.8°) = 11.03.
+        let (_, ry) = center_resolution(&info, "0,84.8", "EPSG:3857");
+        let sec = 1.0 / 84.8_f64.to_radians().cos();
+        assert!((ry / (width * sec) - 1.0).abs() < 1e-3, "{ry}");
+        // The cell past the square world (85°N reaches 85.125°N) or a pole,
+        // outside EPSG:3067's area, or outside the TM grid's own (its
+        // inverse ends 9 998 km from 27°E).
+        // The map is then the extent average's, a 400 where that is (the
+        // EPSG:3067 map at 179.99°E).
+        let tm = tm_info();
+        for (info, (lon, lat), crs) in [
+            (&info, (0.0, 85.0), MapCrs::Epsg3857),
+            (&info, (0.0, 86.0), MapCrs::Epsg3857),
+            (&info, (0.0, -89.95), MapCrs::Epsg3857),
+            (&info, (0.0, 89.95), MapCrs::Epsg3067),
+            (&info, (179.99, 0.0), MapCrs::Epsg3067),
+            (&tm, (-150.0, 0.0), MapCrs::Crs84),
+        ] {
+            let what = format!("{lon},{lat} in {}", crs.code());
+            assert_eq!(native_resolution_at(info, crs, (lon, lat)), None, "{what}");
+            let frame = |info: &RasterInfo| {
+                let center = format!("{lon},{lat}");
+                format!(
+                    "{:?}",
+                    center_view(info, &center, crs.code(), (200, 100)).map(|v| v.frame)
+                )
+            };
+            let without_grid = RasterInfo {
+                native_grid: None,
+                ..info.clone()
+            };
+            assert_eq!(frame(info), frame(&without_grid), "{what}");
+        }
+    }
+
+    /// No centre, grid or output CRS panics or frames a map with a
+    /// coordinate that is not finite: a map is a frame of finite, positive
+    /// spans at the requested size, or a 400 or 404. The size is the
+    /// request's, whatever the resolution, so the output caps hold as
+    /// before: 8000 × 8000 at most.
+    #[test]
+    fn center_sizes_are_finite_everywhere() {
+        let centers = [
+            "-180,0",
+            "-179.99,0",
+            "179.99,0",
+            "180,0",
+            "200,60",
+            "27,60",
+            "0,-90",
+            "0,-89.9",
+            "0,85.1",
+            "0,89.99",
+            "0,90",
+            "27,89.999",
+            "-120,-60",
+        ];
+        for info in [lat_lon_info(), global_info(), tm_info()] {
+            for crs in MapCrs::ALL {
+                for center in centers {
+                    let size = (8000, 8000);
+                    match center_view(&info, center, crs.code(), size) {
+                        Ok(view) => {
+                            let [x0, y0, x1, y1] = view.frame.plane();
+                            assert!(
+                                [x0, y0, x1, y1].iter().all(|v| v.is_finite())
+                                    && x1 > x0
+                                    && y1 > y0
+                                    && view.bbox.iter().all(|v| v.is_finite()),
+                                "{center} in {}: {:?}",
+                                crs.code(),
+                                view.frame
+                            );
+                            assert_eq!((view.width, view.height), size);
+                        }
+                        Err(MapsError::BadRequest(_) | MapsError::NotFound(_)) => {}
+                        Err(other) => panic!("{center} in {}: {other:?}", crs.code()),
+                    }
+                }
+            }
         }
     }
 }
