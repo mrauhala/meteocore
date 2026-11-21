@@ -6,6 +6,10 @@ license.workspace = true
 
 [features]
 fuzz = []
+# `GeoTiffEngine::remote_for_test`: a remote engine over a store a test
+# brings, for the server's tests of how the APIs answer a failing store
+# (#1523). Enabled only on dev-dependencies.
+test-util = []
 
 [dependencies]
 ds-core = { path = "../core" }

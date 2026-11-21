@@ -1132,8 +1132,9 @@ fn cold_stac_budget_allows_the_cap() {
 /// #889: the first failed cold load fails the query, and the loads still
 /// in flight are dropped with their claims released, so a later query can
 /// claim and load those items. A server error fails the load with the 503
-/// a tile read gives, without a whole download (#1025); an asset that is
-/// gone does not fail it (#1119, below).
+/// a tile read gives, without a whole download (#1025): this one, a 503, is
+/// `Unavailable` (#1523). An asset that is gone does not fail it (#1119,
+/// below).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_cold_load_fails_the_query_and_releases_every_claim() {
     let options = MockOptions {
@@ -1147,7 +1148,7 @@ async fn a_failed_cold_load_fails_the_query_and_releases_every_claim() {
     let err = query_position(&engine, (times[0], times[5]))
         .await
         .expect_err("an item whose asset host fails fails the query");
-    assert!(matches!(err, DataServerError::ResourceExhausted), "{err:?}");
+    assert!(matches!(err, DataServerError::Unavailable(_)), "{err:?}");
     assert!(!engine.is_metadata_loaded(&times[2]));
     assert_eq!(full_gets(&mock), 0, "no whole download after a failed HEAD");
     assert!(
@@ -1228,9 +1229,10 @@ async fn an_item_whose_asset_is_gone_is_read_once_then_dropped() {
 
 /// #1025: a header read that fails, a 503, a body cut short or a 403, fails
 /// this load without downloading the asset whole: the query is the 503 a
-/// tile read gives for the same failures (`ResourceExhausted`, #1051,
-/// #1074), the item stays a stub, and no whole-object GET reaches the host.
-/// Once the reads succeed, the next query loads the item by range.
+/// tile read gives for the same failures, `Unavailable` for the 503
+/// (#1523) and `ResourceExhausted` for the others (#1051, #1074), the item
+/// stays a stub, and no whole-object GET reaches the host. Once the reads
+/// succeed, the next query loads the item by range.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_header_read_fails_the_load_without_a_full_download() {
     for fault in [
@@ -1250,8 +1252,13 @@ async fn a_failed_header_read_fails_the_load_without_a_full_download() {
         let err = query_position(&engine, (time, time))
             .await
             .expect_err("the load fails");
+        let unavailable = matches!(fault, RangeFault::Unavailable);
         assert!(
-            matches!(err, DataServerError::ResourceExhausted),
+            if unavailable {
+                matches!(err, DataServerError::Unavailable(_))
+            } else {
+                matches!(err, DataServerError::ResourceExhausted)
+            },
             "{fault:?}: {err:?}"
         );
         assert_eq!(asset_requests(&mock), 1, "{fault:?}: the header read only");
@@ -1275,6 +1282,57 @@ async fn a_failed_header_read_fails_the_load_without_a_full_download() {
             "{fault:?}: read by range"
         );
     }
+}
+
+/// #1523: once an item is loaded, an asset host that answers its tile
+/// ranges 503 through the read's retries fails the render and the EDR
+/// position query with `Unavailable`, the 503 `SourceUnavailable` a store
+/// that kept answering 503 gets; ranges cut short fail them with
+/// `ResourceExhausted`, as before. Once the host serves the ranges, both
+/// read the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tile_ranges_the_asset_host_keeps_refusing_are_unavailable() {
+    let options = MockOptions {
+        sized: true,
+        ..MockOptions::default()
+    };
+    let mock = mock_stac_with(1, options).await;
+    let time = mock.times[0];
+    let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
+    engine.poll_cycle().await;
+    assert_eq!(loaded_times(&engine), [time], "the poll loads the header");
+
+    for fault in [RangeFault::Unavailable, RangeFault::CutShort] {
+        *mock.range_fault.lock().unwrap() = Some(fault);
+        let unavailable = matches!(fault, RangeFault::Unavailable);
+        let expected = |what: &str, e: DataServerError| match e {
+            DataServerError::Unavailable(detail) if unavailable => {
+                assert!(detail.contains("503"), "{what}: {detail}")
+            }
+            DataServerError::ResourceExhausted if !unavailable => {}
+            e => panic!("{fault:?}, {what}: {e:?}"),
+        };
+        let requests = asset_requests(&mock);
+        expected(
+            "the render",
+            failure(render_at(&engine, time, None).await.unwrap()),
+        );
+        expected(
+            "EDR position",
+            failure(query_position(&engine, (time, time)).await),
+        );
+        assert!(asset_requests(&mock) > requests, "{fault:?}: tiles read");
+    }
+
+    *mock.range_fault.lock().unwrap() = None;
+    render_at(&engine, time, None)
+        .await
+        .unwrap()
+        .expect("the render reads its tiles");
+    let response = query_position(&engine, (time, time))
+        .await
+        .expect("the position reads its tile");
+    assert_eq!(series_times(response), vec![time]);
 }
 
 /// #1025: an origin that ignores `Range` still takes the whole download, as

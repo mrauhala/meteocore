@@ -562,8 +562,11 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
 7. Obey the Performance & Concurrency rules — especially: spawn the poll loop
    on the background runtime, and never project per output pixel.
    **A `MapEngine` returns `Err` for a deadline or a failed read** —
-   `DeadlineExceeded`, or `ResourceExhausted` (503) for a storage failure
-   that outlived its retries, with the detail logged — never an `Ok` tile
+   `DeadlineExceeded`, or for a storage failure that outlived its retries
+   `Unavailable` (503 `SourceUnavailable`, `Retry-After: 10`) when the
+   store's last answer was a 429, 502, 503 or 504, kept through
+   `with_storage_context`, else `ResourceExhausted` (503 `ServerBusy`),
+   with the detail logged (#1523) — never an `Ok` tile
    with nodata in its place: the rendered and meta-tile caches keep every
    `Ok` tile with no TTL, so a gap from a short outage would outlive it
    (#993, #1051). Only a tile or field the source itself declares empty
@@ -1274,6 +1277,10 @@ one never implies the other.
     `Storage(format!(…{e}))`, which turns the 503 into a 500.
   - GRIB position and trajectory queries fail with it, instead of sampling
     the field as null.
+  - An engine reading a host with its own HTTP client types its answers
+    by `ds_storage::is_unavailable_status`, as GeoTIFF's STAC asset reads
+    do (#1523). `ds_storage::test_util::FailingReads` fails a store's reads
+    with one status, for a test of what a caller answers.
   - S3 stores retry per `S3_RETRY` in `crates/storage/src/lib.rs`.
 - **`DataServerError::class()`** (#17) is the one map from a variant to how
   every API answers it (`ds_core::error::ErrorClass`): `BadRequest` 400 with

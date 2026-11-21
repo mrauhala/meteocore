@@ -3,19 +3,21 @@
 //! `ResourceExhausted` (HTTP 503) instead of a nodata gap with HTTP 200, so
 //! neither the no-TTL rendered and meta-tile caches nor a browser keep a
 //! transparent hole, and the engine's own caches hold nothing for the frame.
-//! Once the store answers again, the same requests read the data. Bytes
-//! that arrive but do not decode stay nulls in EDR, read once.
+//! A store that kept answering 429, 502, 503 or 504 fails them with
+//! `Unavailable` instead, the 503 `SourceUnavailable` (#1523). Once the
+//! store answers again, the same requests read the data. Bytes that arrive
+//! but do not decode stay nulls in EDR, read once.
 
 use std::sync::atomic::Ordering;
 
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterTile};
-use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::object_store::{ObjectStoreExt, PutPayload};
+use ds_storage::test_util::FailingReads;
 use ds_storage::DataStore;
 
 use super::*;
 use crate::reader::{DataSource, TiffCompression, TILE_FETCH_RETRIES};
-use crate::remote_header_tests::{FlakyStore, FIXTURE};
+use crate::remote_header_tests::{FlakyStore, FIXTURE, KEY};
 
 /// Range reads one tile makes when every fetch fails: the first attempt and
 /// each retry.
@@ -24,51 +26,17 @@ const FAILED_TILE_READS: usize = 1 + TILE_FETCH_RETRIES as usize;
 /// More failures than any test makes reads: every range read fails.
 const EVERY_READ: usize = usize::MAX / 2;
 
-/// An empty local directory for the engine to start on, removed on drop.
-struct EmptyDir(PathBuf);
-
-impl EmptyDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "meteocore_tile_fetch_failure_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for EmptyDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// An engine reading the fixture by byte range from `flaky` under the prefix
-/// `d`. `new` builds a remote engine only for s3:// or http(s):// URLs, so it
-/// starts on an empty local directory and is then pointed at the store,
-/// with the tile cache a remote source gets; the poll's header read
-/// catalogues the frame.
-fn remote_engine(local: &EmptyDir, flaky: &Arc<FlakyStore>) -> GeoTiffEngine {
+/// An engine reading the fixture by byte range from `store` under the
+/// prefix `d`, with the tile cache a remote source gets; the poll's header
+/// read catalogues the frame.
+fn remote_engine(store: DataStore) -> GeoTiffEngine {
     let config: GeoTiffConfig = serde_json::from_value(serde_json::json!({
         "filename_template": "radar_%Y%m%dT%H%MZ.tif",
         "parameter": "reflectivity",
         "unit": "dBZ",
     }))
     .unwrap();
-    let mut engine = GeoTiffEngine::new("tile-fetch-failure", local.0.to_str(), &config).unwrap();
-    engine.store_mode = StoreMode::Remote {
-        store: DataStore::new(flaky.clone()),
-        prefix: ObjectPath::from("d"),
-    };
-    engine.tile_cache = Arc::new(cache::TileCache::new(
-        config.effective_tile_cache_mb() * 1024 * 1024,
-    ));
-    engine.poll_once();
+    let engine = GeoTiffEngine::remote_for_test("tile-fetch-failure", &config, store, "d").unwrap();
     assert_eq!(
         engine.catalog.load().entries.len(),
         1,
@@ -136,9 +104,8 @@ fn cached_tiles(engine: &GeoTiffEngine) -> usize {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_tile_fetch_fails_the_render_and_edr_and_a_retry_reads() {
-    let local = EmptyDir::new();
     let flaky = FlakyStore::with_object(std::fs::read(FIXTURE).unwrap());
-    let engine = remote_engine(&local, &flaky);
+    let engine = remote_engine(DataStore::new(flaky.clone()));
     let (lon, lat) = inside(&engine);
 
     flaky.fail_ranges.store(EVERY_READ, Ordering::SeqCst);
@@ -190,6 +157,81 @@ async fn a_failed_tile_fetch_fails_the_render_and_edr_and_a_retry_reads() {
         .expect("a retry reads the area");
 }
 
+/// The error of a read that should have failed.
+fn failure<T>(result: Result<T, DataServerError>) -> DataServerError {
+    match result {
+        Err(e) => e,
+        Ok(_) => panic!("expected the read to fail"),
+    }
+}
+
+/// #1523: a store that keeps answering 429, 502, 503 or 504 through every
+/// retry fails the render, EDR position and EDR area with `Unavailable`,
+/// which every API answers 503 `SourceUnavailable` with `Retry-After: 10`,
+/// the status in its detail for the log: not the `ResourceExhausted` of a
+/// fetch that fails otherwise, which a store answering 500 still gets.
+/// Either way each tile is tried and retried, no cache holds anything for
+/// the frame, and once the store answers the same requests read the data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_that_stays_unavailable_fails_the_reads_as_unavailable() {
+    let store = FailingReads::default();
+    store.put(KEY, std::fs::read(FIXTURE).unwrap());
+    let store = Arc::new(store);
+    let engine = remote_engine(DataStore::new(store.clone()));
+    let (lon, lat) = inside(&engine);
+
+    for (status, unavailable) in [
+        (503, true),
+        (429, true),
+        (502, true),
+        (504, true),
+        (500, false),
+    ] {
+        store.fail_with(Some(status));
+        let expected = |what: &str, e: DataServerError| match e {
+            DataServerError::Unavailable(detail) if unavailable => {
+                assert!(detail.contains(&status.to_string()), "{what}: {detail}")
+            }
+            DataServerError::ResourceExhausted if !unavailable => {}
+            e => panic!("{status}, {what}: {e:?}"),
+        };
+        expected("the render", failure(render(&engine)));
+        // Position and this area each read one full-resolution tile, which
+        // no failed read cached.
+        let reads = store.reads();
+        expected(
+            "EDR position",
+            failure(engine.query_point(lat, lon, None, None)),
+        );
+        assert_eq!(
+            store.reads() - reads,
+            FAILED_TILE_READS,
+            "{status}: position fetches its tile, then retries it before failing"
+        );
+        let reads = store.reads();
+        expected(
+            "EDR area",
+            failure(engine.query_bbox(lon, lat, lon + 0.01, lat + 0.01, None, None)),
+        );
+        assert_eq!(
+            store.reads() - reads,
+            FAILED_TILE_READS,
+            "{status}: the area fetches its one tile, then retries it before failing"
+        );
+    }
+    assert_eq!(cached_tiles(&engine), 0, "no cache holds the failed tiles");
+
+    store.fail_with(None);
+    let tile = render(&engine).expect("a retry renders");
+    assert!(!tile.values.is_all_nodata(), "the fixture's echoes render");
+    engine
+        .query_point(lat, lon, None, None)
+        .expect("a retry reads the position");
+    engine
+        .query_bbox(lon, lat, lon + 0.01, lat + 0.01, None, None)
+        .expect("a retry reads the area");
+}
+
 /// The decode half of #1051, by the maintainer's decision: remote tile bytes
 /// that arrive but do not decode are nulls in EDR, with `Ok`, not an error.
 /// The tile is attempted once, since a retry would decode the same bytes. A
@@ -197,10 +239,9 @@ async fn a_failed_tile_fetch_fails_the_render_and_edr_and_a_retry_reads() {
 /// before they decode), or as a second range read without that cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn undecodable_tile_bytes_are_edr_nulls_read_once() {
-    let local = EmptyDir::new();
     let fixture = std::fs::read(FIXTURE).unwrap();
     let flaky = FlakyStore::with_object(fixture.clone());
-    let engine = remote_engine(&local, &flaky);
+    let engine = remote_engine(DataStore::new(flaky.clone()));
 
     // The scan has parsed the header. Overwrite the bytes of every
     // full-resolution tile in the stored object with bytes that are no zlib

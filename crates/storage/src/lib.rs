@@ -30,7 +30,7 @@ use object_store::path::Path as ObjectPath;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 
 pub use bytes;
-pub use error::StorageError;
+pub use error::{is_unavailable_status, StorageError};
 pub use gauge::HostRequests;
 pub use object_store;
 pub use retryable::{forget_retryable_responses, retryable_responses, RetryableResponses};

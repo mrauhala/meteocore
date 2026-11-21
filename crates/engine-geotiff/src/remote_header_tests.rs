@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ds_core::error::DataServerError;
 use ds_storage::discovery::{FilenameMatcher, ScanSpec};
 use ds_storage::object_store::{
     self, memory::InMemory, path::Path as ObjectPath, ObjectStore, ObjectStoreExt, PutPayload,
@@ -26,7 +27,7 @@ pub(crate) const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../testdata/radar/radar_20260324T2315Z.tif"
 );
-const KEY: &str = "d/radar_20260324T2315Z.tif";
+pub(crate) const KEY: &str = "d/radar_20260324T2315Z.tif";
 
 /// An in-memory store whose next `fail_ranges` range reads fail the way a
 /// stalled S3 body does, counting range reads and whole-object GETs. Each
@@ -362,7 +363,10 @@ async fn object_store_reports_an_origin_ignoring_range_as_range_not_honoured() {
 /// with one path per answer. A header that parses is a COG; bytes that do
 /// not, and a 200 for the whole object, take the full download; a 404, 403,
 /// 416 or an object shorter than the listed size is a typed refusal; a 503
-/// and a body cut short are failed reads, never a full download.
+/// and a body cut short are failed reads, never a full download. A 429,
+/// 502, 503 or 504 is `Unavailable`, as a store that kept answering so is
+/// (#1523); a 500 and a body cut short are other failures. A HEAD and a
+/// whole download of a STAC asset type their statuses the same way.
 #[tokio::test(flavor = "multi_thread")]
 async fn http_header_read_tells_a_failed_read_and_a_refusal_from_a_non_cog() {
     use axum::http::{header, HeaderMap, StatusCode};
@@ -414,8 +418,12 @@ async fn http_header_read_tells_a_failed_read_and_a_refusal_from_a_non_cog() {
             axum::routing::get(|| async { StatusCode::RANGE_NOT_SATISFIABLE }),
         )
         .route(
-            "/unavailable",
-            axum::routing::get(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+            "/status/{code}",
+            axum::routing::get(
+                |axum::extract::Path(code): axum::extract::Path<u16>| async move {
+                    StatusCode::from_u16(code).unwrap()
+                },
+            ),
         )
         .route(
             "/cut-short",
@@ -469,8 +477,46 @@ async fn http_header_read_tells_a_failed_read_and_a_refusal_from_a_non_cog() {
             other => panic!("{path}: expected {refusal:?}, got {other:?}"),
         }
     }
-    for path in ["/unavailable", "/cut-short"] {
-        assert!(read(path, size).await.is_err(), "{path}: a failed read");
+    for code in [429, 502, 503, 504] {
+        let path = format!("/status/{code}");
+        match read(&path, size).await {
+            Err(DataServerError::Unavailable(detail)) => {
+                assert!(detail.contains(&code.to_string()), "{path}: {detail}")
+            }
+            other => panic!("{path}: expected Unavailable, got {other:?}"),
+        }
+    }
+    for path in ["/status/500", "/cut-short"] {
+        match read(path, size).await {
+            Err(DataServerError::Engine(_)) => {}
+            other => panic!("{path}: expected a failed read, got {other:?}"),
+        }
+    }
+
+    // A STAC asset's HEAD and whole download type their statuses alike: a
+    // 429 HEAD fails too, rather than standing for an unknown size.
+    let client = crate::stac::StacClient::new(
+        &format!("{base}/collections/radar/items"),
+        "data",
+        vec![base.clone()],
+    )
+    .unwrap();
+    for code in [429, 502, 503, 504, 500] {
+        let url = format!("{base}/status/{code}");
+        let head = client.head_asset_async(&url).await.map(drop);
+        let download = client.get_asset_async(&url).await.map(drop);
+        for (what, result) in [("HEAD", head), ("download", download)] {
+            match result {
+                Err(DataServerError::Unavailable(detail)) if code != 500 => {
+                    assert!(
+                        detail.contains(&code.to_string()),
+                        "{code} {what}: {detail}"
+                    )
+                }
+                Err(DataServerError::Engine(_)) if code == 500 => {}
+                other => panic!("{code} {what}: {other:?}"),
+            }
+        }
     }
 }
 

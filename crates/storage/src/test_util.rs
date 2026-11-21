@@ -7,6 +7,9 @@
 //! the wrong budget fails or succeeds where the test expects the other.
 //! And [`SlowReads`], a store whose every GET takes a set time and counts
 //! as in flight meanwhile, for a test of how many reads a caller overlaps.
+//! And [`FailingReads`], a store whose GETs fail as a store that kept
+//! answering one status through every retry, for a test of what a caller
+//! answers an unavailable store (#1523).
 //!
 //! Compiled for ds-storage's own tests and, through its `test-util`
 //! feature, for the tests of a crate that enables the feature on its
@@ -484,6 +487,160 @@ impl ObjectStore for SlowReads {
         let delay = *self.delay.lock().unwrap_or_else(|e| e.into_inner());
         tokio::time::sleep(delay).await;
         self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Wraps [`InMemory`]: while a status is set ([`Self::fail_with`]), every
+/// GET but a HEAD fails as object_store fails a GET whose every attempt the
+/// server answered with that status, retries included (#1523). The error
+/// reads as object_store's does, a `Generic` error whose source chain ends
+/// in `Server returned non-2xx status code: <status>`, so a
+/// [`DataStore`](crate::DataStore) types it as it types the real answer:
+/// 429, 502, 503 and 504 are `DataServerError::Unavailable`, any other
+/// status a `Storage` error. HEADs, LISTs and writes answer from the store,
+/// so a test builds its engine on it first and then lets the reads fail.
+#[derive(Debug, Default)]
+pub struct FailingReads {
+    pub inner: InMemory,
+    /// The status every GET fails with; 0 while none does.
+    status: std::sync::atomic::AtomicU16,
+    /// GETs that are not HEADs, failed or not.
+    reads: AtomicUsize,
+}
+
+impl FailingReads {
+    /// Store `bytes` under `key`.
+    pub fn put(&self, key: &str, bytes: impl Into<Bytes>) {
+        futures::executor::block_on(
+            self.inner
+                .put(&Path::from(key), PutPayload::from(bytes.into())),
+        )
+        .expect("an in-memory put");
+    }
+
+    /// Fail every GET from now on with `status`, or serve them again with
+    /// `None`.
+    pub fn fail_with(&self, status: Option<u16>) {
+        self.status.store(status.unwrap_or(0), Ordering::SeqCst);
+    }
+
+    /// How many GETs, HEADs left out, have started.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for FailingReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FailingReads")
+    }
+}
+
+/// The server's last answer to a request object_store gave up on, in
+/// object_store's wording, which `error::http_status` reads.
+#[derive(Debug)]
+struct LastAnswer(http::StatusCode);
+
+impl std::fmt::Display for LastAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Server returned non-2xx status code: {}: ", self.0)
+    }
+}
+
+impl std::error::Error for LastAnswer {}
+
+/// object_store's retry loop giving up on a GET: the request and its
+/// retries, with the last answer as its source.
+#[derive(Debug)]
+struct GaveUp {
+    path: String,
+    answer: LastAnswer,
+}
+
+impl std::fmt::Display for GaveUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Error performing GET {} in 1s, after 10 retries, max_retries: 10, \
+             retry_timeout: 120s  - {}",
+            self.path, self.answer
+        )
+    }
+}
+
+impl std::error::Error for GaveUp {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.answer)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for FailingReads {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if options.head {
+            return self.inner.get_opts(path, options).await;
+        }
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        match self.status.load(Ordering::SeqCst) {
+            0 => self.inner.get_opts(path, options).await,
+            status => Err(object_store::Error::Generic {
+                store: "S3",
+                source: Box::new(GaveUp {
+                    path: path.to_string(),
+                    answer: LastAnswer(
+                        http::StatusCode::from_u16(status).expect("an HTTP status code"),
+                    ),
+                }),
+            }),
+        }
     }
 
     fn delete_stream(

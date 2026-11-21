@@ -10,6 +10,8 @@ use chrono::{DateTime, NaiveDate, Utc};
 use ds_core::error::DataServerError;
 use url::Url;
 
+use crate::reader;
+
 /// Maximum items per page when querying the STAC API.
 pub(crate) const STAC_PAGE_LIMIT: u32 = 100;
 
@@ -682,9 +684,11 @@ impl StacClient {
 
     /// Async [`head_asset`](Self::head_asset), for callers already on a
     /// runtime (the poll-cycle metadata preload, #90). A HEAD that gets no
-    /// answer, or a server error, is an `Err`: a full download would go to
-    /// the same failing host (#1025). 501 Not Implemented is no failure: the
-    /// origin does not serve HEAD.
+    /// answer, a server error or a 429 is an `Err`: a full download would go
+    /// to the same failing host (#1025). A 429, 502, 503 or 504 is
+    /// `Unavailable`, as a store that kept answering so is
+    /// ([`reader::http_status_error`], #1523). 501 Not Implemented is no
+    /// failure: the origin does not serve HEAD.
     pub async fn head_asset_async(&self, url: &str) -> Result<AssetHead, DataServerError> {
         let resp = self.http.head(url).send().await.map_err(|e| {
             tracing::warn!("HEAD failed for '{}': {}", url, e);
@@ -694,11 +698,11 @@ impl StacClient {
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(AssetHead::NotFound);
         }
-        if status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED {
+        if ds_storage::is_unavailable_status(status.as_u16())
+            || (status.is_server_error() && status != reqwest::StatusCode::NOT_IMPLEMENTED)
+        {
             tracing::warn!("HEAD returned {} for '{}'", status, url);
-            return Err(DataServerError::Engine(
-                "Failed to fetch remote file metadata".into(),
-            ));
+            return Err(reader::http_status_error("STAC asset HEAD", status));
         }
         if !status.is_success() {
             tracing::warn!("HEAD returned {} for '{}'", status, url);
@@ -713,7 +717,8 @@ impl StacClient {
         Ok(AssetHead::Size(size))
     }
 
-    /// Fetch a byte range from an asset URL.
+    /// Fetch a byte range from an asset URL. A 429, 502, 503 or 504 is
+    /// `Unavailable` ([`reader::http_status_error`], #1523).
     pub fn get_range(
         &self,
         url: &str,
@@ -735,7 +740,10 @@ impl StacClient {
                 })?;
             if !resp.status().is_success() {
                 tracing::warn!("Range read returned {} for '{}'", resp.status(), url_owned);
-                return Err(DataServerError::Engine("Failed to read remote file".into()));
+                return Err(reader::http_status_error(
+                    "STAC asset range read",
+                    resp.status(),
+                ));
             }
             let data = resp.bytes().await.map_err(|e| {
                 tracing::warn!("Failed to read body from '{}': {}", url_owned, e);
@@ -751,7 +759,9 @@ impl StacClient {
     }
 
     /// Async [`get_asset`](Self::get_asset), for callers already on a runtime
-    /// (the poll-cycle metadata preload, #90).
+    /// (the poll-cycle metadata preload, #90). A 429, 502, 503 or 504 is
+    /// `Unavailable`, which every API answers 503 `SourceUnavailable`
+    /// ([`reader::http_status_error`], #1523).
     pub async fn get_asset_async(&self, url: &str) -> Result<bytes::Bytes, DataServerError> {
         let resp = self.http.get(url).send().await.map_err(|e| {
             tracing::warn!("Download failed for '{}': {:?}", url, e);
@@ -759,8 +769,9 @@ impl StacClient {
         })?;
         if !resp.status().is_success() {
             tracing::warn!("Download returned {} for '{}'", resp.status(), url);
-            return Err(DataServerError::Engine(
-                "Failed to download remote file".into(),
+            return Err(reader::http_status_error(
+                "STAC asset download",
+                resp.status(),
             ));
         }
         let data = resp.bytes().await.map_err(|e| {
