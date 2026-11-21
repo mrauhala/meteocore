@@ -20,7 +20,8 @@
 //! meridian. An antimeridian-crossing bbox is then one arc, never the sweep
 //! through 0° that `GeoTransform::bbox_to_pixels` takes from `west` to
 //! `east`. The position query places its point by the same rule
-//! ([`source_longitude`]).
+//! ([`source_longitude`]), and a map render its windows and longitudes
+//! (`map_read`, #1540).
 //!
 //! [`AreaGrid::new`] settles the answer's extent and cell count without
 //! allocating either; [`AreaGrid::plan`] runs the budgets on them before it
@@ -244,15 +245,17 @@ impl AreaPlan {
                 cells
             }
             AreaRead::Sampled { window, projection } => {
-                let (window_nx, _) = windows_dims(&[*window]);
                 let mut cells = Vec::with_capacity(nx * ny);
+                let read = crate::map_read::ReadWindow::new(
+                    *window,
+                    reads.first().map_or(&[][..], Vec::as_slice),
+                );
                 crate::resample_nearest(
                     projection,
                     nx as u32,
                     ny as u32,
-                    reads.first().map_or(&[][..], Vec::as_slice),
-                    window_nx,
-                    *window,
+                    &[read],
+                    None,
                     None,
                     (0, nx as u32 - 1, 0, ny as u32 - 1),
                     &mut cells,
@@ -299,8 +302,9 @@ fn windows_dims(windows: &[Window]) -> (usize, usize) {
 /// pixel off ±180° (edges at -180.5° and 179.5°), the pixel centred on
 /// ±180° meets both ends of a whole-world arc, and is read once, at its
 /// west end. The cells and budgets count those pixels alone. A bbox off
-/// the raster is the 400.
-fn native_windows(
+/// the raster is the 400. A map render reads the same windows of the level
+/// it draws (`map_read::MapRead`, #1540).
+pub(crate) fn native_windows(
     geo_transform: &GeoTransform,
     bbox: &Bbox,
 ) -> Result<Vec<Window>, DataServerError> {
@@ -597,11 +601,15 @@ pub(crate) fn lon_arc(
         }
     };
     // Whole turns, so both ends move by exactly the same amount.
-    let shift = centre.map_or(0.0, |centre| {
-        let middle = (west + east) / 2.0;
-        360.0 * ((lon_within_half_turn(middle, centre) - middle) / 360.0).round()
-    });
+    let shift = centre.map_or(0.0, |centre| whole_turns((west + east) / 2.0, centre));
     Some((west + shift, east + shift))
+}
+
+/// The whole turns, in degrees, that move `lon` to within half a turn of
+/// `centre` ([`lon_within_half_turn`]): a multiple of 360, the same for
+/// both ends of a range, and 0 for a longitude already there.
+pub(crate) fn whole_turns(lon: f64, centre: f64) -> f64 {
+    360.0 * ((lon_within_half_turn(lon, centre) - lon) / 360.0).round()
 }
 
 /// The ground size `(column, row)` in metres of the native pixel at
@@ -636,7 +644,7 @@ fn raster_centre(geo_transform: &GeoTransform) -> Option<(f64, f64)> {
 /// longitudes within half a turn of: a geographic raster's middle, its
 /// columns linear in longitude from its western edge, else the CRS's
 /// central longitude where it has one ([`central_longitude`]).
-fn frame_centre(geo_transform: &GeoTransform) -> Option<f64> {
+pub(crate) fn frame_centre(geo_transform: &GeoTransform) -> Option<f64> {
     match &geo_transform.crs {
         Crs::Wgs84 => {
             let middle = geo_transform.origin_x

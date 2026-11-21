@@ -93,6 +93,11 @@ tiles a request touches, so a remote COG is not downloaded whole.
 - The spatial extent reaches a pole the grid holds, at every longitude,
   and is `west > east` across the antimeridian; the map footprint guard
   takes the same extent (#1194).
+- Longitudes are read in the raster's own frame, in maps and EDR alike: a
+  raster stored from 0° to 360°, or past 180°, draws and answers its
+  western hemisphere; a map or area across its seam reads its last columns
+  and its first; a Lambert grid near ±180° answers from its own side; and a
+  map a turn past ±180° draws the world copy (#1442, #1540).
 - The native grid (#1237) is the first loaded file's: its cells in its own
   CRS, with the EPSG code its `ProjectedCSTypeGeoKey` states. When that code
   is the advertised `storageCrs`, the collection description adds
