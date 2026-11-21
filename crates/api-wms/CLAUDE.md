@@ -211,9 +211,11 @@ error images never are. Measured on a day of a live deployment's GetMaps
 ## Dimensions
 
 - **TIME** — valid-time axis from `RasterInfo.times`. A TIME-less GetMap
-  resolves through `ds_core::map_engine::default_request_time`: the engine's
+  without `DIM_REFERENCE_TIME` resolves through
+  `ds_core::map_engine::default_request_time`: the engine's
   `default_time()` when supplied, else the parameter's latest time, else
-  `times.last()`. GetCapabilities advertises the same default. CAP advertises
+  `times.last()`. GetCapabilities advertises the same default. With a
+  `DIM_REFERENCE_TIME`, the run's own latest step (#1451, below). CAP advertises
   future warnings while keeping its snapshot's `as_of` as the "active now"
   default.
 - **Per-parameter TIME (#819).** When `MapEngine::parameter_times(param)` is
@@ -261,6 +263,25 @@ error images never are. Measured on a day of a live deployment's GetMaps
   `get_raster_tile` and into the rendered + meta-tile cache keys
   (`CacheKey.reference_time`, `TileKeyPrefix.reference_time`) so distinct
   runs don't collide.
+  **Time and run resolve through `api_common::subset::resolve_time_and_run`
+  (#1451)**, the rule Maps and map tiles draw by (`resolve_frame`), with
+  `TIME` as an instant not from a subset. Never resolve them by hand here.
+  A named run, the latest included, is passed as itself and drawn exactly:
+  without `TIME` its own latest step (`MapEngine::run_times`), a `TIME`
+  inside it snapped within it, never another run's step. Never normalise a
+  named latest run to `None`: that gave it GRIB's cross-run fallback, so
+  the URL changed meaning once a newer run landed. The fallback (#1005)
+  stays for requests naming no run. A `NoTimeStep` (a `TIME` outside the
+  run, a run whose `run_times` for the layer are empty) is
+  `InvalidDimensionValue` in GetMap and GetFeatureInfo, before any read:
+  WMS 1.3.0 C.3.4 ("cannot comply with the dimensional parameters as
+  specified"); C.4.3's nearest value is for a value imprecise on the axis,
+  not a valid time another run has. Never the red error tile. The
+  advertised `time` default stays the latest over every run (one default
+  per `<Dimension>`). Pinned by `tests/integration.rs`
+  `a_named_run_draws_its_own_steps` (mock) and, on real data,
+  `crates/server/tests/grib_reference_time.rs` and
+  `wms_get_feature_info.rs` `a_netcdf_named_run_draws_and_reads_its_own_steps`.
 - **Long axes (#1006).** `time` and `reference_time` values come from
   `ds_core::time_axis::wms_extent`: up to `MAX_LISTED_VALUES` (500) values
   the comma-separated list, byte-identical to before; past it, Annex C
@@ -304,9 +325,8 @@ error images never are. Measured on a day of a live deployment's GetMaps
   keeps its frame but gets the short header: its URL draws another frame
   once one lands or the window slides. So does a `TIME` on a layer with runs
   and no `DIM_REFERENCE_TIME`: a newer run or nowcast generation re-covers
-  the valid time. The run is compared as named, before the latest is
-  normalised to `None`, so a named latest run the engine draws stays pinned
-  and one it falls back from (GRIB's cross-run fallback) does not.
+  the valid time. A named run, the latest included, is drawn exactly
+  (#1451), so it is fixed whenever it is drawn.
   `resolve_layer` computes it per request and nothing stores it: the caches
   key on the resolved time and run, so a snapped and an exact request share
   one entry and each sends its own header, on a hit and a 304 too.

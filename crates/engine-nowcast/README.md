@@ -49,8 +49,11 @@ significance, and the motion vectors for particle-animation clients.
 **Map layer.** `time` lists the anchor and one frame per `step` until
 `horizon` is covered. Without `TIME` a request draws the furthest lead, so
 clients should send `TIME`. WMS lists retained generations as the
-`reference_time` dimension (`DIM_REFERENCE_TIME`); Maps and Tiles draw the
-latest.
+`reference_time` dimension (`DIM_REFERENCE_TIME`), and Maps and Tiles take
+one as `subset=reference_time(…)`; without one they draw the latest. A
+generation named, the latest included, is drawn exactly: a time outside
+its frames is WMS `InvalidDimensionValue`, a Maps 404 or an empty map
+tile.
 
 **Storm cells.** One Point feature per cell; the id is the track id. The
 cells of the last 48 generations are kept. Without `datetime` the latest

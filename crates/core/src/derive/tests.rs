@@ -181,6 +181,23 @@ impl MapEngine for Mock {
         (parameter == "z").then(|| Arc::from([hour(4), hour(5)]))
     }
 
+    /// The 00Z run has `10u` at 00–02Z and `10v` at 00–01Z; the 06Z run
+    /// `10u` at 06Z and no `10v`, as a GRIB run lacking it has none.
+    fn run_times(
+        &self,
+        parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        let hours: &[u32] = match (parameter, run == hour(0)) {
+            (Some("10u"), true) => &[0, 1, 2],
+            (Some("10v"), true) => &[0, 1],
+            (Some("10u"), false) => &[6],
+            (Some("10v"), false) => &[],
+            _ => return None,
+        };
+        Some(hours.iter().map(|&h| hour(h)).collect())
+    }
+
     fn resolve_parameter_time(
         &self,
         parameter: Option<&str>,
@@ -533,6 +550,27 @@ fn a_height_resolves_as_its_geopotential() {
     for p in ["gh", "10si"] {
         assert_eq!(derived.content_version_for(Some(p), t(p), rt(p), None), 0);
     }
+}
+
+/// #1451: a derived parameter has its first input's times in a run, and
+/// none in a run that lacks any of its inputs, so a map naming that run is
+/// no data, with a time or without, never the inputs' "share no timestep".
+/// Every other layer's are the wrapped engine's.
+#[test]
+fn a_derived_parameter_has_no_time_in_a_run_without_an_input() {
+    let mock = Mock::new();
+    let (derived, _) = wrap(&mock, Derivations::ALL);
+    let times = |p: Option<&str>, run: u32| derived.run_times(p, hour(run)).map(|t| t.to_vec());
+    assert_eq!(
+        times(Some("10si"), 0),
+        Some(vec![hour(0), hour(1), hour(2)])
+    );
+    assert_eq!(times(Some("10si"), 6), Some(vec![]));
+    assert_eq!(times(Some("10u"), 6), Some(vec![hour(6)]));
+    assert_eq!(times(Some("10v"), 0), Some(vec![hour(0), hour(1)]));
+    // A height from `z`, which the mock gives no run axis, nor the default.
+    assert_eq!(times(Some("gh"), 0), None);
+    assert_eq!(times(None, 0), None);
 }
 
 /// #1100: the wrapper forwards the wrapped engine's feature picks, and a

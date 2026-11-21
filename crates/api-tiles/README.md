@@ -108,13 +108,17 @@ Any other query parameter, or `datetime` with `subset`, is a 400.
 
 - **Map tile time.** No time: the engine's default step, normally the latest.
   An instant snaps to one of the engine's time steps; an interval, a partial
-  date or `*` renders the latest step inside it. No step selected: 204 No
-  Content. `OGCAPI-datetime` names the instant rendered.
+  date or `*` renders the latest step inside it, with a model run named or
+  without. No step selected, or a step drawn outside the interval (a
+  derived parameter whose inputs have different steps): 204 No Content.
+  `OGCAPI-datetime` names the instant rendered.
 - **Map tile model run.** `subset=reference_time("<run>")`, as on a Maps map
   ([api-maps](../api-maps/README.md#map-parameters)): the run's EDR instance
   id, or `*` for the latest. A named run is drawn exactly: the time is one
   of its own valid times, by default its latest, and a time outside it is
-  an empty tile, 204. An unknown run is a 404, an interval of runs a 400,
+  an empty tile, 204. So is a run without the parameter, or without one
+  input of a derived parameter, with a time or without. An unknown run is
+  a 404, an interval of runs a 400,
   and the axis a 400 naming `datetime` on a collection without runs or on a
   vector tile.
 - **Vector tile time.** The tile keeps features whose temporal geometry

@@ -128,7 +128,10 @@ or map window. Nothing is converted or copied first.
 
 **Maps.** A requested instant (WMS `TIME`, Maps/Tiles `datetime`) draws
 the nearest step; without one, the last step. The run is the latest unless
-WMS `DIM_REFERENCE_TIME` names another. A bounding box off the grid renders
+WMS `DIM_REFERENCE_TIME` or a Maps/Tiles `subset=reference_time(…)` names
+another, the latest included: that run is drawn exactly, its own last step
+without a time, and an instant outside it is the API's exception or no
+data. A bounding box off the grid renders
 transparent. Projected output CRSs are sampled through a coarse projection
 grid, never per pixel.
 

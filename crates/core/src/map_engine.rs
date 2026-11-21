@@ -1141,9 +1141,10 @@ pub trait MapEngine: Send + Sync {
 
     /// The valid times model run `run` has for `parameter` (`None`: the one
     /// `get_raster_tile` renders by default), ascending: the axis a map or
-    /// map tile naming that run selects its time on (#337). A named run is
-    /// drawn exactly, so a time outside these is no data, and an interval
-    /// draws the latest of them inside it.
+    /// map tile naming that run, or a WMS layer under `DIM_REFERENCE_TIME`,
+    /// selects its time on (#337, #1451). A named run is drawn exactly, so
+    /// a time outside these is no data, and an interval draws the latest of
+    /// them inside it.
     ///
     /// An engine that retains runs MUST override this when its time axis is
     /// not each run's own: GRIB and NetCDF advertise the union over runs,
@@ -1151,7 +1152,10 @@ pub trait MapEngine: Send + Sync {
     /// what its snapshot already holds; a run it does not retain is `None`.
     /// Wrappers forward it. A parameter's own steps within the run may be
     /// fewer; the engine then snaps to one of them, as
-    /// [`Self::resolve_parameter_time`] says.
+    /// [`Self::resolve_parameter_time`] says. A parameter the run lacks
+    /// has none, an empty axis (GRIB), which a request naming the run draws
+    /// nothing for, with a time or without; `ds_core::derive` gives a
+    /// derived parameter an empty axis where the run lacks any input.
     ///
     /// Default `None`: the run's times are the axis [`Self::parameter_times`]
     /// or `RasterInfo::times` give. **O(1) from a snapshot** (Critical Rule

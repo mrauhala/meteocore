@@ -1097,16 +1097,28 @@ impl MapEngine for Derived {
 
     /// A derived parameter has its first input's times in the run: the
     /// render then picks the step every input has, as
-    /// `resolve_parameter_time` does. Every other layer is the wrapped
-    /// engine's.
+    /// `resolve_parameter_time` does, and a map of an interval whose step
+    /// that puts outside it draws nothing (`api_common::subset`, #1451).
+    /// A run without one of the inputs has no times for it, so a map naming
+    /// that run is no data with a time or without, never the inputs' "share
+    /// no timestep". Every other layer is the wrapped engine's. One `Arc`
+    /// clone per input, no allocation (Critical Rule 10).
     fn run_times(&self, parameter: Option<&str>, run: DateTime<Utc>) -> Option<Times> {
         let plan = self.plan();
-        match parameter.and_then(|p| plan.get(p)) {
-            Some(d) => self
-                .map
-                .run_times(d.inputs.first().map(String::as_str), run),
-            None => self.map.run_times(parameter, run),
+        let Some(d) = parameter.and_then(|p| plan.get(p)) else {
+            return self.map.run_times(parameter, run);
+        };
+        let mut first = None;
+        for (i, input) in d.inputs.iter().enumerate() {
+            let times = self.map.run_times(Some(input), run);
+            if times.as_ref().is_some_and(|times| times.is_empty()) {
+                return times;
+            }
+            if i == 0 {
+                first = times;
+            }
         }
+        first
     }
 
     fn resolve_parameter_time(

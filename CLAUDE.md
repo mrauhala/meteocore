@@ -628,8 +628,10 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    `resolve_parameters_reference_time`, the run several parameters render
    together from (`DerivedWind`'s u and v; GRIB, #1026). And override
    `MapEngine::run_times` with each run's own valid times, an `Arc` from
-   the snapshot: a Maps map or map tile naming a run selects its time on
-   them, and `RasterInfo.times` is not one run's (#337).
+   the snapshot: a Maps map, a map tile or a WMS layer naming a run
+   selects its time on them, and `RasterInfo.times` is not one run's
+   (#337). A parameter a run lacks has an empty axis there, so a request
+   naming the run is no data, with a time or without (#1451).
    **If the engine's content for a fixed `(time, reference_time)` can be
    revised in place** (a push-fed alert set: a warning published later is
    active at instants already rendered), it MUST override
@@ -1081,7 +1083,9 @@ one never implies the other.
     runs as the extent's `reference_time` dimension (#337), through one
     resolution, `api_common::subset::resolve_frame`. A named run is drawn
     exactly and selects its time on its own valid times,
-    `MapEngine::run_times`, which every engine with runs overrides.
+    `MapEngine::run_times`, which every engine with runs overrides. WMS
+    `DIM_REFERENCE_TIME` resolves through the same
+    `resolve_time_and_run`, the latest run named included (#1451).
 - **`ds_core::time_axis`** — the one rule for long time axes (#1006): up to
   `MAX_LISTED_VALUES` (500) values a list, WMS byte-identical to before; past it,
   ranges of equally spaced values, lossless. WMS writes them as Annex C

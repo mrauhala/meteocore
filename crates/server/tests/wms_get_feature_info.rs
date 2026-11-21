@@ -561,6 +561,107 @@ async fn netcdf_pixels_read_the_edr_position_value(wms: axum::Router, edr: axum:
     }
 }
 
+/// #1451: a `DIM_REFERENCE_TIME` is drawn exactly, as a Maps
+/// `reference_time` subset is. MEPS's 06Z run is valid 06–09Z, its 09Z run
+/// 09–11Z. Without `TIME` the 06Z run draws and reads its own latest step,
+/// 09Z, the EDR value of that instance there, where the layer's default,
+/// 11Z, is the 09Z run's only. The latest run named draws 07Z, which only
+/// the 06Z run has, as `InvalidDimensionValue`, never the 06Z run's step,
+/// and a time past the 06Z run is too; naming no run, 07Z still reads the
+/// 06Z run.
+#[test]
+fn a_netcdf_named_run_draws_and_reads_its_own_steps() {
+    let Apis { wms, edr } = meps();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(netcdf_named_runs(wms, edr));
+}
+
+async fn netcdf_named_runs(wms: axum::Router, edr: axum::Router) {
+    const OLD: &str = "2026-10-15T06:00:00Z";
+    const NEW: &str = "2026-10-15T09:00:00Z";
+    let (lon, lat) = MEPS_CELL;
+    let d = 0.01;
+    let bbox = format!("{},{},{},{}", lon - d, lat - d, lon + d, lat + d);
+    let layer = "meps/air_temperature_2m";
+    let info = feature_info(
+        &wms,
+        layer,
+        "CRS:84",
+        &bbox,
+        (3, 3),
+        (1, 1),
+        &format!("&DIM_REFERENCE_TIME={OLD}"),
+    )
+    .await;
+    assert_eq!(info.time, "2026-10-15T09:00:00Z");
+    assert_eq!(info.reference_time, OLD);
+    let reply = get(
+        &edr,
+        &format!(
+            "/collections/meps/instances/{OLD}/position?coords=POINT({}%20{})\
+             &parameter-name=air_temperature_2m&datetime=2026-10-15T09:00:00Z",
+            info.lon, info.lat
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert_eq!(
+        json(&reply)["ranges"]["air_temperature_2m"]["values"][0],
+        info.value
+    );
+
+    let map = |extra: &str| {
+        format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={layer}&STYLES=\
+             &CRS=CRS:84&BBOX=5,55,25,70&WIDTH=32&HEIGHT=32&FORMAT=image/png{extra}"
+        )
+    };
+    let default = get(&wms, &map(&format!("&DIM_REFERENCE_TIME={OLD}"))).await;
+    assert_eq!(
+        (default.status, default.x_cache.as_str()),
+        (StatusCode::OK, "MISS"),
+        "{}",
+        default.body
+    );
+    let f003 = get(
+        &wms,
+        &map(&format!(
+            "&TIME=2026-10-15T09:00:00Z&DIM_REFERENCE_TIME={OLD}"
+        )),
+    )
+    .await;
+    assert_eq!(
+        (f003.status, f003.x_cache.as_str()),
+        (StatusCode::OK, "HIT")
+    );
+    for extra in [
+        format!("&TIME=2026-10-15T07:00:00Z&DIM_REFERENCE_TIME={NEW}"),
+        format!("&TIME=2026-10-15T10:00:00Z&DIM_REFERENCE_TIME={OLD}"),
+    ] {
+        let reply = get(&wms, &map(&extra)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{extra}");
+        assert!(
+            reply.body.contains("code=\"InvalidDimensionValue\""),
+            "{extra}: {}",
+            reply.body
+        );
+    }
+    let fallback = feature_info(
+        &wms,
+        layer,
+        "CRS:84",
+        &bbox,
+        (3, 3),
+        (1, 1),
+        "&TIME=2026-10-15T07:00:00Z",
+    )
+    .await;
+    assert_eq!(fallback.reference_time, OLD);
+}
+
 /// `testdata/meps-netcdf-pl`'s temperature and wind, wrapped in
 /// `DerivedWind` as the server registers it.
 fn meps_pl_engine() -> Arc<DerivedWind> {

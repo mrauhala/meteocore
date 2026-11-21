@@ -110,8 +110,10 @@ tiles, with the Scaling and Background parameters.
   derived, is capped at 8000 a side and 64 000 000 pixels.
 - **Time.** `datetime` or `subset=time(…)`, not both. The engine snaps an
   instant to one of its time steps (a parameter's own axis when it has one).
-  An interval renders the latest step inside it, and is a 404 when it holds
-  none. Without a time, the engine's default time is used, else the latest.
+  An interval renders the latest step inside it, with a model run named or
+  without, and is a 404 when it holds none, or when the step drawn for it
+  lies outside it (a derived parameter whose inputs have different
+  steps). Without a time, the engine's default time is used, else the latest.
 - **Model run.** `subset=reference_time("2026-10-01T06:00:00Z")` on a
   collection whose extent has a `reference_time` dimension. The value is the
   run's EDR instance id; the compact `20261001T0600Z` ids from before #947
@@ -122,10 +124,11 @@ tiles, with the Scaling and Background parameters.
   times (`MapEngine::run_times`), by default its latest: an instant inside
   the run snaps to one of its steps, an interval, a partial date or `*`
   draws the latest step inside it, and an instant outside the run, or an
-  interval holding none of its steps, is a 404. WMS `DIM_REFERENCE_TIME`
-  differs for the latest run: there it falls back like no run, since WMS
-  clients echo the advertised default. A run the collection does not have
-  is a 404. An interval of runs is a 400: a map draws one run. On a
+  interval holding none of its steps, is a 404. So is a run without the
+  parameter, with a time or without: a GRIB run without it, or without one
+  input of a derived parameter such as a wind speed. WMS
+  `DIM_REFERENCE_TIME` draws a run by the same rule, the latest included.
+  A run the collection does not have is a 404. An interval of runs is a 400: a map draws one run. On a
   collection without runs the axis is a 400 naming the valid axes. The run
   drawn keys the rendered cache.
 - **Background.** Transparent, the map keeps its alpha: areas with no data

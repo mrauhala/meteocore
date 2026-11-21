@@ -13,6 +13,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use chrono::{DateTime, Utc};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
@@ -3712,7 +3713,7 @@ async fn legend_graphic_json_format_is_case_insensitive_and_images_unchanged() {
 }
 
 // ---------------------------------------------------------------------------
-// Explicit pin of the current latest run keeps fallback-tolerant resolution
+// A named run, the latest included, is drawn exactly (#1451)
 // ---------------------------------------------------------------------------
 
 /// Mock forecast engine simulating GRIB's cross-run fallback: an UNPINNED
@@ -3774,70 +3775,261 @@ impl MapEngine for FallbackForecastMockMapEngine {
     }
 }
 
-/// Regression (#526 review round 5): a client echoing the GetCapabilities
-/// `default=` (the current latest run) must keep the fallback-tolerant run
-/// resolution an omitted dimension gets — the explicit-latest pin is
-/// normalised to `None` BEFORE `resolve_reference_time`, so the engine may
-/// still fall back to an older covering run instead of refusing. A pin of an
-/// older run stays exact.
+/// #1451: a client naming the current latest run gets that run, exactly as
+/// an older run is drawn, never the engine's fallback to an older covering
+/// run, so the URL keeps meaning that run's frame once a newer run lands. It
+/// used to be normalised to no run, which drew the older run here. A pin of
+/// the older run is that run's own entry.
 #[tokio::test]
-async fn getmap_explicit_latest_pin_keeps_fallback_resolution() {
+async fn getmap_explicit_latest_pin_is_drawn_exactly() {
     let calls: RunRecorder = Arc::new(std::sync::Mutex::new(Vec::new()));
     let engine: Arc<dyn MapEngine> = Arc::new(FallbackForecastMockMapEngine {
         calls: calls.clone(),
     });
     let app = build_forecast_router_with_engine(engine);
+    for (run, expected) in [
+        ("2026-06-07T12:00:00Z", vec![Some(forecast_runs()[1])]),
+        (
+            "2026-06-07T00:00:00Z",
+            vec![Some(forecast_runs()[1]), Some(forecast_runs()[0])],
+        ),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{FC_GETMAP_URI}&DIM_REFERENCE_TIME={run}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{run}");
+        assert_eq!(calls.lock().unwrap().clone(), expected, "{run}");
+    }
+}
 
-    // Echoing the latest run (forecast_runs()[1]) must resolve like an
-    // omitted dimension: the mock's fallback picks the OLDER run.
-    let resp = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "{FC_GETMAP_URI}&DIM_REFERENCE_TIME=2026-06-07T12:00:00Z"
-                ))
-                .body(Body::empty())
-                .unwrap(),
+/// Runs 00Z, valid 00, 03, 06 and 09Z, and 06Z, valid 06, 09 and 12Z, as a
+/// GRIB collection advertises them: the union. Without a run a time before
+/// 06Z falls back to the 00Z run; a pinned run snaps a time within its own
+/// steps to the nearest, and echoes one outside them, which it then fails
+/// to render, as GRIB does. Records each render's time and run.
+struct RunStepsMock {
+    calls: FrameRecorder,
+}
+
+/// Each render's `(time, reference_time)`.
+type FrameRecorder = Arc<std::sync::Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>>;
+
+fn run_steps_hour(h: i64) -> DateTime<Utc> {
+    forecast_runs()[0] + chrono::Duration::hours(h)
+}
+
+/// The 00Z and 06Z runs, of `forecast_runs()`'s day.
+fn run_steps_runs() -> [DateTime<Utc>; 2] {
+    [run_steps_hour(0), run_steps_hour(6)]
+}
+
+fn run_steps_of(run: DateTime<Utc>) -> Vec<DateTime<Utc>> {
+    let first = (run - run_steps_hour(0)).num_hours();
+    let hours: &[i64] = if first == 0 {
+        &[0, 3, 6, 9]
+    } else {
+        &[0, 3, 6]
+    };
+    hours.iter().map(|h| run_steps_hour(first + h)).collect()
+}
+
+impl MapEngine for RunStepsMock {
+    fn get_raster_tile(
+        &self,
+        _bbox: [f64; 4],
+        width: u32,
+        height: u32,
+        time: Option<DateTime<Utc>>,
+        _output_crs: &OutputCrs,
+        _parameter: Option<&str>,
+        _z: Option<f64>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        let (Some(time), Some(run)) = (time, reference_time) else {
+            return Err(DataServerError::InvalidParameter("no frame".into()));
+        };
+        self.calls.lock().unwrap().push((time, run));
+        if !run_steps_of(run).contains(&time) {
+            return Err(DataServerError::InvalidParameter(format!(
+                "No forecast step for time {time}"
+            )));
+        }
+        let pixels = (width * height) as usize;
+        let values: Vec<Option<f64>> = (0..pixels)
+            .map(|i| Some(i as f64 / pixels as f64))
+            .collect();
+        Ok(RasterTile {
+            width,
+            height,
+            values: values.into(),
+        })
+    }
+
+    fn raster_info(&self) -> RasterInfo {
+        RasterInfo {
+            times: (0..=12).step_by(3).map(run_steps_hour).collect(),
+            reference_times: run_steps_runs().to_vec(),
+            ..FallbackForecastMockMapEngine {
+                calls: Arc::default(),
+            }
+            .raster_info()
+        }
+    }
+
+    fn run_times(
+        &self,
+        _parameter: Option<&str>,
+        run: DateTime<Utc>,
+    ) -> Option<Arc<[DateTime<Utc>]>> {
+        run_steps_runs()
+            .contains(&run)
+            .then(|| run_steps_of(run).into())
+    }
+
+    fn resolve_reference_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let [older, newer] = run_steps_runs();
+        reference_time.or(Some(if time.is_some_and(|t| t < newer) {
+            older
+        } else {
+            newer
+        }))
+    }
+
+    fn resolve_time(
+        &self,
+        time: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Option<DateTime<Utc>> {
+        let steps = run_steps_of(reference_time?);
+        let (first, last) = (steps[0], *steps.last().unwrap());
+        match time {
+            None => Some(last),
+            Some(t) if t < first || t > last => Some(t),
+            Some(t) => steps.into_iter().min_by_key(|s| (*s - t).abs()),
+        }
+    }
+}
+
+/// #1451: WMS draws a named run as Maps and map tiles do, through one rule.
+/// Without `TIME` an older run draws its own latest step, 09Z, not the
+/// layer's default, 12Z, which only the newer run has: that was the error
+/// tile. A `TIME` outside the named run, the latest included, is
+/// `InvalidDimensionValue` (WMS 1.3.0 C.3.4), never the error tile and
+/// never another run's step; naming no run, the engine still falls back.
+/// The caches key the time and run drawn, so a named run and none share
+/// the frame they both draw, and only the named one is `immutable`.
+#[tokio::test]
+async fn a_named_run_draws_its_own_steps() {
+    const IMMUTABLE: &str = "public, max-age=86400, immutable";
+    const SHORT: &str = "public, max-age=60, must-revalidate";
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = build_forecast_router_with_engine(Arc::new(RunStepsMock {
+        calls: calls.clone(),
+    }));
+    let fetch = |extra: String| {
+        let app = app.clone();
+        async move {
+            let uri = format!("{FC_GETMAP_URI}{extra}");
+            let resp = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let header = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .unwrap_or_default()
+            };
+            let (status, x_cache, cache_control) =
+                (resp.status(), header("x-cache"), header("cache-control"));
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                x_cache,
+                cache_control,
+                String::from_utf8_lossy(&body).into_owned(),
+            )
+        }
+    };
+    let at = |h: i64| run_steps_hour(h).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let [older, newer] = run_steps_runs();
+    let named = |run: DateTime<Utc>| {
+        format!(
+            "&DIM_REFERENCE_TIME={}",
+            run.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    };
+    let last_call = || *calls.lock().unwrap().last().unwrap();
+
+    // The older run without TIME: its own latest step.
+    let (status, x_cache, cache_control, _) = fetch(named(older)).await;
+    assert_eq!((status, x_cache.as_str()), (StatusCode::OK, "MISS"));
+    assert_eq!(cache_control, SHORT, "no TIME follows new data");
+    assert_eq!(last_call(), (run_steps_hour(9), older));
+    let (_, x_cache, cache_control, _) = fetch(format!("&TIME={}{}", at(9), named(older))).await;
     assert_eq!(
-        calls.lock().unwrap().clone(),
-        vec![Some(forecast_runs()[0])],
-        "explicit-latest pin must keep the fallback resolution (older covering run)"
+        (x_cache.as_str(), cache_control.as_str()),
+        ("HIT", IMMUTABLE)
     );
 
-    // An explicit pin of the OLDER run resolves to the same concrete run the
-    // fallback picked — so it must be a pure cache hit on the entry the
-    // first request created (both key `Some(older)`), not a re-render.
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .uri(format!(
-                    "{FC_GETMAP_URI}&DIM_REFERENCE_TIME=2026-06-07T00:00:00Z"
-                ))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    // A TIME outside the named run, the latest included: the exception,
+    // before any render.
+    let renders = calls.lock().unwrap().len();
+    for extra in [
+        format!("&TIME={}{}", at(3), named(newer)),
+        format!("&TIME={}{}", at(12), named(older)),
+    ] {
+        let (status, _, _, body) = fetch(extra.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}");
+        assert!(
+            body.contains("code=\"InvalidDimensionValue\""),
+            "{extra}: {body}"
+        );
+        assert!(body.contains("model run"), "{extra}: {body}");
+    }
+    assert_eq!(calls.lock().unwrap().len(), renders);
+
+    // Naming no run, 03Z falls back to the older run; an older-run TIME
+    // between its steps snaps to the same frame, unpinned.
+    let (status, x_cache, _, _) = fetch(format!("&TIME={}", at(3))).await;
+    assert_eq!((status, x_cache.as_str()), (StatusCode::OK, "MISS"));
+    assert_eq!(last_call(), (run_steps_hour(3), older));
+    let (_, x_cache, cache_control, _) = fetch(format!("&TIME={}{}", at(4), named(older))).await;
+    assert_eq!((x_cache.as_str(), cache_control.as_str()), ("HIT", SHORT));
+
+    // The latest run named and none draw one frame at 09Z, and without a
+    // TIME its latest step; only the named one pins.
+    let (_, x_cache, cache_control, _) = fetch(format!("&TIME={}{}", at(9), named(newer))).await;
     assert_eq!(
-        calls.lock().unwrap().len(),
-        1,
-        "older-run pin must share the cache entry keyed on the fallback-resolved run"
+        (x_cache.as_str(), cache_control.as_str()),
+        ("MISS", IMMUTABLE)
     );
+    assert_eq!(last_call(), (run_steps_hour(9), newer));
+    let (_, x_cache, cache_control, _) = fetch(format!("&TIME={}", at(9))).await;
+    assert_eq!((x_cache.as_str(), cache_control.as_str()), ("HIT", SHORT));
+    let (_, x_cache, _, _) = fetch(named(newer)).await;
+    assert_eq!(x_cache, "MISS");
+    assert_eq!(last_call(), (run_steps_hour(12), newer));
+    let (_, x_cache, _, _) = fetch(String::new()).await;
+    assert_eq!(x_cache, "HIT");
 }
 
 /// #1421: on an engine that retains runs, an exact `TIME` is `immutable`
 /// only under a `DIM_REFERENCE_TIME` the engine draws. Without one the
 /// layer draws the latest run now, and a newer run re-covers the valid time
-/// later. The current latest run, named, is fixed when drawn (it is
-/// normalised before resolution), but not when the engine falls back to an
-/// older run for it: the URL then draws the named run once it covers the
-/// valid time.
+/// later. The current latest run, named, is fixed: it is drawn exactly, on
+/// an engine that falls back without one too (#1451).
 #[tokio::test]
 async fn only_a_named_run_drawn_is_immutable() {
     const IMMUTABLE: &str = "public, max-age=86400, immutable";
@@ -3863,7 +4055,7 @@ async fn only_a_named_run_drawn_is_immutable() {
     let fallback = build_forecast_router_with_engine(Arc::new(FallbackForecastMockMapEngine {
         calls: Arc::new(std::sync::Mutex::new(Vec::new())),
     }));
-    for (run, expected) in [("", SHORT), (OLDER, IMMUTABLE), (LATEST, SHORT)] {
+    for (run, expected) in [("", SHORT), (OLDER, IMMUTABLE), (LATEST, IMMUTABLE)] {
         assert_eq!(
             cache_control(&fallback, run).await,
             expected,

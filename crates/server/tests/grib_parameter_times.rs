@@ -446,13 +446,17 @@ async fn the_run_rendered_is_the_parameters_on_every_map_api() {
         (first.status, first.x_cache.as_str()),
         (StatusCode::OK, "MISS")
     );
-    // A client echoing the advertised default run, the newest, and a pin of
-    // the run rendered both hit the entry keyed on the 00Z run's f006.
-    for run in [6, 0] {
-        let reply = get(&app, &map(6, Some(run))).await;
-        assert_eq!(reply.x_cache, "HIT", "DIM_REFERENCE_TIME = +{run} h");
-        assert_eq!(reply.body, first.body);
-    }
+    // A pin of the run rendered hits the entry keyed on the 00Z run's f006.
+    let reply = get(&app, &map(6, Some(0))).await;
+    assert_eq!(reply.x_cache, "HIT", "DIM_REFERENCE_TIME = +0 h");
+    assert_eq!(reply.body, first.body);
+    // The newest run named is drawn exactly (#1451): its 6 h averages begin
+    // at 12Z, so it has none at 06Z, the exception rather than the 00Z
+    // run's frame.
+    let reply = get(&app, &map(6, Some(6))).await;
+    let body = String::from_utf8_lossy(&reply.body);
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("InvalidDimensionValue"), "{body}");
     // The 06Z run's own window is another entry.
     assert_eq!(get(&app, &map(12, None)).await.x_cache, "MISS");
 
