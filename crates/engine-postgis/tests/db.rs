@@ -2127,6 +2127,167 @@ async fn events_pick_shape() {
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
 
+/// The late-strike fixture (#1432): strike 1 inside the 06:00 frame's
+/// window, strike 2 after it, the newest.
+const LATE_EVENTS: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.strikes (
+    id bigint PRIMARY KEY,
+    time timestamptz NOT NULL,
+    geom geometry(Point, 4326) NOT NULL,
+    peak_current real
+);
+INSERT INTO __S__.strikes VALUES
+    (1, '2026-01-01 05:30:00+00', ST_SetSRID(ST_MakePoint(1.05, 1.05), 4326), 5),
+    (2, '2026-01-01 06:10:00+00', ST_SetSRID(ST_MakePoint(9.05, 9.05), 4326), 5);
+CREATE INDEX ON __S__.strikes (time);
+ANALYZE;
+";
+
+/// The lightning layer at `at` over 0°–10° in 100 × 100 CRS:84 pixels, on a
+/// blocking thread as the render executor draws it: the ages at the pixels
+/// of (1.05, 1.05), (3.05, 3.05) and (5.05, 5.05), columns 10, 30 and 50 of
+/// rows 89, 69 and 49.
+async fn events_frame(engine: &Arc<PostgisEngine>, at: DateTime<Utc>) -> Vec<Option<f64>> {
+    use ds_core::map_engine::{MapEngine, OutputCrs};
+    let engine = Arc::clone(engine);
+    let tile = tokio::task::spawn_blocking(move || {
+        engine.get_raster_tile(
+            [0.0, 0.0, 10.0, 10.0],
+            100,
+            100,
+            Some(at),
+            &OutputCrs::Wgs84,
+            Some("lightning_age"),
+            None,
+            None,
+        )
+    })
+    .await
+    .expect("render task")
+    .expect("events frame");
+    [(10, 89), (30, 69), (50, 49)]
+        .into_iter()
+        .map(|(col, row)| tile.values.value_at(row * 100 + col))
+        .collect()
+}
+
+/// #1432: an unsettled lightning frame draws a strike written late into its
+/// window from the first refresh that brings a newer strike, not only once
+/// it settles; a refresh without one keeps the frame's version and read. A
+/// frame settling draws the strikes written until then, under version `0`,
+/// which later refreshes keep. The 06:00 frame draws `(05:00, 06:00]`; each
+/// value is a strike's age in minutes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn events_frames_follow_late_strikes_until_settled() {
+    use ds_core::map_engine::MapEngine;
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc1432_events";
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, LATE_EVENTS).await;
+    }
+    let mut cfg = config(
+        None,
+        PostgisObservationsConfig {
+            table: Some(format!("{schema}.strikes")),
+            time_col: Some("time".into()),
+            geom_col: Some("geom".into()),
+            id_col: Some("id".into()),
+            extent_bbox: Some([0.0, 0.0, 10.0, 10.0]),
+            ..observations("events")
+        },
+    );
+    cfg.parameters = vec![PostgisParameterConfig {
+        name: "peak_current".into(),
+        label: "Peak current".into(),
+        unit: "kA".into(),
+        observed_property: None,
+        source_key: None,
+        valid_range: None,
+        missing_values: vec![],
+    }];
+    let engine = engine(schema, &cfg).await;
+    let frame = on_jan_1("06:00");
+    let version = |engine: &Arc<PostgisEngine>| {
+        let end = engine.resolve_time(Some(frame), None);
+        assert_eq!(end, Some(frame));
+        engine.content_version_for(None, end, None, None)
+    };
+
+    // Newest strike 06:10: the frame is unsettled.
+    let first = version(&engine);
+    assert_ne!(first, 0);
+    assert_eq!(events_frame(&engine, frame).await, [Some(30.0), None, None]);
+
+    // A strike written late, and no newer one: the refresh keeps the
+    // version, and the frame its read.
+    exec(
+        &client,
+        schema,
+        "INSERT INTO __S__.strikes VALUES \
+         (3, '2026-01-01 05:45:00+00', ST_SetSRID(ST_MakePoint(3.05, 3.05), 4326), 5);",
+    )
+    .await;
+    engine.refresh_metadata().await.expect("refresh");
+    assert_eq!(version(&engine), first);
+    assert_eq!(events_frame(&engine, frame).await, [Some(30.0), None, None]);
+
+    // A newer strike, 06:40, the frame still unsettled: the version moves
+    // and the frame draws the late strike.
+    exec(
+        &client,
+        schema,
+        "INSERT INTO __S__.strikes VALUES \
+         (4, '2026-01-01 06:40:00+00', ST_SetSRID(ST_MakePoint(9.05, 1.05), 4326), 5);",
+    )
+    .await;
+    engine.refresh_metadata().await.expect("refresh");
+    let second = version(&engine);
+    assert_ne!(second, 0);
+    assert_ne!(second, first);
+    assert_eq!(
+        events_frame(&engine, frame).await,
+        [Some(30.0), Some(15.0), None],
+        "the late strike is drawn before the frame settles"
+    );
+
+    // Another late strike, and one at 07:00, an hour after the frame: it
+    // settles and draws every strike written until then.
+    exec(
+        &client,
+        schema,
+        "INSERT INTO __S__.strikes VALUES \
+         (5, '2026-01-01 05:50:00+00', ST_SetSRID(ST_MakePoint(5.05, 5.05), 4326), 5), \
+         (6, '2026-01-01 07:00:00+00', ST_SetSRID(ST_MakePoint(9.05, 1.05), 4326), 5);",
+    )
+    .await;
+    engine.refresh_metadata().await.expect("refresh");
+    assert_eq!(version(&engine), 0);
+    assert_eq!(
+        events_frame(&engine, frame).await,
+        [Some(30.0), Some(15.0), Some(10.0)],
+        "a settling frame is read again"
+    );
+
+    // Later strikes keep a settled frame's version.
+    exec(
+        &client,
+        schema,
+        "INSERT INTO __S__.strikes VALUES \
+         (7, '2026-01-01 08:00:00+00', ST_SetSRID(ST_MakePoint(9.05, 1.05), 4326), 5);",
+    )
+    .await;
+    engine.refresh_metadata().await.expect("refresh");
+    assert_eq!(version(&engine), 0);
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
 /// The Features fixture (#503): a naive-UTC time column keyed `(time, id)`,
 /// as a TimescaleDB hypertable is. Three events share 05:20, their ids
 /// ordering differently as text ("10" < "2" < "3") than as numbers; one has
