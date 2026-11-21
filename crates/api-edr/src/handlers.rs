@@ -1246,6 +1246,83 @@ fn cube_operation(
     })
 }
 
+/// The OpenAPI operation of collection `id`'s trajectory query, in the
+/// variant its engine's `shape` answers (along a path, or a radar
+/// cross-section), on the collection or, with `instance_id_param`, on one
+/// of its model runs (#924). `formats` are the ones the handler
+/// negotiates for that shape.
+fn trajectory_operation(
+    title: &str,
+    id: &str,
+    instance_id_param: Option<serde_json::Value>,
+    shape: TrajectoryShape,
+    formats: &[EdrFormat],
+) -> serde_json::Value {
+    let (operation_id, on_run) = match instance_id_param {
+        Some(_) => (
+            format!("getInstanceTrajectory_{id}"),
+            " against a model run",
+        ),
+        None => (format!("getTrajectory_{id}"), ""),
+    };
+    let mut parameters: Vec<serde_json::Value> = instance_id_param.into_iter().collect();
+    let ok = |description: &str| {
+        responses(
+            json!({"description": description, "content": data_response_content(formats)}),
+            QUERY_ERRORS,
+        )
+    };
+    match shape {
+        TrajectoryShape::AlongPath => {
+            parameters.extend([
+                json!({"$ref": "#/components/parameters/coords-trajectory"}),
+                json!({"$ref": "#/components/parameters/datetime"}),
+                json!({"$ref": "#/components/parameters/parameter-name"}),
+                json!({"$ref": "#/components/parameters/z"}),
+                json!({"$ref": "#/components/parameters/crs"}),
+                data_format_parameter(formats),
+                json!({"$ref": "#/components/parameters/limit"}),
+            ]);
+            json!({
+                "get": {
+                    "summary": format!("Trajectory query{on_run} for {title}"),
+                    "description": "Values sampled along the path at about the source grid spacing (one sample per grid cell crossed, the path's vertices kept), interpolated the way a position query is. Segments follow the short great circle. A 2-D or Z path returns one CoverageJSON Trajectory coverage per timestep that `datetime` selects; a 2-D or M path one per level that `z` selects (all levels when omitted on a collection with a vertical extent). Samples at the same place and step appear once.",
+                    "operationId": operation_id,
+                    "tags": [id],
+                    "parameters": parameters,
+                    "responses": ok(
+                        "Coverage data: a CoverageJSON Trajectory coverage, or a CoverageCollection of them",
+                    )
+                }
+            })
+        }
+        TrajectoryShape::CrossSection => {
+            let mut format = data_format_parameter(formats);
+            format["description"] = json!("Output format: CoverageJSON (default), PNG (a colour-mapped distance×height cross-section heatmap) or HTML (a page of the response). Case-insensitive; the media types are accepted too (encode + as %2B). Without f, the Accept header chooses among them.");
+            parameters.extend([
+                json!({"$ref": "#/components/parameters/coords-linestring"}),
+                json!({"$ref": "#/components/parameters/datetime"}),
+                json!({"$ref": "#/components/parameters/parameter-name"}),
+                json!({"$ref": "#/components/parameters/z-trajectory"}),
+                json!({"$ref": "#/components/parameters/crs"}),
+                format,
+                json!({"$ref": "#/components/parameters/limit"}),
+            ]);
+            json!({
+                "get": {
+                    "summary": format!("Trajectory cross-section{on_run} for {title}"),
+                    "operationId": operation_id,
+                    "tags": [id],
+                    "parameters": parameters,
+                    "responses": ok(
+                        "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
+                    )
+                }
+            })
+        }
+    }
+}
+
 pub async fn api_definition(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1477,59 +1554,13 @@ pub async fn api_definition(
         // along-path sampling (gridded) or a radar cross-section.
         if supported.contains("trajectory") {
             let trajectory_path = format!("/edr/collections/{id}/trajectory");
-            // The formats this shape offers, the ones the handler negotiates.
-            let trajectory_formats = formats("trajectory");
-            let trajectory_responses = |description: &str| {
-                responses(
-                    json!({"description": description, "content": data_response_content(trajectory_formats)}),
-                    QUERY_ERRORS,
-                )
-            };
-            collection_paths[&trajectory_path] = match trajectory_shape {
-                TrajectoryShape::AlongPath => json!({
-                    "get": {
-                        "summary": format!("Trajectory query for {}", config.title),
-                        "description": "Values sampled along the path at about the source grid spacing (one sample per grid cell crossed, the path's vertices kept), interpolated the way a position query is. Segments follow the short great circle. A 2-D or Z path returns one CoverageJSON Trajectory coverage per timestep that `datetime` selects; a 2-D or M path one per level that `z` selects (all levels when omitted on a collection with a vertical extent). Samples at the same place and step appear once.",
-                        "operationId": format!("getTrajectory_{id}"),
-                        "tags": [id],
-                        "parameters": [
-                            {"$ref": "#/components/parameters/coords-trajectory"},
-                            {"$ref": "#/components/parameters/datetime"},
-                            {"$ref": "#/components/parameters/parameter-name"},
-                            {"$ref": "#/components/parameters/z"},
-                            {"$ref": "#/components/parameters/crs"},
-                            data_format_parameter(trajectory_formats),
-                            {"$ref": "#/components/parameters/limit"}
-                        ],
-                        "responses": trajectory_responses(
-                            "Coverage data: a CoverageJSON Trajectory coverage, or a CoverageCollection of them",
-                        )
-                    }
-                }),
-                TrajectoryShape::CrossSection => {
-                    let mut format = data_format_parameter(trajectory_formats);
-                    format["description"] = json!("Output format: CoverageJSON (default), PNG (a colour-mapped distance×height cross-section heatmap) or HTML (a page of the response). Case-insensitive; the media types are accepted too (encode + as %2B). Without f, the Accept header chooses among them.");
-                    json!({
-                        "get": {
-                            "summary": format!("Trajectory cross-section for {}", config.title),
-                            "operationId": format!("getTrajectory_{id}"),
-                            "tags": [id],
-                            "parameters": [
-                                {"$ref": "#/components/parameters/coords-linestring"},
-                                {"$ref": "#/components/parameters/datetime"},
-                                {"$ref": "#/components/parameters/parameter-name"},
-                                {"$ref": "#/components/parameters/z-trajectory"},
-                                {"$ref": "#/components/parameters/crs"},
-                                format,
-                                {"$ref": "#/components/parameters/limit"}
-                            ],
-                            "responses": trajectory_responses(
-                                "Coverage data — CoverageJSON Section domain or PNG heatmap. The Section domain carries the per-node lowest-beam coverage floor (metres above antenna) in the `meteocore:beamCoverage` foreign member; the PNG draws it as a hatched-below overlay line. Below the floor the volume is unobserved, not echo-free.",
-                            )
-                        }
-                    })
-                }
-            };
+            collection_paths[&trajectory_path] = trajectory_operation(
+                &config.title,
+                id,
+                None,
+                trajectory_shape,
+                formats("trajectory"),
+            );
         }
 
         // Items (#928): only collections whose engine also serves features,
@@ -1646,6 +1677,16 @@ pub async fn api_definition(
                     id,
                     Some(instance_id_param.clone()),
                     formats("cube"),
+                );
+            }
+            if supported.contains("trajectory") {
+                let p = format!("/edr/collections/{id}/instances/{{instanceId}}/trajectory");
+                collection_paths[&p] = trajectory_operation(
+                    &config.title,
+                    id,
+                    Some(instance_id_param.clone()),
+                    trajectory_shape,
+                    formats("trajectory"),
                 );
             }
             if supported.contains("area") {
@@ -3700,6 +3741,39 @@ pub async fn trajectory_query(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, HandlerError> {
+    let request = DataRequest {
+        instance_id: None,
+        raw_query,
+        headers,
+    };
+    run_trajectory_query(id, request, params, state).await
+}
+
+/// `GET /collections/{id}/instances/{instanceId}/trajectory` — trajectory
+/// query against a specific forecast model run (#924). The engine samples
+/// that run only: a time or level the run lacks is its answer for the run,
+/// never another run's.
+pub async fn instance_trajectory_query(
+    Path((id, instance_id)): Path<(String, String)>,
+    JsonQuery(params): JsonQuery<TrajectoryQueryParams>,
+    RawQuery(raw_query): RawQuery,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Response, HandlerError> {
+    let request = DataRequest {
+        instance_id: Some(instance_id),
+        raw_query,
+        headers,
+    };
+    run_trajectory_query(id, request, params, state).await
+}
+
+async fn run_trajectory_query(
+    id: String,
+    request: DataRequest,
+    params: TrajectoryQueryParams,
+    state: AppState,
+) -> Result<Response, HandlerError> {
     let state = state.load_full();
     let (engine, config) = lookup_collection(&state, &id)?;
 
@@ -3720,7 +3794,7 @@ pub async fn trajectory_query(
         engine,
         "trajectory",
         params.f.as_deref(),
-        &headers,
+        &request.headers,
         "trajectory queries",
     )?;
     let format = negotiated.format;
@@ -3766,6 +3840,10 @@ pub async fn trajectory_query(
         }
     }
 
+    // After the request's own checks, so an instance route rejects a
+    // malformed request as the collection's route does.
+    let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
+
     // A cross-section engine drives its remote reads with `handle.block_on`
     // on the runtime it finds, which needs a thread outside the runtime's
     // workers: the blocking pool here. A `datetime` list's instants run as
@@ -3775,14 +3853,8 @@ pub async fn trajectory_query(
     let blocking = shape == TrajectoryShape::CrossSection;
     // The CoverageJSON and the HTML page (#971) are written on the query
     // worker under the response budget, as every query's are.
-    let page = (format == EdrFormat::Html).then(|| {
-        DataRequest {
-            instance_id: None,
-            raw_query,
-            headers,
-        }
-        .geojson(&state, engine, config, "trajectory")
-    });
+    let page =
+        (format == EdrFormat::Html).then(|| request.geojson(&state, engine, config, "trajectory"));
     let engine = engine.clone();
     let coords = params.coords.clone();
     let (width, height) = (params.width, params.height);
@@ -3796,7 +3868,7 @@ pub async fn trajectory_query(
                 datetime,
                 param_names.as_deref(),
                 z.as_deref(),
-                None,
+                reference_time,
             )
         })
         .map_err(|e| map_query_error(&e, "Trajectory"))?;
@@ -3867,8 +3939,9 @@ fn render_section_png(
 }
 
 /// The data queries with an `/instances/{instanceId}/…` route, so the only
-/// ones an instance document advertises.
-const INSTANCE_QUERY_TYPES: [&str; 4] = ["position", "area", "radius", "cube"];
+/// ones an instance document advertises. Not `locations`: no engine with
+/// model runs has named locations (#924).
+const INSTANCE_QUERY_TYPES: [&str; 5] = ["position", "area", "radius", "cube", "trajectory"];
 
 /// An EDR `extent.temporal` object: the interval, the Gregorian TRS and,
 /// when known, the individual timesteps.

@@ -309,7 +309,8 @@ async fn openapi_documents_coverage_json_as_the_edr_1_2_media_type() {
             .any(|suffix| p.contains(suffix))
         })
         .collect();
-    assert_eq!(data_paths.len(), 8, "{data_paths:?}");
+    // The collection's five and the run's four (#924).
+    assert_eq!(data_paths.len(), 9, "{data_paths:?}");
     for path in data_paths {
         let content = &paths[path]["get"]["responses"]["200"]["content"];
         assert_eq!(

@@ -1012,7 +1012,7 @@ async fn collection_pages_anchor_their_data_queries() {
         ),
         (
             &*format!("/collections/c/instances/{INSTANCE}?f=html"),
-            &["position", "area", "radius", "cube"][..],
+            &["position", "area", "radius", "trajectory", "cube"][..],
         ),
     ] {
         let (status, _, body) = get(uri, None).await;
@@ -1029,6 +1029,14 @@ async fn collection_pages_anchor_their_data_queries() {
     let (_, _, body) = get("/collections/c?f=html", None).await;
     for q in ["locations", "items", "instances"] {
         assert!(body.contains(&format!("href=\"{base}/{q}?f=html\"")), "{q}");
+    }
+    // A run has no locations or items of its own (#924).
+    let (_, _, body) = get(&format!("/collections/c/instances/{INSTANCE}?f=html"), None).await;
+    for q in ["locations", "items"] {
+        assert!(
+            !body.contains(&format!("{base}/instances/{INSTANCE}/{q}")),
+            "{q}"
+        );
     }
 }
 

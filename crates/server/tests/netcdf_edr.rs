@@ -1,4 +1,5 @@
-//! engine-netcdf through the EDR API (#1067, trajectory and cube #1169),
+//! engine-netcdf through the EDR API (#1067, trajectory and cube #1169,
+//! instance trajectories #924),
 //! end to end on the committed MEPS samples (`testdata/meps-netcdf`: two runs on MET Norway's Lambert
 //! grid; `testdata/meps-netcdf-pl`: the same on four pressure levels),
 //! wrapped in `DerivedWind` as the server registers it: every CoverageJSON
@@ -403,6 +404,148 @@ async fn netcdf_edr_responses_validate() {
         edr_schema::JSON,
         &instances,
         "EDR instances",
+    );
+}
+
+/// A trajectory under an instance (#924) reads that run and no other: the
+/// run's own steps, its own values at a time both runs are valid, and a 404
+/// for a time only the other run has, where the collection's trajectory
+/// reads that other run. An M path snaps to the run's steps, and a vertex
+/// time the run does not cover is a 400. Every body validates against the
+/// CoverageJSON schema, and the instance document advertises the route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn netcdf_instance_trajectories_read_that_run_only() {
+    let app = tokio::task::spawn_blocking(router).await.unwrap();
+    let covjson = coverage_json_schema();
+    let base = format!("/collections/{ID}");
+    let line = "coords=LINESTRING(5%2058,30%2066)&parameter-name=air_temperature_2m";
+    let coverages = |answer: &Value| -> Vec<Value> {
+        match answer["type"].as_str() {
+            Some("CoverageCollection") => answer["coverages"].as_array().unwrap().clone(),
+            _ => vec![answer.clone()],
+        }
+    };
+    let step = |coverage: &Value| -> String {
+        coverage["domain"]["axes"]["composite"]["values"][0][0]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let steps = |answer: &Value| -> Vec<String> { coverages(answer).iter().map(step).collect() };
+    let ok = |what: &str, status: StatusCode, json: &Value| {
+        assert_eq!(status, StatusCode::OK, "{what}: {json}");
+        assert_valid(&covjson, json, what);
+    };
+
+    let (status, older) = get(
+        &app,
+        &format!("{base}/instances/2026-10-15T06:00:00Z/trajectory?{line}"),
+    )
+    .await;
+    ok("06Z run", status, &older);
+    assert_eq!(
+        steps(&older),
+        [
+            "2026-10-15T06:00:00+00:00",
+            "2026-10-15T07:00:00+00:00",
+            "2026-10-15T08:00:00+00:00",
+            "2026-10-15T09:00:00+00:00"
+        ],
+        "the 06Z run's steps"
+    );
+    let (status, latest) = get(&app, &format!("{base}/trajectory?{line}")).await;
+    ok("latest run", status, &latest);
+    let (status, newest) = get(
+        &app,
+        &format!("{base}/instances/2026-10-15T09:00:00Z/trajectory?{line}"),
+    )
+    .await;
+    ok("09Z run", status, &newest);
+    assert_eq!(newest, latest, "the latest run named is the latest run");
+
+    // 09Z is valid in both runs: each instance samples its own run's field.
+    let at_nine = |answer: &Value| -> Value {
+        coverages(answer)
+            .into_iter()
+            .find(|c| step(c) == "2026-10-15T09:00:00+00:00")
+            .unwrap()["ranges"]["air_temperature_2m"]["values"]
+            .clone()
+    };
+    assert_ne!(at_nine(&older), at_nine(&latest), "two runs, two fields");
+    let (status, pinned_nine) = get(
+        &app,
+        &format!(
+            "{base}/instances/2026-10-15T06:00:00Z/trajectory?{line}&datetime=2026-10-15T09:00:00Z"
+        ),
+    )
+    .await;
+    ok("06Z run at 09Z", status, &pinned_nine);
+    assert_eq!(at_nine(&pinned_nine), at_nine(&older));
+
+    // A time only the other run has: the collection's trajectory reads that
+    // run, the instance's is a 404, never the other run's step.
+    for (run, other_only) in [
+        ("2026-10-15T06:00:00Z", "2026-10-15T10:00:00Z"),
+        ("2026-10-15T09:00:00Z", "2026-10-15T07:00:00Z"),
+    ] {
+        let (status, json) = get(
+            &app,
+            &format!("{base}/trajectory?{line}&datetime={other_only}"),
+        )
+        .await;
+        ok(other_only, status, &json);
+        let uri = format!("{base}/instances/{run}/trajectory?{line}&datetime={other_only}");
+        let (status, json) = get(&app, &uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {json}");
+    }
+
+    // An M path from 07Z to 09Z on the 06Z run; from 09Z to 11Z it leaves
+    // that run, a 400, though the 09Z run covers it.
+    let m_path = |from: i64, to: i64| {
+        format!(
+            "coords=LINESTRINGM(5%2058%20{from},30%2066%20{to})&parameter-name=air_temperature_2m"
+        )
+    };
+    let (status, json) = get(
+        &app,
+        &format!(
+            "{base}/instances/2026-10-15T06:00:00Z/trajectory?{}",
+            m_path(1792047600, 1792054800)
+        ),
+    )
+    .await;
+    ok("M path on the 06Z run", status, &json);
+    let composite = json["domain"]["axes"]["composite"]["values"]
+        .as_array()
+        .unwrap();
+    assert_eq!(composite[0][0], "2026-10-15T07:00:00+00:00");
+    assert_eq!(
+        composite[composite.len() - 1][0],
+        "2026-10-15T09:00:00+00:00"
+    );
+    let later = m_path(1792054800, 1792062000);
+    let (status, json) = get(&app, &format!("{base}/trajectory?{later}")).await;
+    ok("M path on the latest run", status, &json);
+    let uri = format!("{base}/instances/2026-10-15T06:00:00Z/trajectory?{later}");
+    let (status, json) = get(&app, &uri).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {json}");
+
+    // A run the collection does not have.
+    let uri = format!("{base}/instances/2026-10-15T03:00:00Z/trajectory?{line}");
+    let (status, json) = get(&app, &uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {json}");
+
+    let (status, instance) = get(&app, &format!("{base}/instances/2026-10-15T06:00:00Z")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        instance["data_queries"]["trajectory"]["link"]["href"],
+        "/edr/collections/meps/instances/2026-10-15T06:00:00Z/trajectory"
+    );
+    edr_schema::assert_valid(
+        edr_schema::INSTANCE,
+        edr_schema::JSON,
+        &instance,
+        "EDR instance",
     );
 }
 

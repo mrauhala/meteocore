@@ -76,7 +76,7 @@ Part 1 `core` and Part 2 `collections` with `https://` URIs, the form EDR
 | `/collections/{id}/{position,area,radius,trajectory,cube}` | data queries |
 | `/collections/{id}/items`, `/items/{itemId}` | the collection's features |
 | `/collections/{id}/instances`, `/instances/{instanceId}` | model runs |
-| `/collections/{id}/instances/{instanceId}/{position,area,radius,cube}` | data queries against one run |
+| `/collections/{id}/instances/{instanceId}/{position,area,radius,cube,trajectory}` | data queries against one run |
 
 A query type the collection's engine does not support has no resource: its
 route answers 404 and `/api` omits the path.
@@ -240,6 +240,12 @@ with a 404.
 - An instance document has its collection's title and description and the
   run's own extent. A query under `/instances/{instanceId}/` reads that
   run; the same query without an instance path reads the latest run.
+- A run serves the collection's `position`, `area`, `radius`, `cube` and
+  `trajectory`, each where the collection offers it, and reads that run
+  alone: a `datetime` with no step of the run is a 404 and an `M` path
+  vertex time outside it a 400, where the collection's query may read
+  another run. No engine with model runs has named locations, so a run has
+  no `locations`; `items` are the collection's features, never a run's.
 - The run axis is not advertised as an `extent.custom` dimension, and data
   queries take no `reference_time` parameter: select a run by its instance
   path.
@@ -485,7 +491,9 @@ steps before included, and the `MC_NETCDF_EDR_QUERY_MB` and
 
 ## Per-engine query-type matrix
 
-✓ supported · – not supported · n/a no model runs.
+✓ supported · – not supported · n/a no model runs. An engine with model
+runs serves every query type of its row but `locations` and `items` under
+`/instances/{instanceId}/` too.
 
 | Engine | locations | position | area | radius | cube | trajectory | instances | items |
 |---|---|---|---|---|---|---|---|---|
@@ -589,7 +597,8 @@ Settings: `[memory.caches] edr_response` (default 512; the deprecated
 - Data queries are served in CRS84 only.
 - No `corridor` query, no `MULTILINESTRING` trajectory, no
   `resolution-x`/`-y` on area.
-- No `locations`, `trajectory` or `items` under `/instances/{instanceId}/`.
+- No `locations` or `items` under `/instances/{instanceId}/`: no engine with
+  model runs has named locations, and items are the collection's features.
 - GeoJSON and CSV only on station collections; no GeoJSON for area; no
   NetCDF output.
 - Along-path trajectory only on GRIB, QueryData, Zarr and NetCDF; cube only

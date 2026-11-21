@@ -2333,6 +2333,38 @@ mod tests {
         assert!(engine
             .query_position("POINT(36.8 -1.3)", None, None, None, Some(bogus))
             .is_err());
+        // A trajectory too (an EDR instance trajectory, #924): the latest run
+        // pinned answers as the default, an absent run is a 404, never the
+        // latest run's samples.
+        let path = "LINESTRING(35 -2, 37 0, 39 1)";
+        // Each coverage's domain and its ranges by name, in a stable order.
+        let samples = |run| -> Vec<String> {
+            let coverages = match engine
+                .query_trajectory(path, None, None, None, run)
+                .unwrap()
+            {
+                CoverageResponse::Collection(coverages) => coverages,
+                CoverageResponse::Single(coverage) => vec![coverage],
+            };
+            coverages
+                .into_iter()
+                .map(|c| {
+                    let ranges: BTreeMap<String, Vec<Option<f64>>> =
+                        c.ranges.into_iter().map(|(k, v)| (k, v.values)).collect();
+                    format!("{:?} {ranges:?}", c.domain)
+                })
+                .collect()
+        };
+        let default = samples(None);
+        assert!(!default.is_empty());
+        assert_eq!(default, samples(Some(latest_rt)));
+        let err = engine
+            .query_trajectory(path, None, None, None, Some(bogus))
+            .unwrap_err();
+        assert!(
+            matches!(err, DataServerError::ReferenceTimeNotFound(_)),
+            "{err}"
+        );
     }
 
     /// #1485: `raster_info_shared` is the run set's snapshot, built with

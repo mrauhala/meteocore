@@ -874,10 +874,16 @@ async fn data_query_links_carry_edr_1_2_required_variables() {
         if !runs {
             continue;
         }
-        // An instance serves only the run-queryable types.
+        // An instance serves only the run-queryable types: every one but
+        // `locations` (#924).
         let want_run: Vec<String> = want
             .iter()
-            .filter(|t| matches!(t.as_str(), "area" | "position" | "radius"))
+            .filter(|t| {
+                matches!(
+                    t.as_str(),
+                    "area" | "position" | "radius" | "cube" | "trajectory"
+                )
+            })
             .cloned()
             .collect();
         let list = get_json_from(engine.clone(), "/collections/weather/instances").await;

@@ -8,6 +8,8 @@
 //! is a 404, and the collection's `extent` lists the runs as the
 //! `reference_time` dimension, by their EDR instance ids.
 //!
+//! An EDR trajectory under an instance samples that run only (#924).
+//!
 //! WMS `DIM_REFERENCE_TIME` draws by the same rule (#1451): without `TIME`
 //! the run's own latest step, the latest run named exactly too, and a
 //! `TIME` outside the run is `InvalidDimensionValue`, never the error tile
@@ -456,6 +458,78 @@ async fn the_extent_lists_the_runs_by_their_instance_ids() {
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     assert_eq!(sorted, [OLD_RUN, NEW_RUN], "{instances}");
+}
+
+/// An EDR trajectory under an instance (#924) samples that run: at a valid
+/// time of both runs each instance answers its own run's field, the
+/// collection's trajectory the latest run's, and a time only the other run
+/// has is a 404 on the instance, where the collection's trajectory reads
+/// that other run. An M path's vertex times must lie in the named run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instance_trajectory_samples_that_run() {
+    let dir = tempfile::tempdir().unwrap();
+    write_runs(dir.path());
+    let app = edr(engine(dir.path()), dir.path());
+    let line = "coords=LINESTRING(0%2040,10%2050)&parameter-name=UGRD";
+    let query = |run: Option<&str>, rest: &str| match run {
+        Some(run) => format!("/collections/{ID}/instances/{run}/trajectory?{rest}"),
+        None => format!("/collections/{ID}/trajectory?{rest}"),
+    };
+    let values = |uri: &str, reply: &Reply| -> Value {
+        assert_eq!(reply.status, StatusCode::OK, "{uri}: {:?}", reply.body);
+        let body = json_of(reply);
+        assert_eq!(body["domain"]["domainType"], "Trajectory", "{uri}");
+        let values = body["ranges"]["UGRD"]["values"].clone();
+        assert!(
+            values.as_array().unwrap().iter().all(Value::is_number),
+            "{uri}: {values}"
+        );
+        values
+    };
+
+    let both = format!("{line}&datetime={BOTH}");
+    let mut answers = Vec::new();
+    for run in [Some(OLD_RUN), Some(NEW_RUN), None] {
+        let uri = query(run, &both);
+        answers.push(values(&uri, &get(&app, &uri).await));
+    }
+    // The 00Z run's UGRD is the u message, the 06Z run's the v message.
+    assert_ne!(answers[0], answers[1], "two runs, two fields");
+    assert_eq!(answers[2], answers[1], "no instance is the latest run");
+
+    // 03Z is the 00Z run's only, 12Z the 06Z run's.
+    for (run, other_only, other) in [
+        (NEW_RUN, "2026-05-11T03:00:00Z", OLD_RUN),
+        (OLD_RUN, "2026-05-11T12:00:00Z", NEW_RUN),
+    ] {
+        let rest = format!("{line}&datetime={other_only}");
+        let unpinned = query(None, &rest);
+        let from_other = values(&unpinned, &get(&app, &unpinned).await);
+        let other_uri = query(Some(other), &rest);
+        assert_eq!(
+            from_other,
+            values(&other_uri, &get(&app, &other_uri).await),
+            "{unpinned}: the run that has the step"
+        );
+        let pinned = query(Some(run), &rest);
+        let reply = get(&app, &pinned).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{pinned}");
+    }
+
+    // An M path from 03Z to 09Z: in the 00Z run, not in the 06Z run.
+    let m_path = "coords=LINESTRINGM(0%2040%201778468400,10%2050%201778490000)&parameter-name=UGRD";
+    let uri = query(Some(OLD_RUN), m_path);
+    values(&uri, &get(&app, &uri).await);
+    let uri = query(Some(NEW_RUN), m_path);
+    assert_eq!(
+        get(&app, &uri).await.status,
+        StatusCode::BAD_REQUEST,
+        "{uri}"
+    );
+
+    // A run the collection does not have.
+    let uri = query(Some("2026-05-10T18:00:00Z"), &both);
+    assert_eq!(get(&app, &uri).await.status, StatusCode::NOT_FOUND, "{uri}");
 }
 
 fn wms(engine: Arc<DerivedWind>, dir: &Path) -> axum::Router {
