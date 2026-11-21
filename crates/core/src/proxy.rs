@@ -31,6 +31,13 @@
 /// response repeats it, so a longer value is dropped rather than echoed.
 pub const MAX_PREFIX_LEN: usize = 128;
 
+/// Longest forwarded host honoured, in bytes, after trimming: a 253-byte DNS
+/// name, its optional trailing dot and a `:65535` port. An IPv6 literal with
+/// brackets and a port is shorter. Every link of a response repeats the host,
+/// so a longer value, which no DNS name can be, falls through to the next
+/// source like any other rejected host (#1532).
+pub const MAX_HOST_LEN: usize = 253 + 1 + 6;
+
 /// Resolve the effective base URL for a single request, without a trailing
 /// slash.
 ///
@@ -266,10 +273,11 @@ fn scheme_of(url: &str) -> String {
 /// Reject host values that contain whitespace, slashes, or any character that
 /// could break out of the authority component / inject another URL part
 /// (`@`, `?`, `#`, `%`, control bytes, non-ASCII, …). Returns the trimmed host
-/// when it is composed solely of safe host/IPv6-literal/port characters.
+/// when it is composed solely of safe host/IPv6-literal/port characters and
+/// is at most [`MAX_HOST_LEN`] bytes.
 fn sanitize_host(host: &str) -> Option<&str> {
     let host = host.trim();
-    if host.is_empty() {
+    if host.is_empty() || host.len() > MAX_HOST_LEN {
         return None;
     }
     let safe = host
@@ -532,6 +540,40 @@ mod tests {
                 "host {bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn host_length_cap() {
+        // A dotted name of exactly MAX_HOST_LEN bytes, port included, is kept;
+        // the same host one byte longer, valid in every other way, falls
+        // through to the fallback, from either header.
+        let label = "a".repeat(63);
+        let name = format!("{label}.{label}.{label}.{}", "b".repeat(61));
+        assert_eq!(name.len(), 253);
+        let at_cap = format!("{name}.:65535");
+        assert_eq!(at_cap.len(), MAX_HOST_LEN);
+        let over = format!("c{at_cap}");
+        let fallback = "http://127.0.0.1:8000";
+        for (host, want) in [
+            (at_cap.as_str(), format!("https://{at_cap}")),
+            (over.as_str(), fallback.to_string()),
+        ] {
+            let x = resolve_base_url(fallback, true, |name: &str| match name {
+                "x-forwarded-host" => vec![host],
+                "x-forwarded-proto" => vec!["https"],
+                _ => vec![],
+            });
+            assert_eq!(x, want, "X-Forwarded-Host of {} bytes", host.len());
+            let forwarded = format!("proto=https;host=\"{host}\"");
+            let f = resolve_base_url(fallback, true, |name: &str| match name {
+                "forwarded" => vec![forwarded.as_str()],
+                _ => vec![],
+            });
+            assert_eq!(f, want, "Forwarded host of {} bytes", host.len());
+        }
+        // The cap counts the trimmed value: surrounding whitespace is free.
+        let padded = format!("  {at_cap}  ");
+        assert_eq!(sanitize_host(&padded), Some(at_cap.as_str()));
     }
 
     #[test]
