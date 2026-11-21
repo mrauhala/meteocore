@@ -42,15 +42,71 @@ pub enum ExecutionError {
 /// Check between engine calls so a timed-out/disconnected MULTIPOINT stops
 /// before launching another query. A running synchronous call cannot be killed.
 pub struct QueryBudget {
-    deadline: Instant,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    expiry: Expiry,
+    /// EDR's running-query slots, of which `_permit` is this query's.
+    slots: Arc<Semaphore>,
     _permit: OwnedSemaphorePermit,
     _admission: OwnedSemaphorePermit,
 }
 
 impl QueryBudget {
     pub fn expired(&self) -> bool {
+        self.expiry.expired()
+    }
+
+    /// The query's [`Expiry`], for work it hands to other threads (a
+    /// `datetime` list's instants, #1522).
+    pub fn expiry(&self) -> Expiry {
+        self.expiry.clone()
+    }
+
+    /// Up to `wanted` more of EDR's running-query slots, for a query that
+    /// answers parts of itself side by side (a `datetime` list's instants,
+    /// #1522): only those free now, never waiting, and never the last free
+    /// one, which stays for the next query to arrive. A slot is free only
+    /// when no query waits for one (a released slot goes to a waiter
+    /// first), so this never overtakes a queued query, and under load the
+    /// query keeps to the one slot it holds; so does every query when EDR
+    /// admits two (`ds_executor::query_workers()` on two CPUs). Each part
+    /// then runs in a slot of its own, so the engine queries running at
+    /// once stay within EDR's admission, as separate requests would.
+    pub fn spare_slots(&self, wanted: usize) -> SpareSlots {
+        let mut taken = Vec::with_capacity(wanted);
+        while taken.len() < wanted {
+            // Two at once, one of them given back: a slot is taken only
+            // while another is free, however many queries take at once.
+            let Ok(mut pair) = self.slots.clone().try_acquire_many_owned(2) else {
+                break;
+            };
+            if let Some(slot) = pair.split(1) {
+                taken.push(slot);
+            }
+        }
+        SpareSlots(taken)
+    }
+}
+
+/// Whether a query is past its deadline or its client has gone: cheap to
+/// clone into the work the query fans out.
+#[derive(Clone)]
+pub struct Expiry {
+    deadline: Instant,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Expiry {
+    pub fn expired(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= self.deadline
+    }
+}
+
+/// The slots [`QueryBudget::spare_slots`] took, given back on drop.
+pub struct SpareSlots(Vec<OwnedSemaphorePermit>);
+
+impl SpareSlots {
+    /// How many slots were free.
+    pub fn count(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -93,8 +149,11 @@ where
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _cancel = CancelOnDrop(cancelled.clone());
     let budget = QueryBudget {
-        deadline,
-        cancelled,
+        expiry: Expiry {
+            deadline,
+            cancelled,
+        },
+        slots: executor.slots.clone(),
         _permit: permit,
         _admission: admission,
     };
@@ -125,12 +184,113 @@ mod tests {
         let executor = Executor::new();
         for blocking in [false, true] {
             run_on(&executor, blocking, Duration::from_secs(2), |budget| {
-                assert_eq!(ds_core::deadline::current(), Some(budget.deadline));
+                assert_eq!(ds_core::deadline::current(), Some(budget.expiry.deadline));
                 assert!(ds_core::deadline::check().is_ok());
             })
             .await
             .unwrap();
         }
+    }
+
+    /// A query takes only the slots free now beside its own (#1522), never
+    /// waiting for one and never the last free one, and gives them back
+    /// when it is done with them.
+    #[tokio::test]
+    async fn spare_slots_are_the_free_ones_but_the_last_and_given_back() {
+        let spare = |slots: usize, wanted: usize| {
+            let executor = Executor {
+                slots: Arc::new(Semaphore::new(slots)),
+                admitted: Arc::new(Semaphore::new(8)),
+            };
+            async move {
+                let taken = run_on(&executor, false, QUERY_TIMEOUT, move |budget| {
+                    let spare = budget.spare_slots(wanted);
+                    (spare.count(), budget.spare_slots(wanted).count())
+                })
+                .await
+                .unwrap();
+                assert_eq!(executor.slots.available_permits(), slots, "all given back");
+                taken
+            }
+        };
+        // Two slots, the fewest EDR admits: the query keeps to its own.
+        assert_eq!(spare(2, 3).await, (0, 0));
+        assert_eq!(spare(3, 3).await, (1, 0), "one free beside the last");
+        assert_eq!(spare(4, 3).await, (2, 0));
+        assert_eq!(spare(5, 3).await, (3, 0), "as many as wanted");
+        assert_eq!(
+            spare(6, 3).await,
+            (3, 1),
+            "a second taker leaves the last too"
+        );
+
+        let executor = Executor {
+            slots: Arc::new(Semaphore::new(3)),
+            admitted: Arc::new(Semaphore::new(8)),
+        };
+        let _busy = executor.slots.clone().acquire_many_owned(2).await.unwrap();
+        let busy = run_on(&executor, false, QUERY_TIMEOUT, |budget| {
+            budget.spare_slots(5).count()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            busy, 0,
+            "every other slot taken: the query keeps to its own"
+        );
+        assert_eq!(executor.slots.available_permits(), 1);
+    }
+
+    /// A query waiting for a slot is never overtaken (#1522): with one
+    /// queued, a running query takes no spare slot, and slots given back go
+    /// to the waiting query first. Two of three held slots given back leave
+    /// one free, the last, once the waiting query has its own, so the
+    /// running query still takes none; had they gone to it, it would take
+    /// one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spare_slots_never_overtake_a_waiting_query() {
+        let executor = Arc::new(Executor {
+            slots: Arc::new(Semaphore::new(4)),
+            admitted: Arc::new(Semaphore::new(8)),
+        });
+        let held: Vec<_> = (0..3)
+            .map(|_| executor.slots.clone().try_acquire_owned().unwrap())
+            .collect();
+        let (give, given) = std::sync::mpsc::channel::<Vec<OwnedSemaphorePermit>>();
+        let running = tokio::spawn({
+            let executor = executor.clone();
+            async move {
+                run_on(&executor, false, QUERY_TIMEOUT, move |budget| {
+                    let mut held = given.recv_timeout(Duration::from_secs(10)).unwrap();
+                    let queued = budget.spare_slots(3).count();
+                    held.truncate(1);
+                    let after = budget.spare_slots(3).count();
+                    (queued, after)
+                })
+                .await
+                .unwrap()
+            }
+        });
+        while executor.slots.available_permits() > 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let waiting = tokio::spawn({
+            let executor = executor.clone();
+            async move { run_on(&executor, false, QUERY_TIMEOUT, |_| ()).await }
+        });
+        // Admitted, the waiting query is queued for a slot in the same poll.
+        while executor.admitted.available_permits() > 6 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        give.send(held).unwrap();
+        let (queued, after) = running.await.unwrap();
+        assert_eq!(queued, 0, "a query waits: no slot is free");
+        assert_eq!(
+            after, 0,
+            "the given-back slots went to the waiting query first"
+        );
+        waiting.await.unwrap().unwrap();
     }
 
     #[tokio::test]

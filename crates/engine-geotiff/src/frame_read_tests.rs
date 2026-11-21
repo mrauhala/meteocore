@@ -14,7 +14,6 @@
 
 use std::time::{Duration, Instant};
 
-use ds_storage::object_store::path::Path as ObjectPath;
 use ds_storage::test_util::SlowReads;
 use ds_storage::DataStore;
 
@@ -25,30 +24,6 @@ use crate::reader::DataSource;
 /// Frames of a position query in the in-flight tests: as many as the
 /// issue's case.
 const FRAMES: usize = 24;
-
-/// An empty local directory for the engine to start on, removed on drop.
-struct EmptyDir(PathBuf);
-
-impl EmptyDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!(
-            "meteocore_frame_reads_{}_{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for EmptyDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// The `i`th timestep of a test's frames, five minutes apart from 22:00.
 fn time_of(i: usize) -> DateTime<Utc> {
@@ -133,17 +108,10 @@ impl Drop for Engine {
 }
 
 /// A remote engine over `frames` frames in `store`, frame `i` holding the
-/// fixture's file `i` modulo its count. `new` builds a remote engine only
-/// for s3:// or http(s):// URLs, so it starts on an empty local directory
-/// and is then pointed at the store, with the tile cache a remote source
-/// gets; the poll's header reads catalogue the frames. The store answers at
-/// once until a test sets its delay.
-fn remote_engine(
-    local: &EmptyDir,
-    store: &Arc<SlowReads>,
-    fixture: Fixture,
-    frames: usize,
-) -> Engine {
+/// fixture's file `i` modulo its count ([`GeoTiffEngine::remote_for_test`]:
+/// the poll's header reads catalogue the frames). The store answers at once
+/// until a test sets its delay.
+fn remote_engine(store: &Arc<SlowReads>, fixture: Fixture, frames: usize) -> Engine {
     let Fixture {
         dir,
         files,
@@ -166,15 +134,9 @@ fn remote_engine(
         "unit": "dBZ",
     }))
     .unwrap();
-    let mut engine = GeoTiffEngine::new("frame-reads", local.0.to_str(), &config).unwrap();
-    engine.store_mode = StoreMode::Remote {
-        store: DataStore::new(store.clone()),
-        prefix: ObjectPath::from("d"),
-    };
-    engine.tile_cache = Arc::new(cache::TileCache::new(
-        config.effective_tile_cache_mb() * 1024 * 1024,
-    ));
-    engine.poll_once();
+    let engine =
+        GeoTiffEngine::remote_for_test("frame-reads", &config, DataStore::new(store.clone()), "d")
+            .unwrap();
     let times: Vec<_> = engine.catalog.load().entries.keys().copied().collect();
     assert_eq!(times, (0..frames).map(time_of).collect::<Vec<_>>());
     Engine(engine)
@@ -203,9 +165,8 @@ fn series(result: QueryResult) -> (Vec<DateTime<Utc>>, Vec<Option<f64>>) {
 /// here, half of that, is loose enough for a loaded CI host.
 #[test]
 fn a_position_query_reads_its_remote_frames_eight_at_a_time() {
-    let local = EmptyDir::new();
     let store = Arc::new(SlowReads::default());
-    let engine = remote_engine(&local, &store, SMALL_TILES, FRAMES);
+    let engine = remote_engine(&store, SMALL_TILES, FRAMES);
     let (lon, lat) = pixel(&engine, SMALL_TILES.varying);
     let delay = Duration::from_millis(250);
     store.reset();
@@ -236,9 +197,8 @@ fn a_position_query_reads_its_remote_frames_eight_at_a_time() {
 #[test]
 fn an_area_query_reads_one_frame_at_a_time() {
     let frames = 6;
-    let local = EmptyDir::new();
     let store = Arc::new(SlowReads::default());
-    let engine = remote_engine(&local, &store, SMALL_TILES, frames);
+    let engine = remote_engine(&store, SMALL_TILES, frames);
     let (lon, lat) = pixel(&engine, (100, 100));
     let bbox = ds_core::feature::Bbox {
         west: lon - 0.1,
@@ -276,9 +236,8 @@ fn every_frame_answers_at_its_own_step() {
             around: (dx, dy),
             ..
         } = fixture;
-        let local = EmptyDir::new();
         let store = Arc::new(SlowReads::default());
-        let engine = remote_engine(&local, &store, fixture, frames);
+        let engine = remote_engine(&store, fixture, frames);
         let alone = |i: usize| Some((time_of(i), time_of(i)));
 
         let (lon, lat) = pixel(&engine, varying);
@@ -319,9 +278,8 @@ fn every_frame_answers_at_its_own_step() {
 /// `DeadlineExceeded`, which EDR answers with 504.
 #[test]
 fn a_query_past_its_deadline_starts_no_more_reads() {
-    let local = EmptyDir::new();
     let store = Arc::new(SlowReads::default());
-    let engine = remote_engine(&local, &store, SMALL_TILES, FRAMES);
+    let engine = remote_engine(&store, SMALL_TILES, FRAMES);
     let (lon, lat) = pixel(&engine, SMALL_TILES.varying);
     store.reset();
     store.set_delay(Duration::from_millis(500));
@@ -348,9 +306,8 @@ fn a_query_past_its_deadline_starts_no_more_reads() {
 /// 429 back-off bounds.
 #[test]
 fn only_object_store_frames_are_read_together() {
-    let local = EmptyDir::new();
     let store = Arc::new(SlowReads::default());
-    let engine = remote_engine(&local, &store, SMALL_TILES, 2);
+    let engine = remote_engine(&store, SMALL_TILES, 2);
     let catalog = engine.catalog.load();
     let entries: Vec<_> = catalog.entries.iter().collect();
     let remote = frames::frames(&entries);

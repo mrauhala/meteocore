@@ -60,6 +60,14 @@ impl Recorder {
         self.calls.lock().unwrap().clone()
     }
 
+    /// The calls by their window: a `datetime` list's instants run side by
+    /// side (#1522), so their calls arrive in any order.
+    fn calls_by_window(&self) -> Vec<Call> {
+        let mut calls = self.calls();
+        calls.sort_by_key(|call| call.datetime);
+        calls
+    }
+
     fn clear(&self) {
         self.calls.lock().unwrap().clear();
     }
@@ -415,7 +423,11 @@ async fn datetime_list_queries_each_instant_and_merges() {
         flat.clear();
         let (status, body, cache_control) = get(&app, uri).await;
         assert_eq!(status, StatusCode::OK, "{uri}: {body}");
-        let windows: Vec<Option<Window>> = flat.calls().into_iter().map(|c| c.datetime).collect();
+        let windows: Vec<Option<Window>> = flat
+            .calls_by_window()
+            .into_iter()
+            .map(|c| c.datetime)
+            .collect();
         assert_eq!(
             windows,
             vec![
@@ -523,10 +535,10 @@ async fn repeating_datetime_answers_like_the_equivalent_list() {
         flat.clear();
         let uri = template.replace("{dt}", repeating);
         let got = get(&app, &uri).await;
-        let got_calls = flat.calls();
+        let got_calls = flat.calls_by_window();
         flat.clear();
         let want = get(&app, &template.replace("{dt}", list)).await;
-        assert_eq!(got_calls, flat.calls(), "{uri}");
+        assert_eq!(got_calls, flat.calls_by_window(), "{uri}");
         assert_eq!(got, want, "{uri}");
         assert_eq!(got.0, StatusCode::OK, "{uri}: {}", got.1);
     }

@@ -79,7 +79,10 @@ job starts, and the running ones drain before it returns. A caller outside
 any runtime passes its fallback runtime (`field_jobs::block_on`); a caller
 on a current-thread runtime, which cannot `block_in_place`, runs on the
 fallback from a scoped thread carrying its deadline, so the future, the
-field iterator and `consume` are `Send`. Pinned by `field_jobs::tests`
+field iterator and `consume` are `Send`. api-edr runs a `datetime` list's
+instants as jobs too (#1522), up to 4, each in an EDR query slot of its
+own (never the last free one), and an engine's field jobs then nest inside an instant's job: both
+`block_in_place`, so the nesting parks no worker. Pinned by `field_jobs::tests`
 (`the_callers_bound_is_reached_and_never_exceeded` holds every job until the
 bound runs);
 keep it engine-neutral.

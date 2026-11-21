@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -2891,19 +2892,15 @@ pub async fn location_query(
         // Rendering stays on the query executor: GeoJSON reads the engine's
         // location inventory to label the station.
         let response = execute_query(false, move |budget| {
-            let result = crate::datetime_list::run(
-                datetime.as_ref(),
-                || budget.expired(),
-                |datetime| {
-                    engine.query_location(
-                        &loc_id,
-                        datetime,
-                        param_names.as_deref(),
-                        z.as_deref(),
-                        None,
-                    )
-                },
-            )
+            let result = crate::datetime_list::run(datetime.as_ref(), &budget, move |datetime| {
+                engine.query_location(
+                    &loc_id,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    None,
+                )
+            })
             .map_err(|e| map_query_error(&e, "Location"))?;
             let matched = coverage_count(&result);
             render_coverage_response(
@@ -2925,15 +2922,14 @@ pub async fn location_query(
 
     let limit = limit.unwrap_or(usize::MAX);
     let response = execute_query(false, move |budget| {
-        let expired = || budget.expired();
         let found = query_location_list(
-            engine.as_ref(),
+            &engine,
             &ids,
             datetime.as_ref(),
             param_names.as_deref(),
             z.as_deref(),
             limit,
-            &expired,
+            &budget,
         )?;
         if found.coverages.is_empty() {
             // `/req/edr/REQ_rc-locationid-response` C.
@@ -2986,14 +2982,15 @@ struct LocationList {
 /// id fails the whole list with a 404 naming it, ids past `limit` included.
 /// No coverages means every id is known and none has data, the 204.
 fn query_location_list(
-    engine: &dyn EdrEngine,
+    engine: &Arc<dyn EdrEngine>,
     ids: &[String],
     datetime: Option<&DatetimeSelector>,
     parameters: Option<&[String]>,
     z: Option<&[f64]>,
     limit: usize,
-    expired: &dyn Fn() -> bool,
+    budget: &crate::executor::QueryBudget,
 ) -> Result<LocationList, HandlerError> {
+    let expired = || budget.expired();
     let mut known = None;
     let mut found = LocationList {
         coverages: Vec::new(),
@@ -3006,17 +3003,22 @@ fn query_location_list(
             return Err(query_timeout());
         }
         if found.coverages.len() >= limit {
-            require_known_location(engine, &mut known, id)?;
+            require_known_location(engine.as_ref(), &mut known, id)?;
             found.dropped = true;
             continue;
         }
-        let response = crate::datetime_list::run(datetime, expired, |window| {
-            engine.query_location(id, window, parameters, z, None)
-        });
+        let query = {
+            let (engine, id) = (engine.clone(), id.clone());
+            let (parameters, z) = (parameters.map(<[String]>::to_vec), z.map(<[f64]>::to_vec));
+            move |window| {
+                engine.query_location(&id, window, parameters.as_deref(), z.as_deref(), None)
+            }
+        };
+        let response = crate::datetime_list::run(datetime, budget, query);
         let response = match response {
             Ok(response) => response,
             Err(DataServerError::LocationNotFound(_)) => {
-                require_known_location(engine, &mut known, id)?;
+                require_known_location(engine.as_ref(), &mut known, id)?;
                 continue;
             }
             Err(e) => return Err(map_query_error(&e, "Location")),
@@ -3176,6 +3178,20 @@ impl DataRequest {
     }
 }
 
+/// A position response's value budget, a `datetime` list's instants
+/// together included, and the 400 refusing more.
+const POSITION_BUDGET: crate::datetime_list::ValueBudget = crate::datetime_list::ValueBudget {
+    max: crate::params::MAX_POSITION_VALUES,
+    refuse: position_too_large,
+};
+
+fn position_too_large() -> DataServerError {
+    DataServerError::QueryTooLarge(format!(
+        "Position response exceeds {} values",
+        crate::params::MAX_POSITION_VALUES
+    ))
+}
+
 async fn run_position_query(
     id: String,
     request: DataRequest,
@@ -3240,70 +3256,71 @@ async fn run_position_query(
     let geojson = request.geojson(&state, engine, config, "position");
     let engine = engine.clone();
     let response = execute_query(false, move |budget| {
-        // Shared by every instant of a datetime list, so the budget bounds
-        // the whole response.
-        let mut values = 0usize;
         // Whether `limit` dropped a coverage before the final cap (a point
         // never queried, or an instant's batch trimmed): the matches are then
         // uncounted, and a GeoJSON response leaves `numberMatched` out.
-        let mut dropped = skipped_points;
+        let dropped = Arc::new(AtomicBool::new(skipped_points));
         if budget.expired() {
             return Err(query_timeout());
         }
-        // One engine batch over every point for one datetime window.
-        let mut query = |datetime| -> Result<CoverageResponse, DataServerError> {
-            let values_before = values;
-            let mut coverages = Vec::with_capacity(points.len());
-            let mut collection_response = !single;
-            let mut emit = |response| {
-                if budget.expired() {
-                    return Err(DataServerError::DeadlineExceeded);
-                }
-                collection_response |= matches!(&response, CoverageResponse::Collection(_));
-                let mut batch = match response {
-                    CoverageResponse::Single(q) => vec![q],
-                    CoverageResponse::Collection(v) => v,
-                };
-                // Drop what `limit` excludes before it counts against the budget.
-                let produced = batch.len();
-                batch.truncate(limit.saturating_sub(coverages.len()));
-                dropped |= batch.len() < produced;
-                for q in &batch {
-                    for range in q.ranges.values() {
-                        values = values.saturating_add(range.values.len());
+        // One engine batch over every point for one datetime window. A
+        // datetime list's instants run side by side (#1522): each counts
+        // its own values here, and `run_within` holds their sum to the same
+        // budget in the instants' order. So up to `INSTANT_CONCURRENCY`
+        // instants may each hold up to `MAX_POSITION_VALUES` before the
+        // sum refuses the list, one query slot each, as separate requests
+        // would.
+        let query = {
+            let (dropped, expiry) = (dropped.clone(), budget.expiry());
+            move |datetime| -> Result<CoverageResponse, DataServerError> {
+                let mut values = 0usize;
+                let mut coverages = Vec::with_capacity(points.len());
+                let mut collection_response = !single;
+                let mut emit = |response| {
+                    if expiry.expired() {
+                        return Err(DataServerError::DeadlineExceeded);
                     }
-                }
-                if values > crate::params::MAX_POSITION_VALUES {
-                    return Err(DataServerError::QueryTooLarge(format!(
-                        "Position response exceeds {} values",
-                        crate::params::MAX_POSITION_VALUES
-                    )));
-                }
-                coverages.extend(batch);
-                Ok(())
-            };
-            let queried = engine.query_positions(
-                &points,
-                datetime,
-                param_names.as_deref(),
-                z.as_deref(),
-                reference_time,
-                &mut emit,
-            );
-            if let Err(e) = queried {
-                // A datetime-list instant without data is skipped: its
-                // partial batch no longer counts against the budget.
-                values = values_before;
-                return Err(e);
+                    collection_response |= matches!(&response, CoverageResponse::Collection(_));
+                    let mut batch = match response {
+                        CoverageResponse::Single(q) => vec![q],
+                        CoverageResponse::Collection(v) => v,
+                    };
+                    // Drop what `limit` excludes before it counts against the budget.
+                    let produced = batch.len();
+                    batch.truncate(limit.saturating_sub(coverages.len()));
+                    if batch.len() < produced {
+                        dropped.store(true, Ordering::Relaxed);
+                    }
+                    for q in &batch {
+                        for range in q.ranges.values() {
+                            values = values.saturating_add(range.values.len());
+                        }
+                    }
+                    if values > POSITION_BUDGET.max {
+                        return Err((POSITION_BUDGET.refuse)());
+                    }
+                    coverages.extend(batch);
+                    Ok(())
+                };
+                engine.query_positions(
+                    &points,
+                    datetime,
+                    param_names.as_deref(),
+                    z.as_deref(),
+                    reference_time,
+                    &mut emit,
+                )?;
+                Ok(if !collection_response && coverages.len() == 1 {
+                    CoverageResponse::Single(coverages.remove(0))
+                } else {
+                    CoverageResponse::Collection(coverages)
+                })
             }
-            Ok(if !collection_response && coverages.len() == 1 {
-                CoverageResponse::Single(coverages.remove(0))
-            } else {
-                CoverageResponse::Collection(coverages)
-            })
         };
-        let result = crate::datetime_list::run(datetime.as_ref(), || budget.expired(), &mut query)
-            .map_err(|e| map_query_error(&e, "Position"))?;
+        let result =
+            crate::datetime_list::run_within(datetime.as_ref(), &budget, POSITION_BUDGET, query)
+                .map_err(|e| map_query_error(&e, "Position"))?;
+        let dropped = dropped.load(Ordering::Relaxed);
         if budget.expired() {
             return Err(query_timeout());
         }
@@ -3401,19 +3418,16 @@ async fn run_area_query(
     // Rendering stays on the query executor: CSV reads the engine's location
     // inventory to name the stations.
     let response = execute_query(false, move |budget| {
-        let result = crate::datetime_list::run(
-            datetime.as_ref(),
-            || budget.expired(),
-            |datetime| {
-                engine.query_area(
-                    &params.coords,
-                    datetime,
-                    param_names.as_deref(),
-                    z.as_deref(),
-                    reference_time,
-                )
-            },
-        )
+        let coords = params.coords;
+        let result = crate::datetime_list::run(datetime.as_ref(), &budget, move |datetime| {
+            engine.query_area(
+                &coords,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                reference_time,
+            )
+        })
         .map_err(|e| map_query_error(&e, "Area"))?;
         render_coverage_response(
             limit_coverages(result, limit),
@@ -3512,20 +3526,17 @@ async fn run_radius_query(
     // Rendering stays on the query executor: GeoJSON reads the engine's
     // location inventory to name the stations.
     let response = execute_query(false, move |budget| {
-        let result = crate::datetime_list::run(
-            datetime.as_ref(),
-            || budget.expired(),
-            |datetime| {
-                engine.query_radius(
-                    &params.coords,
-                    within_m,
-                    datetime,
-                    param_names.as_deref(),
-                    z.as_deref(),
-                    reference_time,
-                )
-            },
-        )
+        let coords = params.coords;
+        let result = crate::datetime_list::run(datetime.as_ref(), &budget, move |datetime| {
+            engine.query_radius(
+                &coords,
+                within_m,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                reference_time,
+            )
+        })
         .map_err(|e| map_query_error(&e, "Radius"))?;
         let matched = coverage_count(&result);
         render_coverage_response(
@@ -3653,20 +3664,16 @@ async fn run_cube_query(
     let page = request.geojson(&state, engine, config, "cube");
     let engine = engine.clone();
     let response = execute_query(false, move |budget| {
-        let result = crate::datetime_list::run(
-            datetime.as_ref(),
-            || budget.expired(),
-            |datetime| {
-                engine.query_cube(
-                    &bbox,
-                    datetime,
-                    param_names.as_deref(),
-                    z.as_deref(),
-                    resolution,
-                    reference_time,
-                )
-            },
-        )
+        let result = crate::datetime_list::run(datetime.as_ref(), &budget, move |datetime| {
+            engine.query_cube(
+                &bbox,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                resolution,
+                reference_time,
+            )
+        })
         .map_err(|e| map_query_error(&e, "Cube"))?;
         render_coverage_response(
             limit_coverages(result, limit),
@@ -3759,8 +3766,11 @@ pub async fn trajectory_query(
         }
     }
 
-    // A cross-section engine drives its remote reads through an explicit
-    // runtime handle and needs a blocking thread; along-path sampling runs
+    // A cross-section engine drives its remote reads with `handle.block_on`
+    // on the runtime it finds, which needs a thread outside the runtime's
+    // workers: the blocking pool here. A `datetime` list's instants run as
+    // field jobs instead, on query-runtime workers inside `block_in_place`
+    // (#1522), where `handle.block_on` is valid too. Along-path sampling runs
     // on the query runtime's workers like position and area.
     let blocking = shape == TrajectoryShape::CrossSection;
     // The CoverageJSON and the HTML page (#971) are written on the query
@@ -3780,19 +3790,15 @@ pub async fn trajectory_query(
         // A `datetime` list runs one query per instant and merges them
         // (one coverage per instant for an along-path 2-D or Z path; an M
         // path never gets here with a `datetime`).
-        let result = crate::datetime_list::run(
-            datetime.as_ref(),
-            || budget.expired(),
-            |datetime| {
-                engine.query_trajectory(
-                    &coords,
-                    datetime,
-                    param_names.as_deref(),
-                    z.as_deref(),
-                    None,
-                )
-            },
-        )
+        let result = crate::datetime_list::run(datetime.as_ref(), &budget, move |datetime| {
+            engine.query_trajectory(
+                &coords,
+                datetime,
+                param_names.as_deref(),
+                z.as_deref(),
+                None,
+            )
+        })
         .map_err(|e| map_query_error(&e, "Trajectory"))?;
         let result = limit_coverages(result, limit);
         // Every body, the cross-section PNG included, is written here on

@@ -7457,9 +7457,10 @@ impl EdrEngine for PolarVolumeSiteView {
                 self.collection_id, self.nod
             ))
         })?;
-        // Runs inside `spawn_blocking` (api-edr dispatches `query_trajectory`
-        // there) — drive any S3 pixel fetch on the runtime handle, since
-        // `block_in_place` panics on a `spawn_blocking` thread.
+        // Runs outside the runtime's workers: on api-edr's `spawn_blocking`
+        // thread, or for a `datetime` list's instants on a query-runtime
+        // worker inside `block_in_place` (#1522). Both may `handle.block_on`,
+        // so drive any S3 pixel fetch on the runtime handle.
         let handle = blocking_pixel_handle();
         let pix = Pixels {
             moments: None,
