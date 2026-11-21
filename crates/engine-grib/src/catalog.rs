@@ -436,6 +436,9 @@ pub struct Catalog {
     parameter_times: HashMap<String, Arc<[DateTime<Utc>]>>,
     /// Per run, its own valid times, for a map naming it (#337).
     run_times: BTreeMap<DateTime<Utc>, RunTimes>,
+    /// No time: what a run has for a parameter it lacks (#1451). One empty
+    /// `Arc`, so a request clones it rather than allocating.
+    no_times: Arc<[DateTime<Utc>]>,
 }
 
 /// One run's valid times: every step's, and the steps carrying each
@@ -546,16 +549,26 @@ impl Catalog {
     }
 
     /// The valid times of run `run` for `parameter` (`None`: every step's),
-    /// the steps carrying it where some of the run's steps lack it: an `Arc`
-    /// clone from the publication snapshot. `None` for a run not retained.
+    /// the steps carrying it where some of the run's steps lack it, none
+    /// for a parameter the run lacks (#1451): an `Arc` clone from the
+    /// publication snapshot. `None` for a run not retained.
     pub fn run_times(
         &self,
         parameter: Option<&str>,
         run: DateTime<Utc>,
     ) -> Option<Arc<[DateTime<Utc>]>> {
         let times = self.run_times.get(&run)?;
-        let partial = parameter.and_then(|p| times.partial.get(p));
-        Some(partial.unwrap_or(&times.every).clone())
+        let Some(parameter) = parameter else {
+            return Some(times.every.clone());
+        };
+        let has = self
+            .parameter_keys
+            .get(&run)
+            .is_some_and(|keys| keys.contains_key(parameter));
+        if !has {
+            return Some(self.no_times.clone());
+        }
+        Some(times.partial.get(parameter).unwrap_or(&times.every).clone())
     }
 
     /// Whether any retained run has `parameter`.

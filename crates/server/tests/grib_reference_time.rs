@@ -8,6 +8,14 @@
 //! is a 404, and the collection's `extent` lists the runs as the
 //! `reference_time` dimension, by their EDR instance ids.
 //!
+//! WMS `DIM_REFERENCE_TIME` draws by the same rule (#1451): without `TIME`
+//! the run's own latest step, the latest run named exactly too, and a
+//! `TIME` outside the run is `InvalidDimensionValue`, never the error tile
+//! or another run's step. A derived wind speed whose components have
+//! different steps in a run draws nothing for an interval its drawn step
+//! lies outside, and nothing in a run without one of its components, with
+//! a time or without.
+//!
 //! The fields are the real ARPEGE 10 m wind messages of
 //! `testdata/grib-arpege-wind`, written into two GFS-style runs with wgrib2
 //! sidecars: 00Z with f000–f009 and 06Z with f000–f006, so 06Z and 09Z are
@@ -60,11 +68,24 @@ fn arpege() -> Vec<u8> {
 /// One run's step files, `date` as wgrib2 writes it (`YYYYMMDDHH`): `UGRD`
 /// from the ARPEGE message `u` and `VGRD` from `v` at every step.
 fn write_run(dir: &Path, date: &str, steps: &[(u32, &str)], (u, v): (usize, usize)) {
+    let fields = [("UGRD", u), ("VGRD", v)];
+    let steps: Vec<_> = steps
+        .iter()
+        .map(|&(step, forecast)| (step, forecast, &fields[..]))
+        .collect();
+    write_steps(dir, date, &steps);
+}
+
+/// A step's `(parameter, ARPEGE message)`s.
+type Fields<'a> = &'a [(&'a str, usize)];
+
+/// One run's step files: `(step, forecast, fields)`.
+fn write_steps(dir: &Path, date: &str, steps: &[(u32, &str, Fields)]) {
     let source = arpege();
     let message = |index: usize| &source[index * MESSAGE..(index + 1) * MESSAGE];
     let level = "10 m above ground";
-    for &(step, forecast) in steps {
-        let records = [("UGRD", message(u)), ("VGRD", message(v))];
+    for &(step, forecast, fields) in steps {
+        let records: Vec<_> = fields.iter().map(|&(p, i)| (p, message(i))).collect();
         let (mut data, mut index) = (Vec::new(), String::new());
         for (i, (param, bytes)) in records.iter().enumerate() {
             index.push_str(&format!(
@@ -435,4 +456,227 @@ async fn the_extent_lists_the_runs_by_their_instance_ids() {
     let mut sorted = ids.clone();
     sorted.sort_unstable();
     assert_eq!(sorted, [OLD_RUN, NEW_RUN], "{instances}");
+}
+
+fn wms(engine: Arc<DerivedWind>, dir: &Path) -> axum::Router {
+    api_wms::router(Arc::new(ArcSwap::from_pointee(api_wms::WmsState {
+        engines: HashMap::from([(ID.to_string(), engine.clone() as Arc<dyn MapEngine>)]),
+        point_engines: HashMap::from([(ID.to_string(), engine as Arc<dyn EdrEngine>)]),
+        collections: HashMap::from([(ID.to_string(), collection(dir, "wms"))]),
+        styles: styles(),
+        render_semaphore: Arc::new(tokio::sync::Semaphore::new(4)),
+        rendered_cache: Arc::new(RenderedCache::new(16)),
+        tile_cache: Arc::new(ds_render::TilePixelCache::new(16)),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+    })))
+}
+
+/// A GetMap of `layer` over the ARPEGE domain, plus `extra`.
+fn get_map(layer: &str, extra: &str) -> String {
+    format!(
+        "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={ID}/{layer}&STYLES=\
+         &CRS=CRS:84&BBOX={BBOX}&WIDTH=64&HEIGHT=64&FORMAT=image/png{extra}"
+    )
+}
+
+/// The `code` of a ServiceExceptionReport.
+fn exception_code(reply: &Reply) -> String {
+    let xml = String::from_utf8_lossy(&reply.body);
+    let start = xml.find("code=\"").map(|i| i + 6).unwrap_or_default();
+    xml[start..]
+        .split('"')
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// #1451: WMS draws a named run as Maps and map tiles do. Without `TIME`
+/// the 00Z run draws its own latest step, f009, where the layer's default
+/// time, 12Z, is only the 06Z run's: that used to be the error tile. The
+/// latest run named is drawn exactly too, so 03Z, which only the 00Z run
+/// has, is `InvalidDimensionValue` with it, where naming no run still falls
+/// back to the 00Z run. GetFeatureInfo reads and reports the frame drawn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wms_draws_a_named_runs_own_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    write_runs(dir.path());
+    let app = wms(engine(dir.path()), dir.path());
+    let old_run = format!("&DIM_REFERENCE_TIME={OLD_RUN}");
+    let new_run = format!("&DIM_REFERENCE_TIME={NEW_RUN}");
+
+    let default = get(&app, &get_map("UGRD", &old_run)).await;
+    assert_eq!(
+        (default.status, default.x_cache.as_str()),
+        (StatusCode::OK, "MISS"),
+        "{}",
+        String::from_utf8_lossy(&default.body)
+    );
+    // The same frame as the run's f009 named.
+    let f009 = get(&app, &get_map("UGRD", &format!("&TIME={BOTH}{old_run}"))).await;
+    assert_eq!(
+        (f009.status, f009.x_cache.as_str()),
+        (StatusCode::OK, "HIT")
+    );
+    assert_eq!(f009.body, default.body);
+    // The 06Z run at 09Z: its own pixels, and the frame a request naming
+    // no run draws at 09Z.
+    let latest = get(&app, &get_map("UGRD", &format!("&TIME={BOTH}{new_run}"))).await;
+    assert_eq!(
+        (latest.status, latest.x_cache.as_str()),
+        (StatusCode::OK, "MISS")
+    );
+    assert_ne!(latest.body, default.body);
+    let unnamed = get(&app, &get_map("UGRD", &format!("&TIME={BOTH}"))).await;
+    assert_eq!(
+        (unnamed.status, unnamed.x_cache.as_str()),
+        (StatusCode::OK, "HIT")
+    );
+    // A time outside a named run, the latest included: the exception.
+    for extra in [
+        format!("&TIME=2026-05-11T03:00:00Z{new_run}"),
+        format!("&TIME=2026-05-11T12:00:00Z{old_run}"),
+    ] {
+        let reply = get(&app, &get_map("UGRD", &extra)).await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{extra}");
+        assert_eq!(exception_code(&reply), "InvalidDimensionValue", "{extra}");
+    }
+    // Naming no run, 03Z still falls back to the 00Z run.
+    let fallback = get(&app, &get_map("UGRD", "&TIME=2026-05-11T03:00:00Z")).await;
+    assert_eq!(
+        (fallback.status, fallback.x_cache.as_str()),
+        (StatusCode::OK, "MISS")
+    );
+
+    let info = get(
+        &app,
+        &format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS={ID}/UGRD\
+             &QUERY_LAYERS={ID}/UGRD&STYLES=&CRS=CRS:84&BBOX={BBOX}&WIDTH=3&HEIGHT=3\
+             &I=1&J=1&INFO_FORMAT=application/json{old_run}"
+        ),
+    )
+    .await;
+    assert_eq!(info.status, StatusCode::OK);
+    let properties = &json_of(&info)["features"][0]["properties"];
+    assert_eq!(properties["time"], BOTH, "{properties}");
+    assert_eq!(properties["reference_time"], OLD_RUN, "{properties}");
+    let outside = get(
+        &app,
+        &format!(
+            "/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetFeatureInfo&LAYERS={ID}/UGRD\
+             &QUERY_LAYERS={ID}/UGRD&STYLES=&CRS=CRS:84&BBOX={BBOX}&WIDTH=3&HEIGHT=3\
+             &I=1&J=1&INFO_FORMAT=application/json&TIME=2026-05-11T03:00:00Z{new_run}"
+        ),
+    )
+    .await;
+    assert_eq!(outside.status, StatusCode::BAD_REQUEST);
+    assert_eq!(exception_code(&outside), "InvalidDimensionValue");
+}
+
+/// The derived-parameter edges of #1451, on runs whose components differ:
+/// at 00Z `UGRD` at f000–f009 and `VGRD` at f000 and f003 only, at 06Z
+/// `UGRD` only. The wind speed has `UGRD`'s steps in the 00Z run and draws
+/// the nearest step `VGRD` has too.
+fn write_uneven_runs(dir: &Path) {
+    let both: &[(&str, usize)] = &[("UGRD", 2), ("VGRD", 3)];
+    let u: &[(&str, usize)] = &[("UGRD", 2)];
+    write_steps(
+        dir,
+        "2026051100",
+        &[
+            (0, "anl", both),
+            (3, "3 hour fcst", both),
+            (6, "6 hour fcst", u),
+            (9, "9 hour fcst", u),
+        ],
+    );
+    write_steps(
+        dir,
+        "2026051106",
+        &[(0, "anl", u), (3, "3 hour fcst", u), (6, "6 hour fcst", u)],
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_derived_parameter_draws_inside_the_interval_and_only_from_a_run_with_its_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    write_uneven_runs(dir.path());
+    let engine = engine(dir.path());
+    let info = engine.raster_info_shared();
+    assert!(
+        info.parameters.iter().any(|p| p.name == "WIND"),
+        "{:?}",
+        info.parameters
+    );
+    for (app, no_data, base) in [
+        (
+            maps(engine.clone(), dir.path()),
+            StatusCode::NOT_FOUND,
+            format!("/collections/{ID}/map?bbox={BBOX}&width=64&height=64&"),
+        ),
+        (
+            tiles(engine.clone(), dir.path()),
+            StatusCode::NO_CONTENT,
+            format!("/collections/{ID}/tiles/WebMercatorQuad/2/1/2?"),
+        ),
+    ] {
+        let uri = |query: &str| format!("{base}parameter-name={query}");
+        // 06–09Z selects the run's 09Z, which the wind speed draws at 03Z,
+        // outside it: none inside. 02–09Z holds 03Z.
+        let outside = get(
+            &app,
+            &uri(&format!(
+                "WIND&datetime=2026-05-11T06:00:00Z/{BOTH}&{}",
+                run(OLD_RUN)
+            )),
+        )
+        .await;
+        assert_eq!(outside.status, no_data, "{base}");
+        let inside = get(
+            &app,
+            &uri(&format!(
+                "WIND&datetime=2026-05-11T02:00:00Z/{BOTH}&{}",
+                run(OLD_RUN)
+            )),
+        )
+        .await;
+        assert_eq!(inside.status, StatusCode::OK, "{base}");
+        assert_eq!(inside.datetime, "2026-05-11T03:00:00Z", "{base}");
+        // The 06Z run has no `VGRD`: no data for it and the wind speed,
+        // with a time or without, never the 400 "share no timestep".
+        for query in [
+            format!("WIND&{}", run(NEW_RUN)),
+            format!("WIND&datetime={BOTH}&{}", run(NEW_RUN)),
+            format!("VGRD&{}", run(NEW_RUN)),
+            format!("VGRD&datetime={BOTH}&{}", run(NEW_RUN)),
+        ] {
+            let reply = get(&app, &uri(&query)).await;
+            assert_eq!(
+                reply.status,
+                no_data,
+                "{base} {query}: {}",
+                String::from_utf8_lossy(&reply.body)
+            );
+        }
+        // Its `UGRD` draws.
+        let u = get(&app, &uri(&format!("UGRD&{}", run(NEW_RUN)))).await;
+        assert_eq!(u.status, StatusCode::OK, "{base}");
+    }
+    // WMS: the same run is `InvalidDimensionValue`, with a TIME or without.
+    let app = wms(engine, dir.path());
+    let new_run = format!("&DIM_REFERENCE_TIME={NEW_RUN}");
+    for extra in [new_run.clone(), format!("&TIME={BOTH}{new_run}")] {
+        for layer in ["WIND", "VGRD"] {
+            let reply = get(&app, &get_map(layer, &extra)).await;
+            assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{layer}{extra}");
+            assert_eq!(
+                exception_code(&reply),
+                "InvalidDimensionValue",
+                "{layer}{extra}"
+            );
+        }
+    }
+    let u = get(&app, &get_map("UGRD", &new_run)).await;
+    assert_eq!((u.status, u.x_cache.as_str()), (StatusCode::OK, "MISS"));
 }

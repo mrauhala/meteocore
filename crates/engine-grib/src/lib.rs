@@ -2464,7 +2464,8 @@ impl MapEngine for GribEngine {
     }
 
     /// A run's own valid times (#337): every step's, or the steps carrying
-    /// `parameter` where some of the run's steps lack it. From the snapshot.
+    /// `parameter` where some of the run's steps lack it, none where the run
+    /// lacks it (#1451). From the snapshot.
     fn run_times(
         &self,
         parameter: Option<&str>,

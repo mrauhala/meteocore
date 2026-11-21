@@ -74,10 +74,12 @@ Each file is one model run, and the newest run is the default.
 | EDR | `/instances` | one instance per retained run |
 | WMS, Maps, Tiles | map | one layer per parameter: WMS child layer `<collection>/<name>`, Maps and Tiles `parameter-name`; `wms_parameter` is the default |
 
-- EDR without an instance, and WMS without `DIM_REFERENCE_TIME`, use the
-  latest run. An EDR instance that is not retained is a 404; a WMS
-  `DIM_REFERENCE_TIME` that is not retained is an `InvalidDimensionValue`
-  error. Maps and Tiles always render the latest run.
+- EDR without an instance, WMS without `DIM_REFERENCE_TIME` and Maps and
+  Tiles without `subset=reference_time(…)` use the latest run. An EDR
+  instance that is not retained is a 404; a WMS `DIM_REFERENCE_TIME` that
+  is not retained is an `InvalidDimensionValue` error. A run named, the
+  latest included, is drawn exactly on every map API: a time outside it
+  is WMS `InvalidDimensionValue`, a Maps 404 or an empty map tile.
 - EDR `datetime` selects the run's timesteps inside the interval, both ends
   included; without it every timestep is returned. A window with no
   timestep is a 404.

@@ -30,8 +30,10 @@
 //! own times are then the time axis ([`run_time`]).
 //!
 //! [`resolve_frame`] turns a [`RequestedTime`] and a named run into the time
-//! step and run a map or map tile draws, so both select the same frame; each
-//! API maps a selection with none ([`NoTimeStep`]) to its own status.
+//! step and run a map or map tile draws, through [`resolve_time_and_run`],
+//! which WMS GetMap and GetFeatureInfo resolve their `TIME` and
+//! `DIM_REFERENCE_TIME` with, so all three select the same frame; each API
+//! maps a selection with none ([`NoTimeStep`]) to its own status.
 //! [`is_exact_time`] and [`is_fixed_run`] are the rule for whether the
 //! response may be `immutable`, WMS's included.
 
@@ -353,30 +355,13 @@ pub struct DrawnFrame {
 /// so both select the same one. `run` is the run the request named
 /// ([`named_run`]); `*` and none are `None`.
 ///
-/// 1. The time: with no run named, [`render_time`] on the parameter's or
-///    the collection's axis; with one, [`run_time`] on the run's own times.
-/// 2. The run: [`MapEngine::resolve_parameter_reference_time`], the
-///    CONCRETE run the engine renders (#521). Keyed as `None`, the no-TTL
-///    rendered caches would keep serving the first-rendered run's pixels
-///    after a newer run re-covers the same valid times: every few minutes
-///    for a nowcast generation, every few hours for a forecast. A named run
-///    is asked for as itself and drawn exactly, the latest included: no
-///    cross-run fallback, so the URL keeps meaning that run's frame. With
-///    none named the engine picks, its fallback included, and the run is
-///    the parameter's: GRIB renders an aggregate the newest run lacks at
-///    that time from an older run (#1005). Engines without runs keep `None`.
-/// 3. The time step: [`MapEngine::resolve_parameter_time`] in that run
-///    (#507). A not-yet-ingested time then keys the step drawn, never its
-///    own; a parameter with its own time axis snaps on that axis.
-/// 4. The level, on a collection with a vertical axis:
+/// 1. The time and the run: [`resolve_time_and_run`], which WMS resolves
+///    its `TIME` and `DIM_REFERENCE_TIME` with too.
+/// 2. The level, on a collection with a vertical axis:
 ///    [`MapEngine::resolve_elevation`] at that time and run (#1477). An
 ///    `elevation` between levels draws the nearest level the engine can
 ///    draw, so every value drawing one level, and the default, share one
 ///    entry, with WMS's too, which resolves its `ELEVATION` the same way.
-///
-/// WMS `DIM_REFERENCE_TIME` differs for the latest run named: it asks for
-/// `None`, since WMS clients echo the advertised default run on every
-/// frame.
 pub fn resolve_frame(
     requested: Option<&RequestedTime>,
     run: Option<DateTime<Utc>>,
@@ -385,12 +370,7 @@ pub fn resolve_frame(
     info: &RasterInfo,
     parameter: Option<&str>,
 ) -> Result<DrawnFrame, NoTimeStep> {
-    let time = match run {
-        None => render_time(requested, engine, info, parameter)?,
-        Some(run) => run_time(requested, run, engine, info, parameter)?,
-    };
-    let reference_time = engine.resolve_parameter_reference_time(parameter, time, run);
-    let time = engine.resolve_parameter_time(parameter, time, reference_time);
+    let (time, reference_time) = resolve_time_and_run(requested, run, engine, info, parameter)?;
     let z = match info.vertical {
         Some(_) => engine
             .resolve_elevation(parameter, elevation, time, reference_time)
@@ -411,6 +391,82 @@ pub fn resolve_frame(
     })
 }
 
+/// A time step and the model run it is drawn from: `(time, reference_time)`,
+/// `None` where the engine has none to name.
+pub type TimeAndRun = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+
+/// The time step and model run a map, a map tile or a WMS layer draws:
+/// `(time, reference_time)`. `run` is the run the request named (Maps and
+/// Tiles [`named_run`], WMS `DIM_REFERENCE_TIME`); `*` and none are `None`.
+/// WMS passes its `TIME` as an instant not from a subset.
+///
+/// 1. The time: with no run named, [`render_time`] on the parameter's or
+///    the collection's axis; with one, [`run_time`] on the run's own times.
+/// 2. The run: [`MapEngine::resolve_parameter_reference_time`], the
+///    CONCRETE run the engine renders (#521). Keyed as `None`, the no-TTL
+///    rendered caches would keep serving the first-rendered run's pixels
+///    after a newer run re-covers the same valid times: every few minutes
+///    for a nowcast generation, every few hours for a forecast. A named run
+///    is asked for as itself and drawn exactly, the latest included, on
+///    every API: no cross-run fallback, so the URL keeps meaning that run's
+///    frame once a newer run lands (#1451). With none named the engine
+///    picks, its fallback included, and the run is the parameter's: GRIB
+///    renders an aggregate the newest run lacks at that time from an older
+///    run (#1005). Engines without runs keep `None`.
+/// 3. The time step: [`MapEngine::resolve_parameter_time`] in that run
+///    (#507). A not-yet-ingested time then keys the step drawn, never its
+///    own; a parameter with its own time axis snaps on that axis.
+///
+/// An interval, a partial date or `*` draws a time step inside it, or
+/// nothing, with a run named or without: one the engine snaps the selected
+/// time out of selects nothing (#1451). A parameter derived from several
+/// inputs selects on its first input's times in a named run, and draws the
+/// step every input has, which may lie outside the interval.
+///
+/// Known limit, for derived inputs with different steps in a run:
+/// `ds_core::derive::Derived::run_times` is the first input's axis, not the
+/// steps every input shares. An interval then selects the first input's
+/// latest step inside it, which the engine snaps to the nearest shared
+/// step; where that lies past the interval the answer is "none inside",
+/// though an earlier shared step lies inside it. A WMS `TIME` on a step
+/// only the first input has likewise draws the nearest shared step, and
+/// revalidates, as any snapped `TIME` does. Real GRIB u and v components
+/// share their steps.
+pub fn resolve_time_and_run(
+    requested: Option<&RequestedTime>,
+    run: Option<DateTime<Utc>>,
+    engine: &dyn MapEngine,
+    info: &RasterInfo,
+    parameter: Option<&str>,
+) -> Result<TimeAndRun, NoTimeStep> {
+    let selected = match run {
+        None => render_time(requested, engine, info, parameter)?,
+        Some(run) => run_time(requested, run, engine, info, parameter)?,
+    };
+    let reference_time = engine.resolve_parameter_reference_time(parameter, selected, run);
+    let time = engine.resolve_parameter_time(parameter, selected, reference_time);
+    if let Some(RequestedTime {
+        selection: selection @ TimeSelection::Range { .. },
+        ..
+    }) = requested
+    {
+        // Only a time the interval selected: on a collection without a time
+        // axis an interval selects the engine's default, which it ignores.
+        if let (Some(selected), Some(drawn)) = (selected, time) {
+            if selection.contains(selected) && !selection.contains(drawn) {
+                let run =
+                    run.map_or_else(String::new, |run| format!(" in model run {}", rfc3339(run)));
+                return Err(NoTimeStep(format!(
+                    "No data for the requested time interval{run}: the time step drawn \
+                     for it, {}, lies outside it",
+                    rfc3339(drawn)
+                )));
+            }
+        }
+    }
+    Ok((time, reference_time))
+}
+
 /// The instant a map naming model run `run` renders for, before the engine
 /// snaps it. The axis is the run's own times ([`MapEngine::run_times`]),
 /// else the parameter's or the collection's. A named run is drawn exactly,
@@ -423,8 +479,12 @@ pub fn resolve_frame(
 ///   the run; outside them, nothing. Never a time of another run.
 /// - An interval, a partial date or `*`: the latest of the run's times
 ///   inside it; none inside selects nothing.
+/// - A run whose own times for the parameter are none (a GRIB run without
+///   the parameter, a derived parameter one of whose inputs the run lacks):
+///   nothing, with a time or without (#1451).
 ///
-/// Nothing is the API's "no time step": a Maps 404, an empty map tile.
+/// Nothing is the API's "no time step": a Maps 404, an empty map tile, a
+/// WMS `InvalidDimensionValue`.
 pub fn run_time(
     requested: Option<&RequestedTime>,
     run: DateTime<Utc>,
@@ -432,9 +492,15 @@ pub fn run_time(
     info: &RasterInfo,
     parameter: Option<&str>,
 ) -> Result<Option<DateTime<Utc>>, NoTimeStep> {
-    let own = engine
-        .run_times(parameter, run)
-        .or_else(|| parameter.and_then(|p| engine.parameter_times(p)));
+    let own = engine.run_times(parameter, run);
+    if own.as_ref().is_some_and(|times| times.is_empty()) {
+        let what = parameter.map_or_else(|| "the layer".to_string(), |p| format!("'{p}'"));
+        return Err(NoTimeStep(format!(
+            "No data in model run {}: it has no time step for {what}",
+            rfc3339(run)
+        )));
+    }
+    let own = own.or_else(|| parameter.and_then(|p| engine.parameter_times(p)));
     let axis: &[DateTime<Utc>] = own.as_deref().unwrap_or(&info.times);
     let outside = |what: String| {
         NoTimeStep(format!(
@@ -602,15 +668,14 @@ impl TimeSelection {
     /// latest time inside it, `None` when it holds none; for an instant, the
     /// instant itself when listed.
     pub fn latest_in(&self, times: &[DateTime<Utc>]) -> Option<DateTime<Utc>> {
-        let (start, end) = match *self {
-            Self::Instant(t) => (Some(t), Some(t)),
-            Self::Range { start, end } => (start, end),
-        };
-        times
-            .iter()
-            .copied()
-            .filter(|t| start.is_none_or(|s| *t >= s) && end.is_none_or(|e| *t <= e))
-            .max()
+        times.iter().copied().filter(|&t| self.contains(t)).max()
+    }
+
+    /// Whether the selection holds `t`: a range from its start to its end,
+    /// both inclusive; an instant only itself.
+    pub fn contains(&self, t: DateTime<Utc>) -> bool {
+        let DatetimeInterval { start, end } = self.interval();
+        start.is_none_or(|s| t >= s) && end.is_none_or(|e| t <= e)
     }
 }
 
@@ -1503,7 +1568,148 @@ mod tests {
             assert_eq!(frame(None, Some(6)), drawn(12, 6, false));
             assert_eq!(frame(Some(instant(9)), Some(6)), drawn(9, 6, true));
             assert_eq!(frame(Some(instant(3)), None), drawn(3, 0, false));
+            // WMS resolves its TIME and DIM_REFERENCE_TIME by the same rule:
+            // an older run's own latest step without TIME, and a TIME the
+            // latest run named lacks is nothing (#1451).
+            let wms = |time: Option<RequestedTime>, run: Option<u32>| {
+                resolve_time_and_run(time.as_ref(), run.map(hour), &engine, &info, None)
+            };
+            assert_eq!(wms(None, Some(0)), Ok((Some(hour(9)), Some(hour(0)))));
+            assert!(wms(Some(instant(3)), Some(6)).is_err());
+            assert_eq!(
+                wms(Some(instant(3)), None),
+                Ok((Some(hour(3)), Some(hour(0))))
+            );
         }
+    }
+
+    /// One run, 00Z, valid 00Z–09Z hourly. In it, `p` stands for a parameter
+    /// derived from two inputs: it has its first input's steps, 00, 03, 06
+    /// and 09Z, and draws the nearest step its second input has, 00 or 03Z,
+    /// as GRIB draws `WIND` (#1451). The run has no `absent`, as a GRIB run
+    /// lacking a parameter has no time for it. `untimed` has no time axis
+    /// and draws 05Z, as an engine's default does.
+    struct Derivedish;
+
+    impl MapEngine for Derivedish {
+        fn get_raster_tile(
+            &self,
+            _: [f64; 4],
+            _: u32,
+            _: u32,
+            _: Option<DateTime<Utc>>,
+            _: &ds_core::map_engine::OutputCrs,
+            _: Option<&str>,
+            _: Option<f64>,
+            _: Option<DateTime<Utc>>,
+        ) -> Result<ds_core::map_engine::RasterTile, ds_core::error::DataServerError> {
+            unreachable!("frame resolution never renders")
+        }
+
+        fn raster_info(&self) -> RasterInfo {
+            RasterInfo {
+                reference_times: vec![hour(0)],
+                times: (0..=9).map(hour).collect(),
+                ..Axis3.raster_info()
+            }
+        }
+
+        fn run_times(
+            &self,
+            parameter: Option<&str>,
+            _: DateTime<Utc>,
+        ) -> Option<std::sync::Arc<[DateTime<Utc>]>> {
+            match parameter {
+                Some("p") => Some([0, 3, 6, 9].map(hour).into()),
+                Some("absent") => Some(std::sync::Arc::from([])),
+                _ => None,
+            }
+        }
+
+        fn resolve_parameter_reference_time(
+            &self,
+            _: Option<&str>,
+            _: Option<DateTime<Utc>>,
+            reference_time: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            reference_time.or(Some(hour(0)))
+        }
+
+        fn resolve_parameter_time(
+            &self,
+            parameter: Option<&str>,
+            time: Option<DateTime<Utc>>,
+            _: Option<DateTime<Utc>>,
+        ) -> Option<DateTime<Utc>> {
+            match parameter {
+                Some("p") => Some(hour(
+                    if time.is_some_and(|t| t < at("2024-01-01T01:30:00Z")) {
+                        0
+                    } else {
+                        3
+                    },
+                )),
+                Some("untimed") => Some(hour(5)),
+                _ => time,
+            }
+        }
+    }
+
+    /// #1451: an interval draws a time step inside it or nothing, also when
+    /// the engine snaps the step it selected out of it (a derived
+    /// parameter's inputs at different steps). A run without the parameter
+    /// is nothing, with a time or without.
+    #[test]
+    fn an_interval_never_draws_a_step_outside_it() {
+        let engine = Derivedish;
+        let info = engine.raster_info();
+        let resolve = |selection: Option<TimeSelection>, run: Option<u32>, p: &str| {
+            let requested = selection.map(|selection| RequestedTime {
+                selection,
+                from_subset: false,
+            });
+            resolve_time_and_run(requested.as_ref(), run.map(hour), &engine, &info, Some(p))
+        };
+        let range = |start: u32, end: u32| {
+            Some(TimeSelection::Range {
+                start: Some(hour(start)),
+                end: Some(hour(end)),
+            })
+        };
+        let drawn = |h: u32| Ok((Some(hour(h)), Some(hour(0))));
+        for run in [Some(0), None] {
+            // 06–09Z selects 09Z, which `p` draws at 03Z: none inside.
+            let err = resolve(range(6, 9), run, "p").unwrap_err();
+            assert!(err.0.contains("lies outside it"), "{}", err.0);
+            assert_eq!(err.0.contains("in model run"), run.is_some(), "{}", err.0);
+            // 02–09Z holds 03Z.
+            assert_eq!(resolve(range(2, 9), run, "p"), drawn(3));
+            // An instant snaps, as it always did.
+            assert_eq!(
+                resolve(Some(TimeSelection::Instant(hour(9))), run, "p"),
+                drawn(3)
+            );
+        }
+        // Without a time axis an interval is ignored, as before.
+        let untimed = RasterInfo {
+            times: Vec::new(),
+            ..info.clone()
+        };
+        let requested = RequestedTime {
+            selection: range(6, 9).unwrap(),
+            from_subset: false,
+        };
+        assert_eq!(
+            resolve_time_and_run(Some(&requested), None, &engine, &untimed, Some("untimed")),
+            drawn(5)
+        );
+        // A run without the parameter: nothing, whatever the time; naming
+        // no run leaves the engine its pick.
+        for selection in [None, Some(TimeSelection::Instant(hour(3))), range(0, 9)] {
+            let err = resolve(selection, Some(0), "absent").unwrap_err();
+            assert!(err.0.contains("has no time step for 'absent'"), "{}", err.0);
+        }
+        assert_eq!(resolve(range(0, 9), None, "absent"), drawn(9));
     }
 
     /// Levels 1000, 850 and 500 hPa, drawing the nearest one, and none for

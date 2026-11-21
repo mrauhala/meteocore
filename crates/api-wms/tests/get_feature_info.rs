@@ -1215,11 +1215,11 @@ async fn cache_control_is_get_maps() {
 }
 
 /// As GetMap: `immutable` only for a `TIME` the engine draws exactly
-/// (#1415). A snapped one reads another frame later: past the newest step
-/// once the next lands, before the oldest as the window slides, between two
-/// once one lands in the gap. `TIME` is compared as an instant, so every form
-/// that names the step stays pinned. The read itself is of the step drawn.
-/// The run is named, so only the time decides.
+/// (#1415). A snapped one reads another frame later: between two steps
+/// once one lands in the gap. `TIME` is compared as an instant, so every
+/// form that names the step stays pinned. The read itself is of the step
+/// drawn. The run is named, so only the time decides; a `TIME` outside the
+/// named run is `InvalidDimensionValue` (#1451), where naming none snaps it.
 #[tokio::test]
 async fn only_a_time_drawn_exactly_is_pinned() {
     const IMMUTABLE: &str = "public, max-age=86400, immutable";
@@ -1230,12 +1230,10 @@ async fn only_a_time_drawn_exactly_is_pinned() {
         ("2026-10-01T03:00:00%2B02:00", TIMES[1], IMMUTABLE),
         ("2026-10-01T01:00:00", TIMES[1], IMMUTABLE),
         ("2026-10-01T01:00", TIMES[1], IMMUTABLE),
-        // Past the newest step, before the oldest, between two.
-        ("2026-10-01T02:05:00Z", TIMES[2], SHORT),
-        ("2026-09-30T00:00:00Z", TIMES[0], SHORT),
+        // Between two steps.
         ("2026-10-01T00:30:00Z", TIMES[0], SHORT),
-        // It reads like a step, in another offset: 23:00Z the day before.
-        ("2026-10-01T01:00:00%2B02:00", TIMES[0], SHORT),
+        // It reads like a step, in another offset: 00:30Z.
+        ("2026-10-01T02:30:00%2B02:00", TIMES[0], SHORT),
     ] {
         let engine = Nwp::new(Answer::Value(1.0));
         let reply = get(
@@ -1245,6 +1243,32 @@ async fn only_a_time_drawn_exactly_is_pinned() {
         .await;
         assert_eq!(reply.status, StatusCode::OK, "{time}: {}", reply.body);
         assert_eq!(reply.cache_control, expected, "{time}");
+        let read = engine.calls().pop().expect("a read");
+        assert_eq!(read.datetime, Some((at(drawn), at(drawn))), "{time}");
+    }
+    // Past the newest step, before the oldest, 23:00Z the day before.
+    for (time, drawn) in [
+        ("2026-10-01T02:05:00Z", TIMES[2]),
+        ("2026-09-30T00:00:00Z", TIMES[0]),
+        ("2026-10-01T01:00:00%2B02:00", TIMES[0]),
+    ] {
+        let engine = Nwp::new(Answer::Value(1.0));
+        let app = router(engine.clone());
+        let named = get(
+            &app,
+            &gfi("nwp/t2m", 0, 0, &format!("&TIME={time}{}", named_run())),
+        )
+        .await;
+        assert_eq!(named.status, StatusCode::BAD_REQUEST, "{time}");
+        assert_eq!(
+            exception_code(&named.body).as_deref(),
+            Some("InvalidDimensionValue"),
+            "{time}"
+        );
+        assert!(engine.calls().is_empty(), "{time}");
+        let unnamed = get(&app, &gfi("nwp/t2m", 0, 0, &format!("&TIME={time}"))).await;
+        assert_eq!(unnamed.status, StatusCode::OK, "{time}: {}", unnamed.body);
+        assert_eq!(unnamed.cache_control, SHORT, "{time}");
         let read = engine.calls().pop().expect("a read");
         assert_eq!(read.datetime, Some((at(drawn), at(drawn))), "{time}");
     }

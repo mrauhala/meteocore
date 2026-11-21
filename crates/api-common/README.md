@@ -307,19 +307,26 @@ way.
   is a 400. A route adds it to its axes only for a collection with runs, so
   elsewhere it is the unknown-axis 400. `named_run` checks the run against
   `RasterInfo.reference_times` (unknown: 404).
-- `resolve_frame` picks the frame to render, for Maps and map tiles alike:
+- `resolve_frame` picks the frame to render, for Maps and map tiles alike,
+  through `resolve_time_and_run`, which WMS GetMap and GetFeatureInfo
+  resolve `TIME` and `DIM_REFERENCE_TIME` with too:
   - the time. With no run named, `render_time`: no time is the engine's
     default, else the latest time; an instant is passed on for the engine
     to snap to a time step; an interval is the latest time step inside it.
     With one, `run_time`, on the run's own times (`MapEngine::run_times`):
     no time is the run's latest step, an instant outside the run selects
-    nothing, an interval the run's latest step inside it;
+    nothing, an interval the run's latest step inside it, and a run whose
+    times for the parameter are none (a GRIB run without it, a derived
+    parameter one of whose inputs the run lacks) nothing, whatever the
+    time;
   - the run the engine renders, `resolve_parameter_reference_time`: a
     named run exactly, the latest included, else the engine's pick with its
     fallback. Then the step in it, `resolve_parameter_time`. Both key the
-    rendered cache.
+    rendered cache. An interval whose step the engine snaps out of it
+    selects nothing, with a run named or without.
 
-  When no time matches, Maps returns 404 and map tiles return 204.
+  When no time matches, Maps returns 404, map tiles 204 and WMS
+  `InvalidDimensionValue`.
 - `is_exact_time` and `is_fixed_run` are the rule for `immutable` on Maps,
   Tiles and WMS: the engine draws exactly the instant requested, from a
   collection without runs or the run the request named. A snapped instant,

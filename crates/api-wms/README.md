@@ -101,11 +101,51 @@ with that parameter's style. An unknown parameter is `LayerNotDefined`.
 |---|---|---|
 | `time` | `TIME` | ISO 8601 values, `nearestValue="1"`; default the latest, or one the engine sets (CAP: now, as of its latest rebuild) |
 | `elevation` | `ELEVATION` | The vertical levels in their unit, `nearestValue="1"`: a value between levels draws the nearest one ([GetMap](#getmap)); default the first |
-| `reference_time` | `DIM_REFERENCE_TIME` | A forecast layer's model runs; default the latest; exact match |
+| `reference_time` | `DIM_REFERENCE_TIME` | A forecast layer's model runs; default the latest; exact match: a run named is drawn exactly ([Model runs](#model-runs)) |
 
 A `time` or `reference_time` axis of more than 500 values is written in
 Annex C form: each run of three or more evenly spaced values as one
 `min/max/resolution` range, every other value as itself.
+
+### Model runs
+
+A layer with model runs (GRIB, QueryData, Zarr and NetCDF forecasts,
+nowcast generations) draws a run the way OGC API - Maps and map tiles draw
+`subset=reference_time(…)`, through one rule shared by the three APIs, so
+one run and time draw one frame on each:
+
+- **No `DIM_REFERENCE_TIME`.** `TIME` as sent, else the layer's default
+  time, the latest over every run. The engine picks the run for it: the
+  newest run with that valid time, else an older one, as GRIB draws an
+  hour-window aggregate the newest run lacks.
+- **`DIM_REFERENCE_TIME` named, the latest run included.** That run, drawn
+  exactly, never another run's step. Without `TIME`, the run's own latest
+  valid time. A `TIME` inside the run snaps to one of its steps
+  (`nearestValue="1"`). A `TIME` outside the run, or a run without a step
+  for the layer (a GRIB run without the parameter, or without one input of
+  a derived parameter), is `InvalidDimensionValue`, as WMS 1.3.0 C.3.4 has
+  a server answer a request it cannot comply with as specified. It is
+  never the red error image: nothing failed. A client animating over the
+  `time` values with the advertised default run on every frame gets the
+  exception for the frames the latest run does not have: omit
+  `DIM_REFERENCE_TIME` there, or name the run each frame comes from.
+- GetFeatureInfo reads, and reports, the frame GetMap draws. The legend
+  does not depend on the time or run.
+
+The layer's advertised `time` default is the latest over every run, and
+its `reference_time` default the latest run: WMS 1.3.0 gives a dimension
+one default, not one per run. So the two defaults sent together are
+refused with `InvalidDimensionValue` in two cases, while omitting
+`DIM_REFERENCE_TIME` draws them:
+
+- **A newest run shorter than an older one, or still arriving.** The
+  latest valid time is then an older run's: ECMWF's 06Z and 18Z runs end
+  before the 00Z and 12Z runs, a GRIB run mid-ingest has its first steps
+  only, MEPS leads land one by one.
+- **A child layer whose parameter the newest run lacks.** A GRIB run with
+  only its analysis has no maximum temperature or hour-window aggregate,
+  so with the latest run named every `TIME` of such a layer is refused
+  until that run's later steps land.
 
 ## Parameter names
 
@@ -131,7 +171,7 @@ takes its first value. Parameters the server does not use are ignored,
 | `BGCOLOR` | no | `0xRRGGBB`, default `0xFFFFFF`: the background for `TRANSPARENT=FALSE` and for JPEG |
 | `TIME` | no | One instant: RFC 3339, or `YYYY-MM-DDThh:mm[:ss]` as UTC. Each layer's engine resolves it to the timestep it draws (GeoTIFF: the latest not after it). Unparseable: `InvalidDimensionValue` |
 | `ELEVATION` | no | One finite number. The layer is drawn at the nearest level its engine can draw, rounded, not truncated (WMS 1.3.0 C.4.3): `ELEVATION=851` on 1000, 850, 500 and 300 hPa draws 850 hPa. Exactly midway between two levels, the one nearer the ground: 925 draws 1000 hPa, 1.0° between radar sweeps of 0.5° and 1.5° the 0.5° sweep. Of the levels the engine can draw at that time and run: the parameter's own levels in a GRIB run, the sweeps of a radar volume that carry the quantity, the levels every input of a derived parameter has. Every value drawing one level shares that level's cached image, ETag included. A list, another value, or a value the layer has no level to draw at (a radar volume none of whose sweeps carries the quantity, a derived parameter whose inputs share no level there) is `InvalidDimensionValue`, naming the parameter and time |
-| `DIM_REFERENCE_TIME` | no | A model run, RFC 3339 or an EDR instance id. A run the layer does not have is `InvalidDimensionValue` |
+| `DIM_REFERENCE_TIME` | no | A model run, RFC 3339 or an EDR instance id, drawn exactly ([Model runs](#model-runs)). A run the layer does not have, a `TIME` outside the run, or a run without a step for the layer is `InvalidDimensionValue` |
 | `QUALITY` | no | Vendor: 1 to 100 for `image/jpeg` (default 85) and `image/webp` (1–99 lossy, 100 lossless; default the collection's `[wms] webp_quality`, else lossless). With PNG, or out of range: `InvalidParameterValue` |
 
 PNG is written 8-bit indexed when the image has at most 256 colours, else
@@ -411,7 +451,7 @@ A request error is a WMS 1.3.0 `ServiceExceptionReport` served as
 | `StyleNotDefined` | A style the layer does not offer |
 | `InvalidCRS` | A CRS other than the five above |
 | `InvalidFormat` | Unsupported `FORMAT` or `INFO_FORMAT` |
-| `InvalidDimensionValue` | Malformed `TIME`, `ELEVATION` or `DIM_REFERENCE_TIME`; an `ELEVATION` or `DIM_REFERENCE_TIME` no listed layer has; an `ELEVATION` a layer has no level to draw at; a run the layer does not have |
+| `InvalidDimensionValue` | Malformed `TIME`, `ELEVATION` or `DIM_REFERENCE_TIME`; an `ELEVATION` or `DIM_REFERENCE_TIME` no listed layer has; an `ELEVATION` a layer has no level to draw at; a run the layer does not have; a `TIME` outside the `DIM_REFERENCE_TIME` run, or a run without a step for the layer |
 | `LayerNotQueryable` | GetFeatureInfo on a layer that is not queryable |
 | `InvalidPoint` | GetFeatureInfo `I` or `J` outside the image |
 | `MissingParameterValue` | A required parameter is missing |
@@ -492,9 +532,8 @@ the header does not judge it.
 On a layer with model runs (GRIB, QueryData, Zarr and NetCDF forecasts,
 nowcast generations), a `TIME` is drawn from the run the engine picks, and a
 newer run re-covers it, so it revalidates unless `DIM_REFERENCE_TIME` names
-the run drawn. Naming the latest run keeps it pinned while the engine draws
-that run; a valid time the named run does not cover yet, which GRIB draws
-from an older run, revalidates.
+the run. A named run is drawn exactly, the latest included, so a newer run
+landing changes nothing that URL draws: an exact `TIME` from it is pinned.
 
 ## Limits and admission
 

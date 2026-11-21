@@ -620,8 +620,9 @@ pub(crate) struct ResolvedLayer {
     /// to it (#1477). Only such a layer can be `immutable`. The request's,
     /// never a cached entry's.
     pub pinned: bool,
-    /// The timestep drawn: `TIME`, or the layer's default, snapped by the
-    /// engine (#507). `None` when the engine has nothing to draw.
+    /// The timestep drawn: `TIME`, or the layer's default (with a
+    /// `DIM_REFERENCE_TIME`, that run's own latest step, #1451), snapped by
+    /// the engine (#507). `None` when the engine has nothing to draw.
     pub time: Option<DateTime<Utc>>,
     /// The model run drawn (#521); `None` for an engine without runs.
     pub reference_time: Option<DateTime<Utc>>,
@@ -655,8 +656,9 @@ pub(crate) struct ResolvedLayer {
 /// `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` each apply to the listed
 /// layers that have that dimension, and the others ignore it (#1181). A
 /// value a layer with the dimension cannot take is that layer's error (an
-/// `ELEVATION` its engine has no level to draw at is
-/// `InvalidDimensionValue`, #1477); a dimension no listed layer has is the
+/// `ELEVATION` its engine has no level to draw at, or a `TIME` the
+/// `DIM_REFERENCE_TIME` run has no step for, is `InvalidDimensionValue`,
+/// #1477, #1451); a dimension no listed layer has is the
 /// request's, as for one layer: `ELEVATION` and `DIM_REFERENCE_TIME` are
 /// `InvalidDimensionValue`, while a `TIME` goes to every layer, as it
 /// always went to a layer without times.
@@ -772,7 +774,8 @@ fn no_dimension(layers: &[(&str, MapLayer)], dimension: &str) -> String {
 /// The timestep, model run, level and content version GetMap draws one
 /// layer at, from the `TIME`, `ELEVATION` and `DIM_REFERENCE_TIME` it takes
 /// ([`resolve_layers`]). An `ELEVATION` the engine has no level to draw at
-/// is `InvalidDimensionValue` (#1477).
+/// is `InvalidDimensionValue` (#1477), as is a `TIME` outside the
+/// `DIM_REFERENCE_TIME` run, or a run without a step for the layer (#1451).
 fn resolve_layer(
     layer: &str,
     map_layer: MapLayer,
@@ -796,54 +799,42 @@ fn resolve_layer(
     // first: a parameter can have its own time axis, and so can a
     // composite, whose name the engine resolves like a parameter's.
 
-    // Engine-owned default first (CAP: active now), then the
-    // parameter's (else the collection's) latest time. Resolve before
-    // keying so an omitted TIME tracks catalog updates.
-    let time = requested_time.or_else(|| {
-        ds_core::map_engine::default_request_time(engine.as_ref(), &info, parameter.as_deref())
+    // The time step and run drawn, through the rule Maps and map tiles
+    // draw by (`api_common::subset::resolve_time_and_run`), so the three
+    // APIs draw one frame for one run and time, and resolved BEFORE any
+    // cache key is built:
+    //
+    // - Without `DIM_REFERENCE_TIME`, a `TIME` as sent, else the engine's
+    //   default (CAP: active now), else the parameter's (else the
+    //   collection's) latest time; the engine picks the run for it, its
+    //   cross-run fallback included (GRIB, #1005).
+    // - With one, the latest run included, that run drawn exactly (#1451):
+    //   without `TIME` its own latest step, a `TIME` inside it snapped
+    //   within it, never another run's step, so the URL keeps meaning that
+    //   run's frame once a newer run lands. A `TIME` outside the run, or a
+    //   run without a step for the layer, is `InvalidDimensionValue`: WMS
+    //   1.3.0 C.3.4 has the server issue it when it cannot comply with the
+    //   dimensional parameters as specified, and C.4.3's nearest value is
+    //   for a value imprecise on the axis, not for a valid time another run
+    //   has. Never the error tile: nothing failed.
+    //
+    // #521: the CONCRETE run the engine renders keys the no-TTL caches,
+    // never `None`, which would freeze the first-rendered run's pixels once
+    // a newer run re-covers the valid times. #507: so does the time step
+    // the engine snaps to, so a not-yet-ingested TIME never caches T−1's
+    // pixels under T's key, and one request draws one step.
+    let requested = requested_time.map(|t| api_common::subset::RequestedTime {
+        selection: api_common::subset::TimeSelection::Instant(t),
+        from_subset: false,
     });
-
-    // Normalise an explicit pin of the *current* latest run to `None`
-    // BEFORE resolution, so it gets the same fallback-tolerant run
-    // selection as an omitted dimension: the common client flow
-    // echoes the GetCapabilities `default=` (the latest run) on
-    // every request — including animation frames OLDER than that
-    // run's reference time, which an exact pin would refuse (GRIB's
-    // cross-run fallback applies only to `None`). A pin of an
-    // *older* run stays explicit/exact — that is user intent.
-    let requested_run =
-        requested_reference_time.filter(|&rt| info.reference_times.last().copied() != Some(rt));
-
-    // #521: resolve the run axis to the CONCRETE run the engine will
-    // render — the run-axis mirror of what #508 does for TIME below.
-    // The no-TTL caches keyed on `None` ("latest at render time")
-    // would freeze whichever run was latest at first render: when a
-    // newer run re-covers the same valid times with different pixels
-    // (every few hours for NWP, every ~5 min for a nowcast
-    // generation), the stale entries would keep serving forever.
-    // Asking the ENGINE (rather than picking
-    // `reference_times.last()` here) preserves engine-specific
-    // selection such as GRIB's cross-run fallback — a valid time the
-    // newest run doesn't cover resolves to (and keys) the older run
-    // actually rendered. Engines without runs keep the identity
-    // default (`None` stays `None`). The run is the parameter's:
-    // GRIB renders an aggregate the newest run lacks at that time
-    // from an older run that has it (#1005).
-    let reference_time =
-        engine.resolve_parameter_reference_time(parameter.as_deref(), time, requested_run);
-
-    // #507: snap that instant to the exact timestep the engine will
-    // actually render, BEFORE any cache key is built. Engines that
-    // select latest-not-after (geotiff) would otherwise render T−1
-    // pixels for a not-yet-ingested TIME=T and cache them under T's
-    // key — permanently poisoning frame T for the covered tiles once
-    // T's file lands (the partial one-step-behind animation regions
-    // seen under storm load). Resolving here also pins one timestep
-    // for the whole request, so a catalog swap mid-render can no
-    // longer mix timesteps within a single response. Exact-match
-    // engines keep the identity default; a parameter with its own
-    // time axis snaps on that axis.
-    let time = engine.resolve_parameter_time(parameter.as_deref(), time, reference_time);
+    let (time, reference_time) = api_common::subset::resolve_time_and_run(
+        requested.as_ref(),
+        requested_reference_time,
+        engine.as_ref(),
+        &info,
+        parameter.as_deref(),
+    )
+    .map_err(|none| WmsError::InvalidDimensionValue(format!("Layer '{layer}': {}", none.0)))?;
     // #1477: the level the engine draws for that frame, the level-axis
     // mirror of #507. Capabilities declare every elevation dimension
     // `nearestValue="1"`, so an ELEVATION between levels draws the nearest
@@ -894,10 +885,12 @@ fn resolve_layer(
     // (#1334).
     let content_version =
         engine.content_version_for(parameter.as_deref(), time, reference_time, elevation);
-    // The run as named, not normalised: a named latest run the engine draws
-    // is as fixed as an older one, and one it falls back from is not (#1421).
-    // An ELEVATION drawn at another level is no more fixed than a snapped
-    // TIME (#1477): a GRIB run still filling in gains the level asked for.
+    // A named run, the latest included, is drawn exactly (#1451), so it is
+    // fixed: a newer run landing changes nothing this URL draws (#1421).
+    // Without one the engine picks the run, and a newer run re-covers the
+    // valid time later. An ELEVATION drawn at another level is no more
+    // fixed than a snapped TIME (#1477): a GRIB run still filling in gains
+    // the level asked for.
     let pinned = api_common::subset::is_exact_time(requested_time, time)
         && api_common::subset::is_fixed_run(
             &info.reference_times,
