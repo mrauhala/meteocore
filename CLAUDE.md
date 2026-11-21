@@ -567,9 +567,13 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    `Ok` tile with no TTL, so a gap from a short outage would outlive it
    (#993, #1051). Only a tile or field the source itself declares empty
    (a COG tile with `byte_count == 0`) or bytes that do not decode are
-   nodata. A missing object is engine-specific: engine-odim draws a typed
-   `NotFound` as nodata (#993/#996), GeoTIFF answers 503 until the next scan
-   drops the entry.
+   nodata. A missing object is engine-specific: an ODIM PVOL draws a typed
+   `NotFound` as nodata (#993/#996), an ODIM composite answers 503 until the
+   next scan drops the entry (#1506). GeoTIFF draws a gone remote object's
+   tiles as nodata (EDR: nulls) and drops its entry at once, so the time
+   snaps past it; a forbidden object or a fetch out of retries is
+   `ResourceExhausted` (503); a local file deleted after the scan serves
+   its mapped bytes until the next scan (#1074).
    **If the engine snaps a requested time to an available timestep**
    (latest-not-after, nearest, …) instead of exact-matching, it MUST
    override `MapEngine::resolve_time` with the SAME selection logic

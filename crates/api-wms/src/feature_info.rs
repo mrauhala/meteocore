@@ -611,9 +611,13 @@ async fn read_layers(
                         query.layer
                     )));
                 }
+                // Its detail is logged once, by `WmsError::into_response`
+                // (#1484).
                 ErrorClass::Internal => {
-                    tracing::warn!("WMS GetFeatureInfo error for layer '{}': {e}", query.layer);
-                    return Err(WmsError::Internal(e.to_string()));
+                    return Err(WmsError::Internal(format!(
+                        "GetFeatureInfo error for layer '{}': {e}",
+                        query.layer
+                    )));
                 }
             },
         });

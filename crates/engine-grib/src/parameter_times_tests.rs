@@ -315,9 +315,11 @@ fn several_parameters_share_one_carrying_step() {
 }
 
 /// A pressure view carries a parameter at a step that has it at any
-/// level; a level that step lacks is missing data, a 404.
+/// level; a level of the parameter's in the run that the step lacks is an
+/// incomplete step file, the data's fault: an `Engine` error, where it was
+/// a 404 (#1506, `map_fault_tests`).
 #[test]
-fn a_level_the_step_lacks_is_not_found() {
+fn a_level_the_step_lacks_is_a_server_error() {
     let source = TestSource::new();
     let level = |hpa: u32, kelvin: f32| message(0, kelvin, [0; 4], 100, hpa * 100);
     source.write(
@@ -351,10 +353,17 @@ fn a_level_the_step_lacks_is_not_found() {
         render(850.0).unwrap().values.value_at(0).unwrap() as f32,
         -2.15
     );
-    assert!(matches!(
-        render(500.0),
-        Err(DataServerError::LocationNotFound(_))
-    ));
+    // The map draws 500 hPa there: it is temperature's level in the run.
+    assert_eq!(
+        pressure.resolve_elevation(Some("TMP"), Some(500.0), Some(at(3)), None),
+        Some(500.0)
+    );
+    match render(500.0) {
+        Err(e @ DataServerError::Engine(_)) => {
+            assert!(e.to_string().contains("incomplete step file"), "{e}");
+        }
+        other => panic!("{:?}", other.map(drop)),
+    }
 }
 
 /// The real NOAA GFS sidecars of one run (`testdata/gfs`, 2026-04-08 00Z

@@ -230,41 +230,24 @@ pub struct ErrorTile {
     pub reason: &'static str,
 }
 
-/// Every [`ErrorTile::reason`], a bounded label set: the data a request
-/// named is gone (`not_found`), the engine refused the request
-/// (`invalid_request`, such as a source read over its pixel cap), a source
-/// read failed (`storage`), or anything else (`internal`). The last two are
-/// exactly the errors of [`ErrorClass::Internal`], which the
+/// Every [`ErrorTile::reason`], a bounded label set, the render error's
+/// [`DataServerError::failure_reason`] (#1484): the data a request named is
+/// gone (`not_found`), the engine refused the request (`invalid_request`,
+/// such as a source read over its pixel cap), a source read failed
+/// (`storage`), or anything else (`internal`). The last two are exactly the
+/// errors of [`ErrorClass::Internal`] that reach a tile, which the
 /// `WmsErrorTiles` alert counts (`docker/prometheus/rules/meteocore.yml`,
-/// #1476). The first two are mostly a client's request, but some engines
-/// report a data fault with them too, such as a GRIB message missing from
-/// its step or a GeoTIFF source over its pixel cap; the alert misses those
-/// (#1506).
-pub const ERROR_TILE_REASONS: [&str; 4] = ["not_found", "invalid_request", "storage", "internal"];
+/// #1476). The first two are mostly a client's request, but an engine may
+/// report a data fault with them too, such as a GeoTIFF source over its
+/// pixel cap; the alert misses those (#1506).
+pub const ERROR_TILE_REASONS: [&str; 4] = DataServerError::FAILURE_REASONS;
 
 impl ErrorTile {
+    /// `finish_render` answers a transient error (a shed, timed-out or
+    /// refused render) with the 503, never the tile, so `error` is never
+    /// one.
     fn new(collection: &str, error: &DataServerError) -> Self {
-        use DataServerError as E;
-        let reason = match error {
-            E::CollectionNotFound(_)
-            | E::LocationNotFound(_)
-            | E::FeatureNotFound(_)
-            | E::ReferenceTimeNotFound(_) => "not_found",
-            E::InvalidDatetime(_)
-            | E::InvalidBbox(_)
-            | E::InvalidParameter(_)
-            | E::QueryTooLarge(_) => "invalid_request",
-            E::Storage(_) | E::Io(_) => "storage",
-            // `finish_render` answers a shed, timed-out or refused render
-            // (`ResourceExhausted`, `DeadlineExceeded`, `Unavailable`) with
-            // the 503, never the tile: named only to keep the match whole.
-            E::Engine(_)
-            | E::Config(_)
-            | E::Render(_)
-            | E::ResourceExhausted
-            | E::DeadlineExceeded
-            | E::Unavailable(_) => "internal",
-        };
+        let reason = error.failure_reason();
         Self {
             collection: collection.to_owned(),
             reason,
@@ -1260,7 +1243,9 @@ pub async fn wms_handler(
                 }
                 Ok(Finished::Empty(tile, _)) => {
                     let cached = tile.map_err(|e| {
-                        WmsError::Internal(format!("Failed to encode empty tile: {e}"))
+                        WmsError::Internal(format!(
+                            "Failed to encode the empty image for layer '{layer_names}': {e}"
+                        ))
                     })?;
                     (cached, "EMPTY", None)
                 }
@@ -1276,7 +1261,9 @@ pub async fn wms_handler(
                 Ok(Finished::Error(tile, e)) => {
                     tracing::warn!("WMS render error for layer '{layer_names}': {e}");
                     let cached = tile.map_err(|e| {
-                        WmsError::Internal(format!("Failed to encode error tile: {e}"))
+                        WmsError::Internal(format!(
+                            "Failed to encode the error tile for layer '{layer_names}': {e}"
+                        ))
                     })?;
                     (cached, "ERROR", Some(ErrorTile::new(&collection_id, &e)))
                 }
@@ -1453,8 +1440,14 @@ pub async fn wms_handler(
                 )
             })
             .await
-            .map_err(|e| WmsError::Internal(format!("Legend render failed: {e}")))?
-            .map_err(|e| WmsError::Internal(format!("Legend render error: {e}")))?;
+            .map_err(|e| {
+                WmsError::Internal(format!("Legend task for layer '{layer_name}' failed: {e}"))
+            })?
+            .map_err(|e| {
+                WmsError::Internal(format!(
+                    "Legend render for layer '{layer_name}' failed: {e}"
+                ))
+            })?;
 
             Ok((
                 [
@@ -1919,8 +1912,12 @@ async fn composite_legend(
         ds_render::render_composite_legend(&spec, &units, width, height, format)
     })
     .await
-    .map_err(|e| WmsError::Internal(format!("Legend render failed: {e}")))?
-    .map_err(|e| WmsError::Internal(format!("Legend render error: {e}")))?;
+    .map_err(|e| WmsError::Internal(format!("Legend task for layer '{layer_name}' failed: {e}")))?
+    .map_err(|e| {
+        WmsError::Internal(format!(
+            "Legend render for layer '{layer_name}' failed: {e}"
+        ))
+    })?;
     Ok((
         [
             (header::CONTENT_TYPE, format.content_type()),
@@ -1938,7 +1935,9 @@ async fn composite_legend(
 impl From<ds_executor::ExecutionError> for WmsError {
     fn from(error: ds_executor::ExecutionError) -> Self {
         match error {
-            ds_executor::ExecutionError::Task(e) => Self::Internal(e.to_string()),
+            // A render job's panic or cancellation: its detail is logged
+            // once, by `WmsError::into_response`.
+            error @ ds_executor::ExecutionError::Task(_) => Self::Internal(error.to_string()),
             _ => Self::ServiceUnavailable,
         }
     }

@@ -138,11 +138,22 @@ around `ds-storage` calls (Critical Rules 6–7).
   `ErrorClass::is_transient`, and EDR position/area fail the query on a
   transient error, never a null timestep that the answer's caches would
   keep; the map path propagates it, so WMS answers 503, not the error
-  tile. Only a file gone since the scan (a typed 404 from
-  `DataStore::head_or_refusal`/`get_or_refusal`, a local `NotFound`),
-  grown past `MAX_REMOTE_FILE_SIZE` or whose bytes do not decode is an
-  `Engine` error: a null timestep in EDR, an error for a map, as before.
-  Never tell them apart by error text. Nothing failed enters
+  tile. A file gone since the scan (a typed 404 from
+  `DataStore::head_or_refusal`/`get_or_refusal`, a local `NotFound`) or
+  grown past `MAX_REMOTE_FILE_SIZE` is `LoadError::Withdrawn`: EDR answers
+  it as a null timestep (`load_composite`, an `Engine` error), as
+  GeoTIFF's EDR answers a gone object; a map answers it `ResourceExhausted`
+  (`LoadError::for_map`, 503, detail at WARN, #1506): the next scan drops
+  the entry and the same time then draws its nearest file. A template
+  probe never re-HEADs a file it found, so `load` asks it to
+  (`TemplateProber::recheck`, `recheck_withdrawn`, only if the poll is not
+  holding the prober's lock). Never the WMS
+  error tile or Maps' opaque 500, which name a server fault, nor a nodata
+  tile, which the no-TTL caches would keep. (GeoTIFF draws a gone object's
+  tiles as nodata, but drops its entry at once, #1074; this catalog has no
+  such state.) Bytes that do not decode are an `Engine` error: a null
+  timestep in EDR, the error tile for a map. Never tell them apart by
+  error text. Nothing failed enters
   `COMPOSITE_CACHE`. Pinned by `composite_read_failure_tests` and
   `a_wait_for_another_composite_fetch_ends_at_the_deadline`.
 - **The sweep a map draws is `drawn_sweep`**: among the sweeps carrying the

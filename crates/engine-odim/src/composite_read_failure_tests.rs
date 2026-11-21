@@ -5,7 +5,10 @@
 //! answer's caches would keep as "no data", nor the WMS error tile. Nothing
 //! failed is cached, so the same request reads the file once the store
 //! answers again. A file whose bytes do not decode, or that is gone since
-//! the scan, is still a null timestep in EDR.
+//! the scan, is still a null timestep in EDR. A map of a file gone since
+//! the scan, or grown past the size limit, is a 503 (`ResourceExhausted`)
+//! until the next scan drops it (#1506); of one that does not decode, an
+//! `Engine` error, the WMS error tile.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -397,14 +400,59 @@ fn undecodable_and_gone_composites_are_edr_null_timesteps() {
     assert!(area[2 * cells..3 * cells].iter().any(Option::is_some));
     assert_eq!(area[2 * cells..3 * cells], area[3 * cells..]);
 
-    // Nor does the map ask for a retry of either.
-    for time in [from, "2026-01-20T11:20:00Z"] {
-        let map = views.map(time).map(drop);
+    // A map of the gone file is a 503 until the next scan drops it, never
+    // the error tile of a server fault (#1506); one of the bytes that do
+    // not decode is that error tile.
+    let gone = views.map(from).map(drop);
+    assert!(
+        matches!(gone, Err(DataServerError::ResourceExhausted)),
+        "{gone:?}"
+    );
+    let undecodable = views.map("2026-01-20T11:20:00Z").map(drop);
+    assert!(
+        matches!(&undecodable, Err(e @ DataServerError::Engine(_)) if e.class() == ErrorClass::Internal),
+        "{undecodable:?}"
+    );
+    for file in ["1115", "1120"] {
         assert!(
-            !matches!(&map, Err(e) if e.class().is_transient()),
-            "{time}: {map:?}"
+            !COMPOSITE_CACHE.contains_key(key(prefix, file).as_str()),
+            "{file}"
         );
     }
+}
+
+/// A file grown past the size limit since the scan listed it is never
+/// read: a null timestep in EDR, and a map of it the 503 a gone file's is
+/// (#1506), with nothing cached.
+#[test]
+fn a_composite_grown_past_the_limit_is_an_edr_null_and_a_map_503() {
+    let prefix = "read-failure-1506-grown/";
+    let fixture = std::fs::read(FIXTURE).unwrap();
+    let store = Arc::new(FailingStore::default());
+    let engine = engine_over(
+        &store,
+        prefix,
+        &[
+            ("1120", fixture.clone()),
+            ("1125", fixture.clone()),
+            ("1130", fixture.clone()),
+        ],
+    );
+    let grown = key(prefix, "1120");
+    let limit = usize::try_from(crate::catalog::MAX_REMOTE_FILE_SIZE).unwrap();
+    store.put_file(&grown, vec![0; limit + 1]);
+    let views = Views::new(&engine);
+    let from = "2026-01-20T11:20:00Z";
+
+    let position = views.position(from, NEWER).expect("the series answers");
+    assert_eq!(position[0], None, "{position:?}");
+    assert!(position[1].is_some(), "the echo is data: {position:?}");
+    let map = views.map(from).map(drop);
+    assert!(
+        matches!(map, Err(DataServerError::ResourceExhausted)),
+        "{map:?}"
+    );
+    assert!(!COMPOSITE_CACHE.contains_key(grown.as_str()));
 }
 
 /// A local file the server cannot read (here a directory in its place) is
@@ -440,4 +488,79 @@ fn a_local_composite_that_cannot_be_read_fails_and_a_gone_one_is_null() {
     assert_eq!(position[0], None);
     assert!(position[1].is_some(), "the echo is data: {position:?}");
     assert_eq!(position[1], position[2]);
+    // A map of it is a 503 until the next scan drops it (#1506).
+    let map = views.map(from).map(drop);
+    assert!(
+        matches!(map, Err(DataServerError::ResourceExhausted)),
+        "{map:?}"
+    );
+}
+
+/// A template probe never re-HEADs a file it found (#287), so a map that
+/// finds one gone has it HEADed again on the next poll, which drops it:
+/// the same time then draws its nearest file, as a listing source's next
+/// scan has it do (#1506).
+#[test]
+fn a_template_probe_drops_a_withdrawn_composite_on_its_next_poll() {
+    use chrono::DurationRound;
+
+    let fixture = std::fs::read(FIXTURE).unwrap();
+    let store = Arc::new(FailingStore::default());
+    let base = "read-failure-1506-template";
+    let config = super::tests::config_with(None, None, None, Some("-PT30M"));
+    let template = config.filename_template.clone().unwrap();
+    // The two newest slots of the probe's window.
+    let cadence = chrono::Duration::minutes(5);
+    let newest = Utc::now().duration_trunc(cadence).unwrap();
+    let older = newest - cadence;
+    let key_at = |time: DateTime<Utc>| format!("{base}/{}", time.format(&template));
+    for time in [older, newest] {
+        store.put_file(&key_at(time), fixture.clone());
+    }
+    let prober = template_prober(
+        "read-failure-template",
+        base.to_owned(),
+        template.clone(),
+        300,
+        Some(TimeWindow::parse("-PT30M").unwrap()),
+        None,
+    )
+    .unwrap();
+    let source = Source::TemplateHttp {
+        store: ds_storage::DataStore::new(store.clone()),
+        base_url: "test://template".into(),
+        prober: Arc::new(Mutex::new(prober)),
+    };
+    let engine = OdimEngine::assemble(
+        "read-failure-template",
+        "reflectivity".into(),
+        "dBZ".into(),
+        Overrides {
+            gain: None,
+            offset: None,
+            nodata: None,
+        },
+        source,
+        build_matcher(&config).unwrap(),
+        None,
+        30,
+    )
+    .expect("the engine reads its seed composite");
+    let times = || -> Vec<DateTime<Utc>> { engine.catalog.load().iter().map(|e| e.time).collect() };
+    assert_eq!(times(), [older, newest]);
+    let views = Views::new(&engine);
+    let older_time = older.to_rfc3339();
+
+    store.remove(&key_at(older));
+    let map = views.map(&older_time).map(drop);
+    assert!(
+        matches!(map, Err(DataServerError::ResourceExhausted)),
+        "{map:?}"
+    );
+    engine.poll_once();
+    assert_eq!(times(), [newest], "the next poll drops the gone file");
+    let map = views
+        .map(&older_time)
+        .expect("the time draws its nearest file");
+    assert!(!map.values.is_all_nodata(), "the echo renders");
 }
