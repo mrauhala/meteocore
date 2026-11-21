@@ -65,7 +65,7 @@ use std::sync::Arc;
 
 use super::{CurvilinearGrid, ProjectionGrid};
 use crate::error::DataServerError;
-use crate::geo::{Crs, GeoTransform};
+use crate::geo::{lon_within_half_turn, Crs, GeoTransform};
 use crate::map_engine::{OutputCrs, RasterTile, RasterValues};
 
 /// A source grid: a regular one's [`GeoTransform`], or a curvilinear
@@ -285,7 +285,7 @@ impl SourceGrid {
                 (bbox, width, height, output_crs),
                 node,
                 |lon, lat| {
-                    let lon = centre.map_or(lon, |c| within_half_turn(lon, c));
+                    let lon = centre.map_or(lon, |c| lon_within_half_turn(lon, c));
                     centred(transform.world_to_pixel_f64(lon, lat))
                 },
             ),
@@ -356,7 +356,7 @@ impl SourceGrid {
             Layout::Projected {
                 transform, centre, ..
             } => {
-                let lon = centre.map_or(lon, |c| within_half_turn(lon, c));
+                let lon = centre.map_or(lon, |c| lon_within_half_turn(lon, c));
                 centred(transform.world_to_pixel_f64(lon, lat))
             }
             Layout::Curvilinear { grid, .. } => grid.locate(lon, lat),
@@ -733,18 +733,6 @@ impl OutputMap<'_> {
 /// first cell's centre rather than its corner.
 fn centred((col, row): (f64, f64)) -> (f64, f64) {
     (col - 0.5, row - 0.5)
-}
-
-/// `lon` moved by whole turns into `[centre - 180°, centre + 180°)`. A
-/// longitude already there is returned as is, so it never moves by a
-/// rounding error; NaN stays NaN.
-fn within_half_turn(lon: f64, centre: f64) -> f64 {
-    let start = centre - 180.0;
-    if (start..start + 360.0).contains(&lon) {
-        lon
-    } else {
-        start + (lon - start).rem_euclid(360.0)
-    }
 }
 
 /// The envelope [`OutputCrs::footprint_pixel_window`] needs for `bbox`: on

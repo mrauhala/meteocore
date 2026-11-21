@@ -436,23 +436,6 @@ fn nearest_loaded_metadata(
         .map(Arc::as_ref)
 }
 
-/// The native pixel window `(col_start, row_start, col_end, row_end)` of an
-/// area query's bbox on `geo_transform`; a bbox that misses the raster is
-/// the 400.
-fn area_pixel_window(
-    geo_transform: &ds_core::geo::GeoTransform,
-    west: f64,
-    south: f64,
-    east: f64,
-    north: f64,
-) -> Result<(u32, u32, u32, u32), DataServerError> {
-    geo_transform
-        .bbox_to_pixels(west, south, east, north)
-        .ok_or_else(|| {
-            DataServerError::InvalidParameter("Requested bbox does not intersect the raster".into())
-        })
-}
-
 /// Most newly discovered remote frames one poll cycle pre-warms (#1004),
 /// newest first: the frames a client animates first. A cold start or a poll
 /// after an outage can discover a backlog; older frames load on first view.
@@ -2394,7 +2377,12 @@ impl GeoTiffEngine {
             frames::position_frame_reads(&frames),
             frames,
             move |frame| {
-                let Some((col, row)) = frame.metadata.geo_transform.world_to_pixel(lon, lat) else {
+                // The point's longitude in the source's own frame (#1442):
+                // near a Lambert cone's central meridian, on a geographic
+                // raster's columns.
+                let gt = &frame.metadata.geo_transform;
+                let Some((col, row)) = gt.world_to_pixel(area::source_longitude(gt, lon), lat)
+                else {
                     return Ok(None);
                 };
                 match reader::read_pixel(
@@ -2514,17 +2502,16 @@ impl GeoTiffEngine {
         let first_metadata = first_entry
             .metadata()
             .ok_or_else(|| DataServerError::Engine("First entry has no metadata loaded".into()))?;
-        // A geographic source answers its native window; a projected one
-        // its regular CRS84 grid (#1435), each cell sampled from the native
-        // window through `plan.projection`.
+        // A geographic source answers its native windows, two across a
+        // global raster's seam (#1442); a projected one its regular CRS84
+        // grid (#1435), each cell sampled from the native window
+        // (`area::AreaRead`).
         let plan = area::AreaGrid::new(&first_metadata.geo_transform, bbox)?.plan(
             polygon,
             entries.len(),
             &self.collection_id,
         )?;
         let (nx, ny) = (plan.x.len(), plan.y.len());
-        let (window_nx, _) = plan.window_dims();
-        let all_cells = (0, nx as u32 - 1, 0, ny as u32 - 1);
 
         let times: Vec<DateTime<Utc>> = entries.iter().map(|(timestamp, _)| **timestamp).collect();
         // `[t][y][x]`; an entry without metadata, or a file that cannot be
@@ -2550,42 +2537,32 @@ impl GeoTiffEngine {
             frames,
             move |frame| {
                 let plan = &frame_plan;
-                let (col_start, row_start, col_end, row_end) = plan.window;
-                let read = reader::read_bbox(
-                    &frame.source,
-                    &frame.metadata,
-                    col_start,
-                    row_start,
-                    col_end,
-                    row_end,
-                    Some(&tile_cache),
-                    &frame.path,
-                    band_index,
-                );
-                match (read, &plan.projection) {
-                    (Ok(window), None) => Ok(Some(window)),
-                    // Each cell the native pixel holding its centre:
-                    // nearest, never interpolated.
-                    (Ok(window), Some(projection)) => {
-                        let mut values = Vec::with_capacity(cells);
-                        resample_nearest(
-                            projection,
-                            nx as u32,
-                            ny as u32,
-                            &window,
-                            window_nx,
-                            plan.window,
-                            None,
-                            all_cells,
-                            &mut values,
-                        );
-                        Ok(Some(values))
-                    }
-                    (Err(e), _) if is_unreadable_file(&e) => {
+                // Each window in turn: two where a global raster's seam
+                // lies inside the bbox (#1442).
+                let reads = plan
+                    .windows()
+                    .iter()
+                    .map(|&(col_start, row_start, col_end, row_end)| {
+                        reader::read_bbox(
+                            &frame.source,
+                            &frame.metadata,
+                            col_start,
+                            row_start,
+                            col_end,
+                            row_end,
+                            Some(&tile_cache),
+                            &frame.path,
+                            band_index,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                match reads {
+                    Ok(reads) => Ok(Some(plan.cells(reads))),
+                    Err(e) if is_unreadable_file(&e) => {
                         tracing::warn!("Failed to read bbox from {}: {e}", frame.path.display());
                         Ok(None)
                     }
-                    (Err(e), _) => Err(e),
+                    Err(e) => Err(e),
                 }
             },
             |index, values| {
@@ -2658,18 +2635,15 @@ fn mask_area(
     plan: &area::AreaPlan,
     polygon: &ds_core::feature::QueryPolygon,
 ) {
-    let (nx, ny) = (plan.x.len(), plan.y.len());
-    let inside: Vec<bool> = match (&plan.projection, plan.window) {
-        (None, (col_start, row_start, _, _)) => (0..ny)
-            .flat_map(|iy| (0..nx).map(move |ix| (ix, iy)))
-            .map(|(ix, iy)| {
-                let (lon, lat) = plan
-                    .geo_transform
-                    .pixel_to_world(col_start + ix as u32, row_start + iy as u32);
-                polygon.contains(lon, lat)
-            })
+    let inside: Vec<bool> = match &plan.read {
+        // A geographic source's cells are its pixels, each in when its
+        // centre is: the axes are those centres, in CRS84.
+        area::AreaRead::Native(_) => plan
+            .y
+            .iter()
+            .flat_map(|&lat| plan.x.iter().map(move |&lon| polygon.contains(lon, lat)))
             .collect(),
-        _ => polygon.mask_cells(&plan.x, &plan.y),
+        area::AreaRead::Sampled { .. } => polygon.mask_cells(&plan.x, &plan.y),
     };
     for (i, value) in values.iter_mut().enumerate() {
         if !inside[i % inside.len()] {

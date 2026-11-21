@@ -196,6 +196,21 @@ pub fn wrap_lon(lon_deg: f64) -> f64 {
     }
 }
 
+/// `lon_deg` moved by whole turns into `[centre_deg − 180°, centre_deg +
+/// 180°)`: the longitude a grid or projection centred on `centre_deg` is
+/// meant to be given. A Lambert conformal conic's forward is not periodic
+/// in longitude (θ = n·Δλ, #1114), and a geographic grid's columns are
+/// linear in it. A longitude already there is returned as is, so it never
+/// moves by a rounding error; NaN stays NaN.
+pub fn lon_within_half_turn(lon_deg: f64, centre_deg: f64) -> f64 {
+    let start = centre_deg - 180.0;
+    if (start..start + 360.0).contains(&lon_deg) {
+        lon_deg
+    } else {
+        start + (lon_deg - start).rem_euclid(360.0)
+    }
+}
+
 /// Great-circle distance between two WGS84 points, metres (haversine on the
 /// mean Earth radius). Good to ~0.3% — fine for range and coverage tests.
 ///
@@ -2899,6 +2914,25 @@ pub fn geometry_to_pixels(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_longitude_moves_by_whole_turns_to_within_half_a_turn() {
+        // Half open: [centre − 180°, centre + 180°).
+        assert_eq!(lon_within_half_turn(-179.9, 180.0), 180.1);
+        assert_eq!(lon_within_half_turn(179.9, 180.0), 179.9);
+        assert_eq!(lon_within_half_turn(0.0, 180.0), 0.0);
+        assert_eq!(lon_within_half_turn(360.0, 180.0), 0.0);
+        assert_eq!(lon_within_half_turn(180.0, 0.0), -180.0);
+        assert_eq!(lon_within_half_turn(-180.0, 0.0), -180.0);
+        assert_eq!(lon_within_half_turn(-170.0, 180.0), 190.0);
+        assert_eq!(lon_within_half_turn(550.0, 0.0), -170.0);
+        // A longitude already there never moves by a rounding error.
+        assert_eq!(
+            lon_within_half_turn(24.55, 25.5).to_bits(),
+            24.55_f64.to_bits()
+        );
+        assert!(lon_within_half_turn(f64::NAN, 0.0).is_nan());
+    }
 
     #[test]
     fn crs84_extent_normalizes_advertised_bounds() {

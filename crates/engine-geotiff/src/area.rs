@@ -1,7 +1,9 @@
 //! The grid an EDR area or radius query answers (#1435).
 //!
 //! A geographic source's pixel centres are a regular CRS84 grid already, so
-//! the answer is its native pixel window. A projected source's are not: a
+//! the answer is its native pixel window, or the two windows either side of
+//! a global raster's seam when the bbox holds it (#1442). A projected
+//! source's are not: a
 //! cell's longitude depends on its row as well as its column, so no pair of
 //! `x` and `y` axes places its native cells, and axes taken along the
 //! window's middle row and column put the corners of a few degrees' window
@@ -12,14 +14,28 @@
 //! reach their pixels through a coarse [`ProjectionGrid`], never one CRS
 //! transform per cell (root Critical Rule 5).
 //!
+//! Both kinds place the bbox's longitudes in the source's own frame first
+//! ([`lon_arc`] round [`frame_centre`]): a geographic raster's columns, a
+//! turn wide at most, and a projection's longitudes near its central
+//! meridian. An antimeridian-crossing bbox is then one arc, never the sweep
+//! through 0° that `GeoTransform::bbox_to_pixels` takes from `west` to
+//! `east`. The position query places its point by the same rule
+//! ([`source_longitude`]).
+//!
 //! [`AreaGrid::new`] settles the answer's extent and cell count without
 //! allocating either; [`AreaGrid::plan`] runs the budgets on them before it
-//! builds the axes, the projection grid and the native window to read.
+//! builds the axes, the projection grid and the native windows to read.
 
 use ds_core::error::DataServerError;
 use ds_core::feature::{check_area_budget, check_mask_budget, Bbox, QueryPolygon, MAX_AREA_VALUES};
-use ds_core::geo::{great_circle_distance_m, Crs, GeoTransform, EARTH_RADIUS_M};
+use ds_core::geo::{
+    great_circle_distance_m, lon_within_half_turn, wrap_lon, Crs, GeoTransform, EARTH_RADIUS_M,
+};
 use ds_core::resample::ProjectionGrid;
+
+/// A native pixel window `(col_start, row_start, col_end, row_end)`, ends
+/// exclusive.
+pub(crate) type Window = (u32, u32, u32, u32);
 
 /// The answer to one area query over one source grid, before its budgets.
 pub(crate) struct AreaGrid {
@@ -29,9 +45,14 @@ pub(crate) struct AreaGrid {
 }
 
 enum Kind {
-    /// A geographic source: its native pixel window
-    /// `(col_start, row_start, col_end, row_end)` is the answer.
-    Native { window: (u32, u32, u32, u32) },
+    /// A geographic source: its native pixel windows ([`native_windows`]),
+    /// on the same rows, side by side west to east, are the answer.
+    /// `antimeridian` is the CRS84 longitude a pixel centred on ±180° takes
+    /// ([`crs84_lon`]).
+    Native {
+        windows: Vec<Window>,
+        antimeridian: f64,
+    },
     /// A projected source: a regular CRS84 grid.
     Regular(RegularGrid),
 }
@@ -53,17 +74,28 @@ struct RegularGrid {
 
 /// What an area query reads and answers, once its budgets have passed.
 pub(crate) struct AreaPlan {
-    /// The source grid the answer is read from.
-    pub(crate) geo_transform: GeoTransform,
-    /// The answer's cell-centre axes: `x` ascending, `y` descending.
+    /// The answer's cell-centre axes: `x` eastward in CRS84 (from 180° on
+    /// to -180° across the antimeridian, as `QueryPolygon::grid_axes`
+    /// steps), `y` descending.
     pub(crate) x: Vec<f64>,
     pub(crate) y: Vec<f64>,
-    /// The native window `(col_start, row_start, col_end, row_end)` each
-    /// timestep reads.
-    pub(crate) window: (u32, u32, u32, u32),
-    /// A projected source's cell → source pixel map; `None` for a
-    /// geographic source, whose window is the answer.
-    pub(crate) projection: Option<ProjectionGrid>,
+    /// What each timestep reads, and how its pixels become the cells.
+    pub(crate) read: AreaRead,
+}
+
+/// The native windows an area query reads per timestep, and how their
+/// pixels become the answer's cells.
+pub(crate) enum AreaRead {
+    /// A geographic source: windows on the same rows whose pixels, side by
+    /// side west to east, are the cells. One window, or two where a global
+    /// raster's seam lies inside the bbox: its last columns, then its first.
+    Native(Vec<Window>),
+    /// A projected source: one native window, each cell the pixel of it
+    /// holding the cell's centre, through `projection`.
+    Sampled {
+        window: Window,
+        projection: ProjectionGrid,
+    },
 }
 
 impl AreaGrid {
@@ -72,13 +104,8 @@ impl AreaGrid {
     pub(crate) fn new(geo_transform: &GeoTransform, bbox: &Bbox) -> Result<Self, DataServerError> {
         let kind = if matches!(geo_transform.crs, Crs::Wgs84) {
             Kind::Native {
-                window: crate::area_pixel_window(
-                    geo_transform,
-                    bbox.west,
-                    bbox.south,
-                    bbox.east,
-                    bbox.north,
-                )?,
+                windows: native_windows(geo_transform, bbox)?,
+                antimeridian: antimeridian_name(bbox),
             }
         } else {
             Kind::Regular(RegularGrid::new(geo_transform, bbox)?)
@@ -93,7 +120,7 @@ impl AreaGrid {
     pub(crate) fn dims(&self) -> (usize, usize) {
         match &self.kind {
             Kind::Regular(regular) => regular.dims,
-            Kind::Native { window } => window_dims(*window),
+            Kind::Native { windows, .. } => windows_dims(windows),
         }
     }
 
@@ -117,22 +144,32 @@ impl AreaGrid {
         check_area_budget(timesteps, ny, nx, 1)?;
         let geo_transform = self.geo_transform;
         match self.kind {
-            Kind::Native { window } => {
-                let (col_start, row_start, col_end, row_end) = window;
+            Kind::Native {
+                windows,
+                antimeridian,
+            } => {
+                let (col_start, row_start, col_end, row_end) = windows[0];
                 let mid_row = (row_start + row_end) / 2;
                 let mid_col = (col_start + col_end) / 2;
-                let x = (col_start..col_end)
-                    .map(|c| geo_transform.pixel_to_world(c, mid_row).0)
+                // The pixel centres' longitudes in CRS84, as the bbox names
+                // them: a raster stored past 180° (0–360°, or across the
+                // antimeridian), and a pixel centred on ±180°.
+                let pixel = geo_transform.pixel_width;
+                let x = windows
+                    .iter()
+                    .flat_map(|&(col_start, _, col_end, _)| col_start..col_end)
+                    .map(|c| {
+                        let lon = geo_transform.pixel_to_world(c, mid_row).0;
+                        crs84_lon(lon, antimeridian, pixel)
+                    })
                     .collect();
                 let y = (row_start..row_end)
                     .map(|r| geo_transform.pixel_to_world(mid_col, r).1)
                     .collect();
                 Ok(AreaPlan {
-                    geo_transform,
                     x,
                     y,
-                    window,
-                    projection: None,
+                    read: AreaRead::Native(windows),
                 })
             }
             Kind::Regular(regular) => {
@@ -149,7 +186,7 @@ impl AreaGrid {
                 // cold item loads for it).
                 let window = source_window(&projection, axes.dims(), &geo_transform)
                     .ok_or_else(misses_raster)?;
-                let (window_nx, window_ny) = window_dims(window);
+                let (window_nx, window_ny) = windows_dims(&[window]);
                 let pixels = window_nx * window_ny;
                 if pixels > MAX_AREA_VALUES {
                     return Err(DataServerError::QueryTooLarge(format!(
@@ -159,11 +196,9 @@ impl AreaGrid {
                     )));
                 }
                 Ok(AreaPlan {
-                    geo_transform,
                     x: axes.x,
                     y: axes.y,
-                    window,
-                    projection: Some(projection),
+                    read: AreaRead::Sampled { window, projection },
                 })
             }
         }
@@ -171,24 +206,192 @@ impl AreaGrid {
 }
 
 impl AreaPlan {
-    /// The native window's `(nx, ny)` pixels.
+    /// The native windows each timestep reads, in the order
+    /// [`Self::cells`] takes their pixels.
+    pub(crate) fn windows(&self) -> &[Window] {
+        match &self.read {
+            AreaRead::Native(windows) => windows,
+            AreaRead::Sampled { window, .. } => std::slice::from_ref(window),
+        }
+    }
+
+    /// The `(nx, ny)` native pixels each timestep reads, its windows side
+    /// by side.
+    #[cfg(test)]
     pub(crate) fn window_dims(&self) -> (usize, usize) {
-        window_dims(self.window)
+        windows_dims(self.windows())
+    }
+
+    /// One timestep's cells, row-major `y × x`, from `reads`: what
+    /// `reader::read_bbox` gave for each of [`Self::windows`], in order. A
+    /// geographic source's cells are the windows' pixels side by side; a
+    /// projected source's each the pixel holding its centre, nearest and
+    /// never interpolated, so radar classes stay the file's values.
+    pub(crate) fn cells(&self, reads: Vec<Vec<Option<f64>>>) -> Vec<Option<f64>> {
+        let (nx, ny) = (self.x.len(), self.y.len());
+        match &self.read {
+            AreaRead::Native(windows) if windows.len() == 1 => {
+                reads.into_iter().next().unwrap_or_default()
+            }
+            AreaRead::Native(windows) => {
+                let mut cells = Vec::with_capacity(nx * ny);
+                for row in 0..ny {
+                    for (&(col_start, _, col_end, _), read) in windows.iter().zip(&reads) {
+                        let width = (col_end - col_start) as usize;
+                        cells.extend_from_slice(&read[row * width..(row + 1) * width]);
+                    }
+                }
+                cells
+            }
+            AreaRead::Sampled { window, projection } => {
+                let (window_nx, _) = windows_dims(&[*window]);
+                let mut cells = Vec::with_capacity(nx * ny);
+                crate::resample_nearest(
+                    projection,
+                    nx as u32,
+                    ny as u32,
+                    reads.first().map_or(&[][..], Vec::as_slice),
+                    window_nx,
+                    *window,
+                    None,
+                    (0, nx as u32 - 1, 0, ny as u32 - 1),
+                    &mut cells,
+                );
+                cells
+            }
+        }
     }
 }
 
-/// The 400 of an area query whose bbox misses the raster, as
-/// `crate::area_pixel_window` gives it for a geographic source.
+/// The 400 of an area query whose bbox misses the raster.
 fn misses_raster() -> DataServerError {
     DataServerError::InvalidParameter("Requested bbox does not intersect the raster".into())
 }
 
-/// A pixel window's `(nx, ny)`.
-fn window_dims((col_start, row_start, col_end, row_end): (u32, u32, u32, u32)) -> (usize, usize) {
-    (
-        (col_end - col_start) as usize,
-        (row_end - row_start) as usize,
+/// The `(nx, ny)` pixels of windows on the same rows, side by side.
+fn windows_dims(windows: &[Window]) -> (usize, usize) {
+    let nx = windows
+        .iter()
+        .map(|&(col_start, _, col_end, _)| (col_end - col_start) as usize)
+        .sum();
+    let ny = windows.first().map_or(0, |&(_, row_start, _, row_end)| {
+        (row_end - row_start) as usize
+    });
+    (nx, ny)
+}
+
+/// A geographic source's native windows under `bbox` (#1442), on the same
+/// rows, west to east: the pixels `GeoTransform::bbox_to_pixels` gives the
+/// bbox's arc in the raster's own longitude frame ([`lon_arc`] round
+/// [`frame_centre`]), never its sweep from `west` to `east` through 0°,
+/// which across the antimeridian took nearly every column of a global
+/// raster and none of a regional one.
+///
+/// A regional raster answers the part of the bbox it covers, one side of
+/// the antimeridian if that is all it holds, and a raster stored past 180°
+/// (170–190°E) the bbox's longitudes on it. An arc over the raster's seam,
+/// its western edge a turn on, is split there, whatever the raster's width:
+/// on a global raster (170–190°E on one from 180°W, 350–370°E on one from
+/// 0°) two windows, its last columns then its first; on a near-global one
+/// (1439 columns of 0.25° from 180°W) each piece clamped to the columns it
+/// has, and a piece off the raster reads none. No column is read twice,
+/// nor more than the raster's width: on a raster whose seam lies half a
+/// pixel off ±180° (edges at -180.5° and 179.5°), the pixel centred on
+/// ±180° meets both ends of a whole-world arc, and is read once, at its
+/// west end. The cells and budgets count those pixels alone. A bbox off
+/// the raster is the 400.
+fn native_windows(
+    geo_transform: &GeoTransform,
+    bbox: &Bbox,
+) -> Result<Vec<Window>, DataServerError> {
+    let pixel = geo_transform.pixel_width;
+    let span = f64::from(geo_transform.width) * pixel;
+    // A whole turn within half a pixel holds every longitude, as the
+    // shared sampler's periodic grids do.
+    let global = span >= 360.0 - pixel / 2.0;
+    let (west, east) = lon_arc(
+        bbox_arc(bbox),
+        (geo_transform.origin_x, if global { 360.0 } else { span }),
+        frame_centre(geo_transform),
     )
+    .ok_or_else(misses_raster)?;
+    let (origin, seam) = (geo_transform.origin_x, geo_transform.origin_x + 360.0);
+    let mut pieces = if west < origin {
+        vec![(west + 360.0, seam), (origin, east)]
+    } else if east > seam {
+        vec![(west, seam), (origin, east - 360.0)]
+    } else {
+        vec![(west, east)]
+    };
+    // A piece of the split narrower than a millionth of a pixel is a
+    // rounding of the seam beside a real one, no column of the answer.
+    let sliver = |&(west, east): &(f64, f64)| east - west <= pixel * 1e-6;
+    if pieces.len() == 2 && pieces.iter().filter(|piece| sliver(piece)).count() == 1 {
+        pieces.retain(|piece| !sliver(piece));
+    }
+    let mut windows: Vec<Window> = pieces
+        .into_iter()
+        .filter_map(|(west, east)| geo_transform.bbox_to_pixels(west, bbox.south, east, bbox.north))
+        .collect();
+    // The second window starts at column 0; where it reaches the first's
+    // columns, the arc's east end has come round to its west end: those
+    // columns are the first window's.
+    if let [(first_start, ..), (second_start, _, second_end, _)] = &mut windows[..] {
+        *second_end = (*second_end).min(*first_start);
+        if *second_end <= *second_start {
+            windows.pop();
+        }
+    }
+    if windows.is_empty() {
+        return Err(misses_raster());
+    }
+    // The pieces share the bbox's latitudes, so their rows.
+    debug_assert!(windows
+        .iter()
+        .all(|&(_, row_start, _, row_end)| (row_start, row_end) == (windows[0].1, windows[0].3)));
+    Ok(windows)
+}
+
+/// The bbox's longitude arc `(start, span)` in degrees, eastward from
+/// `west`: across the antimeridian (`west > east`) it reaches `east` a turn
+/// on.
+fn bbox_arc(bbox: &Bbox) -> (f64, f64) {
+    let span = if bbox.crosses_antimeridian() {
+        bbox.east + 360.0 - bbox.west
+    } else {
+        bbox.east - bbox.west
+    };
+    (bbox.west, span)
+}
+
+/// The CRS84 longitude the bbox names the antimeridian by: 180° in a bbox
+/// whose middle lies east of the prime meridian, so reaching it from the
+/// west (170,10,180,20, 0,-10,180,10, or across it), else -180°
+/// (-180,-10,0,10, the whole world). Its pixel's centre then lies inside
+/// the bbox, which the centre-in mask keeps, and the `x` axis steps on.
+fn antimeridian_name(bbox: &Bbox) -> f64 {
+    let (west, span) = bbox_arc(bbox);
+    if west + span / 2.0 > 0.0 {
+        180.0
+    } else {
+        -180.0
+    }
+}
+
+/// A pixel centre's longitude in CRS84: as is within ±180°, else wrapped
+/// there; on the antimeridian, within a millionth of a `pixel`, the name
+/// `antimeridian` the bbox gives it ([`antimeridian_name`]).
+fn crs84_lon(lon: f64, antimeridian: f64, pixel: f64) -> f64 {
+    let lon = if (-180.0..=180.0).contains(&lon) {
+        lon
+    } else {
+        wrap_lon(lon)
+    };
+    if 180.0 - lon.abs() <= pixel * 1e-6 {
+        antimeridian
+    } else {
+        lon
+    }
 }
 
 impl RegularGrid {
@@ -223,15 +426,10 @@ impl RegularGrid {
         if south > north {
             return Err(misses_raster());
         }
-        let bbox_span = if bbox.crosses_antimeridian() {
-            bbox.east + 360.0 - bbox.west
-        } else {
-            bbox.east - bbox.west
-        };
         let (west, east) = lon_arc(
-            (bbox.west, bbox_span),
+            bbox_arc(bbox),
             (env_west, env_east - env_west),
-            central_longitude(&geo_transform.crs),
+            frame_centre(geo_transform),
         )
         .ok_or_else(misses_raster)?;
 
@@ -346,10 +544,12 @@ fn source_window(
 
 /// The intersection of two longitude arcs, `(start, span)` in degrees: the
 /// bbox's and the raster envelope's (`span >= 360` is every longitude), as
-/// `(west, east)` with `west <= east`, placed within half a turn of the
-/// source's central longitude `centre` where it has one, where its forward
-/// transform is meant to be evaluated: a Lambert conformal conic's is not
-/// periodic in longitude (#1114). None give `None`.
+/// `(west, east)` with `west <= east`, its middle placed within half a turn
+/// of the source's frame centre `centre` ([`frame_centre`]) where it has
+/// one, by the rule [`source_longitude`] places a point by: where its
+/// forward transform is meant to be evaluated, a Lambert conformal conic's
+/// not being periodic in longitude (#1114), and a geographic raster's
+/// columns linear in it. None give `None`.
 ///
 /// Two pieces, when the arcs meet at both ends (a bbox nearly a whole turn
 /// wide, its gap inside the envelope), give the shorter of the two arcs
@@ -396,8 +596,10 @@ pub(crate) fn lon_arc(
             (None, None) => return None,
         }
     };
+    // Whole turns, so both ends move by exactly the same amount.
     let shift = centre.map_or(0.0, |centre| {
-        360.0 * ((centre - (west + east) / 2.0) / 360.0).round()
+        let middle = (west + east) / 2.0;
+        360.0 * ((lon_within_half_turn(middle, centre) - middle) / 360.0).round()
     });
     Some((west + shift, east + shift))
 }
@@ -428,6 +630,32 @@ fn raster_centre(geo_transform: &GeoTransform) -> Option<(f64, f64)> {
         geo_transform.origin_x + f64::from(geo_transform.width) / 2.0 * geo_transform.pixel_width,
         geo_transform.origin_y - f64::from(geo_transform.height) / 2.0 * geo_transform.pixel_height,
     )
+}
+
+/// The longitude the source's forward transform is meant to be given
+/// longitudes within half a turn of: a geographic raster's middle, its
+/// columns linear in longitude from its western edge, else the CRS's
+/// central longitude where it has one ([`central_longitude`]).
+fn frame_centre(geo_transform: &GeoTransform) -> Option<f64> {
+    match &geo_transform.crs {
+        Crs::Wgs84 => {
+            let middle = geo_transform.origin_x
+                + f64::from(geo_transform.width) * geo_transform.pixel_width / 2.0;
+            middle.is_finite().then_some(middle)
+        }
+        crs => central_longitude(crs),
+    }
+}
+
+/// `lon` as the source's forward transform is meant to be given it: moved
+/// by whole turns to within half a turn of [`frame_centre`] (#1442). A
+/// position query's point takes it, as [`lon_arc`] places an area's frame:
+/// a Lambert conformal conic's forward is not periodic in longitude (#1114),
+/// so a point near ±180° on a cone centred there lands on its own side, and
+/// a geographic raster stored past 180° (0–360°, or across the
+/// antimeridian) finds its columns for -170°.
+pub(crate) fn source_longitude(geo_transform: &GeoTransform, lon: f64) -> f64 {
+    frame_centre(geo_transform).map_or(lon, |centre| lon_within_half_turn(lon, centre))
 }
 
 /// The source CRS's central longitude in degrees, where it has one.

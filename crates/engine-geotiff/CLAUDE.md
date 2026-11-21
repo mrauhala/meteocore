@@ -520,7 +520,20 @@ on the first matching entry's grid (#1435), at native resolution: no
 selection.
 
 - **Geographic (CRS84) source:** the native pixel window of the bbox, like
-  GRIB. Its pixel centres are the axes; each cell is masked by its centre.
+  GRIB. Its pixel centres are the axes, in CRS84; each cell is masked by its
+  centre. `area::native_windows` places the bbox's arc in the raster's own
+  frame (`lon_arc` round its middle) before `bbox_to_pixels`, never the
+  sweep from `west` to `east` through 0° (#1442): across the antimeridian a
+  regional raster answers the side it holds, one stored past 180° its own
+  columns, and any raster whose seam (its western edge a turn on) lies in
+  the arc is split there: a global one reads two windows, its last columns
+  then its first, a near-global one each piece clamped. No column is read
+  twice, nor more than the raster's width: on a seam half a pixel off ±180°
+  (ERA5/GFS edges at -180.5°/179.5°) the pixel centred on ±180° meets both
+  ends of a whole-world arc and is read once. That pixel's `x` is the name
+  the bbox gives it (`area::antimeridian_name`: 180° from the west, -180°
+  from the east), so the axis steps on and the centre-in mask keeps it.
+  The budgets count those columns.
 - **Projected source:** a regular CRS84 grid, `QueryPolygon::grid_axes`'
   cell centres over the bbox clipped to the raster's CRS84 envelope
   (`footprint_envelope`: a bbox past the raster answers the raster's part,
@@ -562,6 +575,15 @@ selection.
   them, the envelope's side, its gap's cells masked, never the arc round the
   bbox (-179,10,179,20 over a raster at 170–190°E: 220 cells wide, not
   3925). A zero-width piece beside a real one is dropped.
+- **Position** takes its point's longitude by the same rule
+  (`area::source_longitude`: `ds_core::geo::lon_within_half_turn` round
+  `area::frame_centre`, the CRS's central longitude or a geographic
+  raster's middle), so -179.9° on a Lambert cone centred on 180° reads the
+  pixel there, not one a turn away on the cone (#1442). EDR only, with
+  WMS GetFeatureInfo, which asks position: the map path (`bbox_to_pixels`
+  of the CRS84 bbox, `world_to_pixel_f64` as given) does not move its
+  longitudes yet, so a 0–360° raster draws nodata at -170° where
+  GetFeatureInfo there answers a value (map follow-up #1540).
 
 `AreaGrid::new` settles the answer's extent and cell count without
 allocating either; `AreaGrid::plan` runs every budget on them before the

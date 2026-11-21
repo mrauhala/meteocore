@@ -776,7 +776,7 @@ fn polar_meta_tiles_refine_only_the_footprint() {
                     continue;
                 }
                 let (lon, lat) = crs.project_node(bbox, fx, fy);
-                let exact = centred(gt.world_to_pixel_f64(within_half_turn(lon, centre), lat));
+                let exact = centred(gt.world_to_pixel_f64(lon_within_half_turn(lon, centre), lat));
                 let want = grid.sample(&values, None, exact.0, exact.1);
                 if !read {
                     // Outside the footprint: nothing drawn, nothing to draw.
