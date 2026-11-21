@@ -268,11 +268,15 @@ client's value through by default — nginx `proxy_pass`, ingress-nginx
 without its annotation, Caddy, Traefik before 2.11.14 / 3.2.1 (which then
 started dropping an untrusted one). There is no separate flag. A client
 value that passes through changes only the links in that client's own
-response: no MeteoCore cache stores a link-bearing document. The
-server-side caches hold rendered images, MVT tiles and 3D Tiles binaries
-(tileset JSON links its content relatively and is rebuilt per request);
-metadata, HTML and GetCapabilities are built per request, and
-`caching::conditional_get` only hashes. Responses do carry
+response. The one MeteoCore cache that stores a link-bearing document,
+WMS GetCapabilities (#1482), keys it on the resolved base URL, so it is
+served only to requests whose headers resolve to the same links. It holds
+at most four documents and builds two at a time: forged values cycle the
+documents and queue for the builds. That bounds documents, not bytes,
+since every link repeats the host. The other server-side caches hold
+rendered images, MVT tiles and 3D Tiles binaries (tileset JSON links its
+content relatively and is rebuilt per request); metadata and HTML are
+built per request, and `caching::conditional_get` only hashes. Responses do carry
 `Cache-Control: public`, so a URL-keyed shared HTTP cache that sees
 unsanitised headers could hand one client's links to others — the proxy
 must own the header.
@@ -977,7 +981,9 @@ Until its volumes return, a kept site serves this, pinned by
 - `collection_has_data` 0.
 
 Its quantity layers, their time dimension and its data come back with its
-volumes.
+volumes. WMS GetCapabilities shows either change within its cache window,
+`api_wms::CAPABILITIES_TTL` (5 s, #1482); the test builds it per request
+(`router_with_capabilities_ttl`, zero).
 
 ## GRIB level collections
 

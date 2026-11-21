@@ -273,6 +273,7 @@ dependencies = [
  "ds-core",
  "ds-executor",
  "ds-render",
+ "flate2",
  "http-body-util",
  "png",
  "quick-xml 0.42.0",
