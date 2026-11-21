@@ -7,7 +7,7 @@ use axum::routing::get;
 use axum::{Extension, Router};
 
 pub use handlers::{AppState, MapsState};
-pub use shared::MapsBlock;
+pub use shared::{MapsBlock, StyleFallback};
 
 /// The Maps service router, mounted at [`api_common::mounts::MAPS`].
 pub fn router(state: AppState) -> Router {

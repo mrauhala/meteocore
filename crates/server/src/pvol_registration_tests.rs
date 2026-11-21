@@ -428,7 +428,10 @@ async fn a_kept_site_serves_one_layer_until_its_volumes_return() {
     let shared = api_common::shared::router(api_common::shared::SharedApi::new(
         "",
         vec![
-            Arc::new(api_maps::MapsBlock::new(state.maps.clone())),
+            Arc::new(super::shared_maps_block(
+                state.maps.clone(),
+                state.tiles.clone(),
+            )),
             Arc::new(api_tiles::TilesBlock::new(state.tiles.clone())),
         ],
         vec![],

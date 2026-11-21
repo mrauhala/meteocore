@@ -36,7 +36,10 @@ engine type: it looks up the `MapEngine` by the collection id in the URL.
 
 Paths are relative to `/maps`. The shared root serves the map, style and
 legend routes too; api-common builds its other resources from this crate's
-collection fields, links, conformance classes and OpenAPI paths.
+collection fields, links, conformance classes and OpenAPI paths. The shared
+root's legend route also answers a raster collection only Tiles draws
+(`tiles` but not `maps` in its `apis`), from Tiles' engine and styles
+(`MapsBlock::with_style_fallback`, #792); its style list and maps do not.
 
 | Path | Returns |
 |---|---|

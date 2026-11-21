@@ -6926,6 +6926,21 @@ impl api_common::shared::CollectionServices for ServedBySnapshot {
     }
 }
 
+/// The shared OGC API root's Maps block (#789) over `maps`. Its legend
+/// route answers a raster collection only Tiles draws (`tiles` but not
+/// `maps` in its `apis`) from Tiles' registry, `tiles`, whose shared-root
+/// styles link it (#792).
+pub fn shared_maps_block(
+    maps: api_maps::AppState,
+    tiles: api_tiles::AppState,
+) -> api_maps::MapsBlock {
+    api_maps::MapsBlock::new(maps).with_style_fallback(api_maps::StyleFallback::over(
+        tiles,
+        |tiles| &tiles.map_engines,
+        |tiles| &tiles.styles,
+    ))
+}
+
 /// Register a WMS collection's EDR engine for GetFeatureInfo (#1064) when it
 /// answers position queries (`api_wms::feature_info::answers_position`),
 /// whether or not the collection lists `edr`: the WMS reads a layer's value
@@ -16116,7 +16131,10 @@ colormap = "no_such_map"
             let shared = api_common::shared::router(api_common::shared::SharedApi::new(
                 "",
                 vec![
-                    Arc::new(api_maps::MapsBlock::new(state.maps.clone())),
+                    Arc::new(super::shared_maps_block(
+                        state.maps.clone(),
+                        state.tiles.clone(),
+                    )),
                     Arc::new(api_tiles::TilesBlock::new(state.tiles.clone())),
                     Arc::new(api_features::FeaturesBlock::new(state.features.clone())),
                 ],

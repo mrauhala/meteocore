@@ -338,7 +338,7 @@ The shared OGC API root (Maps + Tiles + Features building blocks; Tiles Table 8 
 /collections/{id}/map                          Map (default style)
 /collections/{id}/styles                       Styles
 /collections/{id}/styles/{styleId}/map         Styled map
-/collections/{id}/styles/{styleId}/legend      Style legend (JSON or PNG)
+/collections/{id}/styles/{styleId}/legend      Style legend (JSON or PNG), Tiles-only collections too
 /collections/{id}/map/tiles                    Map tilesets
 /collections/{id}/map/tiles/{tms}              Map tileset metadata
 /collections/{id}/map/tiles/{tms}/{z}/{row}/{col}                  Map tile (PNG/JPEG/WebP)

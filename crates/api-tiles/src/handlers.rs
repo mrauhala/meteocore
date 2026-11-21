@@ -279,18 +279,28 @@ pub(crate) fn collection_parts(
         let s = offer.style;
         let style = style_path(root, id, &s.name);
         let query = parameter_query(offer.parameters.first().copied());
+        let legend = json!({"href": format!("{style}/legend{query}"), "rel": rel::LEGEND, "type": "application/json"});
         let links = match layout {
-            Layout::PerApi => json!([
-                {"href": format!("{style}/legend{query}"), "rel": rel::LEGEND, "type": "application/json"}
-            ]),
-            // The shared root's legend belongs to Maps; Tiles adds each
-            // style's map tilesets (merged into the Maps style entry).
-            Layout::Shared => json!([{
-                "href": format!("{style}/map/tiles{query}"),
-                "rel": rel::TILESETS_MAP,
-                "type": "application/json",
-                "title": "Map tilesets in this style"
-            }]),
+            Layout::PerApi => json!([legend]),
+            // Tiles adds each style's map tilesets, merged into the Maps
+            // style entry where Maps serves the collection too. The root's
+            // legend route is Maps', which answers a collection only Tiles
+            // draws from this registry (#792): a raster's style links it,
+            // the link Maps gives byte for byte, so the merge keeps one.
+            // Vector tiles are unstyled and have no legend.
+            Layout::Shared => {
+                let tilesets = json!({
+                    "href": format!("{style}/map/tiles{query}"),
+                    "rel": rel::TILESETS_MAP,
+                    "type": "application/json",
+                    "title": "Map tilesets in this style"
+                });
+                if raster_info.is_some() {
+                    json!([tilesets, legend])
+                } else {
+                    json!([tilesets])
+                }
+            }
         };
         let mut entry = json!({"id": s.name, "title": offer.title, "links": links});
         if !offer.parameters.is_empty() {
@@ -852,52 +862,8 @@ pub(crate) fn collection_openapi_paths(
                     }
                 }
             });
-            collection_paths[format!("{m}/collections/{id}/styles/{{styleId}}/legend")] = json!({
-                "get": {
-                    "summary": format!("Get style legend for {}", config.title),
-                    "operationId": format!("getStyleLegend_{id}"),
-                    "tags": [id],
-                    "parameters": [
-                        {
-                            "name": "styleId",
-                            "in": "path",
-                            "required": true,
-                            "schema": {"type": "string"},
-                            "description": "Style identifier"
-                        },
-                        {
-                            "name": "f",
-                            "in": "query",
-                            "required": false,
-                            "schema": {"type": "string", "default": "json", "enum": ["json", "application/json", "png", "image/png"]},
-                            "description": "Legend representation: the machine-readable description (default) or a rendered legend image."
-                        },
-                        {
-                            "name": "parameter-name",
-                            "in": "query",
-                            "required": false,
-                            "schema": {"type": "string"},
-                            "description": "Describe the style of this parameter's layer, matching `parameter-name` on the tile routes. Falls back to the collection-level style when the collection has no per-parameter layer."
-                        }
-                    ],
-                    "responses": {
-                        "200": {
-                            "description": "Legend description or image",
-                            "content": {
-                                "application/json": {
-                                    "schema": {"$ref": "#/components/schemas/legend"}
-                                },
-                                "image/png": {
-                                    "schema": {"type": "string", "format": "binary"}
-                                }
-                            }
-                        },
-                        "400": {"description": "Bad request"},
-                        "404": {"description": "Collection or style not found"},
-                        "500": {"description": "Server error"}
-                    }
-                }
-            });
+            collection_paths[format!("{m}/collections/{id}/styles/{{styleId}}/legend")] =
+                legend_openapi_path(config);
         }
     }
 
@@ -905,6 +871,59 @@ pub(crate) fn collection_openapi_paths(
         serde_json::Value::Object(paths) => paths,
         _ => serde_json::Map::new(),
     }
+}
+
+/// The OpenAPI path item of collection `config`'s style legend, below the
+/// per-API service and at the shared root, where Maps' route answers a
+/// collection only Tiles draws (#792).
+pub(crate) fn legend_openapi_path(config: &CollectionConfig) -> serde_json::Value {
+    let id = &config.id;
+    json!({
+        "get": {
+            "summary": format!("Get style legend for {}", config.title),
+            "operationId": format!("getStyleLegend_{id}"),
+            "tags": [id],
+            "parameters": [
+                {
+                    "name": "styleId",
+                    "in": "path",
+                    "required": true,
+                    "schema": {"type": "string"},
+                    "description": "Style identifier"
+                },
+                {
+                    "name": "f",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string", "default": "json", "enum": ["json", "application/json", "png", "image/png"]},
+                    "description": "Legend representation: the machine-readable description (default) or a rendered legend image."
+                },
+                {
+                    "name": "parameter-name",
+                    "in": "query",
+                    "required": false,
+                    "schema": {"type": "string"},
+                    "description": "Describe the style of this parameter's layer, matching `parameter-name` on the tile routes. Falls back to the collection-level style when the collection has no per-parameter layer."
+                }
+            ],
+            "responses": {
+                "200": {
+                    "description": "Legend description or image",
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/legend"}
+                        },
+                        "image/png": {
+                            "schema": {"type": "string", "format": "binary"}
+                        }
+                    }
+                },
+                "400": {"description": "Bad request"},
+                "404": {"description": "Collection or style not found"},
+                "500": {"description": "Server error"}
+            }
+        }
+    })
 }
 
 /// Tiling-scheme paths, keyed below the mount. Both are served only as

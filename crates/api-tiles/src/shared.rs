@@ -110,6 +110,11 @@ impl BuildingBlock for TilesBlock {
             .collect();
         let mut components = Map::new();
         components.insert("parameters".into(), Value::Object(parameters));
+        // The legend schema its legend paths reference, as Maps defines it.
+        components.insert(
+            "schemas".into(),
+            json!({"legend": api_common::legend_schema()}),
+        );
         OpenApiFragment { paths, components }
     }
 
@@ -331,6 +336,14 @@ fn collection_openapi_paths(state: &TilesState, m: &str) -> Map<String, Value> {
                     parameters.push(json!({"$ref": "#/components/parameters/parameter-name"}));
                 }
             }
+            // The legend of each style its links name (#792): Maps' route,
+            // which answers this collection from Tiles' registry when Maps
+            // does not serve it. Where Maps does, the composer keeps the
+            // Maps block's path item, the first for a path.
+            paths.insert(
+                format!("{m}/collections/{id}/styles/{{styleId}}/legend"),
+                handlers::legend_openapi_path(sources.config),
+            );
             // A time selection with no time step is an empty map tile.
             for list in [
                 format!("{m}/collections/{id}/map/tiles"),

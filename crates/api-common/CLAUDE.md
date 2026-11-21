@@ -33,7 +33,9 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   field precedence; discovery bounds follow the kept extent. Blocks must keep
   overlapping OpenAPI components identical — or namespace them, as Features
   does — and operation ids unique (tested); one route per path across blocks
-  (the legend belongs to Maps). Tag every block router with its API kind
+  (the legend belongs to Maps: `MapsBlock::with_style_fallback` answers it
+  for a raster collection only Tiles draws from Tiles' registry, and Tiles'
+  shared-layout styles link it, #792). Tag every block router with its API kind
   (`tag_api_kind`). The per-API Maps/Tiles/Features services stay routed but
   are not advertised: not in the landing links (`related_services()` in
   `server/src/main.rs`) nor the workbench switcher (`SUPERSEDED`).
