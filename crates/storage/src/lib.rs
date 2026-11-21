@@ -2850,11 +2850,8 @@ mod budget_tests {
 
     /// `count` objects `k0`, `k1`, …, object `i` holding ten bytes of `i`,
     /// every GET taking `delay`.
-    async fn slow_reads(count: usize, delay: Duration) -> Arc<crate::test_store::SlowReads> {
-        let store = crate::test_store::SlowReads {
-            delay,
-            ..Default::default()
-        };
+    async fn slow_reads(count: usize, delay: Duration) -> Arc<crate::test_util::SlowReads> {
+        let store = crate::test_util::SlowReads::new(delay);
         for i in 0..count {
             store
                 .inner

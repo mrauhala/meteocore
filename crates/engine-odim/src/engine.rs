@@ -49,6 +49,7 @@ use ds_storage::discovery::{
 };
 
 use crate::catalog::{scan_local_directory, scan_remote, CatalogEntry, CatalogError, Location};
+use crate::edr::FrameAdmission;
 use crate::reader::{read_composite, OdimComposite};
 
 /// Days of date-partitioned prefixes to scan when an S3 source has no
@@ -101,6 +102,18 @@ static COMPOSITE_CACHE: std::sync::LazyLock<
             source,
         )
 });
+
+/// Hold [`COMPOSITE_CACHE`] for a test that reads back a composite it just
+/// put in it, or that puts many in it at once (#1495). Only tests that take
+/// the hold exclude each other: one that does not can still run beside
+/// them. Once other entries fill the hot share, a fresh composite waits in
+/// the small cold share, and an insert past the capacity, another test's
+/// included, evicts it unread.
+#[cfg(test)]
+pub(crate) fn hold_composite_cache_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Snapshot of the process-global composite cache for `/metrics`. Mirrors
 /// `volume_engine::voxel_grid_cache_metrics`.
@@ -357,7 +370,7 @@ impl LoadError {
     /// An EDR query's answer: a withdrawn file is an `Engine` error, which
     /// the query answers as a null timestep, as GeoTIFF's EDR answers a gone
     /// object, and as a file whose bytes do not decode.
-    fn for_query(self) -> DataServerError {
+    pub(crate) fn for_query(self) -> DataServerError {
         match self {
             LoadError::Withdrawn(detail) => DataServerError::Engine(detail),
             LoadError::Request(e) => e,
@@ -418,17 +431,21 @@ fn refused(key: &str, refusal: ds_storage::RangeRefusal) -> FetchError {
 /// A file gone since the scan is told apart from a failed read by type
 /// (a local `NotFound`, a store's 404 refusal), never by error text.
 fn fetch_bytes(location: &Location) -> Result<Bytes, FetchError> {
+    if let Location::Remote { .. } = location {
+        file_size(location)?;
+    }
+    read_bytes(location)
+}
+
+/// The size of the ODIM file at `location`: a remote object's `head`,
+/// refused past [`crate::catalog::MAX_REMOTE_FILE_SIZE`], or a local
+/// file's metadata. Gone or failed as [`fetch_bytes`] is.
+fn file_size(location: &Location) -> Result<u64, FetchError> {
     use ds_storage::ReadAnswer;
     match location {
-        Location::Local(path) => std::fs::read(path)
-            .map(Bytes::from)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => FetchError::Gone(path.display().to_string()),
-                _ => FetchError::Failed {
-                    location: path.display().to_string(),
-                    source: DataServerError::Io(e),
-                },
-            }),
+        Location::Local(path) => std::fs::metadata(path)
+            .map(|meta| meta.len())
+            .map_err(|e| local_read_error(path, e)),
         Location::Remote { store, key } => {
             let object = ds_storage::object_store::path::Path::from(key.as_str());
             let failed = |source| FetchError::Failed {
@@ -445,9 +462,28 @@ fn fetch_bytes(location: &Location) -> Result<Bytes, FetchError> {
                     size: meta.size,
                 });
             }
-            match store.get_or_refusal(&object).map_err(failed)? {
-                ReadAnswer::Read(bytes) => Ok(bytes),
-                ReadAnswer::Refused(refusal) => Err(refused(key, refusal)),
+            Ok(meta.size)
+        }
+    }
+}
+
+/// The bytes of the ODIM file at `location`, without the `head` of
+/// [`fetch_bytes`]: for a caller that took the size with [`file_size`].
+fn read_bytes(location: &Location) -> Result<Bytes, FetchError> {
+    use ds_storage::ReadAnswer;
+    match location {
+        Location::Local(path) => std::fs::read(path)
+            .map(Bytes::from)
+            .map_err(|e| local_read_error(path, e)),
+        Location::Remote { store, key } => {
+            let object = ds_storage::object_store::path::Path::from(key.as_str());
+            match store.get_or_refusal(&object) {
+                Ok(ReadAnswer::Read(bytes)) => Ok(bytes),
+                Ok(ReadAnswer::Refused(refusal)) => Err(refused(key, refusal)),
+                Err(source) => Err(FetchError::Failed {
+                    location: key.clone(),
+                    source,
+                }),
             }
         }
     }
@@ -513,6 +549,17 @@ impl std::ops::Deref for CompositeCatalog {
     }
 }
 
+/// A local file's read error: gone for `NotFound`, else a failed read.
+fn local_read_error(path: &std::path::Path, e: std::io::Error) -> FetchError {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => FetchError::Gone(path.display().to_string()),
+        _ => FetchError::Failed {
+            location: path.display().to_string(),
+            source: DataServerError::Io(e),
+        },
+    }
+}
+
 /// `MapEngine` implementation backed by an ODIM_H5 composite catalog.
 ///
 /// Holds an [`ArcSwap`]-protected catalog so the async poll loop can
@@ -541,6 +588,12 @@ pub struct OdimEngine {
     pub(crate) seed_spatial_extent: [f64; 4],
     pub(crate) seed_xsize: u32,
     pub(crate) seed_ysize: u32,
+    /// What decoding one of the collection's composites holds beside its
+    /// file's bytes, as the seed's did: at most 1.25 × the decoded array
+    /// (`tests/decode_memory.rs`). Every timestep shares the seed's grid.
+    /// An EDR query's composite read past its first reserves it with the
+    /// file's size (`edr::FrameAdmission`, #1495).
+    pub(crate) seed_decode_bytes: u64,
     /// Local directory or S3/HTTP object store the poll loop re-scans.
     source: Source,
     matcher: FilenameMatcher,
@@ -789,6 +842,8 @@ impl OdimEngine {
             ),
         };
         let catalog = CompositeCatalog::new(catalog, &info);
+        let decoded = composite.size_bytes() as u64;
+        let seed_decode_bytes = decoded + decoded / 4;
 
         // Seed the process-global composite cache so the first render of the
         // most recent file is a hit (we just decoded it for the metadata
@@ -807,6 +862,7 @@ impl OdimEngine {
             seed_spatial_extent,
             seed_xsize,
             seed_ysize,
+            seed_decode_bytes,
             source,
             matcher,
             max_files,
@@ -1021,22 +1077,34 @@ impl OdimEngine {
     /// Read + parse the ODIM file at `location` and return a shared
     /// `Arc<OdimComposite>` snapshot, served from the process-global
     /// byte-bounded composite LRU ([`COMPOSITE_CACHE`]) keyed by
-    /// [`Location::id`].
+    /// [`Location::id`]: the map path's read.
     ///
     /// **Blocking call** — reads the file (local or remote) and parses HDF5.
     /// Map handlers run this on their blocking pool. EDR position/area queries
     /// run on `api_edr::executor`'s dedicated multi-thread runtime (#178),
-    /// where the storage `block_in_place` bridge is valid. Do not move them
-    /// back onto HTTP workers or use a blocking pool without adapting remote
-    /// I/O to an explicit runtime handle.
+    /// where the storage `block_in_place` bridge is valid, and read their
+    /// frames as field jobs on it ([`CompositeReader::load`], #1495), each
+    /// inside `block_in_place`: a wait for another request's fill of the
+    /// same file holds no worker of the runtime that fill may need (#1200).
+    /// Do not move them back onto HTTP workers or use a blocking pool
+    /// without adapting remote I/O to an explicit runtime handle.
     ///
     /// A read that failed is a transient error (`ErrorClass::is_transient`):
     /// the deadline, `Unavailable` for a store that kept answering 429, 502,
     /// 503 or 504, else `ResourceExhausted` (#1496). A file gone since the
-    /// scan, grown too large or whose bytes do not decode is an `Engine`
-    /// error, which EDR answers as a null timestep; a map answers the first
-    /// two with a 503 ([`LoadError::for_map`], #1506). Nothing failed is
+    /// scan or grown too large is [`LoadError::Withdrawn`], which a map
+    /// answers with a 503 ([`LoadError::for_map`], #1506) and EDR with a null
+    /// timestep ([`LoadError::for_query`]), as bytes that do not decode. A
+    /// withdrawn file of a template-probe source is rechecked on the next
+    /// poll ([`recheck_withdrawn`]), on either path. Nothing failed is
     /// cached, so the next request reads the file again.
+    pub(crate) fn load(&self, location: &Location) -> Result<Arc<OdimComposite>, LoadError> {
+        fill_composite(&self.collection_id, location, || fetch_bytes(location))
+            .inspect_err(|e| recheck_withdrawn(self.template_prober(), e, location))
+    }
+
+    /// [`Self::load`] as EDR answers it, for tests.
+    #[cfg(test)]
     pub(crate) fn load_composite(
         &self,
         location: &Location,
@@ -1044,76 +1112,196 @@ impl OdimEngine {
         self.load(location).map_err(LoadError::for_query)
     }
 
-    /// [`Self::load_composite`], a file gone or grown too large told apart
-    /// ([`LoadError::Withdrawn`]).
-    pub(crate) fn load(&self, location: &Location) -> Result<Arc<OdimComposite>, LoadError> {
-        // Composites are immutable, so the location id (local path or S3 key)
-        // fully determines the decode — no data-version in the key (same as
-        // the PVOL pixel / voxel-grid caches). `get_or_insert_with_until` is the
-        // single-flight: quick_cache's placeholder guard runs the fetch+decode
-        // closure for exactly one caller per key and blocks concurrent callers
-        // for the SAME key until it finishes, so a burst of cold misses on one
-        // file decodes once. Crucially, distinct timesteps stay resident
-        // side-by-side, so a concurrent full-viewport WMS animation — N
-        // distinct-time render tasks, each firing ~40 `load_composite` calls
-        // through the meta-tile loop — no longer ping-pongs a single slot and
-        // re-decodes the same 67 MB (f32-stored, #464) OPERA grid many
-        // times (#212).
-        let key: Arc<str> = Arc::from(location.id().as_str());
-        // The fallible form returns a fetch/decode error to *this* caller
-        // without inserting (the placeholder is dropped), so a transient read
-        // failure does NOT poison the key — the next request retries it.
-        // Hit/miss accounting (including counting a failed read as a miss)
-        // lives in the shared cache.
-        //
-        // A request waits for another's fill no longer than its deadline
-        // (#1399): `DeadlineExceeded`, and the fill lands for the requests
-        // after it. Past the deadline it starts no fetch of its own.
-        let composite = COMPOSITE_CACHE
-            .get_or_insert_with_until(
-                &key,
-                ds_core::deadline::current(),
-                || {
-                    let bytes = fetch_bytes(location)
-                        .map_err(|e| e.into_load_error(&self.collection_id))?;
-                    let composite = Arc::new(read_composite(&bytes).map_err(|e| {
-                        LoadError::Request(DataServerError::Engine(format!(
-                            "[{}] failed to parse ODIM file `{}`: {e}",
-                            self.collection_id, key
-                        )))
-                    })?);
-                    Ok::<_, LoadError>(composite)
-                },
-                || LoadError::Request(DataServerError::DeadlineExceeded),
-            )
-            .inspect_err(|e| {
-                if matches!(e, LoadError::Withdrawn(_)) {
-                    self.recheck_withdrawn(location);
-                }
-            })?;
-        Ok(composite)
+    /// A template-probe source's prober, `None` for a listing source.
+    fn template_prober(&self) -> Option<&Arc<Mutex<TemplateProber>>> {
+        match &self.source {
+            Source::TemplateHttp { prober, .. } => Some(prober),
+            _ => None,
+        }
     }
 
-    /// Have a template probe HEAD a withdrawn file again on its next poll,
-    /// which then drops it (#1506). The probe never re-HEADs a file it found
-    /// (`immutable`), so a file gone since would otherwise stay catalogued,
-    /// and a map of its time a 503, until its slot left the window; a
-    /// listing source's next scan drops it by itself. The poll holds the
-    /// prober's lock across its HEADs, so a request takes it only if it is
-    /// free (root CLAUDE.md, Critical Rule 7), and a later one asks again.
-    fn recheck_withdrawn(&self, location: &Location) {
-        let (Source::TemplateHttp { prober, .. }, Location::Remote { key, .. }) =
-            (&self.source, location)
-        else {
-            return;
-        };
-        let mut prober = match prober.try_lock() {
-            Ok(prober) => prober,
-            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
-            Err(TryLockError::WouldBlock) => return,
-        };
-        prober.recheck(key);
+    /// What an EDR query's composite reads need of the engine, owned, for
+    /// reads that are tasks of their own (#1495).
+    pub(crate) fn composite_reader(&self) -> CompositeReader {
+        CompositeReader {
+            collection_id: Arc::from(self.collection_id.as_str()),
+            prober: self.template_prober().cloned(),
+        }
     }
+}
+
+/// Have a template probe HEAD a withdrawn file again on its next poll,
+/// which then drops it (#1506), whichever path's read found it withdrawn.
+/// The probe never re-HEADs a file it found (`immutable`), so a file gone
+/// since would otherwise stay catalogued, and a map of its time a 503,
+/// until its slot left the window; a listing source's next scan drops it
+/// by itself (`prober` is `None`). The poll holds the prober's lock across
+/// its HEADs, so a request takes it only if it is free (root CLAUDE.md,
+/// Critical Rule 7), and a later one asks again.
+fn recheck_withdrawn(
+    prober: Option<&Arc<Mutex<TemplateProber>>>,
+    error: &LoadError,
+    location: &Location,
+) {
+    let (Some(prober), LoadError::Withdrawn(_), Location::Remote { key, .. }) =
+        (prober, error, location)
+    else {
+        return;
+    };
+    let mut prober = match prober.try_lock() {
+        Ok(prober) => prober,
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(TryLockError::WouldBlock) => return,
+    };
+    prober.recheck(key);
+}
+
+/// The composite reads of an EDR query, each a task of its own (#1495):
+/// its engine's collection id, and a template-probe source's prober, which
+/// a withdrawn file asks to recheck as a map read's does (#1506).
+#[derive(Clone)]
+pub(crate) struct CompositeReader {
+    collection_id: Arc<str>,
+    prober: Option<Arc<Mutex<TemplateProber>>>,
+}
+
+impl CompositeReader {
+    /// [`OdimEngine::load`] for an EDR query, a fetch of its own admitted by
+    /// the query's `admission` ([`load_admitted`]). A file gone or grown too
+    /// large is [`LoadError::Withdrawn`], which the query answers with
+    /// [`LoadError::for_query`]: a null timestep.
+    pub(crate) fn load(
+        &self,
+        location: &Location,
+        admission: &Arc<FrameAdmission>,
+    ) -> Result<Arc<OdimComposite>, LoadError> {
+        load_admitted(&self.collection_id, location, admission)
+            .inspect_err(|e| recheck_withdrawn(self.prober.as_ref(), e, location))
+    }
+}
+
+/// [`OdimEngine::load`] of collection `collection_id`, for an EDR query's
+/// frame reads (#1495), a fetch of its own admitted by the query's
+/// `admission`.
+///
+/// - A resident composite, or the one another request's fill in progress
+///   gives, is returned without a HEAD or an admission: the read waits for
+///   that fill holding nothing, until its deadline.
+/// - Otherwise the read claims the fill, takes the file's size
+///   ([`file_size`]) and tries an admission that never waits
+///   ([`FrameAdmission::try_admit`]). Admitted, it reads and decodes the
+///   file under its claim, as any fill does.
+/// - Without room, it gives the claim back and waits for its query's
+///   unbudgeted read holding nothing ([`FrameAdmission::admit`]), then
+///   fills, or takes the composite another request filled meanwhile and
+///   releases its admission at once.
+///
+/// So no read waits for an admission while it holds a fill claim, and a map
+/// render or another query that wants the composite is never held behind
+/// a query's admission wait.
+fn load_admitted(
+    collection_id: &str,
+    location: &Location,
+    admission: &Arc<FrameAdmission>,
+) -> Result<Arc<OdimComposite>, LoadError> {
+    let key: Arc<str> = Arc::from(location.id().as_str());
+    let deadline = ds_core::deadline::current();
+    let wait = deadline.map_or(JOIN_WITHOUT_DEADLINE, |deadline| {
+        deadline.saturating_duration_since(std::time::Instant::now())
+    });
+    let claim = match COMPOSITE_CACHE.get_value_or_guard_untracked(&key, wait) {
+        ds_cache::CacheEntry::Value(composite) => {
+            COMPOSITE_CACHE.record_hit();
+            return Ok(composite);
+        }
+        ds_cache::CacheEntry::Timeout => {
+            return Err(LoadError::Request(DataServerError::DeadlineExceeded))
+        }
+        ds_cache::CacheEntry::Vacant(claim) => claim,
+    };
+    // As `get_or_insert_with_until`: no fill is claimed at the deadline.
+    ds_core::deadline::check().map_err(LoadError::Request)?;
+    let size = file_size(location).map_err(|e| {
+        // A failed read counts as a miss, as in a fill.
+        COMPOSITE_CACHE.record_claimed_miss(&claim);
+        e.into_load_error(collection_id)
+    })?;
+    let Some(admitted) = admission.try_admit(size) else {
+        // No room: the claim goes back before the wait, to whoever waits
+        // for it, and this read is counted where it fills or joins.
+        drop(claim);
+        let admitted = admission.admit(size).map_err(LoadError::Request)?;
+        let composite = fill_composite(collection_id, location, || read_bytes(location));
+        drop(admitted);
+        return composite;
+    };
+    COMPOSITE_CACHE.record_claimed_miss(&claim);
+    let bytes = read_bytes(location).map_err(|e| e.into_load_error(collection_id))?;
+    let composite = Arc::new(parse_composite(collection_id, &key, &bytes)?);
+    let _ = claim.insert(Arc::clone(&composite));
+    // Held through the decode, until the cache counts the composite.
+    drop(admitted);
+    Ok(composite)
+}
+
+/// How long a read without a deadline waits for another request's fill of
+/// a composite: a test's; every request has a deadline.
+const JOIN_WITHOUT_DEADLINE: Duration = Duration::from_secs(3600);
+
+/// Decode the ODIM file `key` of collection `collection_id`: bytes that do
+/// not decode are an `Engine` error, a null timestep in EDR and the error a
+/// map answers with.
+fn parse_composite(
+    collection_id: &str,
+    key: &str,
+    bytes: &Bytes,
+) -> Result<OdimComposite, LoadError> {
+    read_composite(bytes).map_err(|e| {
+        LoadError::Request(DataServerError::Engine(format!(
+            "[{collection_id}] failed to parse ODIM file `{key}`: {e}"
+        )))
+    })
+}
+
+/// The composite at `location` from the process-global composite LRU
+/// ([`COMPOSITE_CACHE`]), filled from the bytes `fetch` reads on a miss.
+fn fill_composite(
+    collection_id: &str,
+    location: &Location,
+    fetch: impl FnOnce() -> Result<Bytes, FetchError>,
+) -> Result<Arc<OdimComposite>, LoadError> {
+    // Composites are immutable, so the location id (local path or S3 key)
+    // fully determines the decode — no data-version in the key (same as
+    // the PVOL pixel / voxel-grid caches). `get_or_insert_with_until` is the
+    // single-flight: quick_cache's placeholder guard runs the fetch+decode
+    // closure for exactly one caller per key and blocks concurrent callers
+    // for the SAME key until it finishes, so a burst of cold misses on one
+    // file decodes once. Crucially, distinct timesteps stay resident
+    // side-by-side, so a concurrent full-viewport WMS animation — N
+    // distinct-time render tasks, each firing ~40 `load_composite` calls
+    // through the meta-tile loop — no longer ping-pongs a single slot and
+    // re-decodes the same 67 MB (f32-stored, #464) OPERA grid many
+    // times (#212).
+    let key: Arc<str> = Arc::from(location.id().as_str());
+    // The fallible form returns a fetch/decode error to *this* caller
+    // without inserting (the placeholder is dropped), so a transient read
+    // failure does NOT poison the key — the next request retries it.
+    // Hit/miss accounting (including counting a failed read as a miss)
+    // lives in the shared cache.
+    //
+    // A request waits for another's fill no longer than its deadline
+    // (#1399): `DeadlineExceeded`, and the fill lands for the requests
+    // after it. Past the deadline it starts no fetch of its own.
+    let composite = COMPOSITE_CACHE.get_or_insert_with_until(
+        &key,
+        ds_core::deadline::current(),
+        || {
+            let bytes = fetch().map_err(|e| e.into_load_error(collection_id))?;
+            Ok::<_, LoadError>(Arc::new(parse_composite(collection_id, &key, &bytes)?))
+        },
+        || LoadError::Request(DataServerError::DeadlineExceeded),
+    )?;
+    Ok(composite)
 }
 
 /// Resolve the engine's shared [`FilenameMatcher`] from config: prefer
@@ -1527,6 +1715,10 @@ fn crs_label(crs: &Crs) -> String {
 mod composite_read_failure_tests;
 
 #[cfg(test)]
+#[path = "composite_frame_read_tests.rs"]
+mod composite_frame_read_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1660,6 +1852,7 @@ mod tests {
     /// global-cache entries.
     #[test]
     fn composite_cache_keeps_distinct_timesteps_resident() {
+        let _held = hold_composite_cache_for_test();
         let dir = tempfile::tempdir().expect("create tempdir");
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../testdata/odim-dmi-fixture.h5")
@@ -1724,6 +1917,7 @@ mod tests {
     /// for the next request; without a deadline the waiter gets it.
     #[test]
     fn a_wait_for_another_composite_fetch_ends_at_the_deadline() {
+        let _held = hold_composite_cache_for_test();
         use ds_core::edr_engine::EdrEngine;
         use std::sync::mpsc;
         use std::time::{Duration, Instant};
@@ -2027,6 +2221,7 @@ mod tests {
     /// local source reports none.
     #[test]
     fn remote_composites_count_the_bytes_they_read() {
+        let _held = hold_composite_cache_for_test();
         let fixture = std::fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/odim-dmi-fixture.h5"),
         )

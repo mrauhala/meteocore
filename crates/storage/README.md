@@ -64,6 +64,11 @@ paused clock and moves the clock 60 s past each stalled GET: longer than
 the request budget, shorter than the background one. A test pins with them
 which budget a caller passes (#1055); the engines' own tests use them for
 the GeoTIFF scan, the satellite ingest and refetches, and the PVOL scan.
+It also exports `test_util::SlowReads`, an in-memory store whose every
+GET, a HEAD included, takes a delay a test can change, counting the GETs
+in flight and the most at once: the batched range reads' tests and the
+engines' EDR frame read tests (#1495) pin how many reads a caller overlaps
+with it.
 
 # Catalog discovery
 

@@ -272,6 +272,16 @@ pub(crate) fn insert(
     CACHE.insert(ChunkKey::new(scope, ifd_index, chunk_index), chunk);
 }
 
+/// Drop every chunk that remote reads through the compressed cache
+/// `namespace` put in the cache, so a test that decodes many leaves none of
+/// them filling shards for the rest of the suite (#1495).
+#[cfg(test)]
+pub(crate) fn forget_for_test(namespace: u64) {
+    CACHE.retain(
+        |key, _| !matches!(key.origin, Origin::Remote { namespace: of, .. } if of == namespace),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

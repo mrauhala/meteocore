@@ -123,13 +123,58 @@ around `ds-storage` calls (Critical Rules 6–7).
   measurement), or the 3D Tiles products (those sample nearest, then
   `ds-3dtiles` applies its own 3-D `smooth_grid` blur; the point cloud is
   raw).
-- **COMP composites: one fetch and decode per file** (`load_composite`,
+- **COMP composites: one fetch and decode per file** (`OdimEngine::load`,
   `COMPOSITE_CACHE`, `[memory.caches] odim_composite`), shared by renders and
   EDR. A request waits for another's fill until its deadline
   (`get_or_insert_with_until`, #1399), then `DeadlineExceeded`; the fill
   lands for later requests, and none starts past the deadline.
+- **EDR reads a query's composites a few at a time (#1495).** Position and
+  area run `CompositeReader::load` per catalog entry as jobs of
+  `ds_executor::field_jobs::run_field_jobs` (`edr::read_frames`), each a
+  task of the query runtime inside `block_in_place`, so a wait in
+  `COMPOSITE_CACHE` for another request's fill of the file holds no worker
+  of the runtime that fill may need (#1200), and the single-flight still
+  shares the fill. Each result is placed by its entry's index.
+  `edr::frame_reads` gives `MAX_FRAME_READS` (8) over a remote catalog and
+  1 over a local one, which has no round trip to overlap.
+- **A query's composite reads past its first are budgeted (#1495).** A
+  read holds the file and the decode (about 1.25 × the decoded array, 87 MB
+  for OPERA's 4400 × 3800 grid) until its composite is cached.
+  `edr::FrameAdmission`, made per query, admits only the reads that fetch
+  themselves (`CompositeReader::load`, `load_admitted`):
+  - A resident composite, or another request's fill in progress, is joined
+    first, holding nothing (`get_value_or_guard_untracked` until the
+    deadline): no HEAD, no admission.
+  - A read that claims the fill takes its HEAD under the claim and tries
+    `try_admit`, which never waits: the query's one unbudgeted read, as
+    when a query read one composite at a time, else the file's size plus
+    `seed_decode_bytes` from `read_budget::BUDGET` with
+    `try_reserve_background`, which leaves half the budget to the PVOL
+    walks and counts no rejection. Admitted, it reads and decodes under
+    its claim.
+  - Without room it gives the claim back, waits on a condvar for the
+    unbudgeted read until the deadline (`admit`), never refused, then
+    fills or takes what another request filled meanwhile.
+
+  So no read waits for admission holding a fill claim: map renders and
+  other queries wanting the composite wait for a fill in progress, never
+  behind a query's admission wait
+  (`a_query_waiting_for_the_budget_holds_no_fill_others_wait_for`). An
+  admission inside the claim would deadlock
+  nothing, since an unbudgeted read only reads and decodes, but it held
+  those renders past their deadline. Map reads pass no admission. An
+  area's cell positions are placed once per composite geometry under a
+  mutex (`AreaFrames`), a wait on computation only. The error rules below
+  hold inside the job, and the first transient error stops new reads while
+  the running ones drain. Pinned by `composite_frame_read_tests`, among
+  them a child process at `MC_PVOL_READ_MEMORY_MB=0` whose GETs run one at
+  a time and a query joining fills in progress with no HEAD or
+  reservation. A test that reads back a composite it just put in the
+  process-wide `COMPOSITE_CACHE`, or puts many in it, takes
+  `hold_composite_cache_for_test`: fresh composites past the hot share go
+  cold, and the next inserts evict them unread.
 - **A COMP read that fails fails the request (#1496).** `fetch_bytes`
-  returns a `FetchError`, and `FetchError::into_request_error` maps it:
+  returns a `FetchError`, and `FetchError::into_load_error` maps it:
   the fetch's own deadline stays `DeadlineExceeded`; a store that kept
   answering 429/502/503/504 stays `Unavailable` through
   `with_storage_context` (503, `Retry-After: 10`); any other failed read,
@@ -140,14 +185,16 @@ around `ds-storage` calls (Critical Rules 6–7).
   keep; the map path propagates it, so WMS answers 503, not the error
   tile. A file gone since the scan (a typed 404 from
   `DataStore::head_or_refusal`/`get_or_refusal`, a local `NotFound`) or
-  grown past `MAX_REMOTE_FILE_SIZE` is `LoadError::Withdrawn`: EDR answers
-  it as a null timestep (`load_composite`, an `Engine` error), as
+  grown past `MAX_REMOTE_FILE_SIZE` is `LoadError::Withdrawn`, the one
+  error both paths read (`OdimEngine::load` for maps,
+  `CompositeReader::load` for EDR): EDR answers it as a null timestep
+  (`LoadError::for_query`, an `Engine` error), as
   GeoTIFF's EDR answers a gone object; a map answers it `ResourceExhausted`
   (`LoadError::for_map`, 503, detail at WARN, #1506): the next scan drops
   the entry and the same time then draws its nearest file. A template
-  probe never re-HEADs a file it found, so `load` asks it to
-  (`TemplateProber::recheck`, `recheck_withdrawn`, only if the poll is not
-  holding the prober's lock). Never the WMS
+  probe never re-HEADs a file it found, so a read on either path asks it
+  to (`TemplateProber::recheck`, `recheck_withdrawn`, only if the poll is
+  not holding the prober's lock). Never the WMS
   error tile or Maps' opaque 500, which name a server fault, nor a nodata
   tile, which the no-TTL caches would keep. (GeoTIFF draws a gone object's
   tiles as nodata, but drops its entry at once, #1074; this catalog has no
@@ -234,7 +281,9 @@ around `ds-storage` calls (Critical Rules 6–7).
   running at once. The PVOL read budget counts it (next bullet).
 - **EDR walks reserve their reads (#1041).** `read_budget::BUDGET`
   (`[memory.caches] pvol_read`, default 1024 MiB, a `ByteBudget`) admits
-  every volume of `walk_volumes` before its file is read. A batch with
+  every volume of `walk_volumes` before its file is read. It also admits
+  the COMP EDR reads beside a query's first (#1495, above), in its
+  background half. A batch with
   nothing read ahead reserves inside `load_moments_from`'s loader, once
   `load_many` has named the missing moments: their arrays at `sweep_bytes`
   (4 B/sample, twice FMI's u16 arrays: 155 MB for that volume), held with

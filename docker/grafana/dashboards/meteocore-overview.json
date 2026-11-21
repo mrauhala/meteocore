@@ -9490,7 +9490,7 @@
         "spec": {
           "id": 59,
           "title": "Admission budgets — use",
-          "description": "Transient memory reserved against each admission budget: render ([memory.caches] render_budget), GeoTIFF decode ([memory.caches] geotiff_decode), Zarr read ([memory.caches] zarr_read), NetCDF field read ([memory.caches] netcdf_read), station-grid compute ([memory.caches] station_grid_compute), EDR response bodies ([memory.caches] edr_response), PVOL EDR reads ([memory.caches] pvol_read). These are admission estimates, not measured RSS; a request that does not fit is answered 503.",
+          "description": "Transient memory reserved against each admission budget: render ([memory.caches] render_budget), GeoTIFF decode ([memory.caches] geotiff_decode), Zarr read ([memory.caches] zarr_read), NetCDF field read ([memory.caches] netcdf_read), station-grid compute ([memory.caches] station_grid_compute), EDR response bodies ([memory.caches] edr_response), PVOL EDR reads and the ODIM composite EDR reads beside a query's first ([memory.caches] pvol_read). These are admission estimates, not measured RSS; a request that does not fit is answered 503.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

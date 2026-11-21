@@ -5,6 +5,8 @@
 //! pins with them which [`FetchBudget`] a caller passes: the stall outlasts
 //! [`FetchBudget::Request`], not [`FetchBudget::Background`], so a read under
 //! the wrong budget fails or succeeds where the test expects the other.
+//! And [`SlowReads`], a store whose every GET takes a set time and counts
+//! as in flight meanwhile, for a test of how many reads a caller overlaps.
 //!
 //! Compiled for ds-storage's own tests and, through its `test-util`
 //! feature, for the tests of a crate that enables the feature on its
@@ -14,6 +16,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -327,6 +330,160 @@ impl ObjectStore for StalledBody {
             attributes,
             extensions,
         })
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Wraps [`InMemory`]: every GET, a HEAD included, sleeps for the store's
+/// delay while it counts as in flight (and, unless a HEAD, as fetching),
+/// and records its key when it starts:
+/// for the batched range read tests (#1042), and for the engines' tests of
+/// how many frames an EDR query reads at once (#1495). The delay can change
+/// between reads ([`Self::set_delay`]), so a test builds its engine at once
+/// and then times the reads it means.
+#[derive(Debug, Default)]
+pub struct SlowReads {
+    pub inner: InMemory,
+    delay: Mutex<Duration>,
+    /// GETs in flight now, and the most there ever were.
+    pub active: Arc<AtomicUsize>,
+    pub peak: Arc<AtomicUsize>,
+    /// The same of the GETs that are not HEADs, which fetch bytes.
+    pub fetching: Arc<AtomicUsize>,
+    pub fetch_peak: Arc<AtomicUsize>,
+    /// Every key GET, in the order the GETs started.
+    pub started: Mutex<Vec<String>>,
+}
+
+impl SlowReads {
+    /// An empty store whose every GET takes `delay`.
+    pub fn new(delay: Duration) -> Self {
+        Self {
+            delay: Mutex::new(delay),
+            ..Self::default()
+        }
+    }
+
+    /// Every GET from now on takes `delay`.
+    pub fn set_delay(&self, delay: Duration) {
+        *self.delay.lock().unwrap_or_else(|e| e.into_inner()) = delay;
+    }
+
+    /// Store `bytes` under `key`.
+    pub fn put(&self, key: &str, bytes: impl Into<Bytes>) {
+        futures::executor::block_on(
+            self.inner
+                .put(&Path::from(key), PutPayload::from(bytes.into())),
+        )
+        .expect("an in-memory put");
+    }
+
+    /// Forget the GETs so far: the keys started and the peaks in flight.
+    pub fn reset(&self) {
+        self.started
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.peak.store(0, Ordering::SeqCst);
+        self.fetch_peak.store(0, Ordering::SeqCst);
+    }
+
+    /// How many GETs have started.
+    pub fn reads(&self) -> usize {
+        self.started.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    /// The most GETs in flight at once.
+    pub fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
+    /// The most GETs in flight at once that fetch bytes, HEADs left out.
+    pub fn fetch_peak(&self) -> usize {
+        self.fetch_peak.load(Ordering::SeqCst)
+    }
+}
+
+impl std::fmt::Display for SlowReads {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SlowReads")
+    }
+}
+
+/// Counts one GET in flight until it finishes or is dropped.
+struct InFlight(Arc<AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for SlowReads {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.started
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(path.to_string());
+        let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(now, Ordering::SeqCst);
+        let _in_flight = InFlight(self.active.clone());
+        let _fetching = (!options.head).then(|| {
+            let now = self.fetching.fetch_add(1, Ordering::SeqCst) + 1;
+            self.fetch_peak.fetch_max(now, Ordering::SeqCst);
+            InFlight(self.fetching.clone())
+        });
+        let delay = *self.delay.lock().unwrap_or_else(|e| e.into_inner());
+        tokio::time::sleep(delay).await;
+        self.inner.get_opts(path, options).await
     }
 
     fn delete_stream(

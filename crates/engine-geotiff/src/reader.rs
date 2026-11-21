@@ -266,6 +266,14 @@ impl DataSource {
         }
     }
 
+    /// Whether its tiles are byte ranges of an object-store object, each
+    /// read a round trip through a `DataStore`, whose host limits and 429
+    /// back-off bound its reads (#1495): not decoded in process from a
+    /// local file or bytes held in memory, nor read by direct HTTP.
+    pub(crate) fn reads_from_object_store(&self) -> bool {
+        matches!(self, DataSource::Remote { .. })
+    }
+
     /// What tile reads learned about a remote object (#1074); `None` for a
     /// local or in-memory source, which has no range to refuse.
     pub(crate) fn health(&self) -> Option<&ObjectHealth> {
@@ -5372,6 +5380,28 @@ mod tests {
         }
     }
 
+    /// Whether to run the test `name` of this module here: in a process of
+    /// its own, where no other test's chunks fill the process-wide
+    /// decoded-chunk cache. Once other entries fill a shard's hot share, a
+    /// fresh chunk waits in its small cold share, and the next insert past
+    /// the shard's capacity evicts it unread, so a test that reads its own
+    /// chunks back failed now and then beside the rest of the suite
+    /// (#1495). In the suite's process this runs `name` in a child and
+    /// returns `false`; in the child, `true`.
+    fn alone_in_a_process(name: &str) -> bool {
+        const CHILD: &str = "MC_TEST_DECODED_CACHE_ALONE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return true;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{name} failed in its own process");
+        false
+    }
+
     // The decoded-chunk cache (#463) must be transparent: a repeat read of the
     // same window returns identical values while serving the chunks from cache
     // (hits increase by at least the covering-tile count, and no new misses for
@@ -5381,6 +5411,9 @@ mod tests {
     // delta-based and directional (other tests can only ADD counts).
     #[test]
     fn decoded_chunk_cache_serves_repeat_reads() {
+        if !alone_in_a_process("reader::tests::decoded_chunk_cache_serves_repeat_reads") {
+            return;
+        }
         let dir = find_test_radar_dir();
         let tif_path = find_first_tif(&dir);
         let tmp =
@@ -5468,6 +5501,10 @@ mod tests {
     /// over the same object path must not share those chunks.
     #[tokio::test(flavor = "multi_thread")]
     async fn remote_decoded_chunks_serve_repeat_reads_per_engine() {
+        if !alone_in_a_process("reader::tests::remote_decoded_chunks_serve_repeat_reads_per_engine")
+        {
+            return;
+        }
         let (store, source, meta, pseudo_path) = remote_fixture();
         // Two tile columns and rows of the full-resolution grid.
         let (col_end, row_end) = (

@@ -84,7 +84,9 @@ fn remote_engine(local: &TempDir, remote: &TempDir) -> GeoTiffEngine {
         store,
         prefix: ObjectPath::from("d"),
     };
-    engine.tile_cache = TileCache::new(config().effective_tile_cache_mb() * 1024 * 1024);
+    engine.tile_cache = Arc::new(TileCache::new(
+        config().effective_tile_cache_mb() * 1024 * 1024,
+    ));
     engine
 }
 
@@ -570,7 +572,9 @@ async fn benchmark_first_view_over_latency() {
             store: store.clone(),
             prefix: ObjectPath::from(""),
         };
-        engine.tile_cache = TileCache::new(config().effective_tile_cache_mb() * 1024 * 1024);
+        engine.tile_cache = Arc::new(TileCache::new(
+            config().effective_tile_cache_mb() * 1024 * 1024,
+        ));
         engine.catalog.store(Arc::new(catalog));
         engine
     };
@@ -1101,7 +1105,7 @@ async fn a_cache_tier_2_shrank_still_prewarms_the_frame_its_keep_protects() {
     // by a tenth at most: a cache built that small stands in for the steps.)
     let shrunk = 6 * keep;
     let configured = engine.tile_cache.configured();
-    engine.tile_cache = TileCache::new(shrunk);
+    engine.tile_cache = Arc::new(TileCache::new(shrunk));
     engine.tile_cache.set_configured(configured);
     assert!((shrunk / 8) < keep - 64 * 1024, "the cap binds: {keep}");
     // The next frame: the same tiles under a later time.

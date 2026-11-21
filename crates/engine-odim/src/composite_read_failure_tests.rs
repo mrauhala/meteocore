@@ -21,7 +21,7 @@ use futures::stream::BoxStream;
 use super::*;
 
 /// The committed DMI composite.
-const FIXTURE: &str = concat!(
+pub(super) const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../testdata/odim-dmi-fixture.h5"
 );
@@ -200,7 +200,7 @@ fn values(response: CoverageResponse) -> Vec<Option<f64>> {
 
 /// The `(lon, lat)` of the first pixel centre of `engine`'s seed composite
 /// that holds an echo: the fixture's echoes are sparse.
-fn echo(engine: &OdimEngine) -> (f64, f64) {
+pub(super) fn echo(engine: &OdimEngine) -> (f64, f64) {
     let seed = engine.catalog.load().last().unwrap().location.clone();
     let composite = engine.load_composite(&seed).unwrap();
     let [w, s, e, n] = composite.bbox;
@@ -314,6 +314,7 @@ fn every_view_fails(
 /// requests answer with the file's data.
 #[test]
 fn a_failed_composite_read_fails_edr_and_the_map_and_a_retry_reads() {
+    let _held = hold_composite_cache_for_test();
     let prefix = "read-failure-1496-throttled/";
     let fixture = std::fs::read(FIXTURE).unwrap();
     let store = Arc::new(FailingStore::default());

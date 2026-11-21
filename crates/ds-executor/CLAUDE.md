@@ -69,7 +69,10 @@ server's `edr_and_get_feature_info_share_one_query_runtime`.
 `field_jobs::run_field_jobs` is an engine query's bounded field-read
 scheduler (#1067: engine-grib's, shared with engine-netcdf): at most
 `concurrency` jobs per query, a parameter: engine-netcdf passes
-`FIELD_CONCURRENCY` (4), engine-grib its memory-bounded plan, 4–16 (#1297), as tasks on the runtime the query
+`FIELD_CONCURRENCY` (4), engine-grib its memory-bounded plan, 4–16 (#1297),
+engine-geotiff 8 object-store frames of a position query (else 1, and 1
+for an area) and engine-odim 8 remote composites, those past a query's
+first in its read budget (#1495), as tasks on the runtime the query
 runs on (the query runtime), each inside `block_in_place` and re-entering
 the caller's `ds_core::deadline`; on the first error or the deadline no
 job starts, and the running ones drain before it returns. A caller outside

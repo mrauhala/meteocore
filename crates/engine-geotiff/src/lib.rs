@@ -7,6 +7,9 @@ pub mod decode_budget;
 mod decoded_cache;
 #[cfg(test)]
 mod footprint_tests;
+#[cfg(test)]
+mod frame_read_tests;
+mod frames;
 mod gone;
 #[cfg(test)]
 mod gone_object_tests;
@@ -230,7 +233,7 @@ pub struct GeoTiffEngine {
     /// Compressed tiles of remote sources. A local source reads none, so
     /// its cache holds nothing (capacity 0). Requests take it through
     /// [`Self::request_tile_cache`], which notes the read.
-    tile_cache: cache::TileCache,
+    tile_cache: Arc<cache::TileCache>,
     /// When a request last read tiles, which decides how much a poll
     /// pre-warms (#1318). Starts at construction, as if read then.
     last_read: prewarm::LastRead,
@@ -641,6 +644,18 @@ impl GeoTiffEngine {
         }
     }
 
+    /// [`Self::note_object_health`] for every entry of an EDR query's window,
+    /// once its frame reads ended, however they did (#1495): they run as
+    /// tasks of their own, and after an error the reads still running end
+    /// unseen. An entry no read of this query reached has nothing to note,
+    /// unless another request's read just learned something of its object,
+    /// which is then noted here instead, once.
+    fn note_frames_health(&self, entries: &[(&DateTime<Utc>, &catalog::FileEntry)]) {
+        for (timestamp, entry) in entries {
+            self.note_object_health(timestamp, entry);
+        }
+    }
+
     /// Rebuild the cached [`RasterInfo`] from the current catalog and publish it.
     /// Call after every catalog swap (#211). [`build_raster_info`](Self::build_raster_info)
     /// only *reads* already-loaded metadata (no I/O), so this is cheap and safe
@@ -805,6 +820,13 @@ impl GeoTiffEngine {
     fn request_tile_cache(&self) -> &cache::TileCache {
         self.last_read.note();
         &self.tile_cache
+    }
+
+    /// [`Self::request_tile_cache`], shared with the frame reads of an EDR
+    /// query, each a task of its own (#1495).
+    fn shared_request_tile_cache(&self) -> Arc<cache::TileCache> {
+        self.last_read.note();
+        Arc::clone(&self.tile_cache)
     }
 
     /// Return (hits, misses) for the tile cache.
@@ -1057,7 +1079,7 @@ impl GeoTiffEngine {
                 .effective_tile_cache_mb()
                 .saturating_mul(ds_cache::MIB),
         };
-        let tile_cache = cache::TileCache::new(cache_bytes);
+        let tile_cache = Arc::new(cache::TileCache::new(cache_bytes));
 
         let band_index = (config.band.max(1) - 1) as usize; // 1-based config → 0-based index
 
@@ -2315,59 +2337,52 @@ impl GeoTiffEngine {
             ));
         }
 
-        let mut times = Vec::with_capacity(entries.len());
-        let mut values = Vec::with_capacity(entries.len());
+        let times: Vec<DateTime<Utc>> = entries.iter().map(|(timestamp, _)| **timestamp).collect();
+        // An entry without metadata stays null.
+        let mut values = vec![None; entries.len()];
+        let frames = frames::frames(&entries);
         // The finest of the files read, so no file's values lose digits.
-        let mut precision = None;
-        let tile_cache = self.request_tile_cache();
+        let precision = frames
+            .iter()
+            .map(|frame| frame.metadata.value_precision())
+            .max();
+        let tile_cache = self.shared_request_tile_cache();
+        let band_index = self.band_index;
 
-        for (timestamp, entry) in &entries {
-            // Past the request's deadline no further file is read (#18): a
-            // local read checks no deadline of its own.
-            ds_core::deadline::check()?;
-            times.push(**timestamp);
-
-            let (metadata, source) = match (entry.metadata(), entry.source()) {
-                (Some(m), Some(s)) => (m, s),
-                _ => {
-                    values.push(None);
-                    continue;
-                }
-            };
-            precision = precision.max(Some(metadata.value_precision()));
-
-            let pixel = metadata.geo_transform.world_to_pixel(lon, lat);
-            let value = match pixel {
-                Some((col, row)) => {
-                    let read = reader::read_pixel(
-                        source,
-                        metadata,
-                        col,
-                        row,
-                        Some(tile_cache),
-                        &entry.path,
-                        self.band_index,
-                    );
-                    self.note_object_health(timestamp, entry);
-                    match read {
-                        Ok(v) => v,
-                        Err(
-                            e @ (DataServerError::ResourceExhausted
-                            | DataServerError::DeadlineExceeded),
-                        ) => return Err(e),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to read pixel from {}: {e}",
-                                entry.path.display()
-                            );
-                            None
-                        }
+        // A few frames at a time (#1495), each checking the deadline before
+        // its read (#18): a local read checks none of its own.
+        let read = frames::read_frames(
+            frames::position_frame_reads(&frames),
+            frames,
+            move |frame| {
+                let Some((col, row)) = frame.metadata.geo_transform.world_to_pixel(lon, lat) else {
+                    return Ok(None);
+                };
+                match reader::read_pixel(
+                    &frame.source,
+                    &frame.metadata,
+                    col,
+                    row,
+                    Some(&tile_cache),
+                    &frame.path,
+                    band_index,
+                ) {
+                    Ok(v) => Ok(v),
+                    Err(
+                        e
+                        @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
+                    ) => Err(e),
+                    Err(e) => {
+                        tracing::warn!("Failed to read pixel from {}: {e}", frame.path.display());
+                        Ok(None)
                     }
                 }
-                None => None,
-            };
-            values.push(value);
-        }
+            },
+            |index, value| values[index] = value,
+        );
+        // However the reads ended, and before an error is returned.
+        self.note_frames_health(&entries);
+        read?;
 
         let domain = DomainDescription::PointSeries {
             x: lon,
@@ -2472,64 +2487,80 @@ impl GeoTiffEngine {
         let (window_nx, _) = plan.window_dims();
         let all_cells = (0, nx as u32 - 1, 0, ny as u32 - 1);
 
-        let mut times = Vec::with_capacity(entries.len());
-        let mut all_values = Vec::with_capacity(entries.len() * ny * nx);
+        let times: Vec<DateTime<Utc>> = entries.iter().map(|(timestamp, _)| **timestamp).collect();
+        // `[t][y][x]`; an entry without metadata, or a file that cannot be
+        // read, stays a timestep of nulls.
+        let cells = nx * ny;
+        let mut all_values = vec![None; entries.len() * cells];
+        let frames = frames::frames(&entries);
         // The finest of the files read, so no file's values lose digits.
-        let mut precision = None;
-        let tile_cache = self.request_tile_cache();
+        let precision = frames
+            .iter()
+            .map(|frame| frame.metadata.value_precision())
+            .max();
+        let tile_cache = self.shared_request_tile_cache();
+        let band_index = self.band_index;
+        let plan = Arc::new(plan);
+        let frame_plan = Arc::clone(&plan);
 
-        for (timestamp, entry) in &entries {
-            // As in `query_point`: no further file past the deadline (#18).
-            ds_core::deadline::check()?;
-            times.push(**timestamp);
-
-            let (metadata, source) = match (entry.metadata(), entry.source()) {
-                (Some(m), Some(s)) => (m, s),
-                _ => {
-                    all_values.extend(std::iter::repeat_n(None, nx * ny));
-                    continue;
+        // One frame at a time, its tiles on the shared tile-fetch pool
+        // (#1495), and as in `query_point` no further file past the
+        // deadline (#18).
+        let read = frames::read_frames(
+            frames::AREA_FRAME_READS,
+            frames,
+            move |frame| {
+                let plan = &frame_plan;
+                let (col_start, row_start, col_end, row_end) = plan.window;
+                let read = reader::read_bbox(
+                    &frame.source,
+                    &frame.metadata,
+                    col_start,
+                    row_start,
+                    col_end,
+                    row_end,
+                    Some(&tile_cache),
+                    &frame.path,
+                    band_index,
+                );
+                match (read, &plan.projection) {
+                    (Ok(window), None) => Ok(Some(window)),
+                    // Each cell the native pixel holding its centre:
+                    // nearest, never interpolated.
+                    (Ok(window), Some(projection)) => {
+                        let mut values = Vec::with_capacity(cells);
+                        resample_nearest(
+                            projection,
+                            nx as u32,
+                            ny as u32,
+                            &window,
+                            window_nx,
+                            plan.window,
+                            None,
+                            all_cells,
+                            &mut values,
+                        );
+                        Ok(Some(values))
+                    }
+                    (Err(e), _) if is_unreadable_file(&e) => {
+                        tracing::warn!("Failed to read bbox from {}: {e}", frame.path.display());
+                        Ok(None)
+                    }
+                    (Err(e), _) => Err(e),
                 }
-            };
-            precision = precision.max(Some(metadata.value_precision()));
-            let (col_start, row_start, col_end, row_end) = plan.window;
-
-            let read = reader::read_bbox(
-                source,
-                metadata,
-                col_start,
-                row_start,
-                col_end,
-                row_end,
-                Some(tile_cache),
-                &entry.path,
-                self.band_index,
-            );
-            self.note_object_health(timestamp, entry);
-            match (read, &plan.projection) {
-                (Ok(window), None) => {
-                    all_values.extend(window);
+            },
+            |index, values| {
+                if let Some(values) = values {
+                    let step = &mut all_values[index * cells..(index + 1) * cells];
+                    for (cell, value) in step.iter_mut().zip(values) {
+                        *cell = value;
+                    }
                 }
-                // Each cell the native pixel holding its centre: nearest,
-                // never interpolated.
-                (Ok(window), Some(projection)) => resample_nearest(
-                    projection,
-                    nx as u32,
-                    ny as u32,
-                    &window,
-                    window_nx,
-                    (col_start, row_start, col_end, row_end),
-                    None,
-                    all_cells,
-                    &mut all_values,
-                ),
-                (Err(e), _) if is_unreadable_file(&e) => {
-                    tracing::warn!("Failed to read bbox from {}: {e}", entry.path.display());
-                    // Fill with None for this timestep
-                    all_values.extend(std::iter::repeat_n(None, nx * ny));
-                }
-                (Err(e), _) => return Err(e),
-            }
-        }
+            },
+        );
+        // However the reads ended, and before an error is returned.
+        self.note_frames_health(&entries);
+        read?;
 
         if let Some(polygon) = polygon {
             mask_area(&mut all_values, &plan, polygon);
@@ -2539,8 +2570,8 @@ impl GeoTiffEngine {
         // steps served are always on a `t` axis, one step included (#1412):
         // `[t, y, x]` however many match.
         let domain = DomainDescription::Grid {
-            x: plan.x,
-            y: plan.y,
+            x: plan.x.clone(),
+            y: plan.y.clone(),
             t: Some(times),
             z: None,
             coarsened: None,
