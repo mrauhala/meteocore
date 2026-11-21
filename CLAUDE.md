@@ -848,6 +848,8 @@ they were found. Critical Rules 5–7, 9 and 10 above are part of this set.
   longitude meets at the pole, so plain `build_2d` interpolates straight
   through both in any Arctic view (#323; engine-grib does this, and
   `SourceGrid` does it for engine-netcdf and engine-querydata, #1188).
+  Near a pole such a grid splits only the cells within a quarter of the
+  image of it, down to a pixel, instead of refining the whole grid (#1195).
 - **A new gridded engine renders through `ds_core::resample::SourceGrid`**
   (#1067), not a sampler of its own: decode the field to a row-major
   `&[f32]`, north row first, on its `GeoTransform`, and call `render_f32`

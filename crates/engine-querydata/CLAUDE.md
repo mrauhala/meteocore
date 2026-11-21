@@ -70,11 +70,12 @@ runtime).
   not render through `render_f32` because QueryData's param → location →
   level → time layout strides one field by levels × times, so a decoded
   `&[f32]` field would cost a full-field strided read per tile.
-- A global lat/lon grid on a tile holding a pole still refines its map to
-  the 256-cell density, about 1.49 M projections (~0.4 s): beside the pole
-  the bilinear column map converges only linearly. It meets the budget and
-  no longer caps; the cost is `ProjectionGrid`'s, shared by engine-grib and
-  every `SourceGrid` (see `engine/global_tests.rs`).
+- A global lat/lon grid on a tile holding a pole meets its map's budget by
+  splitting only the cells around the pole, down to a pixel: beside the
+  pole the bilinear column map converges only linearly. About 30 k
+  projections per 256 px tile where refining the whole grid took 1.49 M
+  (#1195); the cost is `ProjectionGrid`'s, shared by engine-grib and every
+  `SourceGrid` (see `engine/global_tests.rs`).
 - EDR position queries and map rendering use bilinear interpolation. EDR area (and radius via the shared default) returns a
   CRS84 `Grid` over the polygon bbox at native resolution while it fits
   the 1M-value budget across time × cells × parameters, evenly coarser past
