@@ -220,7 +220,8 @@ pub(crate) struct Locations {
 /// 3. The body is written, parsed, and dropped with the transient part,
 ///    and what they held beyond the document is released.
 /// 4. The page's part of the reservation is handed over to its buffer,
-///    which keeps it until the body is delivered or dropped.
+///    shrunk to its length, which keeps that much until the body is
+///    delivered or dropped; the rest of the estimate is released then.
 ///
 /// A page that starts building is sure to finish: it never reserves more
 /// mid-way, so concurrent pages cannot each build a document and then
@@ -269,12 +270,17 @@ pub(crate) fn coverage_page(
     // held beyond the document.
     drop(reserved.split(reserved.bytes().saturating_sub(bound.retained)));
     let coverages = coverage_list(&doc);
-    page_part.into_bytes(
-        fill(&head, &tail, capacity, |body| {
-            coverage_body(body, &doc, coverages, page, locations)
-        })
-        .into_bytes(),
-    )
+    let html = fill(&head, &tail, capacity, |body| {
+        coverage_body(body, &doc, coverages, page, locations)
+    })
+    .into_bytes();
+    // The page is shrunk to its length as it is handed over, and keeps only
+    // that of its estimate (#1500). The document goes first, its part still
+    // reserved, so a shrink that moves the page copies it into that room.
+    drop(doc);
+    let body = page_part.into_bytes(html);
+    drop(reserved);
+    body
 }
 
 /// A [`DocumentScan`] over a body as it is serialised, checking the

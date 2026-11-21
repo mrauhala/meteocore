@@ -941,6 +941,28 @@ mod errors {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A blank `datetime`, as a form submits an empty field, is no filter
+    /// (#1500): not a 400, even on a collection without time.
+    #[tokio::test]
+    async fn a_blank_datetime_is_absent() {
+        let (_, all) = get("/collections/cities/items").await;
+        for blank in ["", "%20"] {
+            let (status, json) = get(&format!("/collections/cities/items?datetime={blank}")).await;
+            assert_eq!(status, StatusCode::OK, "{blank:?}: {json}");
+            assert_eq!(json["features"], all["features"], "{blank:?}");
+            let resp = build_router_with(Arc::new(TimelessEngine(MockFeatureEngine::new())))
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/collections/cities/items?datetime={blank}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "{blank:?}");
+        }
+    }
+
     #[tokio::test]
     async fn invalid_datetime_returns_400() {
         let (status, json) = get("/collections/cities/items?datetime=not-a-date").await;

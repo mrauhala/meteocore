@@ -107,7 +107,7 @@ any `bbox` or `datetime`. The search rules are in
 |---|---|
 | `bbox` | 4 values, or 6 with the heights ignored, in `bbox-crs` axis order. In CRS84 and EPSG:4326 a west edge east of the east edge crosses the antimeridian. Malformed values, a south edge above the north edge, and latitudes or longitudes out of range are a 400 |
 | `bbox-crs` | CRS of `bbox`, one of the collection's `crs` values; default CRS84. The engine always gets a CRS84 box. Checked even without `bbox` |
-| `datetime` | RFC 3339 instant, `start/end`, `../end`, `start/..` or `../..`. A reversed interval is a 400. On a collection without a time dimension it is a 400 |
+| `datetime` | RFC 3339 instant, `start/end`, `../end`, `start/..` or `../..`; blank is absent. A reversed interval is a 400. On a collection without a time dimension it is a 400 |
 | `limit` | default 100; a value outside 1–1000 is clamped. A value that is not a non-negative integer is a 400 |
 | `offset` | default 0; a value that is not a non-negative integer is a 400. On a collection paged by cursor, a value other than 0 is a 400 |
 | `cursor` | only on a collection paged by cursor (PostGIS `events`): where the page starts, the value of the previous page's `next` link, opaque. Elsewhere a 400. A cursor the engine did not write is a 400 |

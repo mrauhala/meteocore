@@ -2,7 +2,8 @@
 //! encodes from a query (CoverageJSON, EDR GeoJSON, CSV and HTML) and for
 //! `/locations`. One process-wide [`ByteBudget`],
 //! `MC_EDR_RESPONSE_MEMORY_MB` (default 512 MiB). It never waits: a body
-//! that does not fit fails at once, and the handler answers 503 `ServerBusy`.
+//! that does not fit fails at once, and the handler answers 503 `ServerBusy`,
+//! or 400 when no idle budget could hold it either.
 //! Reservations follow the actual allocation through `Bytes` clones,
 //! middleware and response delivery: a body stays charged until its last
 //! clone drops, after the client has read it or gone away.
@@ -80,6 +81,11 @@ pub(crate) enum Failure {
     /// can admit it: a 400 naming a smaller form (an HTML page only,
     /// [`reserve_toward`]).
     Oversize,
+    /// A body written through a [`Writer`] needs more at once than the
+    /// whole budget: its next buffer beside the one it copies from. No
+    /// retry can admit it (#1500): a 400 asking for less, not counted
+    /// among rejected admissions, as [`Self::Oversize`] is not.
+    BodyOversize,
 }
 
 struct Allocation {
@@ -156,10 +162,16 @@ impl Write for Writer<'_> {
             return Err(self.fail(Failure::Limit));
         };
         if needed > self.allocation.data.capacity() {
-            let capacity = needed
-                .max(self.allocation.data.capacity().saturating_mul(2))
-                .max(UNIT)
-                .min(self.limit);
+            let held = self.allocation.data.capacity();
+            let capacity = needed.max(held.saturating_mul(2)).max(UNIT).min(self.limit);
+            // The same body grows the same way on every attempt: past the
+            // whole budget beside the buffer it copies from, no retry can
+            // admit it.
+            if u64::try_from(held.saturating_add(capacity))
+                .map_or(true, |at_once| at_once > self.budget.capacity())
+            {
+                return Err(self.fail(Failure::BodyOversize));
+            }
             let permit = u64::try_from(capacity)
                 .ok()
                 .and_then(|n| self.budget.reserve(n).ok())
@@ -194,30 +206,34 @@ pub(crate) struct Reservation {
     bytes: usize,
 }
 
-/// Reserve `bytes` for a body about to be built, or fail before anything
-/// is allocated.
-pub(crate) fn reserve(bytes: usize) -> Result<Reservation, Failure> {
-    reserve_from(&BUDGET, bytes)
-}
-
-/// Reserve `bytes`, one part of a body whose parts held at once total
-/// `whole`: [`Failure::Oversize`] when `whole` exceeds the whole budget,
-/// which an idle budget cannot admit either, else as [`reserve`], whose
-/// [`Failure::Memory`] is worth a retry. An oversize body is the client's
+/// Reserve `bytes`, one part of a body about to be built whose parts held
+/// at once total `whole`, or fail before anything is allocated:
+/// [`Failure::Oversize`] when `whole` exceeds the whole budget, which an
+/// idle budget cannot admit either, else [`Failure::Memory`] when the
+/// budget cannot hold `bytes` now, worth a retry. An oversize body is the client's
 /// request, answered 400, not admission turning work away: it is not
 /// counted among the budget's rejected admissions, which `/metrics`
 /// exports as `edr_response_rejected_total` for the shed-requests alert.
 pub(crate) fn reserve_toward(bytes: usize, whole: usize) -> Result<Reservation, Failure> {
-    reserve_toward_from(&BUDGET, bytes, whole)
+    reserve_toward_from(&BUDGET, bytes, whole, Failure::Oversize)
 }
 
+/// Reserve `bytes` for a body built in one buffer of that size, as CSV is:
+/// [`Failure::BodyOversize`] when they exceed the whole budget, which no
+/// retry can admit (#1500), else as [`reserve_toward`].
+pub(crate) fn reserve_body(bytes: usize) -> Result<Reservation, Failure> {
+    reserve_toward_from(&BUDGET, bytes, bytes, Failure::BodyOversize)
+}
+
+/// [`reserve_toward`], failing with `oversize` past the whole budget.
 fn reserve_toward_from(
     budget: &Arc<ByteBudget>,
     bytes: usize,
     whole: usize,
+    oversize: Failure,
 ) -> Result<Reservation, Failure> {
     if u64::try_from(whole).map_or(true, |whole| whole > budget.capacity()) {
-        return Err(Failure::Oversize);
+        return Err(oversize);
     }
     reserve_from(budget, bytes)
 }
@@ -254,11 +270,17 @@ impl Reservation {
         }
     }
 
-    /// The body built in `data`, charged until its last clone drops. A
+    /// The body built in `data`, shrunk to its length and charged its
+    /// capacity until its last clone drops; the rest of the reservation is
+    /// released now (#1500). A reservation made from an estimate, an HTML
+    /// page's, then holds the page, not the estimate, until delivery.
+    /// Shrinking first keeps the budget counting what stays allocated. A
     /// buffer that outgrew the reservation is charged its whole capacity
     /// instead, or fails.
-    pub(crate) fn into_bytes(self, data: Vec<u8>) -> Result<Bytes, Failure> {
+    pub(crate) fn into_bytes(mut self, mut data: Vec<u8>) -> Result<Bytes, Failure> {
+        data.shrink_to_fit();
         let permit = if data.capacity() <= self.bytes {
+            drop(self.split(self.bytes - data.capacity()));
             self.permit
         } else {
             reserve_from(&self.budget, data.capacity())?.permit
@@ -301,16 +323,42 @@ mod tests {
 
     #[test]
     fn growth_charges_old_and_new_allocations_and_releases_on_failure() {
-        let budget = Arc::new(ByteBudget::new(2 * UNIT as u64));
+        let budget = Arc::new(ByteBudget::new(4 * UNIT as u64));
+        let other = budget.reserve(2 * UNIT as u64).unwrap();
         let mut writer = Writer::with_budget(budget.clone(), 4 * UNIT, &|| false);
         writer.write_all(&vec![0; UNIT]).unwrap();
-        assert_eq!(used(&budget), UNIT as u64);
-        // Growing 1→2 units needs three units during the copy, not two.
+        assert_eq!(used(&budget), 3 * UNIT as u64);
+        // Growing 1→2 units needs three units during the copy, not two:
+        // beside the other body's two, five of four.
         assert!(writer.write_all(b"x").is_err());
         assert_eq!(writer.failure, Some(Failure::Memory));
-        assert_eq!(used(&budget), UNIT as u64);
+        assert_eq!(used(&budget), 3 * UNIT as u64);
         assert_eq!(budget.metrics().2, 1, "one rejected response");
+        drop((writer, other));
+        assert_eq!(used(&budget), 0);
+    }
+
+    /// A body whose next buffer, beside the one it copies from, exceeds
+    /// the whole budget is `BodyOversize`, never worth a retry, and not
+    /// counted as a rejected admission (#1500); before it was a 503 on
+    /// every retry. One that fits beside its old buffer grows.
+    #[test]
+    fn a_body_past_the_whole_budget_is_body_oversize() {
+        let budget = Arc::new(ByteBudget::new(3 * UNIT as u64));
+        let mut writer = Writer::with_budget(budget.clone(), usize::MAX, &|| false);
+        writer.write_all(&vec![0; UNIT]).unwrap();
+        writer.write_all(b"x").unwrap();
+        assert_eq!(used(&budget), 2 * UNIT as u64, "1→2 units fit three");
+        // 2→4 units needs six of three, idle or not.
+        assert!(writer.write_all(&vec![0; UNIT]).is_err());
+        assert_eq!(writer.failure, Some(Failure::BodyOversize));
+        assert_eq!(budget.metrics().2, 0, "an oversize body is not shed");
+        assert_eq!(used(&budget), 2 * UNIT as u64);
         drop(writer);
+        assert_eq!(used(&budget), 0);
+        let mut writer = Writer::with_budget(budget.clone(), usize::MAX, &|| false);
+        assert!(writer.write_all(&vec![0; 3 * UNIT + 1]).is_err());
+        assert_eq!(writer.failure, Some(Failure::BodyOversize));
         assert_eq!(used(&budget), 0);
     }
 
@@ -356,19 +404,19 @@ mod tests {
     #[test]
     fn a_body_over_the_whole_budget_is_oversize() {
         let budget = Arc::new(ByteBudget::new(100));
-        assert_eq!(
-            reserve_toward_from(&budget, 10, 101).err(),
-            Some(Failure::Oversize)
-        );
+        let page = |bytes, whole| reserve_toward_from(&budget, bytes, whole, Failure::Oversize);
+        assert_eq!(page(10, 101).err(), Some(Failure::Oversize));
+        // A body in one buffer, CSV's, is its own whole (#1500).
+        let body = |bytes| reserve_toward_from(&budget, bytes, bytes, Failure::BodyOversize);
+        assert_eq!(body(101).err(), Some(Failure::BodyOversize));
         assert_eq!(budget.metrics().2, 0, "an oversize request is not shed");
-        let held = reserve_toward_from(&budget, 60, 100).unwrap();
-        assert_eq!(
-            reserve_toward_from(&budget, 60, 100).err(),
-            Some(Failure::Memory)
-        );
-        assert_eq!(budget.metrics().2, 1, "a busy budget sheds it");
+        let held = page(60, 100).unwrap();
+        assert_eq!(page(60, 100).err(), Some(Failure::Memory));
+        assert_eq!(body(60).err(), Some(Failure::Memory));
+        assert_eq!(budget.metrics().2, 2, "a busy budget sheds them");
         drop(held);
-        assert!(reserve_toward_from(&budget, 60, 100).is_ok());
+        assert!(page(60, 100).is_ok());
+        assert!(body(100).is_ok());
         assert_eq!(used(&budget), 0);
     }
 
@@ -382,7 +430,7 @@ mod tests {
         assert_eq!((whole.bytes(), page.bytes()), (50, 40));
         drop(whole.split(30));
         assert_eq!(used(&budget), 60);
-        let body = page.into_bytes(Vec::with_capacity(40)).unwrap();
+        let body = page.into_bytes(vec![0; 40]).unwrap();
         drop(whole);
         assert_eq!(used(&budget), 40, "the body keeps its part");
         drop(body);
@@ -400,21 +448,38 @@ mod tests {
         let reservation = reserve_from(&budget, 60).unwrap();
         assert_eq!(used(&budget), 60);
         assert_eq!(reserve_from(&budget, 41).err(), Some(Failure::Memory));
-        let body = reservation.into_bytes(Vec::with_capacity(60)).unwrap();
+        let body = reservation.into_bytes(vec![0; 60]).unwrap();
         assert_eq!(used(&budget), 60);
         drop(body);
         assert_eq!(used(&budget), 0);
         // A buffer that outgrew its reservation is charged all of it.
         let grown = reserve_from(&budget, 10)
             .unwrap()
-            .into_bytes(Vec::with_capacity(80))
+            .into_bytes(vec![0; 80])
             .unwrap();
         assert_eq!(used(&budget), 80);
         drop(grown);
         assert!(reserve_from(&budget, 10)
             .unwrap()
-            .into_bytes(Vec::with_capacity(101))
+            .into_bytes(vec![0; 101])
             .is_err());
+        assert_eq!(used(&budget), 0);
+    }
+
+    /// A body built under a reservation larger than it, as an HTML page's
+    /// estimate is, keeps only what it holds once shrunk: the rest is
+    /// released when it is handed over, not when it is delivered (#1500).
+    #[test]
+    fn a_body_keeps_only_what_it_holds_of_its_reservation() {
+        let budget = Arc::new(ByteBudget::new(100));
+        let reservation = reserve_from(&budget, 90).unwrap();
+        let mut page = Vec::with_capacity(90);
+        page.extend_from_slice(&[b'x'; 40]);
+        let body = reservation.into_bytes(page).unwrap();
+        assert_eq!(body.len(), 40);
+        assert_eq!(used(&budget), 40, "the page, not its estimate");
+        assert!(reserve_from(&budget, 60).is_ok(), "the rest is free");
+        drop(body);
         assert_eq!(used(&budget), 0);
     }
 

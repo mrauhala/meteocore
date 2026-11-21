@@ -12,7 +12,11 @@ pub enum DataServerError {
     #[error("Collection not found: {0}")]
     CollectionNotFound(String),
 
-    #[error("Location not found: {0}")]
+    /// A location, or data at it or in a query's window, that the engine
+    /// does not have (404). [`Self::no_data_yet`]'s collection-wide
+    /// message reads without the `Location not found` prefix: no location
+    /// is involved, as in a Maps map or a Tiles tile (#1500).
+    #[error("{}", location_not_found(.0))]
     LocationNotFound(String),
 
     #[error("Invalid datetime format: {0}")]
@@ -66,6 +70,16 @@ pub enum DataServerError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// [`DataServerError::LocationNotFound`]'s message: `Location not found: `
+/// and the detail, or [`DataServerError::NO_DATA_YET`] alone.
+fn location_not_found(detail: &str) -> std::borrow::Cow<'_, str> {
+    if detail == DataServerError::NO_DATA_YET {
+        detail.into()
+    } else {
+        format!("Location not found: {detail}").into()
+    }
 }
 
 impl DataServerError {
@@ -323,7 +337,9 @@ mod tests {
     }
 
     /// A collection without data yet is a not-found, which a `datetime`
-    /// list skips, never an internal error (#1499).
+    /// list skips, never an internal error (#1499). Its message names no
+    /// location, since none is involved (#1500); every other not-found
+    /// location keeps the prefix.
     #[test]
     fn no_data_yet_is_a_location_not_found() {
         let error = DataServerError::no_data_yet();
@@ -332,9 +348,14 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(error.class(), ErrorClass::NotFound);
+        assert_eq!(error.to_string(), "No data available yet");
         assert_eq!(
-            error.to_string(),
-            "Location not found: No data available yet"
+            DataServerError::LocationNotFound("no data then".into()).to_string(),
+            "Location not found: no data then"
+        );
+        assert_eq!(
+            DataServerError::LocationNotFound(String::new()).to_string(),
+            "Location not found: "
         );
     }
 

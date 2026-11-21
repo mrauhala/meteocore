@@ -18,7 +18,7 @@ use ds_core::feature_engine::FeatureEngine;
 
 use crate::crs::{FeatureCrs, ResponseCrs};
 use crate::params::{
-    parse_bbox_values, parse_datetime, parse_sortby, ItemQueryParams, ItemsQueryParams,
+    parse_bbox_values, parse_datetime_param, parse_sortby, ItemQueryParams, ItemsQueryParams,
     DEFAULT_LIMIT, MAX_LIMIT,
 };
 use crate::response::{
@@ -1156,11 +1156,7 @@ fn items_request(
         .transpose()
         .map_err(|e| Rejected::at("bbox", bad_request(e)))?;
 
-    let datetime = params
-        .datetime
-        .as_deref()
-        .map(parse_datetime)
-        .transpose()
+    let datetime = parse_datetime_param(params.datetime.as_deref())
         .map_err(|e| Rejected::at("datetime", bad_request_msg(&e.to_string())))?;
     // A collection whose features carry no time cannot filter by it: a 400,
     // not the full set with 200 (#682).
