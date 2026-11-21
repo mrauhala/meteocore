@@ -68,7 +68,14 @@ It also exports `test_util::SlowReads`, an in-memory store whose every
 GET, a HEAD included, takes a delay a test can change, counting the GETs
 in flight and the most at once: the batched range reads' tests and the
 engines' EDR frame read tests (#1495) pin how many reads a caller overlaps
-with it.
+with it. And `test_util::FailingReads`, an in-memory store whose GETs, once
+a test sets a status, fail as object_store fails a GET whose every attempt
+met that status: 503 is `Unavailable`, 500 a `Storage` error (#1523).
+
+A read whose last answer, after all retries, was 429, 502, 503 or 504 is
+`DataServerError::Unavailable` (#1355). `is_unavailable_status` is that
+rule, for an engine that reads a host by its own HTTP client: GeoTIFF's
+STAC assets (#1523).
 
 # Catalog discovery
 

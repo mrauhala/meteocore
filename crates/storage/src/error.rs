@@ -81,13 +81,21 @@ fn http_status(err: &(dyn std::error::Error + 'static)) -> Option<u16> {
     None
 }
 
-/// Whether a failed request's last answer says the store is unavailable
-/// for now rather than refusing it for good (#1355): 429 Too Many Requests
-/// (a throttle), 502 Bad Gateway, 503 Service Unavailable (an S3 bucket's
-/// `SlowDown`) or 504 Gateway Timeout. object_store retries each of them
-/// with back-off, so one that reaches an error outlasted every retry.
+/// Whether an HTTP status says the store is unavailable for now rather
+/// than refusing the request for good (#1355): 429 Too Many Requests (a
+/// throttle), 502 Bad Gateway, 503 Service Unavailable (an S3 bucket's
+/// `SlowDown`) or 504 Gateway Timeout. The one rule for every read: an
+/// engine that reads a host outside a [`crate::DataStore`] (GeoTIFF's STAC
+/// assets, through reqwest) types its answers by it too (#1523).
+pub fn is_unavailable_status(status: u16) -> bool {
+    matches!(status, 429 | 502 | 503 | 504)
+}
+
+/// Whether a failed request's last answer was an
+/// [`is_unavailable_status`]. object_store retries each of them with
+/// back-off, so one that reaches an error outlasted every retry.
 fn unavailable(err: &object_store::Error) -> bool {
-    matches!(http_status(err), Some(429 | 502 | 503 | 504))
+    http_status(err).is_some_and(is_unavailable_status)
 }
 
 impl From<object_store::Error> for StorageError {
@@ -173,6 +181,57 @@ mod tests {
         }
         let (_server, store) = bucket(Some("500 Internal Server Error"));
         assert!(matches!(store.get(&path), Err(DataServerError::Storage(_))));
+    }
+
+    /// `test_util::FailingReads` fails a read as a bucket that keeps
+    /// answering the same status does (#1523): the error is typed alike,
+    /// `Unavailable` exactly where [`is_unavailable_status`] says so, with
+    /// the status in its detail. HEADs still answer, and a store whose
+    /// status is cleared serves its reads again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failing_reads_fail_as_a_bucket_answering_that_status() {
+        let path = Path::from("object");
+        let failing = crate::test_util::FailingReads::default();
+        failing.put("object", &b"0123456789"[..]);
+        let failing = std::sync::Arc::new(failing);
+        let store = crate::DataStore::new(failing.clone());
+        for (code, status) in [
+            (429, "429 Too Many Requests"),
+            (502, "502 Bad Gateway"),
+            (503, "503 Slow Down"),
+            (504, "504 Gateway Timeout"),
+            (500, "500 Internal Server Error"),
+        ] {
+            let (_server, bucket) = bucket(Some(status));
+            let real = bucket.get_range(&path, 2..5).unwrap_err();
+            failing.fail_with(Some(code));
+            let reads = failing.reads();
+            let errors = [
+                store.get(&path).map(drop).unwrap_err(),
+                store.get_range(&path, 2..5).map(drop).unwrap_err(),
+                store
+                    .get_range_or_refusal(&path, 2..5)
+                    .map(drop)
+                    .unwrap_err(),
+            ];
+            assert_eq!(failing.reads() - reads, 3, "{status}");
+            for error in errors {
+                assert_eq!(
+                    std::mem::discriminant(&error),
+                    std::mem::discriminant(&real),
+                    "{status}: {error:?} against {real:?}"
+                );
+                assert_eq!(
+                    matches!(error, DataServerError::Unavailable(_)),
+                    is_unavailable_status(code),
+                    "{status}"
+                );
+                assert!(error.to_string().contains(&status[..3]), "{error}");
+            }
+            assert!(store.head(&path).is_ok(), "{status}: HEADs answer");
+        }
+        failing.fail_with(None);
+        assert_eq!(store.get_range(&path, 2..5).unwrap(), &b"234"[..]);
     }
 
     /// A bucket that throttles twice and then answers serves the read:

@@ -430,8 +430,10 @@ impl RemoteTile {
 #[derive(Debug)]
 enum TileReadError {
     /// The encoded bytes did not arrive: a storage or transport error, or a
-    /// short body. Retried; one that still fails fails the read with
-    /// `ResourceExhausted`, so no cache keeps a gap in its place.
+    /// short body. Retried; one that still fails fails the read, so no
+    /// cache keeps a gap in its place: with `Unavailable` when the store's
+    /// last answer was a 429, 502, 503 or 504 (#1523), else with
+    /// `ResourceExhausted`.
     Fetch(DataServerError),
     /// The bytes arrived but do not decode. A retry would decode the same
     /// bytes, which the compressed cache already holds, so the tile is a
@@ -491,11 +493,12 @@ fn fetch_tile_range(
 }
 
 /// Context for a failed object-store range read. The deadline and admission
-/// pass through unchanged, so a retry loop still stops on them.
+/// pass through unchanged, so a retry loop still stops on them, and an
+/// unavailable store stays `Unavailable` (#1355, #1523).
 fn range_read_error(e: DataServerError) -> DataServerError {
     match e {
         DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded => e,
-        e => DataServerError::Storage(format!("Failed to read tile range: {e}")),
+        e => e.with_storage_context("Failed to read tile range"),
     }
 }
 
@@ -921,7 +924,8 @@ impl TiffMetadata {
     ///
     /// As on the object-store scan (#1003), a read that fails is not a
     /// header that does not parse (#1025). `Err` is a failed read: no
-    /// answer, a status that is neither a refusal nor a success, a body cut
+    /// answer, a status that is neither a refusal nor a success (a 429,
+    /// 502, 503 or 504 `Unavailable`, [`http_status_error`]), a body cut
     /// short. The caller fails this load, since a full download would go to
     /// the same storage. Only [`HttpHeaderRead::NotCog`] and
     /// [`HttpHeaderRead::RangeIgnored`] take the full-download fallback. A
@@ -948,11 +952,7 @@ impl TiffMetadata {
             reqwest::StatusCode::PARTIAL_CONTENT => {}
             // The whole object instead of the range.
             reqwest::StatusCode::OK => return Ok(HttpHeaderRead::RangeIgnored),
-            status => {
-                return Err(DataServerError::Engine(format!(
-                    "HTTP header read returned {status}"
-                )))
-            }
+            status => return Err(http_status_error("HTTP header read", status)),
         }
         let header_bytes = read_range_body(resp, range.len()).await?;
         if header_bytes.len() != range.len() {
@@ -1644,7 +1644,8 @@ fn read_http_range(
 /// store's [`ds_storage::DataStore::get_range_or_refusal`] is (#1074): a 404,
 /// a 401/403 and a 416 are refusals, and so is a 206 whose `Content-Range`
 /// names a total size that ends before the range. Any other failure is an
-/// `Err`.
+/// `Err`: a host that answered 429, 502, 503 or 504 an `Unavailable` one, as
+/// a store that kept answering so is ([`http_status_error`], #1523).
 fn read_http_range_answer(
     http: &reqwest::Client,
     url: &str,
@@ -1666,10 +1667,7 @@ fn read_http_range_answer(
             return Ok(RangeAnswer::Refused(refusal));
         }
         if !resp.status().is_success() {
-            return Err(DataServerError::Engine(format!(
-                "HTTP range read returned {}",
-                resp.status()
-            )));
+            return Err(http_status_error("HTTP range read", resp.status()));
         }
         let limit = range.end.saturating_sub(range.start);
         Ok(RangeAnswer::Read(read_range_body(resp, limit).await?))
@@ -1710,6 +1708,20 @@ fn http_range_refusal(
             Some(RangeRefusal::Truncated)
         }
         _ => None,
+    }
+}
+
+/// A direct HTTP read that `status` failed, typed as the object store types
+/// its own (#1523): `Unavailable` when the host answered 429, 502, 503 or
+/// 504 ([`ds_storage::is_unavailable_status`]), which every API answers 503
+/// `SourceUnavailable` with `Retry-After: 10`; any other status an `Engine`
+/// error. One home for STAC tile and header reads, HEADs and downloads.
+pub(crate) fn http_status_error(read: &str, status: reqwest::StatusCode) -> DataServerError {
+    let detail = format!("{read} returned {status}");
+    if ds_storage::is_unavailable_status(status.as_u16()) {
+        DataServerError::Unavailable(detail)
+    } else {
+        DataServerError::Engine(detail)
     }
 }
 
@@ -1808,8 +1820,10 @@ fn read_http_chunk(
 /// For remote sources, `cache` enables compressed tile caching and `file_path`
 /// identifies the file in the cache. A remote tile read follows the map
 /// path's policy ([`read_remote_chunk_with_retry`], #1051): a fetch that still
-/// fails after its retries is `ResourceExhausted`, never a `None` value; so is
-/// a forbidden range, and a gone object's range is `None` (#1074).
+/// fails after its retries is an error, never a `None` value: `Unavailable`
+/// from a store that kept answering 429, 502, 503 or 504 (#1523), else
+/// `ResourceExhausted`, as a forbidden range is; a gone object's range is
+/// `None` (#1074).
 /// `band_index` selects which band (0-based) for multi-band files.
 pub fn read_pixel(
     source: &DataSource,
@@ -2536,12 +2550,15 @@ pub(crate) const TILE_FETCH_RETRIES: u64 = 2;
 /// times within the request deadline. The failure's class decides the rest
 /// (#1051):
 ///
-/// - A fetch that still fails after the last retry fails the read with
-///   `ResourceExhausted` (HTTP 503) and logs the detail. It is never a nodata
-///   tile: the rendered and meta-tile caches keep every `Ok` tile with no
-///   TTL, and an explicit-time response is browser-cached for a day, so a gap
-///   from a short storage outage would outlive the outage. The client's
-///   retry renders the tile.
+/// - A fetch that still fails after the last retry fails the read. A store
+///   whose last answer was a 429, 502, 503 or 504 stays `Unavailable`
+///   (#1523), which every API answers 503 `SourceUnavailable` with
+///   `Retry-After: 10` and logs at WARN with the detail. Any other failure
+///   is `ResourceExhausted` (HTTP 503 `ServerBusy`), its detail logged here.
+///   It is never a nodata tile: the rendered and meta-tile caches keep
+///   every `Ok` tile with no TTL, and an explicit-time response is
+///   browser-cached for a day, so a gap from a short storage outage would
+///   outlive the outage. The client's retry renders the tile.
 /// - Bytes that arrived but do not decode are a logged nodata gap at once,
 ///   since a retry would decode the same bytes.
 /// - A range the store refused for good is not retried (#1074), and the
@@ -2604,6 +2621,15 @@ where
                 // Past the deadline the request ran out of time; the store
                 // did not necessarily fail.
                 ds_core::deadline::check()?;
+                // The store kept refusing: its own 503, which the API logs.
+                if matches!(e, DataServerError::Unavailable(_)) {
+                    tracing::debug!(
+                        "Tile ({tile_row}, {tile_col}), chunk {chunk_index}: the store stayed \
+                         unavailable through {} attempts: {e}. Failing the read.",
+                        attempt + 1
+                    );
+                    return Err(e);
+                }
                 tracing::error!(
                     "Tile ({tile_row}, {tile_col}), chunk {chunk_index} fetch failed after {} \
                      attempts: {e}. Failing the read.",

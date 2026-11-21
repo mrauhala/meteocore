@@ -1207,6 +1207,45 @@ impl GeoTiffEngine {
         Ok(engine)
     }
 
+    /// An engine reading the COGs `store` holds under `prefix` by range, as
+    /// a configured `s3://` or `http(s)://` source reads them, for a test
+    /// that brings its own store (#1523): this crate's, and through the
+    /// `test-util` feature another crate's. [`new`](Self::new) builds a
+    /// remote engine only for a store it can reach by URL, so this one
+    /// starts on an empty local directory of its own, then reads `store`
+    /// with the tile cache a remote source gets and polls it once: the
+    /// header reads catalogue the files `config` names.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn remote_for_test(
+        collection_id: &str,
+        config: &GeoTiffConfig,
+        store: ds_storage::DataStore,
+        prefix: &str,
+    ) -> Result<Self, DataServerError> {
+        static DIRS: AtomicU64 = AtomicU64::new(0);
+        let local = std::env::temp_dir().join(format!(
+            "meteocore_geotiff_remote_{}_{}",
+            std::process::id(),
+            DIRS.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&local)?;
+        let engine = Self::new(collection_id, local.to_str(), config);
+        let _ = std::fs::remove_dir_all(&local);
+        let mut engine = engine?;
+        engine.store_mode = StoreMode::Remote {
+            store: store.for_collection(collection_id),
+            prefix: ds_storage::object_store::path::Path::from(prefix),
+        };
+        engine.tile_cache = Arc::new(cache::TileCache::new(
+            config
+                .effective_tile_cache_mb()
+                .saturating_mul(ds_cache::MIB),
+        ));
+        engine.data_path_display = format!("test store/{prefix}");
+        engine.poll_once();
+        Ok(engine)
+    }
+
     /// The filename matcher of a directory or prefix source. Only a STAC
     /// source has none, and it never scans by filename.
     fn filename_matcher(&self) -> Result<&FilenameMatcher, DataServerError> {
@@ -1369,12 +1408,12 @@ impl GeoTiffEngine {
     /// no `file:size`). Only a header that does not parse, an origin that
     /// ignores `Range` and an unknown size fall back to a full download. A
     /// header read that fails or is forbidden (401/403), and a HEAD without
-    /// answer or with a server error, fail this load instead (#1025): a full
-    /// download would go to the same storage. They fail it with
-    /// `ResourceExhausted`, the 503 a tile read gives for the same failures
-    /// (#1051, #1074), with the detail in the log only. A 404, 416 or an
-    /// object shorter than the range is [`AssetRead::Gone`] (#1119), for the
-    /// caller to drop the item.
+    /// answer or with a server error or a 429, fail this load instead
+    /// (#1025): a full download would go to the same storage. They fail it
+    /// with the 503 a tile read gives for the same failures
+    /// ([`failed_asset_read`]), with the detail in the log only. A 404, 416
+    /// or an object shorter than the range is [`AssetRead::Gone`] (#1119),
+    /// for the caller to drop the item.
     async fn fetch_stac_entry_metadata(
         &self,
         stac_client: &stac::StacClient,
@@ -1387,7 +1426,7 @@ impl GeoTiffEngine {
             let head = stac_client
                 .head_asset_async(asset_url)
                 .await
-                .map_err(|_| DataServerError::ResourceExhausted)?;
+                .map_err(failed_asset_read)?;
             match head {
                 stac::AssetHead::Size(size) => size,
                 stac::AssetHead::NotFound => {
@@ -1448,7 +1487,7 @@ impl GeoTiffEngine {
                         self.collection_id,
                         asset_url
                     );
-                    return Err(DataServerError::ResourceExhausted);
+                    return Err(failed_asset_read(e));
                 }
             }
         }
@@ -2368,10 +2407,10 @@ impl GeoTiffEngine {
                     band_index,
                 ) {
                     Ok(v) => Ok(v),
-                    Err(
-                        e
-                        @ (DataServerError::ResourceExhausted | DataServerError::DeadlineExceeded),
-                    ) => Err(e),
+                    // Admission, the deadline, and a store that kept
+                    // refusing the read (`Unavailable`, #1523) fail the
+                    // query: a 503 or 504, never a null with 200.
+                    Err(e) if e.class().is_transient() => Err(e),
                     Err(e) => {
                         tracing::warn!("Failed to read pixel from {}: {e}", frame.path.display());
                         Ok(None)
@@ -2639,15 +2678,28 @@ fn mask_area(
     }
 }
 
+/// What a STAC metadata load answers for a HEAD or header read that failed
+/// (#1025), as a tile read answers its own (#1051): a host that answered
+/// 429, 502, 503 or 504 stays `Unavailable` (#1523), the 503
+/// `SourceUnavailable` with `Retry-After: 10`; any other failure is
+/// `ResourceExhausted`, the 503 `ServerBusy`.
+fn failed_asset_read(e: DataServerError) -> DataServerError {
+    match e {
+        DataServerError::Unavailable(_) => e,
+        _ => DataServerError::ResourceExhausted,
+    }
+}
+
 /// Whether an EDR area read error means the file itself could not be read
 /// (a local open, decode or I/O failure, an invalid remote tile layout),
 /// which the query answers as a timestep of nulls. Every other error belongs
 /// to the request and fails it (#858): admission and deadline (503/504),
 /// and client errors such as `QueryTooLarge` / `InvalidParameter` (400) —
 /// never nulls with HTTP 200. A remote tile fetch that still fails after its
-/// retries arrives here as `ResourceExhausted`, so it is a 503 as on the map
-/// path, not nulls; remote bytes that do not decode are already nulls in the
-/// grid (#1051).
+/// retries arrives here as `Unavailable` (a store that kept answering 429,
+/// 502, 503 or 504, #1523) or `ResourceExhausted`, so it is a 503 as on the
+/// map path, not nulls; remote bytes that do not decode are already nulls in
+/// the grid (#1051).
 fn is_unreadable_file(e: &DataServerError) -> bool {
     matches!(
         e,

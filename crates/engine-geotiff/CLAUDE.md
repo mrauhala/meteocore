@@ -76,12 +76,14 @@ apply here.
   longer. `from_header_read` is the one-object form, for tests. The STAC
   loader's direct-HTTP header read (`from_http_header_read`, #1025) makes
   the same split as `HttpHeaderRead`: `NotCog` and `RangeIgnored` (a 200)
-  download whole; `Err` (no answer, a 5xx, a body cut short) or a 401/403
-  fails that load with the tile reads' 503, and the next request loads
-  again. So does a HEAD (`StacClient::head_asset_async`) without answer or
-  with a 5xx other than 501; its other non-404 statuses, such as a
-  GET-only signed URL's 403, still mean an unknown size and a full
-  download.
+  download whole; `Err` (no answer, a 5xx or 429, a body cut short) or a
+  401/403 fails that load with the tile reads' 503 (`failed_asset_read`:
+  `Unavailable` for a 429, 502, 503 or 504, else `ResourceExhausted`), and
+  the next request loads again. So does a HEAD
+  (`StacClient::head_asset_async`) without answer or with a 429 or a 5xx
+  other than 501; its other non-404 statuses, such as a GET-only signed
+  URL's 403, still mean an unknown size and a full download, whose 429,
+  502, 503 or 504 is `Unavailable` too.
 - **Remote metadata pass (#1042):** `catalog::load_remote` reads new files'
   headers newest first through `DataStore::get_range_many`,
   `SCAN_READ_CONCURRENCY` (4) in flight, in batches of `SCAN_READ_BATCH`
@@ -375,12 +377,25 @@ tile read: map renders (WMS, Maps, Tiles), EDR area and radius
 failure a class, `TileReadError`, and the class decides, never the message:
 
 - **`Fetch`**: a storage or transport error, or a short body. Retried twice
-  (50 ms, then 100 ms, within the request deadline). Still failing, the read
-  fails with `ResourceExhausted` and the detail is logged: HTTP 503 with
-  `Retry-After` in WMS/Maps/Tiles, 503 in EDR. Never an `Ok` tile with
-  nodata in its place: the rendered and meta-tile caches keep every `Ok`
-  tile with no TTL, and an explicit-time response is browser-cached for a
-  day, so a gap from a short storage outage outlived it.
+  (50 ms, then 100 ms, within the request deadline). Still failing, the
+  read fails (#1523). A store whose last answer was a 429, 502, 503 or 504
+  stays `Unavailable` (#1355): `range_read_error` adds context through
+  `with_storage_context`, and a STAC asset's status is typed by
+  `reader::http_status_error` over `ds_storage::is_unavailable_status`.
+  Every API answers it 503 `SourceUnavailable` with `Retry-After: 10` and
+  logs the detail at WARN. Any other failure is `ResourceExhausted`, its
+  detail logged at ERROR here: 503 `ServerBusy` with `Retry-After: 1`.
+  Never an `Ok` tile with nodata in its place: the rendered and meta-tile
+  caches keep every `Ok` tile with no TTL, and an explicit-time response
+  is browser-cached for a day, so a gap from a short storage outage
+  outlived it. EDR position passes every transient class through
+  (`ErrorClass::is_transient`), never a null. Pinned on an object store by
+  `a_store_that_stays_unavailable_fails_the_reads_as_unavailable` over
+  `ds_storage::test_util::FailingReads`, on STAC assets by
+  `tile_ranges_the_asset_host_keeps_refusing_are_unavailable`, and through
+  EDR, WMS and Maps by `server/tests/geotiff_unavailable_store.rs`, which
+  builds its engine with `GeoTiffEngine::remote_for_test` (feature
+  `test-util`).
 - **`Refused`**: the store refused the range for good, typed by
   `DataStore::get_range_or_refusal` (object store) or
   `read_http_range_answer` (STAC assets) as a `ds_storage::RangeRefusal`:
@@ -566,8 +581,9 @@ Per timestep, only a file that cannot be read (`Engine`, `Storage`, `Io`:
 remote file with an invalid tile layout, becomes logged nulls; any other read
 error fails the query — client errors stay 400, admission/deadline 503/504. A
 remote tile fetch is no unreadable file: one that still fails after its
-retries is `ResourceExhausted`, so the whole area query is a 503 and never a
-timestep of nulls with HTTP 200 (#1051). Remote bytes that do not decode are
+retries is `Unavailable` (429, 502, 503, 504) or `ResourceExhausted`, so the
+whole area query is a 503 and never a timestep of nulls with HTTP 200 (#1051,
+#1523). Remote bytes that do not decode are
 nulls in that tile's cells. Position follows the same policy: a failed remote
 fetch is a 503, an undecodable tile or an invalid tile layout a null. On a
 STAC source a query first loads the metadata of the cold items in its window,
