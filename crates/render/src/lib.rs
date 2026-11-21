@@ -998,9 +998,11 @@ pub fn legend_json(
         return legend;
     }
     // domain_stops: a .pal display-threshold guard (one ULP below the
-    // real minimum) is excluded so stops[0].value equals the reported
-    // "min" — below-min values are simply absent from a legend client's
-    // colormap, which reproduces the threshold behavior.
+    // real minimum, or above the maximum in a palette reversed by a
+    // high-to-low range, #872) is excluded so the end stop's value equals
+    // the reported "min" — below-min values are simply absent from a
+    // legend client's colormap, which reproduces the threshold behavior.
+    // The style's palette carries that reversal and its `min` <= `max`.
     let stops: Vec<serde_json::Value> = style
         .palette
         .domain_stops()
@@ -1563,6 +1565,99 @@ mod tests {
         assert_eq!(stops[0]["color"], "#010203");
     }
 
+    /// The style a resolved colormap gives, as the server builds it.
+    fn resolved_style(r: crate::ResolvedColormap) -> StyleInfo {
+        StyleInfo {
+            name: "default".into(),
+            title: "Default".into(),
+            colormap: r.colormap,
+            palette: r.palette,
+            min: r.min,
+            max: r.max,
+            parameter: None,
+            contour: None,
+        }
+    }
+
+    /// A range given high to low (#872): the JSON legend reports the range
+    /// low to high with the palette's stops reversed, a `.pal` guard left
+    /// out at the end it moved to, and the legend image is the upright
+    /// one's colour bar upside down.
+    #[test]
+    fn legends_of_an_inverted_range_show_the_palette_reversed() {
+        let mut reg = crate::PaletteRegistry::with_builtins();
+        reg.insert(crate::parse_pal("x", "Color: 10 1 2 3\nColor: 50 4 5 6\n").unwrap())
+            .unwrap();
+        let ctx = crate::StyleContext::new(reg);
+        let style = |name, min, max| {
+            resolved_style(
+                ctx.build_colormap(&crate::StyleSpec {
+                    colormap: Some(name),
+                    min: Some(min),
+                    max: Some(max),
+                    ..crate::StyleSpec::default()
+                })
+                .unwrap(),
+            )
+        };
+        let viridis = builtin_palette("viridis").unwrap();
+        let hex = |c| serde_json::json!(Palette::color_hex(c));
+        let json = legend_json(&style("viridis", 100.0, 0.0), None, None);
+        assert_eq!(
+            (json["min"].as_f64(), json["max"].as_f64()),
+            (Some(0.0), Some(100.0))
+        );
+        let stops = json["stops"].as_array().unwrap();
+        assert_eq!(stops.len(), viridis.stops.len());
+        assert_eq!(stops[0]["value"], 0.0);
+        assert_eq!(stops[0]["color"], hex(viridis.stops.last().unwrap().color));
+        assert_eq!(stops[stops.len() - 1]["value"], 100.0);
+        assert_eq!(stops[stops.len() - 1]["color"], hex(viridis.stops[0].color));
+
+        let json = legend_json(&style("x", 50.0, 10.0), None, None);
+        assert_eq!(
+            (json["min"].as_f64(), json["max"].as_f64()),
+            (Some(10.0), Some(50.0))
+        );
+        assert_eq!(
+            json["stops"],
+            serde_json::json!([
+                {"value": 10.0, "color": "#040506"},
+                {"value": 50.0, "color": "#010203"},
+            ])
+        );
+
+        // The image: each swatch row is the upright legend's mirrored row.
+        // Over 0..10 the float LUT draws both, so only its steps differ.
+        let (w, h) = (LEGEND_DEFAULT_WIDTH, LEGEND_DEFAULT_HEIGHT);
+        let canvas =
+            |s: &StyleInfo| legend_canvas(s.colormap.as_ref(), s.min, s.max, w, h, None, 0);
+        let (upright, inverted) = (style("viridis", 0.0, 10.0), style("viridis", 10.0, 0.0));
+        let (up, down) = (canvas(&upright), canvas(&inverted));
+        let px = |rgba: &[u8], y: u32| {
+            let i = ((y * w + 10) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        // No title: the swatch spans rows 4..h-4, its border on the outer
+        // two.
+        let (top, bottom) = (5, h - 6);
+        assert_ne!(px(&down, top), px(&down, bottom));
+        for y in top..=bottom {
+            let (got, want) = (px(&down, y), px(&up, top + bottom - y));
+            assert!(
+                got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 2),
+                "row {y}: {got:?} vs {want:?}"
+            );
+        }
+        // Viridis's top colour now heads the bar at the bottom of the range.
+        let last = viridis.stops.last().unwrap().color;
+        assert!(px(&down, bottom)
+            .iter()
+            .zip(last)
+            .all(|(g, w)| g.abs_diff(w) <= 2));
+        assert!(render_style_legend(&inverted, None, w, h, ImageFormat::Png, None).is_ok());
+    }
+
     #[test]
     fn legend_json_carries_every_palette_stop_and_range() {
         let style = style_over("radar_dbz", "default", "Default", -32.0, 94.5);
@@ -2027,13 +2122,29 @@ mod tests {
             values: boxed.into(),
         };
         // A colormap whose stops sit at fractional dBZ values, so rounding
-        // behaviour is exercised, over the packed byte range.
-        let cmap = LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.5);
-        assert_eq!(
-            colorize(&u8_tile, &cmap),
-            colorize(&f64_tile, &cmap),
-            "U8 LUT colorize must be byte-identical to the boxed F64 path"
-        );
+        // behaviour is exercised, over the packed byte range; also given
+        // high to low, which draws it reversed (#872), and as the
+        // integer-LUT-wrapped colormap a reversed style resolves to.
+        let reversed_style = crate::StyleContext::with_builtins()
+            .build_colormap(&crate::StyleSpec {
+                colormap: Some("wind_speed"),
+                min: Some(60.0),
+                max: Some(-20.0),
+                ..crate::StyleSpec::default()
+            })
+            .unwrap();
+        let cmaps: [&dyn ColorMap; 3] = [
+            &LutColorMap::from_builtin(BuiltinColormap::RadarDbz, -32.0, 95.5),
+            &LutColorMap::from_builtin(BuiltinColormap::RadarDbz, 95.5, -32.0),
+            reversed_style.colormap.as_ref(),
+        ];
+        for cmap in cmaps {
+            assert_eq!(
+                colorize(&u8_tile, cmap),
+                colorize(&f64_tile, cmap),
+                "U8 LUT colorize must be byte-identical to the boxed F64 path"
+            );
+        }
     }
 
     /// The #475 counterpart for `F32`: colorizing the compact float form
@@ -2065,12 +2176,14 @@ mod tests {
             data.extend([edge.next_down(), edge, edge.next_up()]);
         }
         let lut = LutColorMap::from_builtin(BuiltinColormap::Temperature, min, max);
-        let linear = LinearColorMap::new(
-            builtin_palette("temperature")
-                .expect("builtin palette")
-                .stops
-                .clone(),
-        );
+        let stops = builtin_palette("temperature")
+            .expect("builtin palette")
+            .stops
+            .clone();
+        let linear = LinearColorMap::new(stops.clone());
+        // The same over the range given high to low (#872).
+        let reversed_lut = LutColorMap::from_builtin(BuiltinColormap::Temperature, max, min);
+        let reversed_linear = LinearColorMap::reversed_over(stops, min, max);
         // Tells a boxed `None` from a non-finite `Some`, which the builtin
         // colormaps render alike: pins that NaN/±∞ decode to `None`.
         struct NonFiniteProbe;
@@ -2104,7 +2217,13 @@ mod tests {
                 height: 1,
                 values: boxed.into(),
             };
-            for cmap in [&lut as &dyn ColorMap, &linear, &NonFiniteProbe] {
+            for cmap in [
+                &lut as &dyn ColorMap,
+                &linear,
+                &reversed_lut,
+                &reversed_linear,
+                &NonFiniteProbe,
+            ] {
                 assert_eq!(
                     colorize(&f32_tile, cmap),
                     colorize(&f64_tile, cmap),

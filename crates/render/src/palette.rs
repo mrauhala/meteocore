@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
-use crate::colormap::{sample_stops, ColorStop};
+use crate::colormap::{mirror, sample_stops, ColorStop};
 
 /// How colors are produced between stops.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -89,13 +89,20 @@ impl Palette {
 
     /// A [`normalized`](Self::normalized) palette's stops stretched from
     /// their 0..1 domain onto the physical range `[min, max]` (#823), so it
-    /// is sampled and legended in data units. A data-valued palette comes
+    /// is sampled and legended in data units; reversed over it when
+    /// `min > max` ([`Self::reversed_over`]). A data-valued palette comes
     /// back unchanged.
     pub fn stretched(&self, min: f64, max: f64) -> Palette {
         if !self.normalized {
             return self.clone();
         }
-        self.remapped(0.0, 1.0, min, max)
+        let (lo, hi) = ascending(min, max);
+        let stretched = self.remapped(0.0, 1.0, lo, hi);
+        if max < min {
+            stretched.reversed_over(lo, hi)
+        } else {
+            stretched
+        }
     }
 
     /// The palette to sample over a style range `[min, max]`, when that is
@@ -107,42 +114,126 @@ impl Palette {
     ///   lying entirely outside its stops is rescaled onto them, because
     ///   clipping could then paint only one colour. That is a unit mismatch,
     ///   such as the °C `temperature` palette given a kelvin range.
+    /// - A range given high to low (`min > max`) is fitted as the same range
+    ///   low to high, by the rules above, then [reversed](Self::reversed_over)
+    ///   over it (#872). That is the palette a [`LutColorMap`] over
+    ///   `min..max` draws and the legend shows.
+    ///
+    /// [`LutColorMap`]: crate::colormap::LutColorMap
     pub fn fitted_to(&self, min: f64, max: f64) -> Option<Palette> {
+        let (lo, hi) = ascending(min, max);
+        let fitted = self.fitted_ascending(lo, hi);
+        if max < min {
+            return Some(fitted.as_ref().unwrap_or(self).reversed_over(lo, hi));
+        }
+        fitted
+    }
+
+    /// [`Self::fitted_to`] for a range given low to high.
+    fn fitted_ascending(&self, min: f64, max: f64) -> Option<Palette> {
         if self.normalized {
-            return Some(self.stretched(min, max));
+            return Some(self.remapped(0.0, 1.0, min, max));
         }
         let domain = self.domain_stops();
         let (lo, hi) = (domain.first()?.value, domain.last()?.value);
-        let outside = min.max(max) < lo || min.min(max) > hi;
+        let outside = max < lo || min > hi;
         (outside && hi > lo && min.is_finite() && max.is_finite())
             .then(|| self.remapped(lo, hi, min, max))
     }
 
     /// Every stop mapped linearly from `[from_lo, from_hi]` onto
-    /// `[min, max]`, as a data-valued palette.
+    /// `[min, max]` (`min <= max`), as a data-valued palette.
     fn remapped(&self, from_lo: f64, from_hi: f64, min: f64, max: f64) -> Palette {
         let scale = (max - min) / (from_hi - from_lo);
         let mut stops: Vec<ColorStop> = self
             .stops
             .iter()
             .map(|s| ColorStop {
-                value: min + (s.value - from_lo) * scale,
+                // The domain's ends land exactly on the range's.
+                value: if s.value == from_hi {
+                    max
+                } else {
+                    min + (s.value - from_lo) * scale
+                },
                 color: s.color,
             })
             .collect();
-        if max < min {
-            // An inverted range maps the stops descending; the samplers and
-            // the legend assume ascending, so flip them (a hard edge's paired
-            // stops flip with it, which keeps each colour on its side).
-            stops.reverse();
-        } else if self.domain_stops().len() < self.stops.len() {
-            // Keep a display-threshold guard exactly one ULP below its stop,
-            // which is what makes it a guard ([`Self::domain_stops`]).
+        // Keep a display-threshold guard exactly one ULP outside its stop,
+        // which is what makes it a guard ([`Self::domain_stops`]).
+        let n = stops.len();
+        if leading_guard(&self.stops) {
             stops[0].value = stops[1].value.next_down();
+        }
+        if trailing_guard(&self.stops) {
+            stops[n - 1].value = stops[n - 2].value.next_up();
         }
         Palette {
             stops,
             normalized: false,
+            ..self.clone()
+        }
+    }
+
+    /// This palette reversed over `[lo, hi]` (#872): each value takes the
+    /// colour of its mirror image `lo + hi - v`, which is how a style range
+    /// given high to low draws its palette. Stops stay ascending, which the
+    /// samplers and legends assume.
+    ///
+    /// - Linear: every stop moves to its mirror image. A hard edge's paired
+    ///   stops swap, keeping each colour on its side, and a display-threshold
+    ///   guard follows its stop to the other end, one ULP past it, so the
+    ///   values beyond the threshold still vanish ([`Self::domain_stops`]).
+    /// - Step: a class keeps its colour over its mirrored bounds, so each
+    ///   colour moves to the stop that closed its class; the class below the
+    ///   first boundary starts at `lo`. A value exactly on a boundary falls
+    ///   in the class above it here, while a [`LutColorMap`] over the
+    ///   reversed range keeps it in the class of its mirror image.
+    ///
+    /// [`LutColorMap`]: crate::colormap::LutColorMap
+    pub fn reversed_over(&self, lo: f64, hi: f64) -> Palette {
+        let at = |s: &ColorStop| mirror(s.value, lo, hi);
+        let mut stops: Vec<ColorStop> = match self.interpolation {
+            Interpolation::Linear => {
+                let mut stops: Vec<ColorStop> = self
+                    .stops
+                    .iter()
+                    .rev()
+                    .map(|s| ColorStop {
+                        value: at(s),
+                        color: s.color,
+                    })
+                    .collect();
+                let n = stops.len();
+                if leading_guard(&self.stops) {
+                    stops[n - 1].value = stops[n - 2].value.next_up();
+                }
+                if trailing_guard(&self.stops) {
+                    stops[0].value = stops[1].value.next_down();
+                }
+                stops
+            }
+            // Class i, `[s_i, s_{i+1})` in colour c_i, mirrors onto
+            // `(m(s_{i+1}), m(s_i)]`: c_i starts at m(s_{i+1}). The top class,
+            // from s_n up, ends at m(s_n) and starts at `lo`.
+            Interpolation::Step => match self.stops.last() {
+                None => Vec::new(),
+                Some(top) => std::iter::once(ColorStop {
+                    value: lo.min(at(top)),
+                    color: top.color,
+                })
+                .chain(self.stops.windows(2).rev().map(|w| ColorStop {
+                    value: at(&w[1]),
+                    color: w[0].color,
+                }))
+                .collect(),
+            },
+        };
+        // The mirror is monotone, but exact at the ends only: a stable sort
+        // undoes any one-ULP inversion next to them, keeping equal stops in
+        // their order.
+        stops.sort_by(|a, b| a.value.total_cmp(&b.value));
+        Palette {
+            stops,
             ..self.clone()
         }
     }
@@ -165,18 +256,20 @@ impl Palette {
     }
 
     /// The stops that define the palette's domain: all of them, minus a
-    /// leading display-threshold guard (see [`domain_min_stop`]). Legend
-    /// serialization uses this so the emitted stops start at the same
-    /// value the derived `min` reports.
+    /// leading display-threshold guard (see [`domain_min_stop`]) and a
+    /// trailing one, a fully-transparent last stop exactly one ULP above
+    /// the stop before it, where [`Self::reversed_over`] moves a guard.
+    /// Legend serialization uses this so the emitted stops start at the
+    /// same value the derived `min` reports.
     pub fn domain_stops(&self) -> &[ColorStop] {
-        match (self.stops.first(), self.stops.get(1)) {
-            (Some(first), Some(second))
-                if first.color[3] == 0 && first.value == second.value.next_down() =>
-            {
-                &self.stops[1..]
-            }
-            _ => &self.stops,
+        let mut stops = &self.stops[..];
+        if leading_guard(stops) {
+            stops = &stops[1..];
         }
+        if trailing_guard(stops) {
+            stops = &stops[..stops.len() - 1];
+        }
+        stops
     }
 
     /// Hex-encode a stop color for machine-readable legends: `#RRGGBB`,
@@ -191,6 +284,30 @@ impl Palette {
             )
         }
     }
+}
+
+/// `[min, max]` low to high: a range given high to low swapped.
+pub(crate) fn ascending(min: f64, max: f64) -> (f64, f64) {
+    if max < min {
+        (max, min)
+    } else {
+        (min, max)
+    }
+}
+
+/// Whether `stops` open with a display-threshold guard: a fully-transparent
+/// stop exactly one ULP below the next ([`Palette::domain_min_stop`]).
+fn leading_guard(stops: &[ColorStop]) -> bool {
+    matches!(stops, [first, second, ..]
+        if first.color[3] == 0 && first.value == second.value.next_down())
+}
+
+/// Whether `stops` close with a display-threshold guard, as
+/// [`Palette::reversed_over`] leaves a leading one: a fully-transparent
+/// stop exactly one ULP above the one before it.
+fn trailing_guard(stops: &[ColorStop]) -> bool {
+    matches!(stops, [.., before, last]
+        if last.color[3] == 0 && last.value == before.value.next_up())
 }
 
 impl Interpolation {
@@ -831,8 +948,137 @@ mod tests {
         assert_eq!(fitted.domain_stops().len(), 2);
         assert!(p.fitted_to(0.0, 30.0).is_none(), "overlapping");
         assert!(p.fitted_to(60.0, 90.0).is_none(), "touching");
+        // Inverted and disjoint (#872): rescaled by the same rule, then
+        // reversed, the guard following its stop to the top, one ULP above
+        // it, where it hides the values past the threshold.
         let inverted = p.fitted_to(200.0, 100.0).unwrap();
         assert!(inverted.stops.windows(2).all(|w| w[0].value <= w[1].value));
+        let values: Vec<f64> = inverted.stops.iter().map(|s| s.value).collect();
+        assert_eq!(values, [100.0, 200.0, 200f64.next_up()]);
+        let colors: Vec<[u8; 4]> = inverted.stops.iter().map(|s| s.color).collect();
+        assert_eq!(colors, [[4, 5, 6, 255], [1, 2, 3, 255], [0, 0, 0, 0]]);
+        assert_eq!(inverted.domain_stops(), &inverted.stops[..2]);
+        assert_eq!(inverted.domain_min_stop().unwrap().value, 100.0);
+    }
+
+    fn stop(value: f64, color: [u8; 4]) -> ColorStop {
+        ColorStop { value, color }
+    }
+
+    /// The colour every value takes, sampled over and past `[lo, hi]`.
+    fn sweep(p: &Palette, lo: f64, hi: f64) -> Vec<[u8; 4]> {
+        (-8..=88)
+            .map(|i| p.sample(lo + (hi - lo) * i as f64 / 80.0))
+            .collect()
+    }
+
+    /// A linear palette reversed over a range (#872) gives every value the
+    /// colour of its mirror image, a hard edge keeping each colour on its
+    /// side and a guard hiding the values past the threshold at the other
+    /// end. Reversed again, it is the palette it was.
+    #[test]
+    fn reversed_over_mirrors_linear_stops_hard_edges_and_guards() {
+        let p = Palette::new(
+            "edged",
+            vec![
+                stop(10f64.next_down(), [0, 0, 0, 0]),
+                stop(10.0, [10, 0, 0, 255]),
+                stop(20.0, [20, 0, 0, 255]),
+                stop(20.0, [0, 20, 0, 255]),
+                stop(50.0, [0, 50, 0, 255]),
+            ],
+            Interpolation::Linear,
+        );
+        let (lo, hi) = (10.0, 50.0);
+        let r = p.reversed_over(lo, hi);
+        assert!(r.stops.windows(2).all(|w| w[0].value <= w[1].value));
+        for i in 1..80 {
+            let v = lo + (hi - lo) * i as f64 / 80.0;
+            if v != 40.0 {
+                assert!(near(r.sample(v), p.sample(lo + hi - v)), "{v}");
+            }
+        }
+        // The edge at 20 mirrors to 40: green below it, red above.
+        assert_eq!(r.sample(39.9), [0, 20, 0, 255]);
+        assert_eq!(r.sample(40.1), [20, 0, 0, 255]);
+        // The threshold at 10 now ends the range at 50, still drawn.
+        assert_eq!(r.sample(50.0), [10, 0, 0, 255]);
+        assert_eq!(r.sample(50f64.next_up()), [0, 0, 0, 0]);
+        assert_eq!(r.sample(9.0), [0, 50, 0, 255], "clamps below");
+        assert_eq!(r.stops.last().unwrap().value, 50f64.next_up());
+        let domain = r.domain_stops();
+        assert_eq!((domain[0].value, domain[domain.len() - 1].value), (lo, hi));
+        // Reversed twice, the guard is back one ULP below its stop.
+        let back = r.reversed_over(lo, hi);
+        assert_eq!(back.stops, p.stops);
+        assert_eq!(sweep(&back, lo, hi), sweep(&p, lo, hi));
+    }
+
+    /// A step palette reversed over a range keeps each class's colour over
+    /// its mirrored bounds: the class `[1, 2)` of `0..4` covers `(2, 3]`.
+    #[test]
+    fn reversed_over_moves_step_colours_to_their_mirrored_classes() {
+        let classes = Palette::new(
+            "classes",
+            (0..=4)
+                .map(|k| stop(k as f64, [k as u8 * 10, 0, 0, 255]))
+                .collect(),
+            Interpolation::Step,
+        );
+        let r = classes.reversed_over(0.0, 4.0);
+        let values: Vec<f64> = r.stops.iter().map(|s| s.value).collect();
+        assert_eq!(values, [0.0, 0.0, 1.0, 2.0, 3.0]);
+        // Inside each class the mirror image's colour.
+        for v in [-0.5, 0.25, 0.5, 1.5, 2.5, 3.5, 3.75, 5.0] {
+            assert_eq!(r.sample(v), classes.sample(4.0 - v), "{v}");
+        }
+        // The top class, values of 4 and up, is the bottom one, to 0.
+        assert_eq!(r.sample(-1.0), [40, 0, 0, 255]);
+        assert_eq!(r.stops[0].color, [40, 0, 0, 255]);
+        // Over a range past the top stop, that class starts at the range's
+        // low end.
+        let wider = classes.reversed_over(0.0, 6.0);
+        assert_eq!((wider.stops[0].value, wider.stops[1].value), (0.0, 2.0));
+    }
+
+    /// Every fit of a range given high to low is the same range's fit low to
+    /// high, reversed (#872): a normalized palette's stretch, a data-valued
+    /// palette sampled as is over a range overlapping its stops, and the
+    /// rescale #823 gives a range entirely outside them.
+    #[test]
+    fn fitted_to_an_inverted_range_reverses_every_fit() {
+        let temperature = builtin_palette("temperature").unwrap();
+        let viridis = builtin_palette("viridis").unwrap();
+        for (p, lo, hi) in [
+            (viridis, 0.0, 100.0),
+            (temperature, 0.0, 40.0),
+            (temperature, -100.0, 60.0),
+            (temperature, 183.15, 323.15),
+        ] {
+            let upright = p.fitted_to(lo, hi).unwrap_or_else(|| p.clone());
+            let inverted = p.fitted_to(hi, lo).expect("a high-to-low range reverses");
+            assert_eq!(
+                inverted.stops,
+                upright.reversed_over(lo, hi).stops,
+                "{} {lo}..{hi}",
+                p.name
+            );
+            assert!(!inverted.normalized);
+        }
+        // Overlapping: 0 °C takes the colour of 40 °C, 30 °C of 10 °C.
+        let inverted = temperature.fitted_to(40.0, 0.0).unwrap();
+        for v in [0.0, 5.0, 10.5, 30.0, 39.5] {
+            assert!(
+                near(inverted.sample(v), temperature.sample(40.0 - v)),
+                "{v}"
+            );
+        }
+    }
+
+    /// Colours within one unit per channel: a mirrored stop list
+    /// interpolates the same colour in another order of operations.
+    fn near(a: [u8; 4], b: [u8; 4]) -> bool {
+        a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 1)
     }
 
     /// An inverted range flips a normalized palette and keeps its stops

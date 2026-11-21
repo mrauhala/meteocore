@@ -2891,6 +2891,14 @@ palette given a kelvin range. Legends show the rescaled values; the
 palette's title keeps its original unit. The same rule applies to inline
 `color_stops`.
 
+**Reversed palettes** (#872): `min` above `max` draws the palette reversed
+over the range, as a composite channel's `min > max` inverts it. Viridis with
+`min = 100`, `max = 0` puts yellow at 0 and purple at 100, and `temperature`
+with `min = 40`, `max = 0` gives 0 °C the colour of 40 °C. The range is fitted
+by the rule above as if given low to high, then reversed. A `.pal` display
+threshold moves with its colour to the top of the range: values above it
+vanish. Legends list the range low to high with the reversed colours.
+
 **Per-parameter default styles** (#320) — parameters of multi-parameter
 collections (GRIB, QueryData, Zarr, NetCDF, radar volumes) with no explicit style,
 and the one parameter a single-parameter collection with no configured palette

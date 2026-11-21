@@ -82,12 +82,22 @@ impl BuiltinColormap {
 
 /// Lookup-table colormap. O(1) per pixel.
 /// Best for integer-like data (radar U8, classification).
+///
+/// A range given high to low (`min > max`) draws the palette reversed over
+/// it (#872): each value takes the colour the low-to-high range gives its
+/// mirror image `min + max - v`, its LUT entry and the colour past each end
+/// included.
 pub struct LutColorMap {
     lut: Vec<[u8; 4]>,
+    /// The range's low end, whichever bound the caller gave it as.
     min: f64,
+    /// The range's high end.
     max: f64,
+    /// The range was given high to low: `min` takes the colours of `max`.
+    reversed: bool,
     nodata_color: [u8; 4],
-    /// Color for values strictly below `min`. Probed from the stops one
+    /// Color for values past the palette's low end: strictly below `min`,
+    /// or strictly above `max` when `reversed`. Probed from the stops one
     /// ULP under `min`, so it equals the clamp color for ordinary
     /// palettes and transparent for palettes carrying a display-threshold
     /// guard stop (the `.pal` importer) — below-minimum data then
@@ -131,7 +141,8 @@ impl LutColorMap {
     /// Create a LUT colormap from color stops.
     ///
     /// The `min`/`max` define the data value range. The color stops define
-    /// which colors appear at which values within (or beyond) that range.
+    /// which colors appear at which values within (or beyond) that range;
+    /// `min > max` draws them reversed over it (see [`LutColorMap`]).
     /// The LUT has 4096 entries for better precision with wide value ranges.
     pub fn from_stops(stops: &[ColorStop], min: f64, max: f64) -> Self {
         Self::from_stops_interp(stops, min, max, crate::palette::Interpolation::Linear)
@@ -145,6 +156,8 @@ impl LutColorMap {
         max: f64,
         interp: crate::palette::Interpolation,
     ) -> Self {
+        let reversed = max < min;
+        let (min, max) = if reversed { (max, min) } else { (min, max) };
         let lut_size = 4096;
         let mut lut = Vec::with_capacity(lut_size);
 
@@ -158,6 +171,7 @@ impl LutColorMap {
             lut,
             min,
             max,
+            reversed,
             nodata_color: [0, 0, 0, 0],
             underflow_color: sample_stops(stops, min.next_down(), interp),
         }
@@ -180,15 +194,24 @@ impl ColorMap for LutColorMap {
             // three colormap impls on `nodata_color`, which is what a NaN
             // pixel actually means.
             Some(v) if !v.is_finite() => self.nodata_color,
-            // Strictly below the domain: the probed underflow color (clamp
-            // color for ordinary palettes, transparent past a display-
-            // threshold guard).
-            Some(v) if v < self.min => self.underflow_color,
+            // Strictly past the palette's low end (below the domain, above
+            // it when reversed): the probed underflow color (clamp color
+            // for ordinary palettes, transparent past a display-threshold
+            // guard).
+            Some(v) if (!self.reversed && v < self.min) || (self.reversed && v > self.max) => {
+                self.underflow_color
+            }
             Some(v) => {
                 if self.max <= self.min {
                     return self.lut[0];
                 }
-                let t = (v - self.min) / (self.max - self.min);
+                // How far `v` lies from the end the palette starts at.
+                let from_start = if self.reversed {
+                    self.max - v
+                } else {
+                    v - self.min
+                };
+                let t = from_start / (self.max - self.min);
                 let idx = (t * (self.lut.len() - 1) as f64)
                     .round()
                     .clamp(0.0, (self.lut.len() - 1) as f64) as usize;
@@ -384,6 +407,8 @@ impl ColorMap for SymbolColorMap {
 pub struct LinearColorMap {
     stops: Vec<ColorStop>,
     nodata_color: [u8; 4],
+    /// `Some((lo, hi))`: the stops drawn reversed over `[lo, hi]`.
+    mirror: Option<(f64, f64)>,
 }
 
 impl LinearColorMap {
@@ -391,6 +416,17 @@ impl LinearColorMap {
         Self {
             stops,
             nodata_color: [0, 0, 0, 0],
+            mirror: None,
+        }
+    }
+
+    /// `stops` drawn reversed over `[lo, hi]`, a style range given high to
+    /// low (#872): each value takes the colour [`new`](Self::new) gives its
+    /// mirror image `lo + hi - v`, as [`LutColorMap`] reverses its range.
+    pub fn reversed_over(stops: Vec<ColorStop>, lo: f64, hi: f64) -> Self {
+        Self {
+            mirror: Some((lo, hi)),
+            ..Self::new(stops)
         }
     }
 
@@ -414,8 +450,23 @@ impl ColorMap for LinearColorMap {
             // a NaN falls through every comparison in `interpolate_stops` and
             // returns the LAST stop's colour, diverging from the other paths.
             Some(v) if !v.is_finite() => self.nodata_color,
-            Some(v) => interpolate_stops(&self.stops, v),
+            Some(v) => {
+                let v = self.mirror.map_or(v, |(lo, hi)| mirror(v, lo, hi));
+                interpolate_stops(&self.stops, v)
+            }
         }
+    }
+}
+
+/// The mirror image of `v` in `[lo, hi]`, `lo + hi - v`, exact at both
+/// ends: where a range given high to low samples its palette (#872).
+pub(crate) fn mirror(v: f64, lo: f64, hi: f64) -> f64 {
+    if v == lo {
+        hi
+    } else if v == hi {
+        lo
+    } else {
+        lo + (hi - v)
     }
 }
 
@@ -983,6 +1034,92 @@ mod tests {
                 int_lut.color(Some(v as f64)),
                 builtin.color(Some(v as f64)),
                 "mismatch at dBZ {v}"
+            );
+        }
+    }
+
+    /// Values over and past `[lo, hi]` whose mirror image `lo + hi - v` is
+    /// exact for whole-number bounds.
+    fn mirror_sweep(lo: f64, hi: f64) -> impl Iterator<Item = f64> {
+        let (from, to) = ((lo as i64 - 6) * 8, (hi as i64 + 6) * 8);
+        (from..=to).map(|i| i as f64 / 8.0)
+    }
+
+    /// A range given high to low draws the palette reversed (#872): every
+    /// value, past either end included, takes exactly the colour the
+    /// low-to-high LUT gives its mirror image. One colour for the whole
+    /// range was the bug. Covers a smooth ramp, a hard edge, a step palette
+    /// on its class boundaries and a `.pal` display-threshold guard.
+    #[test]
+    fn lut_over_an_inverted_range_mirrors_the_upright_one() {
+        use crate::palette::builtin_palette;
+        let pal = crate::parse_pal("x", "Color: 10 1 2 3\nColor: 50 4 5 6\n").unwrap();
+        let cases = [
+            (builtin_palette("radar_dbz").unwrap().clone(), -32.0, 95.0),
+            (builtin_palette("temperature").unwrap().clone(), -40.0, 40.0),
+            (classes(), 0.0, 4.0),
+            (pal.clone(), 10.0, 50.0),
+            (pal.clone(), 0.0, 60.0),
+        ];
+        for (palette, lo, hi) in cases {
+            let upright = LutColorMap::from_palette(&palette, lo, hi);
+            let reversed = LutColorMap::from_palette(&palette, hi, lo);
+            for v in mirror_sweep(lo, hi) {
+                assert_eq!(
+                    reversed.color(Some(v)),
+                    upright.color(Some(lo + hi - v)),
+                    "{} {hi}..{lo} at {v}",
+                    palette.name
+                );
+            }
+            assert_eq!(reversed.color(None), upright.color(None));
+            assert_eq!(reversed.color(Some(f64::NAN)), [0, 0, 0, 0]);
+        }
+        // Reversed over its own range, the guard hides what lies past the
+        // threshold, now above 50, and 50 itself is drawn.
+        let reversed = LutColorMap::from_palette(&pal, 50.0, 10.0);
+        assert_eq!(reversed.color(Some(50.0)), [1, 2, 3, 255]);
+        assert_eq!(reversed.color(Some(50.3)), [0, 0, 0, 0]);
+        assert_eq!(reversed.color(Some(10.0)), [4, 5, 6, 255]);
+        assert_eq!(reversed.color(Some(5.0)), [4, 5, 6, 255]);
+    }
+
+    /// A step palette of five classes, 0..=4, red 50 per class.
+    fn classes() -> crate::palette::Palette {
+        crate::palette::Palette::new(
+            "classes",
+            (0..=4)
+                .map(|k| ColorStop {
+                    value: k as f64,
+                    color: [k as u8 * 50, 0, 0, 255],
+                })
+                .collect(),
+            crate::palette::Interpolation::Step,
+        )
+    }
+
+    /// The inline-stops colormap reverses as the LUT does, and an integer
+    /// LUT over a reversed colormap reads it like any other.
+    #[test]
+    fn linear_and_integer_luts_reverse_with_the_range() {
+        let stops = builtin_stops(&BuiltinColormap::WindSpeed);
+        let upright = LinearColorMap::new(stops.clone());
+        let reversed = LinearColorMap::reversed_over(stops, 0.0, 50.0);
+        for v in mirror_sweep(0.0, 50.0) {
+            assert_eq!(
+                reversed.color(Some(v)),
+                upright.color(Some(50.0 - v)),
+                "{v}"
+            );
+        }
+        assert_eq!(reversed.color(Some(f64::INFINITY)), [0, 0, 0, 0]);
+        let lut = LutColorMap::from_builtin(BuiltinColormap::WindSpeed, 50.0, 0.0);
+        let int_lut = lut.to_integer_lut(0, 50).unwrap();
+        for v in -3..=53 {
+            assert_eq!(
+                int_lut.color(Some(v as f64)),
+                lut.color(Some(v as f64)),
+                "{v}"
             );
         }
     }
