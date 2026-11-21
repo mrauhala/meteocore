@@ -282,7 +282,9 @@ and never under an instance.
   the JSON emits it as the `meteocore:resolution` domain member
   (`response::RESOLUTION_MEMBER`, `{native, served}` `[dx, dy]` degrees),
   absent at native resolution. A `datetime` list shares the budget among
-  its instants (`AreaShare::answers` in `query_instants`), and the derived
+  its instants (`AreaShare::answers`, entered in each instant's job of
+  `query_instants`: the scope is a thread-local, and an instant runs on
+  another thread than the list), and the derived
   wrapper reserves its added ranges (`AreaShare::extra_parameters`):
   without either, a grid filling the budget alone turns into the list's or
   wrapper's 400. `data_queries.area`/`.radius` describe it when the
@@ -357,6 +359,32 @@ and never under an instance.
   steps it does not hold. A coverage without a `t` axis to merge along is
   dropped only when it is identical to another instant's, range values
   included; one whose values differ stays, in a `CoverageCollection`.
+- A list's instants run side by side (#1522): `query_instants` hands them
+  to `ds_executor::field_jobs::run_field_jobs`, at most
+  `INSTANT_CONCURRENCY` (4) at once, each past the first only in a query
+  slot free at the start (`QueryBudget::spare_slots`, never waiting, so a
+  queued query is never overtaken). A list therefore runs no more engine
+  queries at once than EDR admits, and each engine's per-query bounds
+  (GRIB's field memory, an ODIM composite query's unbudgeted read,
+  NetCDF's plan caps) hold per slot, as for separate requests; never raise
+  the bound without that. The engines' own field jobs nest inside an
+  instant's job: both `block_in_place`, so no worker parks (#1200,
+  `instants_running_field_jobs_complete_on_a_small_runtime`). The query
+  closure is `Fn + Send + Sync + 'static`: it owns what it reads (clone
+  the engine `Arc`, the coordinates), and per-instant state is its own,
+  never shared across instants (position counts each instant's values
+  itself; `run_within` holds their sum to `POSITION_BUDGET`, whose 400 a
+  list has always answered). Answers arrive in any order; one that
+  decides the list (an error other than `LocationNotFound`, or values past
+  the budget) starts no more instants, and the running ones finish. The
+  outcome is then replayed in instant order, by the rules of one instant
+  after another, so the body, ETag and error never depend on timing: the
+  first instant's error, or the budget's 400 at the instant passing it; an
+  instant never started means the deadline passed (504). Pinned by
+  `answers_are_those_of_one_instant_after_another`,
+  `the_first_instant_in_turn_decides_the_error`, and against a remote
+  GeoTIFF store that delays each read by the server's
+  `edr_datetime_list_reads`.
 - A repeating interval `Rn/date-time/duration` (#933) expands inside
   `parse_datetime` to the same `DatetimeSelector::Instants`, so handlers
   never see it. `n` counts instants, like `z`'s `Rn` (the informative

@@ -69,7 +69,8 @@ uuid = { version = "1", features = ["v4"] }
 # `test-util`: filling a meta-tile cache past a reload's new size (#1311).
 ds-render = { path = "../render", features = ["test-util"] }
 # `test-util`: a GeoTIFF collection over a store that stays unavailable,
-# `FailingReads` and `GeoTiffEngine::remote_for_test` (#1523).
+# `FailingReads` and `GeoTiffEngine::remote_for_test` (#1523), or that
+# delays its reads, `SlowReads`, for a `datetime` list's instants (#1522).
 ds-storage = { path = "../storage", features = ["test-util"] }
 engine-geotiff = { path = "../engine-geotiff", features = ["test-util"] }
 http-body-util = "0.1"

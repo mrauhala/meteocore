@@ -42,15 +42,62 @@ pub enum ExecutionError {
 /// Check between engine calls so a timed-out/disconnected MULTIPOINT stops
 /// before launching another query. A running synchronous call cannot be killed.
 pub struct QueryBudget {
-    deadline: Instant,
-    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    expiry: Expiry,
+    /// EDR's running-query slots, of which `_permit` is this query's.
+    slots: Arc<Semaphore>,
     _permit: OwnedSemaphorePermit,
     _admission: OwnedSemaphorePermit,
 }
 
 impl QueryBudget {
     pub fn expired(&self) -> bool {
+        self.expiry.expired()
+    }
+
+    /// The query's [`Expiry`], for work it hands to other threads (a
+    /// `datetime` list's instants, #1522).
+    pub fn expiry(&self) -> Expiry {
+        self.expiry.clone()
+    }
+
+    /// Up to `wanted` more of EDR's running-query slots, for a query that
+    /// answers parts of itself side by side (a `datetime` list's instants,
+    /// #1522): only those free now, never waiting. A slot is free only
+    /// when no query waits for one (a released slot goes to a waiter
+    /// first), so this never overtakes a queued query, and under load the
+    /// query keeps to the one slot it holds. Each part then runs in a slot
+    /// of its own, so the engine queries running at once stay within EDR's
+    /// admission, as separate requests would.
+    pub fn spare_slots(&self, wanted: usize) -> SpareSlots {
+        SpareSlots(
+            std::iter::from_fn(|| self.slots.clone().try_acquire_owned().ok())
+                .take(wanted)
+                .collect(),
+        )
+    }
+}
+
+/// Whether a query is past its deadline or its client has gone: cheap to
+/// clone into the work the query fans out.
+#[derive(Clone)]
+pub struct Expiry {
+    deadline: Instant,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Expiry {
+    pub fn expired(&self) -> bool {
         self.cancelled.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= self.deadline
+    }
+}
+
+/// The slots [`QueryBudget::spare_slots`] took, given back on drop.
+pub struct SpareSlots(Vec<OwnedSemaphorePermit>);
+
+impl SpareSlots {
+    /// How many slots were free.
+    pub fn count(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -93,8 +140,11 @@ where
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _cancel = CancelOnDrop(cancelled.clone());
     let budget = QueryBudget {
-        deadline,
-        cancelled,
+        expiry: Expiry {
+            deadline,
+            cancelled,
+        },
+        slots: executor.slots.clone(),
         _permit: permit,
         _admission: admission,
     };
@@ -125,12 +175,42 @@ mod tests {
         let executor = Executor::new();
         for blocking in [false, true] {
             run_on(&executor, blocking, Duration::from_secs(2), |budget| {
-                assert_eq!(ds_core::deadline::current(), Some(budget.deadline));
+                assert_eq!(ds_core::deadline::current(), Some(budget.expiry.deadline));
                 assert!(ds_core::deadline::check().is_ok());
             })
             .await
             .unwrap();
         }
+    }
+
+    /// A query takes only the slots free now beside its own (#1522), never
+    /// waiting for one, and gives them back when it is done with them.
+    #[tokio::test]
+    async fn spare_slots_are_the_free_ones_and_given_back() {
+        let executor = Executor {
+            slots: Arc::new(Semaphore::new(3)),
+            admitted: Arc::new(Semaphore::new(8)),
+        };
+        let idle = run_on(&executor, false, QUERY_TIMEOUT, |budget| {
+            let spare = budget.spare_slots(5);
+            (spare.count(), budget.spare_slots(5).count())
+        })
+        .await
+        .unwrap();
+        assert_eq!(idle, (2, 0), "two free beside the query's own, then none");
+        assert_eq!(executor.slots.available_permits(), 3, "all given back");
+
+        let _busy = executor.slots.clone().acquire_many_owned(2).await.unwrap();
+        let busy = run_on(&executor, false, QUERY_TIMEOUT, |budget| {
+            budget.spare_slots(5).count()
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            busy, 0,
+            "every other slot taken: the query keeps to its own"
+        );
+        assert_eq!(executor.slots.available_permits(), 1);
     }
 
     #[tokio::test]

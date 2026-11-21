@@ -612,6 +612,11 @@ the catalog's order.
   fetched on the process-wide `TILE_FETCH_POOL`, which cold map renders
   share, and eight area frames at once would starve them, the #240/#243
   convoy.
+- **A `datetime` list** (#1522): api-edr queries its instants side by
+  side, up to 4, each an engine query of one frame in an EDR query slot of
+  its own. So a list reads as many frames at once as that many separate
+  requests would, an area's on the tile pool included, never more than EDR
+  admits.
 
 A job builds its frame's whole answer (an area's resampled cells), never
 keeping a decoded window past it, and owns what it reads (`frames::Frame`,
@@ -621,7 +626,10 @@ reads and the running ones drain; `note_frames_health` runs for the window
 once the reads end, before an error returns. Pinned by `frame_read_tests`
 (eight position reads in flight over a delaying
 `ds_storage::test_util::SlowReads`, one area read, each frame of a
-multi-frame answer equal to that frame alone, no read past the deadline). Tests decode into the process-wide decoded-chunk cache for the
+multi-frame answer equal to that frame alone, no read past the deadline).
+Their remote engine is `GeoTiffEngine::remote_for_test`, public under the
+`test-util` feature for the server's tests (`geotiff_unavailable_store`,
+`edr_datetime_list_reads`), a dev-dependency feature only. Tests decode into the process-wide decoded-chunk cache for the
 rest of the suite, and a test reading its own chunks back fails once their
 shards are full of others' (about 200 MB resident did it). So the
 read-back tests run in a process of their own (`alone_in_a_process` in

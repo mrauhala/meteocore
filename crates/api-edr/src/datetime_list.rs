@@ -24,12 +24,23 @@
 //!
 //! The response is `Single` when every instant answered `Single` and the merge
 //! left one coverage, else a `CoverageCollection`.
+//!
+//! The instants are answered side by side (#1522): up to
+//! [`INSTANT_CONCURRENCY`] at once, as jobs of
+//! `ds_executor::field_jobs::run_field_jobs`, each in an EDR query slot of
+//! its own ([`crate::executor::QueryBudget::spare_slots`]). The answers are
+//! then taken in the instants' order, by the rules one instant after
+//! another followed, so the response, its ETag and its errors are those of
+//! answering them in turn.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::feature::AreaShare;
 use ds_core::model::{CoverageResponse, DomainDescription, NdArray, QueryResult, VerticalCoord};
 
+use crate::executor::QueryBudget;
 use crate::params::DatetimeSelector;
 
 /// Value budget of one datetime-list response across all its instants: the
@@ -38,64 +49,165 @@ use crate::params::DatetimeSelector;
 /// return.
 pub const MAX_LIST_VALUES: usize = ds_core::feature::MAX_AREA_VALUES;
 
+/// The most instants of one list answered at once (#1522). An instant on
+/// GeoTIFF or an ODIM composite reads one frame, a round trip on a remote
+/// source, so only the list can overlap them; four cut a 16-instant list's
+/// round trips to four. Each instant past the first takes an EDR query slot
+/// free at the start, or runs in turn, so a list answers no more engine
+/// queries at once than EDR admits (`ds_executor::query_workers()`, 2–8),
+/// and each engine's own per-query bounds (GRIB's field memory, an ODIM
+/// composite query's one unbudgeted read, NetCDF's read plan) hold per slot
+/// as for separate requests. Four leaves the other slots of a small
+/// runtime to other queries, and is ds-executor's `FIELD_CONCURRENCY`.
+pub const INSTANT_CONCURRENCY: usize = 4;
+
 type Window = (DateTime<Utc>, DateTime<Utc>);
 
-/// Run `query` for a parsed `datetime`: once with the window (or `None`), or
-/// once per listed instant via [`query_instants`].
+/// The values a list's answers may hold together, and the 400 refusing
+/// more.
+#[derive(Clone, Copy)]
+pub struct ValueBudget {
+    pub max: usize,
+    pub refuse: fn() -> DataServerError,
+}
+
+/// A list's budget: [`MAX_LIST_VALUES`].
+pub const LIST_BUDGET: ValueBudget = ValueBudget {
+    max: MAX_LIST_VALUES,
+    refuse: list_too_large,
+};
+
+fn list_too_large() -> DataServerError {
+    DataServerError::QueryTooLarge(format!(
+        "the datetime list's responses exceed {MAX_LIST_VALUES} values — \
+         name fewer instants, parameters or a smaller area"
+    ))
+}
+
+/// Run `query` for a parsed `datetime`: once with the window (or `None`) on
+/// the calling thread, or once per listed instant via [`query_instants`],
+/// under [`LIST_BUDGET`].
 pub fn run(
     datetime: Option<&DatetimeSelector>,
-    expired: impl Fn() -> bool,
-    mut query: impl FnMut(Option<Window>) -> Result<CoverageResponse, DataServerError>,
+    budget: &QueryBudget,
+    query: impl Fn(Option<Window>) -> Result<CoverageResponse, DataServerError> + Send + Sync + 'static,
+) -> Result<CoverageResponse, DataServerError> {
+    run_within(datetime, budget, LIST_BUDGET, query)
+}
+
+/// [`run`], a list's answers held to `values`: a query type whose own
+/// budget refuses a list's answers first (position's, whose 400 a list has
+/// always answered).
+pub fn run_within(
+    datetime: Option<&DatetimeSelector>,
+    budget: &QueryBudget,
+    values: ValueBudget,
+    query: impl Fn(Option<Window>) -> Result<CoverageResponse, DataServerError> + Send + Sync + 'static,
 ) -> Result<CoverageResponse, DataServerError> {
     match datetime {
         None => query(None),
         Some(DatetimeSelector::Window(start, end)) => query(Some((*start, *end))),
         Some(DatetimeSelector::Instants(instants)) => {
-            query_instants(instants, expired, |w| query(Some(w)))
+            let wanted = INSTANT_CONCURRENCY.min(instants.len()).saturating_sub(1);
+            let spare = budget.spare_slots(wanted);
+            query_instants(
+                instants,
+                || budget.expired(),
+                1 + spare.count(),
+                values,
+                move |window| query(Some(window)),
+            )
         }
     }
 }
 
-/// Query each instant as the window `(t, t)` and merge the answers.
+/// Query each instant as the window `(t, t)`, `concurrency` at once, and
+/// merge the answers.
 ///
 /// An instant with no data — the engine's `LocationNotFound`, the 404 a
 /// single instant gets — contributes nothing; when no instant has data the
 /// first instant's error is the answer. Any other error fails the request,
 /// as it would for that instant alone. The merged response is bounded by
-/// [`MAX_LIST_VALUES`], and `expired` is checked before every instant.
+/// `values`, and `expired` is checked before every instant starts.
+///
+/// The instants start in order and their answers arrive in any order. Once
+/// an answer decides the list (an error, or the values that have arrived
+/// passing the budget), no instant starts; those running finish. The
+/// answers are then taken in the instants' order, exactly as one after
+/// another were: the first instant whose error is not "no data", or whose
+/// answer takes the values past the budget, decides the error, and an
+/// instant not started means the time ran out first. So the outcome never
+/// depends on which answer arrived first, and `merge` sees the answers in
+/// the instants' order.
 ///
 /// An engine that fits an area grid to the value budget fits each
-/// instant's to its share of it ([`AreaShare::answers`], #1436): every
-/// instant then gets the same grid, so the answers join along `t`, and
-/// together they fit the list's budget instead of each filling it.
+/// instant's to its share of it ([`AreaShare::answers`], #1436, entered on
+/// the thread each instant runs on): every instant then gets the same grid,
+/// so the answers join along `t`, and together they fit the list's budget
+/// instead of each filling it.
 pub fn query_instants(
     instants: &[DateTime<Utc>],
-    expired: impl Fn() -> bool,
-    mut query: impl FnMut(Window) -> Result<CoverageResponse, DataServerError>,
+    expired: impl Fn() -> bool + Sync,
+    concurrency: usize,
+    values: ValueBudget,
+    query: impl Fn(Window) -> Result<CoverageResponse, DataServerError> + Send + Sync + 'static,
 ) -> Result<CoverageResponse, DataServerError> {
-    let mut responses = Vec::with_capacity(instants.len());
+    let answers = instants.len();
+    let mut outcomes: Vec<Option<Result<CoverageResponse, DataServerError>>> = Vec::new();
+    outcomes.resize_with(answers, || None);
+    // Both read and written on the scheduler's thread, between jobs.
+    let decided = AtomicBool::new(false);
+    let mut arrived = 0usize;
+    let start = instants
+        .iter()
+        .copied()
+        .enumerate()
+        .take_while(|_| !decided.load(Ordering::Relaxed) && !expired());
+    ds_executor::field_jobs::run_field_jobs(
+        ds_executor::query_runtime(),
+        concurrency,
+        start,
+        move |(index, t): (usize, DateTime<Utc>)| {
+            let _share = AreaShare::answers(answers);
+            Ok((index, query((t, t))))
+        },
+        |(index, answer): (usize, Result<CoverageResponse, DataServerError>)| {
+            let decides = match &answer {
+                Ok(response) => {
+                    arrived = arrived.saturating_add(count_values(response));
+                    arrived > values.max
+                }
+                Err(DataServerError::LocationNotFound(_)) => false,
+                Err(_) => true,
+            };
+            if decides {
+                decided.store(true, Ordering::Relaxed);
+            }
+            outcomes[index] = Some(answer);
+            Ok(())
+        },
+    )?;
+
+    // Every instant started has answered. One that did not start comes
+    // after any answer that decided the list, which then decides it here
+    // first: past the deadline, the 504.
+    let mut responses = Vec::with_capacity(answers);
     let mut no_data = None;
-    let mut values = 0usize;
-    let _share = AreaShare::answers(instants.len());
-    for &t in instants {
-        if expired() {
-            return Err(DataServerError::DeadlineExceeded);
-        }
-        match query((t, t)) {
-            Ok(response) => {
-                values = values.saturating_add(count_values(&response));
-                if values > MAX_LIST_VALUES {
-                    return Err(DataServerError::QueryTooLarge(format!(
-                        "the datetime list's responses exceed {MAX_LIST_VALUES} values — \
-                         name fewer instants, parameters or a smaller area"
-                    )));
+    let mut total = 0usize;
+    for outcome in outcomes {
+        match outcome {
+            None => return Err(DataServerError::DeadlineExceeded),
+            Some(Ok(response)) => {
+                total = total.saturating_add(count_values(&response));
+                if total > values.max {
+                    return Err((values.refuse)());
                 }
                 responses.push(response);
             }
-            Err(e @ DataServerError::LocationNotFound(_)) => {
+            Some(Err(e @ DataServerError::LocationNotFound(_))) => {
                 no_data.get_or_insert(e);
             }
-            Err(e) => return Err(e),
+            Some(Err(e)) => return Err(e),
         }
     }
     if responses.is_empty() {
@@ -409,6 +521,17 @@ mod tests {
     use ds_core::model::{ParameterDescription, ValuePrecision};
     use ds_core::vertical::VerticalKind;
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// [`query_instants`] as a list runs with every slot it wants free.
+    fn listed(
+        instants: &[DateTime<Utc>],
+        query: impl Fn(Window) -> Result<CoverageResponse, DataServerError> + Send + Sync + 'static,
+    ) -> Result<CoverageResponse, DataServerError> {
+        query_instants(instants, || false, INSTANT_CONCURRENCY, LIST_BUDGET, query)
+    }
 
     fn at(hour: u32) -> DateTime<Utc> {
         format!("2026-06-01T{hour:02}:00:00Z").parse().unwrap()
@@ -622,13 +745,12 @@ mod tests {
     fn instants_share_the_area_budget() {
         let polygon = ds_core::feature::parse_area_coords("0,0,40,20").unwrap();
         let alone = polygon.fit_grid(0.01, 0.01, 1, 1).unwrap().dims();
-        let mut grids = Vec::new();
-        let got = query_instants(
-            &[at(1), at(2), at(3), at(4)],
-            || false,
-            |(t, _)| {
+        let fitted = Arc::new(Mutex::new(Vec::new()));
+        let got = listed(&[at(1), at(2), at(3), at(4)], {
+            let fitted = fitted.clone();
+            move |(t, _)| {
                 let axes = polygon.fit_grid(0.01, 0.01, 1, 1)?;
-                grids.push(axes.dims());
+                fitted.lock().unwrap().push(axes.dims());
                 let (nx, ny) = axes.dims();
                 let mut q = step_grid(Some(t.hour()), 1.0, None);
                 q.domain = DomainDescription::Grid {
@@ -642,17 +764,19 @@ mod tests {
                 range.shape = vec![1, ny, nx];
                 range.values = vec![Some(1.0); nx * ny];
                 Ok(CoverageResponse::Single(q))
-            },
-        );
+            }
+        });
         let CoverageResponse::Single(q) = got.unwrap() else {
             panic!("the instants' grids join along t");
         };
+        let grids = fitted.lock().unwrap().clone();
         assert_eq!(grids.len(), 4);
         assert!(grids.iter().all(|&g| g == grids[0]), "{grids:?}");
         let (nx, ny) = grids[0];
         assert!(4 * nx * ny <= MAX_LIST_VALUES && nx * ny < alone.0 * alone.1);
         assert_eq!(q.ranges["temperature"].shape, vec![4, ny, nx]);
         // Outside the list a query has the whole budget again.
+        let polygon = ds_core::feature::parse_area_coords("0,0,40,20").unwrap();
         assert_eq!(polygon.fit_grid(0.01, 0.01, 1, 1).unwrap().dims(), alone);
     }
 
@@ -661,21 +785,17 @@ mod tests {
     /// `t`, the instant without data dropping out.
     #[test]
     fn one_step_grids_join_along_t_per_instant() {
-        let got = query_instants(
-            &[at(1), at(2), at(3)],
-            || false,
-            |(t, _)| {
-                if t == at(2) {
-                    return Err(DataServerError::LocationNotFound("no step".into()));
-                }
-                let hour = t.hour();
-                Ok(CoverageResponse::Single(step_grid(
-                    Some(hour),
-                    f64::from(hour),
-                    None,
-                )))
-            },
-        )
+        let got = listed(&[at(1), at(2), at(3)], |(t, _): Window| {
+            if t == at(2) {
+                return Err(DataServerError::LocationNotFound("no step".into()));
+            }
+            let hour = t.hour();
+            Ok(CoverageResponse::Single(step_grid(
+                Some(hour),
+                f64::from(hour),
+                None,
+            )))
+        })
         .unwrap();
         let CoverageResponse::Single(q) = got else {
             panic!("expected one grid");
@@ -692,18 +812,14 @@ mod tests {
     #[test]
     fn one_step_grids_with_levels_join_as_t_z_y_x() {
         let levels = [850.0, 500.0];
-        let got = query_instants(
-            &[at(1), at(2)],
-            || false,
-            |(t, _)| {
-                let hour = t.hour();
-                Ok(CoverageResponse::Single(step_grid(
-                    Some(hour),
-                    f64::from(hour),
-                    Some(&levels),
-                )))
-            },
-        )
+        let got = listed(&[at(1), at(2)], move |(t, _): Window| {
+            let hour = t.hour();
+            Ok(CoverageResponse::Single(step_grid(
+                Some(hour),
+                f64::from(hour),
+                Some(&levels),
+            )))
+        })
         .unwrap();
         assert_valid_covjson(&got);
         let CoverageResponse::Single(q) = got else {
@@ -720,17 +836,13 @@ mod tests {
     /// One answering instant still says which one it was.
     #[test]
     fn one_answering_instant_keeps_its_time() {
-        let got = query_instants(
-            &[at(1), at(2)],
-            || false,
-            |(t, _)| {
-                if t == at(1) {
-                    Err(DataServerError::LocationNotFound("no step".into()))
-                } else {
-                    Ok(CoverageResponse::Single(step_grid(Some(2), 2.0, None)))
-                }
-            },
-        )
+        let got = listed(&[at(1), at(2)], |(t, _): Window| {
+            if t == at(1) {
+                Err(DataServerError::LocationNotFound("no step".into()))
+            } else {
+                Ok(CoverageResponse::Single(step_grid(Some(2), 2.0, None)))
+            }
+        })
         .unwrap();
         assert_valid_covjson(&got);
         let CoverageResponse::Single(q) = got else {
@@ -745,11 +857,9 @@ mod tests {
     /// listed instants, which are no steps the collection holds.
     #[test]
     fn a_grid_without_time_stays_one_grid_without_t() {
-        let got = query_instants(
-            &[at(1), at(2)],
-            || false,
-            |_| Ok(CoverageResponse::Single(step_grid(None, 5.0, None))),
-        )
+        let got = listed(&[at(1), at(2)], |_| {
+            Ok(CoverageResponse::Single(step_grid(None, 5.0, None)))
+        })
         .unwrap();
         assert_valid_covjson(&got);
         let CoverageResponse::Single(q) = got else {
@@ -767,17 +877,13 @@ mod tests {
     /// first instant's values.
     #[test]
     fn grids_without_time_with_different_values_stay_apart() {
-        let got = query_instants(
-            &[at(1), at(2)],
-            || false,
-            |(t, _)| {
-                Ok(CoverageResponse::Single(step_grid(
-                    None,
-                    f64::from(t.hour()),
-                    None,
-                )))
-            },
-        )
+        let got = listed(&[at(1), at(2)], |(t, _): Window| {
+            Ok(CoverageResponse::Single(step_grid(
+                None,
+                f64::from(t.hour()),
+                None,
+            )))
+        })
         .unwrap();
         assert_valid_covjson(&got);
         let CoverageResponse::Collection(v) = got else {
@@ -876,21 +982,17 @@ mod tests {
 
     #[test]
     fn instants_without_data_are_skipped() {
-        let got = query_instants(
-            &[at(1), at(2), at(3)],
-            || false,
-            |(start, end)| {
-                assert_eq!(start, end, "every instant is queried as (t, t)");
-                if start == at(2) {
-                    Err(DataServerError::LocationNotFound("no data".into()))
-                } else {
-                    Ok(CoverageResponse::Single(series(
-                        24.0,
-                        &[(start.format("%H").to_string().parse().unwrap(), 1.0)],
-                    )))
-                }
-            },
-        )
+        let got = listed(&[at(1), at(2), at(3)], |(start, end): Window| {
+            assert_eq!(start, end, "every instant is queried as (t, t)");
+            if start == at(2) {
+                Err(DataServerError::LocationNotFound("no data".into()))
+            } else {
+                Ok(CoverageResponse::Single(series(
+                    24.0,
+                    &[(start.format("%H").to_string().parse().unwrap(), 1.0)],
+                )))
+            }
+        })
         .unwrap();
         let CoverageResponse::Single(q) = got else {
             panic!("expected one series");
@@ -900,46 +1002,43 @@ mod tests {
 
     #[test]
     fn no_data_at_any_instant_is_the_first_not_found() {
-        let err = query_instants(
-            &[at(1), at(2)],
-            || false,
-            |(t, _)| Err(DataServerError::LocationNotFound(t.to_rfc3339())),
-        )
+        let err = listed(&[at(1), at(2)], |(t, _): Window| {
+            Err(DataServerError::LocationNotFound(t.to_rfc3339()))
+        })
         .unwrap_err();
         assert!(matches!(err, DataServerError::LocationNotFound(m) if m == at(1).to_rfc3339()));
     }
 
     #[test]
     fn other_errors_fail_the_list() {
-        let err = query_instants(
-            &[at(1), at(2)],
-            || false,
-            |(t, _)| {
-                if t == at(2) {
-                    Err(DataServerError::InvalidParameter("bad".into()))
-                } else {
-                    Ok(CoverageResponse::Single(series(24.0, &[(1, 1.0)])))
-                }
-            },
-        )
+        let err = listed(&[at(1), at(2)], |(t, _): Window| {
+            if t == at(2) {
+                Err(DataServerError::InvalidParameter("bad".into()))
+            } else {
+                Ok(CoverageResponse::Single(series(24.0, &[(1, 1.0)])))
+            }
+        })
         .unwrap_err();
         assert!(matches!(err, DataServerError::InvalidParameter(_)));
     }
 
     #[test]
     fn expired_budget_stops_before_the_next_instant() {
-        let mut calls = 0;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
         let err = query_instants(
             &[at(1), at(2)],
             || true,
-            |_| {
-                calls += 1;
+            INSTANT_CONCURRENCY,
+            LIST_BUDGET,
+            move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
                 Ok(CoverageResponse::Single(series(24.0, &[(1, 1.0)])))
             },
         )
         .unwrap_err();
         assert!(matches!(err, DataServerError::DeadlineExceeded));
-        assert_eq!(calls, 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -950,7 +1049,318 @@ mod tests {
             range.values = vec![None; MAX_LIST_VALUES / 2 + 1];
             CoverageResponse::Single(q)
         };
-        let err = query_instants(&[at(1), at(2)], || false, |_| Ok(big())).unwrap_err();
+        let err = listed(&[at(1), at(2)], move |_| Ok(big())).unwrap_err();
         assert!(matches!(err, DataServerError::QueryTooLarge(_)));
+    }
+
+    /// An answer of `values` values at the instant's hour, as a one-step
+    /// series.
+    fn sized(t: DateTime<Utc>, values: usize) -> CoverageResponse {
+        let mut q = series(24.0, &[(t.hour(), f64::from(t.hour()))]);
+        let range = q.ranges.get_mut("temperature").unwrap();
+        range.shape = vec![values];
+        range.values = vec![Some(1.0); values];
+        CoverageResponse::Single(q)
+    }
+
+    /// Instants in flight now, and the most there were at once.
+    #[derive(Default)]
+    struct InFlight {
+        now: AtomicUsize,
+        peak: AtomicUsize,
+        started: AtomicUsize,
+    }
+
+    impl InFlight {
+        /// Run `work` as one instant in flight.
+        fn during<T>(&self, work: impl FnOnce() -> T) -> T {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            let result = work();
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+    }
+
+    /// #1522: a list of eight instants, each taking 100 ms, runs four at a
+    /// time and answers in about two delays, not eight; with one slot it
+    /// runs them in turn. The bound is reached and never passed.
+    #[test]
+    fn instants_run_side_by_side_within_the_bound() {
+        let instants: Vec<_> = (1..=8).map(at).collect();
+        let delay = Duration::from_millis(100);
+        for concurrency in [INSTANT_CONCURRENCY, 1] {
+            let flight = Arc::new(InFlight::default());
+            let started = Instant::now();
+            let got = query_instants(&instants, || false, concurrency, LIST_BUDGET, {
+                let flight = flight.clone();
+                move |(t, _): Window| {
+                    flight.during(|| {
+                        std::thread::sleep(delay);
+                        Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
+                    })
+                }
+            })
+            .unwrap();
+            let elapsed = started.elapsed();
+            let CoverageResponse::Single(q) = got else {
+                panic!("one series");
+            };
+            assert_eq!(times(&q), instants);
+            assert_eq!(flight.peak.load(Ordering::SeqCst), concurrency);
+            let rounds = instants.len().div_ceil(concurrency) as u32;
+            assert!(elapsed >= delay * rounds, "{elapsed:?}");
+            if concurrency > 1 {
+                assert!(
+                    elapsed < delay * 4,
+                    "{elapsed:?} for 8 instants of {delay:?}"
+                );
+            }
+        }
+    }
+
+    /// The answers arrive in any order, last instant first here, and the
+    /// list is still the one answering the instants in turn gives: the same
+    /// JSON, coverage for coverage, with an instant without data among
+    /// them, for a series, a station collection and grids.
+    #[test]
+    fn answers_are_those_of_one_instant_after_another() {
+        let instants: Vec<_> = (1..=6).map(at).collect();
+        type Answer = fn(DateTime<Utc>) -> Result<CoverageResponse, DataServerError>;
+        let answers: [Answer; 3] = [
+            |t| Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)]))),
+            |t| {
+                Ok(CoverageResponse::Collection(vec![
+                    series(24.0, &[(t.hour(), f64::from(t.hour()))]),
+                    series(25.0, &[(t.hour(), -f64::from(t.hour()))]),
+                ]))
+            },
+            |t| {
+                Ok(CoverageResponse::Single(grid(
+                    t.hour(),
+                    f64::from(t.hour()),
+                )))
+            },
+        ];
+        for answer in answers {
+            let json = |concurrency| {
+                let got = query_instants(&instants, || false, concurrency, LIST_BUDGET, {
+                    move |(t, _): Window| {
+                        // The later the instant, the sooner it answers.
+                        std::thread::sleep(Duration::from_millis(10 * u64::from(8 - t.hour())));
+                        if t == at(3) {
+                            return Err(DataServerError::LocationNotFound("none".into()));
+                        }
+                        answer(t)
+                    }
+                })
+                .unwrap();
+                crate::response::coverage_response_to_json(&got).to_string()
+            };
+            let in_turn = json(1);
+            assert_eq!(json(INSTANT_CONCURRENCY), in_turn);
+            assert!(!in_turn.contains(&at(3).to_rfc3339()), "{in_turn}");
+        }
+    }
+
+    /// The error is the one the instants give in turn, whichever arrives
+    /// first: the first instant's error, the first instant without data's
+    /// 404, and the budget's 400 at the instant that passes it, before a
+    /// later instant's error that arrived first.
+    #[test]
+    fn the_first_instant_in_turn_decides_the_error() {
+        let instants: Vec<_> = (1..=4).map(at).collect();
+        let slower_first = |t: DateTime<Utc>| {
+            std::thread::sleep(Duration::from_millis(20 * u64::from(5 - t.hour())));
+        };
+        let run = |query: fn(DateTime<Utc>) -> Result<CoverageResponse, DataServerError>| {
+            query_instants(&instants, || false, INSTANT_CONCURRENCY, LIST_BUDGET, {
+                move |(t, _): Window| {
+                    slower_first(t);
+                    query(t)
+                }
+            })
+            .unwrap_err()
+        };
+        let err = run(|t| Err(DataServerError::InvalidParameter(t.to_rfc3339())));
+        assert!(
+            matches!(&err, DataServerError::InvalidParameter(m) if *m == at(1).to_rfc3339()),
+            "{err:?}"
+        );
+        let err = run(|t| Err(DataServerError::LocationNotFound(t.to_rfc3339())));
+        assert!(
+            matches!(&err, DataServerError::LocationNotFound(m) if *m == at(1).to_rfc3339()),
+            "{err:?}"
+        );
+        // In turn, the second instant passes the budget, before the fourth's
+        // error, which arrives first.
+        let err = run(|t| {
+            if t == at(4) {
+                Err(DataServerError::InvalidParameter("later".into()))
+            } else {
+                Ok(sized(t, MAX_LIST_VALUES / 2 + 1))
+            }
+        });
+        assert_eq!(err.to_string(), list_too_large().to_string());
+        // A query type's own budget refuses with its own 400.
+        let err = query_instants(
+            &instants,
+            || false,
+            INSTANT_CONCURRENCY,
+            ValueBudget {
+                max: 10,
+                refuse: || DataServerError::QueryTooLarge("own".into()),
+            },
+            |(t, _): Window| Ok(sized(t, 6)),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, DataServerError::QueryTooLarge(m) if m == "own"),
+            "{err:?}"
+        );
+    }
+
+    /// An answer deciding the list stops it: no instant starts after it,
+    /// and those running finish first. The first two instants start
+    /// together; the first fails at once, so the second is the last.
+    #[test]
+    fn a_decided_list_starts_no_more_instants() {
+        let instants: Vec<_> = (1..=10).map(at).collect();
+        let flight = Arc::new(InFlight::default());
+        let finished = Arc::new(AtomicUsize::new(0));
+        let err = query_instants(&instants, || false, 2, LIST_BUDGET, {
+            let (flight, finished) = (flight.clone(), finished.clone());
+            move |(t, _): Window| {
+                flight.during(|| {
+                    if t == at(1) {
+                        return Err(DataServerError::InvalidParameter("first".into()));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
+                })
+            }
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, DataServerError::InvalidParameter(_)),
+            "{err:?}"
+        );
+        assert_eq!(flight.started.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            1,
+            "the running one finished"
+        );
+    }
+
+    /// Past its time no instant starts and the list is `DeadlineExceeded`,
+    /// EDR's 504: once the list's budget has expired (the first instant
+    /// expires it here, so only the two started together run), and once
+    /// the request deadline passes mid-list.
+    #[test]
+    fn past_its_time_a_list_starts_no_more_instants() {
+        let instants: Vec<_> = (1..=8).map(at).collect();
+        let expired = Arc::new(AtomicBool::new(false));
+        let flight = Arc::new(InFlight::default());
+        let err = query_instants(
+            &instants,
+            {
+                let expired = expired.clone();
+                move || expired.load(Ordering::SeqCst)
+            },
+            2,
+            LIST_BUDGET,
+            {
+                let (expired, flight) = (expired.clone(), flight.clone());
+                move |(t, _): Window| {
+                    flight.during(|| {
+                        expired.store(true, Ordering::SeqCst);
+                        Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
+                    })
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, DataServerError::DeadlineExceeded), "{err:?}");
+        assert_eq!(flight.started.load(Ordering::SeqCst), 2);
+
+        // 100 ms per instant, two at a time, a deadline at 150 ms: the
+        // second pair starts at 100 ms and ends past it; none starts after.
+        let delay = Duration::from_millis(100);
+        let deadline = Instant::now() + delay * 3 / 2;
+        let _deadline = ds_core::deadline::enter(Some(deadline));
+        let flight = Arc::new(InFlight::default());
+        let err = query_instants(
+            &instants,
+            move || Instant::now() >= deadline,
+            2,
+            LIST_BUDGET,
+            {
+                let flight = flight.clone();
+                move |(t, _): Window| {
+                    flight.during(|| {
+                        std::thread::sleep(delay);
+                        Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
+                    })
+                }
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, DataServerError::DeadlineExceeded), "{err:?}");
+        assert!(flight.started.load(Ordering::SeqCst) <= 4);
+    }
+
+    /// Engines read each instant's fields as field jobs of their own
+    /// (GRIB, NetCDF, GeoTIFF, ODIM): a list's jobs then run field jobs.
+    /// On a runtime of two workers, eight instants four at a time, each
+    /// with four field jobs that wait on the runtime's timer from inside
+    /// their `block_in_place`, complete: no worker is left parked (#1200).
+    #[test]
+    fn instants_running_field_jobs_complete_on_a_small_runtime() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            let instants: Vec<_> = (1..=8).map(at).collect();
+            let got = query_instants(&instants, || false, INSTANT_CONCURRENCY, LIST_BUDGET, {
+                move |(t, _): Window| {
+                    let mut fields = 0;
+                    ds_executor::field_jobs::run_field_jobs(
+                        &handle,
+                        ds_executor::field_jobs::FIELD_CONCURRENCY,
+                        0..4,
+                        |field: usize| {
+                            tokio::runtime::Handle::current()
+                                .block_on(tokio::time::sleep(Duration::from_millis(5)));
+                            Ok(field)
+                        },
+                        |_| {
+                            fields += 1;
+                            Ok(())
+                        },
+                    )?;
+                    assert_eq!(fields, 4);
+                    Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
+                }
+            });
+            done.send(got.map(|got| coverage_count_of(&got))).unwrap();
+        });
+        let got = finished
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the list finished");
+        assert_eq!(got.unwrap(), 1);
+    }
+
+    fn coverage_count_of(response: &CoverageResponse) -> usize {
+        match response {
+            CoverageResponse::Single(_) => 1,
+            CoverageResponse::Collection(v) => v.len(),
+        }
     }
 }

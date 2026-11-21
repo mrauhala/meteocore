@@ -22,6 +22,9 @@ use handlers::AppState;
 /// rejected responses), for `/metrics` (#1041).
 pub use response_budget::metrics as response_budget_metrics;
 
+/// The most instants of a `datetime` list answered at once (#1522).
+pub use datetime_list::INSTANT_CONCURRENCY;
+
 pub fn router(state: AppState) -> Router {
     // Reads the budget's environment at startup, where a retired variable
     // is reported.

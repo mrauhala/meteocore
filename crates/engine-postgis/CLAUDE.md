@@ -301,7 +301,7 @@ in step when changing this lifecycle.
   `area_path`: **set-based** for a `datetime` window of at most
   `SET_BASED_MAX_WINDOW` (12 h, the longest window the timing table
   measured; set-based won at every size there; an instant and each instant
-  of a `datetime` list, which the API queries one by one, are within it) and for a longer
+  of a `datetime` list, which the API queries each on its own, are within it) and for a longer
   window the fan-out could not run (over `MAX_AREA_QUERIES`, so the value
   budget decides); the **fan-out** otherwise and without `datetime`. The
   threshold is a window, not stations × steps: both paths pay per station,
