@@ -48,14 +48,39 @@ impl RunEntry {
 /// The retained model runs, keyed by origin (analysis / forecast reference)
 /// time, ascending — so `values().next_back()` is the latest run. Swapped
 /// atomically on poll. See [`ds_core::instances`].
-#[derive(Default)]
 struct RunSet {
     runs: BTreeMap<DateTime<Utc>, RunEntry>,
     /// The latest run's wind components (#897), built with the set.
     wind: Option<Arc<WindFacts>>,
+    /// The map metadata of these runs (#1485), built with the set and
+    /// swapped with it, so `raster_info_shared` is an `Arc` clone and a
+    /// reader never sees new runs with old metadata.
+    raster_info: Arc<RasterInfo>,
+}
+
+impl Default for RunSet {
+    fn default() -> Self {
+        Self::new(BTreeMap::new(), None)
+    }
 }
 
 impl RunSet {
+    /// The set of `runs`, with what it states built once: the latest run's
+    /// wind facts and the map metadata, its default parameter the one
+    /// `wms_parameter` names.
+    fn new(runs: BTreeMap<DateTime<Utc>, RunEntry>, wms_parameter: Option<&str>) -> Self {
+        let wind = runs
+            .values()
+            .next_back()
+            .map(|latest| Arc::new(wind_facts(&latest.data)));
+        let raster_info = Arc::new(raster_info_of(&runs, wms_parameter));
+        Self {
+            runs,
+            wind,
+            raster_info,
+        }
+    }
+
     /// The latest (most recent reference time) run, if any.
     fn latest(&self) -> Option<&RunEntry> {
         self.runs.values().next_back()
@@ -104,7 +129,13 @@ impl QueryDataEngine {
     ) -> Result<Self, DataServerError> {
         let max_runs = max_runs.max(1);
         let files = list_sqd_files(data_dir);
-        let runset = build_runset(&files, max_runs, &RunSet::default(), collection_id);
+        let runset = build_runset(
+            &files,
+            max_runs,
+            &RunSet::default(),
+            wms_parameter,
+            collection_id,
+        );
         if runset.runs.is_empty() {
             return Err(DataServerError::Engine(format!(
                 "[{collection_id}] No loadable .sqd files found in {}",
@@ -146,7 +177,13 @@ impl QueryDataEngine {
         }
 
         let prev = self.runs.load();
-        let new_set = build_runset(&files, self.max_runs, &prev, &self.collection_id);
+        let new_set = build_runset(
+            &files,
+            self.max_runs,
+            &prev,
+            self.wms_parameter.as_deref(),
+            &self.collection_id,
+        );
         if new_set.runs.is_empty() {
             return; // nothing loadable (e.g. all files corrupt) — keep old data
                     // and do NOT stamp the poll; poll_age keeps growing.
@@ -194,11 +231,7 @@ impl QueryDataEngine {
 
     /// Resolve the map parameter index for the current data snapshot.
     fn resolve_map_param_idx(&self, data: &QueryData) -> usize {
-        if let Some(ref name) = self.wms_parameter {
-            data.param_index_by_name(name).unwrap_or(0)
-        } else {
-            0
-        }
+        map_param_idx(data, self.wms_parameter.as_deref())
     }
 
     /// Check if this engine has data loaded.
@@ -790,83 +823,13 @@ impl MapEngine for QueryDataEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        let set = self.runs.load();
-        // Every retained run is a selectable reference time (WMS dimension /
-        // EDR instance); ascending, latest last.
-        let reference_times: Vec<DateTime<Utc>> = set.runs.keys().copied().collect();
-        let data = match set.latest() {
-            Some(e) => e.data.clone(),
-            None => {
-                // No runs retained (shouldn't happen post-construction).
-                return RasterInfo {
-                    native_crs: "CRS:84".to_string(),
-                    spatial_extent: None,
-                    times: Vec::new(),
-                    parameter: String::new(),
-                    unit: String::new(),
-                    parameters: Vec::new(),
-                    vertical: None,
-                    grid_size: None,
-                    layer_subtitle: None,
-                    reference_times,
-                    native_grid: None,
-                };
-            }
-        };
-        drop(set);
-        let param_idx = self.resolve_map_param_idx(&data);
+        (*self.raster_info_shared()).clone()
+    }
 
-        // The default is named as its map layer, the short name (#1215), so
-        // the root layer draws `{collection}/{parameter}`'s style (#1161).
-        let (param_name, param_unit) = data
-            .params
-            .get(param_idx)
-            .map(|p| (map_name(&p.name).to_string(), units::unit(p.id).to_string()))
-            .unwrap_or_default();
-
-        let gt = data.grid.geo_transform();
-        let bbox = data.grid.bbox();
-
-        let native_crs = match data.grid.area.crs {
-            // Internal grids are lon-first, so CRS:84 (not EPSG:4326, which is
-            // lat-first) — this is the value surfaced as OGC `storageCrs`.
-            // Generic labels match engine-geotiff/engine-odim so
-            // ds_core::geo::native_crs_uri treats every engine consistently.
-            ds_core::geo::Crs::Wgs84 => "CRS:84".to_string(),
-            ds_core::geo::Crs::Stereographic { .. } => "stere".to_string(),
-            ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
-            _ => "projected".to_string(),
-        };
-
-        // Each unit is its FMI parameter number's (`units`), never one
-        // inferred from a name: the style defaults key on it (#1211).
-        let parameters: Vec<ds_core::map_engine::ParameterInfo> = data
-            .params
-            .iter()
-            .map(|p| {
-                // Extract short name from parentheses, e.g., "2 Metre Temperature (2t)" → "2t"
-                let short = map_name(&p.name).to_string();
-                ds_core::map_engine::ParameterInfo {
-                    name: short,
-                    title: p.name.clone(),
-                    unit: units::unit(p.id).to_string(),
-                }
-            })
-            .collect();
-
-        RasterInfo {
-            native_crs,
-            spatial_extent: Some(bbox),
-            times: data.times.clone(),
-            parameter: param_name,
-            unit: param_unit,
-            parameters,
-            vertical: None,
-            grid_size: Some([gt.width, gt.height]),
-            layer_subtitle: None,
-            reference_times,
-            native_grid: data.grid.native_grid().cloned(),
-        }
+    /// The metadata built with the run set (#1485): an `Arc` clone from
+    /// the lock-free snapshot, never a build per request.
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
+        self.runs.load().raster_info.clone()
     }
 }
 
@@ -904,6 +867,99 @@ fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
     entries
 }
 
+/// The map parameter index `wms_parameter` names in `data`, else the first.
+fn map_param_idx(data: &QueryData, wms_parameter: Option<&str>) -> usize {
+    wms_parameter
+        .and_then(|name| data.param_index_by_name(name))
+        .unwrap_or(0)
+}
+
+/// The map metadata of `runs` (#1485): every run a reference time, the
+/// latest run's grid, times and parameters, its default the one
+/// `wms_parameter` names. Built with the [`RunSet`] it describes; nothing in
+/// it depends on the clock.
+fn raster_info_of(
+    runs: &BTreeMap<DateTime<Utc>, RunEntry>,
+    wms_parameter: Option<&str>,
+) -> RasterInfo {
+    // Every retained run is a selectable reference time (WMS dimension /
+    // EDR instance); ascending, latest last.
+    let reference_times: Vec<DateTime<Utc>> = runs.keys().copied().collect();
+    let data = match runs.values().next_back() {
+        Some(e) => &e.data,
+        None => {
+            // No runs retained (only an empty set: the engine refuses to
+            // start without one, and a poll keeps its last set).
+            return RasterInfo {
+                native_crs: "CRS:84".to_string(),
+                spatial_extent: None,
+                times: Vec::new(),
+                parameter: String::new(),
+                unit: String::new(),
+                parameters: Vec::new(),
+                vertical: None,
+                grid_size: None,
+                layer_subtitle: None,
+                reference_times,
+                native_grid: None,
+            };
+        }
+    };
+    let param_idx = map_param_idx(data, wms_parameter);
+
+    // The default is named as its map layer, the short name (#1215), so
+    // the root layer draws `{collection}/{parameter}`'s style (#1161).
+    let (param_name, param_unit) = data
+        .params
+        .get(param_idx)
+        .map(|p| (map_name(&p.name).to_string(), units::unit(p.id).to_string()))
+        .unwrap_or_default();
+
+    let gt = data.grid.geo_transform();
+    let bbox = data.grid.bbox();
+
+    let native_crs = match data.grid.area.crs {
+        // Internal grids are lon-first, so CRS:84 (not EPSG:4326, which is
+        // lat-first) — this is the value surfaced as OGC `storageCrs`.
+        // Generic labels match engine-geotiff/engine-odim so
+        // ds_core::geo::native_crs_uri treats every engine consistently.
+        ds_core::geo::Crs::Wgs84 => "CRS:84".to_string(),
+        ds_core::geo::Crs::Stereographic { .. } => "stere".to_string(),
+        ds_core::geo::Crs::RotatedLatLon { .. } => "rotated_ll".to_string(),
+        _ => "projected".to_string(),
+    };
+
+    // Each unit is its FMI parameter number's (`units`), never one
+    // inferred from a name: the style defaults key on it (#1211).
+    let parameters: Vec<ds_core::map_engine::ParameterInfo> = data
+        .params
+        .iter()
+        .map(|p| {
+            // Extract short name from parentheses, e.g., "2 Metre Temperature (2t)" → "2t"
+            let short = map_name(&p.name).to_string();
+            ds_core::map_engine::ParameterInfo {
+                name: short,
+                title: p.name.clone(),
+                unit: units::unit(p.id).to_string(),
+            }
+        })
+        .collect();
+
+    RasterInfo {
+        native_crs,
+        spatial_extent: Some(bbox),
+        times: data.times.clone(),
+        parameter: param_name,
+        unit: param_unit,
+        parameters,
+        vertical: None,
+        grid_size: Some([gt.width, gt.height]),
+        layer_subtitle: None,
+        reference_times,
+        native_grid: data.grid.native_grid().cloned(),
+    }
+}
+
 /// Build a [`RunSet`] from the directory: load the most recent `max_runs` files
 /// as model runs (keyed by origin time), reusing already-parsed entries from
 /// `prev` whose path is unchanged (so poll never re-parses a stable run).
@@ -920,7 +976,13 @@ fn list_sqd_files(dir: &Path) -> Vec<PathBuf> {
 /// order could thus be windowed wrong; that's an accepted limitation of the
 /// naming-convention assumption (the BTreeMap still keys by origin time, and a
 /// same-origin collision is logged below).
-fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id: &str) -> RunSet {
+fn build_runset(
+    files: &[PathBuf],
+    max_runs: usize,
+    prev: &RunSet,
+    wms_parameter: Option<&str>,
+    collection_id: &str,
+) -> RunSet {
     // Keep only the most recent `max_runs` files (the listing is ascending).
     let window = &files[files.len().saturating_sub(max_runs)..];
 
@@ -960,11 +1022,7 @@ fn build_runset(files: &[PathBuf], max_runs: usize, prev: &RunSet, collection_id
             );
         }
     }
-    let wind = runs
-        .values()
-        .next_back()
-        .map(|latest| Arc::new(wind_facts(&latest.data)));
-    RunSet { runs, wind }
+    RunSet::new(runs, wms_parameter)
 }
 
 /// What a run states about its wind components (#897) and humidity
@@ -2226,7 +2284,7 @@ mod tests {
             })
             .into_iter()
             .collect();
-        engine.runs.store(Arc::new(RunSet { runs, wind: None }));
+        engine.runs.store(Arc::new(RunSet::new(runs, None)));
         assert_eq!(engine.expected_interval(), Some(chrono::Duration::hours(6)));
         // Each run's own valid times for a map naming it (#337); a run not
         // retained has none.
@@ -2275,6 +2333,79 @@ mod tests {
         assert!(engine
             .query_position("POINT(36.8 -1.3)", None, None, None, Some(bogus))
             .is_err());
+    }
+
+    /// #1485: `raster_info_shared` is the run set's snapshot, built with
+    /// it: one `Arc` until a poll swaps the set, then a new one built from
+    /// the new set, as `raster_info` built it per call before.
+    #[test]
+    fn raster_info_is_the_run_sets_snapshot() {
+        assert!(test_file_exists(), "ecmwf-kenya fixture missing");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::copy(test_dir().join(FIXTURE), dir.path().join(FIXTURE)).unwrap();
+        let engine = QueryDataEngine::new(dir.path(), "qd-snapshot", Some("msl"), 30, 4).unwrap();
+
+        let first = engine.raster_info_shared();
+        assert!(Arc::ptr_eq(&first, &engine.raster_info_shared()));
+        {
+            let set = engine.runs.load();
+            let (&origin, run) = set.runs.iter().next_back().unwrap();
+            let data = &run.data;
+            let gt = data.grid.geo_transform();
+            assert_eq!(first.reference_times, [origin]);
+            assert_eq!(first.times, data.times);
+            assert_eq!(first.parameter, "msl", "the configured default");
+            assert_eq!(first.unit, "hPa");
+            assert_eq!(first.spatial_extent, Some(data.grid.bbox()));
+            assert_eq!(first.grid_size, Some([gt.width, gt.height]));
+            assert_eq!(first.native_crs, "CRS:84");
+            assert_eq!(first.native_grid.as_ref(), data.grid.native_grid());
+            let names: Vec<&str> = first.parameters.iter().map(|p| p.name.as_str()).collect();
+            let want: Vec<&str> = data.params.iter().map(|p| map_name(&p.name)).collect();
+            assert_eq!(names, want);
+        }
+        assert_eq!(engine.raster_info().times, first.times, "a clone of it");
+
+        engine.poll_once();
+        assert!(
+            Arc::ptr_eq(&first, &engine.raster_info_shared()),
+            "a poll that finds the same file keeps the set"
+        );
+
+        // The same run under a later name: the set is swapped.
+        std::fs::copy(
+            test_dir().join(FIXTURE),
+            dir.path().join(format!("z{FIXTURE}")),
+        )
+        .unwrap();
+        engine.poll_once();
+        let next = engine.raster_info_shared();
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert!(Arc::ptr_eq(&next, &engine.raster_info_shared()));
+        assert_eq!(format!("{first:?}"), format!("{next:?}"), "the same run");
+
+        // Four runs: each a reference time of the new snapshot.
+        let run = engine
+            .runs
+            .load()
+            .runs
+            .values()
+            .next_back()
+            .unwrap()
+            .data
+            .clone();
+        let runs = [0, 6, 12, 18]
+            .map(|hours| {
+                let origin = run.origin_time + chrono::Duration::hours(hours);
+                (origin, RunEntry::new(run.clone(), PathBuf::new()))
+            })
+            .into_iter()
+            .collect();
+        engine.runs.store(Arc::new(RunSet::new(runs, Some("msl"))));
+        let four = engine.raster_info_shared();
+        assert_eq!(four.reference_times.len(), 4);
+        assert_eq!(four.parameter, "msl");
+        assert_eq!(next.reference_times.len(), 1, "a snapshot never changes");
     }
 }
 

@@ -19,7 +19,9 @@ use std::sync::Arc;
 use chrono::{DateTime, TimeZone};
 
 use crate::feature::{Feature, Geometry, PropertyValue, Related, RelatedTarget};
+use crate::map_engine::{ParameterInfo, RasterInfo};
 use crate::model::Location;
+use crate::vertical::VerticalDimension;
 
 /// Bytes of an `Arc`'s strong and weak counts, ahead of its value.
 pub const ARC_COUNTS: usize = 2 * size_of::<usize>();
@@ -288,6 +290,47 @@ impl HeapSize for Location {
     }
 }
 
+impl HeapSize for ParameterInfo {
+    fn heap_size(&self) -> usize {
+        self.name.heap_size() + self.title.heap_size() + self.unit.heap_size()
+    }
+}
+
+impl HeapSize for VerticalDimension {
+    fn heap_size(&self) -> usize {
+        self.levels.heap_size()
+    }
+}
+
+/// A map engine's metadata snapshot, which a store keeps once per catalog
+/// (#1485). Every field is named, so a new one is weighed here too.
+impl HeapSize for RasterInfo {
+    fn heap_size(&self) -> usize {
+        let RasterInfo {
+            native_crs,
+            spatial_extent: _,
+            times,
+            parameter,
+            unit,
+            parameters,
+            vertical,
+            grid_size: _,
+            native_grid,
+            layer_subtitle,
+            reference_times,
+        } = self;
+        native_crs.heap_size()
+            + times.heap_size()
+            + parameter.heap_size()
+            + unit.heap_size()
+            + parameters.heap_size()
+            + vertical.heap_size()
+            + native_grid.heap_size()
+            + layer_subtitle.heap_size()
+            + reference_times.heap_size()
+    }
+}
+
 /// Bytes live through [`Counting`]: allocated less freed.
 static LIVE: AtomicIsize = AtomicIsize::new(0);
 
@@ -365,6 +408,69 @@ mod tests {
             id.heap_size(),
             32,
             "16 bytes of counts and 15 of text, aligned"
+        );
+    }
+
+    /// A metadata snapshot counts every buffer it owns, an `Arc` of it its
+    /// counts and the value too (#1485). Its native grid counts the CRS
+    /// reference its clones share in full, as any `Arc` is counted.
+    #[test]
+    fn raster_info_counts_its_buffers() {
+        use crate::geo::Crs;
+        use crate::native_grid::NativeGrid;
+        use crate::vertical::VerticalKind;
+        let info = RasterInfo {
+            native_crs: "CRS:84".to_string(),
+            spatial_extent: Some([0.0, 0.0, 1.0, 1.0]),
+            times: Vec::with_capacity(3),
+            parameter: "DBZH".to_string(),
+            unit: "dBZ".to_string(),
+            parameters: vec![ParameterInfo {
+                name: "DBZH".to_string(),
+                title: "Reflectivity".to_string(),
+                unit: "dBZ".to_string(),
+            }],
+            vertical: Some(VerticalDimension {
+                kind: VerticalKind::ElevationAngle,
+                levels: vec![0.5, 1.5],
+            }),
+            grid_size: None,
+            native_grid: None,
+            layer_subtitle: Some("Vihti".to_string()),
+            reference_times: Vec::new(),
+        };
+        let owned = 6
+            + 3 * size_of::<DateTime<chrono::Utc>>()
+            + 4
+            + 3
+            + size_of::<ParameterInfo>()
+            + (4 + 12 + 3)
+            + 2 * size_of::<f64>()
+            + 5;
+        assert_eq!(info.heap_size(), owned);
+        let arc = Arc::new(info);
+        assert_eq!(
+            arc.heap_size(),
+            ARC_COUNTS + size_of::<RasterInfo>() + owned
+        );
+
+        // A grid with a stated EPSG code: its reference is the authority URI.
+        let grid = NativeGrid::new(Crs::Wgs84, Some(4326), [4, 2], [0.0, 0.0], [0.25, 0.5])
+            .expect("a valid grid");
+        let uri = grid.crs_ref().len();
+        assert_eq!(uri, "http://www.opengis.net/def/crs/EPSG/0/4326".len());
+        let reference = (ARC_COUNTS + uri).next_multiple_of(align_of::<usize>());
+        assert_eq!(grid.heap_size(), reference);
+        assert_eq!(grid.clone().heap_size(), reference, "each holder counts it");
+        let mut gridded = Arc::into_inner(arc).unwrap();
+        gridded.native_grid = Some(grid);
+        assert_eq!(gridded.heap_size(), owned + reference);
+        // A WKT2 reference, without a code: the whole text.
+        let wkt = NativeGrid::new(Crs::Wgs84, None, [4, 2], [0.0, 0.0], [0.25, 0.5]).unwrap();
+        assert!(wkt.crs_ref().len() > uri, "{}", wkt.crs_ref());
+        assert_eq!(
+            wkt.heap_size(),
+            (ARC_COUNTS + wkt.crs_ref().len()).next_multiple_of(align_of::<usize>())
         );
     }
 

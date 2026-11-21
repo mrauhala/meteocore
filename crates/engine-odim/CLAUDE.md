@@ -49,10 +49,17 @@ around `ds-storage` calls (Critical Rules 6–7).
   - Maps and Tiles answer 400.
   - EDR answers 404 for `position` and the site's location, and lists no
     location.
+- **Map metadata is a snapshot (#1485).** Each site's `RasterInfo` is
+  built in `derive_site_meta` and kept in its `SiteMeta`, so a view's
+  `raster_info_shared` is an `Arc` clone that swaps with the catalog; a
+  site the catalog lacks answers `NO_SITE_INFO`. COMP's is built with its
+  `CompositeCatalog` (the entries and the `RasterInfo` in one `ArcSwap`):
+  only `times` follows a poll, the rest is the seed composite's and the
+  config's. Never build a `RasterInfo` per call.
 - `catalog_bytes()` (#1307) is computed in `derive_catalog`: each
   catalogued volume's parsed metadata once (the parse cache shares the
   `Arc`s), the parse cache's table and keys, its `left_out` memory, and
-  `SiteMeta`. A new owned
+  `SiteMeta` with its `RasterInfo`, once per site. A new owned
   field in `PolarVolume`/`Sweep`/`PolarMoment` goes into its `HeapSize` impl
   in `pvol.rs`.
 - **Scan metrics (#193).** `ParseCache` holds the parsed volumes with the
