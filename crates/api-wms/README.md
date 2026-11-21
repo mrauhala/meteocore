@@ -27,9 +27,10 @@ names.
   from `ds-executor`), the render on a blocking worker, one encode.
 - EPSG:3857, EPSG:3067 and EPSG:3035 maps are assembled from cached
   256 × 256 meta-tiles on internal tile grids, resampled by nearest
-  neighbour so discrete palettes stay exact. CRS:84 and EPSG:4326 maps, and
-  views that would need too many tiles or zoom past the grids, render
-  directly.
+  neighbour so discrete palettes stay exact. An EPSG:3857 view a whole
+  turn of longitude away draws the view's pixels wherever the engine draws
+  the same data there. CRS:84 and EPSG:4326 maps, and views that would
+  need too many tiles or zoom past the grids, render directly.
 - Styles resolve through `ds-render`, as in Maps and Tiles, so a layer looks
   the same in all three.
 - All XML and the HTML GetFeatureInfo are written with `quick-xml`, which

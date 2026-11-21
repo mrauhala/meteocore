@@ -90,6 +90,16 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   coordinate map; it must stay consistent with `OutputCrs`/`ProjectionGrid`.
 - Viewport/bbox conversions are UNCLAMPED (`ds_core::web_mercator`); clamp to
   `LAT_LIMIT_DEG` only for tile-index selection (#452).
+- An EPSG:3857 view a whole turn of longitude away, a world copy, assembles
+  the view's pixels byte for byte where the engine draws the copy alike
+  (#1189). An odd half-octave step's turn is not a whole number of tiles
+  (5792.619 texels at level 9), so its grid is anchored to the copy holding
+  the view's centre (`Grid::world_copy`, `TileKey.copy`) and continues
+  across ±180° within the view; even steps and views centred in the world
+  in place keep the world's grid. A copy's tiles are its own cache entries,
+  never the world in place's, since an engine may draw a copy otherwise.
+  Pinned by `server/tests/wms_world_copies.rs` and ds-render's
+  `a_world_copy_assembles_the_pixels_of_the_view_in_place`.
 - EPSG:3067/3035 use separate internal metre grids: origin (0,0),
   half-octave ladder from 128000 m/px (including 1000/500/250 m/px).
   These are not advertised OGC tile matrix sets. The grid identity is part
