@@ -4804,6 +4804,110 @@ async fn transient_render_errors_are_their_503_and_others_the_error_tile() {
     }
 }
 
+/// A `MapEngine` whose render panics.
+struct PanickingEngine;
+impl MapEngine for PanickingEngine {
+    fn get_raster_tile(
+        &self,
+        _: [f64; 4],
+        _: u32,
+        _: u32,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+        _: &OutputCrs,
+        _: Option<&str>,
+        _: Option<f64>,
+        _: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<RasterTile, DataServerError> {
+        panic!("render panicked at {}", engine_errors::SECRET)
+    }
+    fn raster_info(&self) -> RasterInfo {
+        PopulatedMockMapEngine.raster_info()
+    }
+}
+
+/// A log sink a `fmt` subscriber writes its lines to.
+#[derive(Clone, Default)]
+struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Lines {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// #1484: a render job that panics is a 500 whose detail, the panic's
+/// message with the layer, is logged exactly once, at WARN, and reaches
+/// neither the body nor the request log's reason. It used to be logged
+/// nowhere, the default panic hook's stderr line aside.
+///
+/// The test runs alone in a child process with a global subscriber: a
+/// thread-local one races the binary's other tests, which reach the same
+/// callsites without one and can leave them disabled in tracing's interest
+/// cache.
+#[test]
+fn a_panicking_render_logs_its_detail_once() {
+    const TEST: &str = "a_panicking_render_logs_its_detail_once";
+    const CHILD: &str = "MC_TEST_WMS_PANIC_LOG_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{TEST} failed in its child process");
+        return;
+    }
+    let lines = Lines::default();
+    let sink = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || sink.clone())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(a_panicking_render_logs_its_detail_once_in_child(lines));
+}
+
+/// [`a_panicking_render_logs_its_detail_once`] in its child process, the
+/// global subscriber writing to `lines`.
+async fn a_panicking_render_logs_its_detail_once_in_child(lines: Lines) {
+    let app = build_populated_router_with_engine(Arc::new(PanickingEngine));
+    let uri = "/?SERVICE=WMS&REQUEST=GetMap&VERSION=1.3.0&LAYERS=radar&CRS=CRS:84\
+               &BBOX=20,60,25,65&WIDTH=32&HEIGHT=32&FORMAT=image/png";
+    let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let reason = response
+        .extensions()
+        .get::<ds_core::error::ErrorReason>()
+        .unwrap()
+        .0
+        .clone();
+    assert_eq!(reason, "Internal: Internal server error");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let xml = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!xml.contains(engine_errors::SECRET), "{xml}");
+    let log = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    let detail: Vec<&str> = log
+        .lines()
+        .filter(|l| l.contains(engine_errors::SECRET))
+        .collect();
+    assert_eq!(detail.len(), 1, "{log}");
+    assert!(detail[0].contains(" WARN "), "{log}");
+    assert!(
+        detail[0].contains("WMS internal error: Render task failed"),
+        "{log}"
+    );
+    assert!(detail[0].contains("panicked"), "{log}");
+}
+
 struct DeadlineMockEngine {
     stalled: std::sync::atomic::AtomicBool,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,

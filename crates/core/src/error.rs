@@ -127,6 +127,38 @@ impl DataServerError {
             | Self::Io(_) => ErrorClass::Internal,
         }
     }
+
+    /// Every [`Self::failure_reason`], a bounded metrics label set.
+    pub const FAILURE_REASONS: [&'static str; 4] =
+        ["not_found", "invalid_request", "storage", "internal"];
+
+    /// Why a request failed, as a bounded metrics label: the data it named
+    /// is absent (`not_found`, [`ErrorClass::NotFound`]), the engine refused
+    /// the request (`invalid_request`, [`ErrorClass::BadRequest`]), a source
+    /// read failed (`storage`: [`Self::Storage`], [`Self::Io`]) or anything
+    /// else (`internal`). Of the errors that are not transient, `storage`
+    /// and `internal` are exactly [`ErrorClass::Internal`]; a transient one
+    /// is `internal`. `storage` is finer than the class, which is why this
+    /// is a mapping of its own; it follows the class otherwise, so a new
+    /// variant needs only its class (#1484).
+    ///
+    /// WMS labels its error tiles with it (`wms_error_tiles_total`, #1375),
+    /// and the `WmsErrorTiles` alert counts `storage` and `internal`
+    /// (#1476): a data fault an engine reports with a client class is a
+    /// tile the alert misses (#1506).
+    pub const fn failure_reason(&self) -> &'static str {
+        match self.class() {
+            ErrorClass::NotFound => "not_found",
+            ErrorClass::BadRequest => "invalid_request",
+            ErrorClass::Internal => match self {
+                Self::Storage(_) | Self::Io(_) => "storage",
+                _ => "internal",
+            },
+            ErrorClass::Busy | ErrorClass::DeadlineExceeded | ErrorClass::SourceUnavailable => {
+                "internal"
+            }
+        }
+    }
 }
 
 /// How every API answers a [`DataServerError`] (#17): each API crate's error
@@ -246,6 +278,48 @@ mod tests {
         assert_eq!(wrapped.class(), C::SourceUnavailable);
         let wrapped = DataServerError::LocationNotFound(s()).with_storage_context("GRIB");
         assert_eq!(wrapped.class(), C::Internal);
+    }
+
+    /// Every variant's failure reason (#1375, #1484), the labels
+    /// `wms_error_tiles_total` has always had: `storage` and `internal` are
+    /// exactly the class-`Internal` errors among those that are not
+    /// transient, which the `WmsErrorTiles` alert relies on (#1476).
+    #[test]
+    fn every_variant_has_its_failure_reason() {
+        use DataServerError as E;
+        let s = || String::from("x");
+        let cases = [
+            (E::DeadlineExceeded, "internal"),
+            (E::ResourceExhausted, "internal"),
+            (E::CollectionNotFound(s()), "not_found"),
+            (E::LocationNotFound(s()), "not_found"),
+            (E::InvalidDatetime(s()), "invalid_request"),
+            (E::Engine(s()), "internal"),
+            (E::Config(s()), "internal"),
+            (E::FeatureNotFound(s()), "not_found"),
+            (E::ReferenceTimeNotFound(s()), "not_found"),
+            (E::InvalidBbox(s()), "invalid_request"),
+            (E::QueryTooLarge(s()), "invalid_request"),
+            (E::InvalidParameter(s()), "invalid_request"),
+            (E::Storage(s()), "storage"),
+            (E::Unavailable(s()), "internal"),
+            (E::Render(s()), "internal"),
+            (E::Io(std::io::Error::other("x")), "storage"),
+        ];
+        for (error, reason) in cases {
+            assert_eq!(error.failure_reason(), reason, "{error:?}");
+            assert!(
+                DataServerError::FAILURE_REASONS.contains(&reason),
+                "{error:?}"
+            );
+            if !error.class().is_transient() {
+                assert_eq!(
+                    matches!(reason, "storage" | "internal"),
+                    error.class() == ErrorClass::Internal,
+                    "{error:?}"
+                );
+            }
+        }
     }
 
     /// A collection without data yet is a not-found, which a `datetime`

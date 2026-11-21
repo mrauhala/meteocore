@@ -22,6 +22,8 @@ tracing = "0.1"
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tower = { version = "0.5", features = ["util"] }
+# Capture log lines: an `Internal` error's detail is logged exactly once (#1484).
+tracing-subscriber = "0.3"
 http-body-util = "0.1"
 # Decode GetMap PNGs to assert TRANSPARENT/BGCOLOR pixels (#163); already
 # in the graph via ds-render.

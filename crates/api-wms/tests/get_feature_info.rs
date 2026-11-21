@@ -1039,6 +1039,65 @@ async fn an_overloaded_engine_is_503_and_a_failing_one_leaks_nothing() {
     assert!(!reply.body.contains("10.0.0.5"), "{}", reply.body);
 }
 
+/// A log sink a `fmt` subscriber writes its lines to.
+#[derive(Clone, Default)]
+struct Lines(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Lines {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// #1484: a failing engine's detail is logged exactly once, at WARN and
+/// naming the layer, by the response it becomes; the body has none of it.
+/// The handler used to log it before mapping it, and the response again.
+/// The test runs alone in a child process with a global subscriber: a
+/// thread-local one races the binary's other tests, which reach the same
+/// callsites without one and can leave them disabled in tracing's interest
+/// cache.
+#[test]
+fn an_internal_error_logs_its_detail_once() {
+    const TEST: &str = "an_internal_error_logs_its_detail_once";
+    const CHILD: &str = "MC_TEST_FEATURE_INFO_INTERNAL_LOG_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{TEST} failed in its child process");
+        return;
+    }
+    let lines = Lines::default();
+    let sink = lines.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::TRACE)
+        .with_writer(move || sink.clone())
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+    let reply = tokio::runtime::Runtime::new().unwrap().block_on(get(
+        &router(Nwp::new(Answer::Fails)),
+        &gfi("nwp/t2m", 0, 0, ""),
+    ));
+    assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(!reply.body.contains("10.0.0.5"), "{}", reply.body);
+    let log = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+    let detail: Vec<&str> = log.lines().filter(|l| l.contains("10.0.0.5")).collect();
+    assert_eq!(detail.len(), 1, "{log}");
+    assert!(detail[0].contains(" WARN "), "{log}");
+    assert!(
+        detail[0].contains("WMS internal error: GetFeatureInfo error for layer 'nwp/t2m'"),
+        "{log}"
+    );
+}
+
 /// Every engine error answers by its class (#17): an absent resource is the
 /// empty answer, a request the engine turns down the 400 naming the layer,
 /// and every other class the status every API answers it with. No error

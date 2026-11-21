@@ -30,7 +30,7 @@
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -319,10 +319,10 @@ impl FetchError {
     /// 429, 502, 503 or 504 through its retries stays `Unavailable` (503
     /// with `Retry-After: 10`, #1355), naming the file; any other failed
     /// read is `ResourceExhausted` (503), its detail logged at WARN here.
-    /// A file gone or grown too large is an `Engine` error, which EDR
-    /// answers as a null timestep, as a file whose bytes do not decode.
-    fn into_request_error(self, collection_id: &str) -> DataServerError {
-        match self {
+    /// A file gone or grown too large is [`LoadError::Withdrawn`], which
+    /// each caller answers its own way.
+    fn into_load_error(self, collection_id: &str) -> LoadError {
+        LoadError::Request(match self {
             FetchError::Failed {
                 source: DataServerError::DeadlineExceeded,
                 ..
@@ -335,7 +335,49 @@ impl FetchError {
                 tracing::warn!("[{collection_id}] failed to read ODIM file `{location}`: {source}");
                 DataServerError::ResourceExhausted
             }
-            unusable => DataServerError::Engine(format!("[{collection_id}] {unusable}")),
+            withdrawn => return LoadError::Withdrawn(format!("[{collection_id}] {withdrawn}")),
+        })
+    }
+}
+
+/// Why [`OdimEngine::load`] has no composite.
+#[derive(Debug)]
+pub(crate) enum LoadError {
+    /// The file the catalog names is gone since the scan, or grown past
+    /// [`crate::catalog::MAX_REMOTE_FILE_SIZE`] since it was listed: no
+    /// fault of the request, and the next scan drops the entry, after which
+    /// the same time draws its nearest file. Told apart by type, never by
+    /// error text. Carries the detail.
+    Withdrawn(String),
+    /// Anything else: the deadline, a failed read, bytes that do not decode.
+    Request(DataServerError),
+}
+
+impl LoadError {
+    /// An EDR query's answer: a withdrawn file is an `Engine` error, which
+    /// the query answers as a null timestep, as GeoTIFF's EDR answers a gone
+    /// object, and as a file whose bytes do not decode.
+    fn for_query(self) -> DataServerError {
+        match self {
+            LoadError::Withdrawn(detail) => DataServerError::Engine(detail),
+            LoadError::Request(e) => e,
+        }
+    }
+
+    /// A map's answer: a withdrawn file is `ResourceExhausted` (503 with
+    /// `Retry-After`), its detail logged at WARN here, as GeoTIFF answers an
+    /// object it cannot read and as a failed read above (#1506). Never the
+    /// WMS error tile or Maps' and Tiles' opaque 500, which name a server
+    /// fault, nor an `Ok` tile of nodata, which the no-TTL rendered caches
+    /// would keep after the next scan dropped the entry (root CLAUDE.md,
+    /// adding a new engine, #993).
+    fn for_map(self) -> DataServerError {
+        match self {
+            LoadError::Withdrawn(detail) => {
+                tracing::warn!("{detail}; a map of it is a 503 until the next scan drops it");
+                DataServerError::ResourceExhausted
+            }
+            LoadError::Request(e) => e,
         }
     }
 }
@@ -992,12 +1034,19 @@ impl OdimEngine {
     /// the deadline, `Unavailable` for a store that kept answering 429, 502,
     /// 503 or 504, else `ResourceExhausted` (#1496). A file gone since the
     /// scan, grown too large or whose bytes do not decode is an `Engine`
-    /// error, which EDR answers as a null timestep. Nothing failed is
+    /// error, which EDR answers as a null timestep; a map answers the first
+    /// two with a 503 ([`LoadError::for_map`], #1506). Nothing failed is
     /// cached, so the next request reads the file again.
     pub(crate) fn load_composite(
         &self,
         location: &Location,
     ) -> Result<Arc<OdimComposite>, DataServerError> {
+        self.load(location).map_err(LoadError::for_query)
+    }
+
+    /// [`Self::load_composite`], a file gone or grown too large told apart
+    /// ([`LoadError::Withdrawn`]).
+    pub(crate) fn load(&self, location: &Location) -> Result<Arc<OdimComposite>, LoadError> {
         // Composites are immutable, so the location id (local path or S3 key)
         // fully determines the decode — no data-version in the key (same as
         // the PVOL pixel / voxel-grid caches). `get_or_insert_with_until` is the
@@ -1020,23 +1069,50 @@ impl OdimEngine {
         // A request waits for another's fill no longer than its deadline
         // (#1399): `DeadlineExceeded`, and the fill lands for the requests
         // after it. Past the deadline it starts no fetch of its own.
-        let composite = COMPOSITE_CACHE.get_or_insert_with_until(
-            &key,
-            ds_core::deadline::current(),
-            || {
-                let bytes =
-                    fetch_bytes(location).map_err(|e| e.into_request_error(&self.collection_id))?;
-                let composite = Arc::new(read_composite(&bytes).map_err(|e| {
-                    DataServerError::Engine(format!(
-                        "[{}] failed to parse ODIM file `{}`: {e}",
-                        self.collection_id, key
-                    ))
-                })?);
-                Ok::<_, DataServerError>(composite)
-            },
-            || DataServerError::DeadlineExceeded,
-        )?;
+        let composite = COMPOSITE_CACHE
+            .get_or_insert_with_until(
+                &key,
+                ds_core::deadline::current(),
+                || {
+                    let bytes = fetch_bytes(location)
+                        .map_err(|e| e.into_load_error(&self.collection_id))?;
+                    let composite = Arc::new(read_composite(&bytes).map_err(|e| {
+                        LoadError::Request(DataServerError::Engine(format!(
+                            "[{}] failed to parse ODIM file `{}`: {e}",
+                            self.collection_id, key
+                        )))
+                    })?);
+                    Ok::<_, LoadError>(composite)
+                },
+                || LoadError::Request(DataServerError::DeadlineExceeded),
+            )
+            .inspect_err(|e| {
+                if matches!(e, LoadError::Withdrawn(_)) {
+                    self.recheck_withdrawn(location);
+                }
+            })?;
         Ok(composite)
+    }
+
+    /// Have a template probe HEAD a withdrawn file again on its next poll,
+    /// which then drops it (#1506). The probe never re-HEADs a file it found
+    /// (`immutable`), so a file gone since would otherwise stay catalogued,
+    /// and a map of its time a 503, until its slot left the window; a
+    /// listing source's next scan drops it by itself. The poll holds the
+    /// prober's lock across its HEADs, so a request takes it only if it is
+    /// free (root CLAUDE.md, Critical Rule 7), and a later one asks again.
+    fn recheck_withdrawn(&self, location: &Location) {
+        let (Source::TemplateHttp { prober, .. }, Location::Remote { key, .. }) =
+            (&self.source, location)
+        else {
+            return;
+        };
+        let mut prober = match prober.try_lock() {
+            Ok(prober) => prober,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        prober.recheck(key);
     }
 }
 
@@ -1311,7 +1387,7 @@ impl MapEngine for OdimEngine {
                 self.collection_id
             ))
         })?;
-        let composite = self.load_composite(&entry.location)?;
+        let composite = self.load(&entry.location).map_err(LoadError::for_map)?;
 
         let gain = self.gain_override.unwrap_or(composite.gain);
         let offset = self.offset_override.unwrap_or(composite.offset);

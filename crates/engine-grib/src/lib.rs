@@ -18,6 +18,8 @@ mod field_plan_tests;
 mod geopotential_tests;
 pub mod index;
 #[cfg(test)]
+mod map_fault_tests;
+#[cfg(test)]
 mod map_version_tests;
 mod message_cache;
 mod metadata;
@@ -1663,9 +1665,17 @@ impl MapMessage<'_> {
 
 /// `param`'s message in `step_file` at its run's canonical `key`, moved to
 /// `level` when one is given: exactly, never another level when that
-/// product is absent from an individual forecast step. A parameter the run
-/// lacks is a bad request; a step without its field (a level one step of a
-/// pressure view lacks) is missing data, a 404.
+/// product is absent from an individual forecast step.
+///
+/// A map reaches it only once the request has been checked: the parameter
+/// against what the collection advertises and the run and step against the
+/// time (`select_run_step`, whose errors stay the client's 400 and 404),
+/// the level against the parameter's own levels in the run (`map_level`).
+/// What is still missing here is a fault of the data, an `Engine` error
+/// (#1506): a parameter the run selected for it lacks (`key` `None`), or a
+/// step without the field at that level, an incomplete step file. Retrying
+/// will not draw it, so neither is a 503. WMS draws the error tile its
+/// `WmsErrorTiles` alert counts; Maps and Tiles answer 500.
 fn canonical_message<'a>(
     step_file: &'a StepFile,
     param: &str,
@@ -1673,8 +1683,9 @@ fn canonical_message<'a>(
     level: Option<f64>,
 ) -> Result<&'a catalog::MessageEntry, DataServerError> {
     let key = key.ok_or_else(|| {
-        DataServerError::InvalidParameter(format!(
-            "Parameter '{param}' is unavailable in this collection and run"
+        DataServerError::Engine(format!(
+            "Parameter '{param}' is missing from the run selected to draw it ({})",
+            step_file.grib_url
         ))
     })?;
     let level = GribEngine::key_level(key, level);
@@ -1683,8 +1694,10 @@ fn canonical_message<'a>(
         .iter()
         .find(|m| key.matches_at(m, level))
         .ok_or_else(|| {
-            DataServerError::LocationNotFound(format!(
-                "Parameter '{param}' at its canonical level not found in forecast step"
+            DataServerError::Engine(format!(
+                "Parameter '{param}' ({} level {level:?}) is missing from its forecast step \
+                 {}: an incomplete step file",
+                key.levtype, step_file.grib_url
             ))
         })
 }

@@ -548,9 +548,17 @@ names. Run selection then prefers runs by the canonical names. Pinned by
   a pin, rule 2 accepts a time outside the pinned run's own steps only when
   the unpinned selection chooses that run; any other pin outside its steps
   is the default layer's 400, never the pinned run's edge step.
-- `fetch_grid`: a parameter the run lacks is `InvalidParameter`; a step
-  without its field at the requested level (a pressure view's `z`) is
-  `LocationNotFound`.
+- A map's message (`map_message` → `canonical_message`) is looked up only
+  after `select_run_step` and `map_level` have checked the request, whose
+  errors stay the client's (an unadvertised parameter, a time outside the
+  data: 400; a pinned run without a carrying step: 404). So what is still
+  missing there is the data's fault, an `Engine` error (#1506): a run
+  selected for a parameter that lacks it, or a step without the field at
+  the level drawn (an incomplete step file, such as a pressure view's step
+  missing one of the parameter's levels). WMS draws the error tile the
+  `WmsErrorTiles` alert counts (`internal`); Maps and Tiles answer 500. A
+  503 would promise that a retry helps. EDR keeps its own rules (null in a
+  position series, 400 in an area naming the parameter).
 - Tests: `parameter_times_tests.rs` (two synthetic runs, and the real GFS
   2026-04-08 f000/f003/f006 sidecars in `testdata/gfs`), and
   `server/tests/grib_parameter_times.rs` (WMS capabilities and GetMap cache

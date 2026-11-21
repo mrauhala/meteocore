@@ -112,8 +112,10 @@ impl WmsError {
     /// CLAUDE.md ("Do not leak internal error details to clients — use
     /// generic messages for 500 errors") and the `MapsError` precedent,
     /// `Internal` gets a fixed redacted message, as the payload-free 503s do;
-    /// the original detail is captured at the handler via `tracing::warn!`
-    /// before the error is mapped, so operators don't lose it.
+    /// the original detail is logged once, at WARN, by
+    /// [`IntoResponse::into_response`] (#1484), so operators don't lose it.
+    /// A site that builds an `Internal` names its context in the detail and
+    /// logs nothing itself.
     fn message(&self) -> &str {
         match self {
             WmsError::LayerNotDefined(m)
@@ -178,7 +180,13 @@ impl WmsError {
 }
 
 impl IntoResponse for WmsError {
+    /// The ServiceExceptionReport. An `Internal` error's detail is logged
+    /// here, once, at WARN (#1484): the body and the `ErrorReason` the
+    /// request log carries hold only the redacted message.
     fn into_response(self) -> axum::response::Response {
+        if let WmsError::Internal(detail) = &self {
+            tracing::warn!("WMS internal error: {detail}");
+        }
         let status = self.status_code();
         let retry_after = self.retry_after();
         let reason =
@@ -247,8 +255,8 @@ mod tests {
         // for 5xx — the inner panic detail must not leak to clients via
         // the response body, and ErrorReason mirrors the body so log lines
         // and user-visible errors stay consistent. Operators get the
-        // original detail via `tracing::warn!` at the handler before the
-        // error is mapped to WmsError::Internal.
+        // original detail from the WARN `into_response` logs (#1484,
+        // `an_internal_error_logs_its_detail_once`).
         let err = WmsError::Internal("render task panicked: secret detail".to_string());
         let response = err.into_response();
 
@@ -262,6 +270,100 @@ mod tests {
             "inner panic detail must not leak via ErrorReason, got {:?}",
             reason.0
         );
+    }
+
+    /// A log sink a `fmt` subscriber writes its lines to.
+    #[derive(Clone, Default)]
+    struct Lines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Lines {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `f` logs, at any level. The subscriber is the process's global
+    /// one, installed on the first call: a thread-local one races the other
+    /// tests of the binary, which reach the same callsites without a
+    /// subscriber and can leave them disabled in tracing's interest cache,
+    /// so only a test alone in a child process calls this.
+    fn logged(f: impl FnOnce()) -> String {
+        static LINES: std::sync::OnceLock<Lines> = std::sync::OnceLock::new();
+        let lines = LINES.get_or_init(|| {
+            let lines = Lines::default();
+            let sink = lines.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(move || sink.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("the child process installs the only global subscriber");
+            lines
+        });
+        lines.0.lock().unwrap().clear();
+        f();
+        let bytes = std::mem::take(&mut *lines.0.lock().unwrap());
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// #1484: an `Internal` error's detail is logged exactly once, at WARN,
+    /// where the response is made, and never reaches the body; no other
+    /// answer logs anything there. Alone in a child process, with a global
+    /// subscriber ([`logged`]).
+    #[test]
+    fn an_internal_error_logs_its_detail_once() {
+        const TEST: &str = "error::tests::an_internal_error_logs_its_detail_once";
+        const CHILD: &str = "MC_TEST_WMS_INTERNAL_LOG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "{TEST} failed in its child process");
+            return;
+        }
+        let mut response = None;
+        let log = logged(|| {
+            response = Some(
+                WmsError::Internal("render task panicked: secret detail".into()).into_response(),
+            );
+        });
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains(" WARN "), "{log}");
+        assert!(
+            log.contains("WMS internal error: render task panicked: secret detail"),
+            "{log}"
+        );
+        let response = response.unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let reason = response.extensions().get::<ErrorReason>().unwrap();
+        assert_eq!(reason.0, "Internal: Internal server error");
+
+        for error in [
+            WmsError::layer_not_found("x"),
+            WmsError::StyleNotDefined("x".into()),
+            WmsError::invalid_crs("x"),
+            WmsError::InvalidDimensionValue("x".into()),
+            WmsError::missing_parameter("x"),
+            WmsError::invalid_format("x"),
+            WmsError::invalid_parameter("x"),
+            WmsError::operation_not_supported("x"),
+            WmsError::LayerNotQueryable("x".into()),
+            WmsError::InvalidPoint("x".into()),
+            WmsError::ServiceUnavailable,
+            WmsError::SourceUnavailable,
+        ] {
+            let what = format!("{error:?}");
+            let log = logged(|| drop(error.into_response()));
+            assert!(log.is_empty(), "{what}: {log}");
+        }
     }
 
     /// A data source that keeps refusing reads (#1355) is the busy

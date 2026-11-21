@@ -714,10 +714,11 @@ need no reload pruning.
   and `prune_render_duration` drops a removed WMS collection's series.
   The `WmsErrorTiles` alert counts only `reason=~"storage|internal"`, the
   class-`Internal` errors (#1476). `not_found` and `invalid_request` are
-  mostly a client's request; some engines report a data fault with them
-  too (a GRIB message missing from its step, a GeoTIFF source over its
-  pixel cap), which the alert misses (#1506). A new reason goes in the
-  rule, its test and the dashboard's ratio panel when it is server-side.
+  mostly a client's request; an engine may report a data fault with them
+  too (a GeoTIFF source over its pixel cap), which the alert misses
+  (#1506). The reason is `DataServerError::failure_reason` in ds-core,
+  from the error's class (#1484). A new reason goes there, in the rule,
+  its test and the dashboard's ratio panel when it is server-side.
 
 ## Operational notes
 

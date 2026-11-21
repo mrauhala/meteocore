@@ -143,11 +143,11 @@ groups:
       # (#1476). The other two reasons are mostly a client's request: the
       # data it named gone (`not_found`) or a request the engine refused
       # (`invalid_request`, such as an elevation the layer does not have).
-      # Some engines report a data fault with them too, such as a GRIB
-      # message missing from its step or a GeoTIFF source over its pixel
-      # cap; this rule misses those (#1506). Served GetMaps are every
-      # error tile plus the renders in render_duration_seconds; a collection
-      # that serves only error tiles has no render series, hence the `or`.
+      # An engine may report a data fault with them too, such as a GeoTIFF
+      # source over its pixel cap; this rule misses those (#1506). Served
+      # GetMaps are every error tile plus the renders in
+      # render_duration_seconds; a collection that serves only error tiles
+      # has no render series, hence the `or`.
       - alert: WmsErrorTiles
         expr: |
           sum by (job, instance, collection) (
