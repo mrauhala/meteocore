@@ -577,6 +577,11 @@ fn an_html_page_that_fits_an_idle_budget_is_a_503_while_it_is_busy() {
             let (status, retry_after, _) = rt.block_on(get(app(page), &html));
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(retry_after.as_deref(), Some("1"));
+            // So is a third CoverageJSON body, which an idle budget holds:
+            // only one that no idle budget could hold is a 400 (#1500).
+            let (status, retry_after, _) = rt.block_on(get(app(full_grid), AREA));
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(retry_after.as_deref(), Some("1"));
 
             drop(held);
             let (status, _, _) = rt.block_on(get(app(page), &html));
@@ -586,21 +591,64 @@ fn an_html_page_that_fits_an_idle_budget_is_a_503_while_it_is_busy() {
     );
 }
 
-/// What a page of `answer` reserves, measured at the default budget: the
-/// document's part and the larger of the body with the parse's transient
-/// part and the page; and the page's part, which its unread response
-/// keeps. As bytes of the document's part, the body with the transient
-/// part, and the page's part.
-fn page_reservation(answer: fn() -> CoverageResponse) -> (usize, usize, usize) {
+/// The most the response budget held at once since the previous call.
+fn response_budget_peak() -> usize {
+    // The budget enters the plan when it is first used.
+    api_edr::response_budget_metrics();
+    ds_cache::plan::take_peaks()
+        .into_iter()
+        .find(|(entry, _)| entry.id == "edr_response")
+        .map(|(_, peak)| peak as usize)
+        .expect("the EDR response budget is in the memory plan")
+}
+
+/// What a page of `answer` reserves, measured at the default budget, in
+/// bytes.
+struct PageReservation {
+    /// The document's part.
+    document: usize,
+    /// The body with the parse's transient part.
+    parse: usize,
+    /// The page's part: its estimate, which its render holds.
+    estimate: usize,
+    /// What the unread response keeps of it: the page itself (#1500).
+    held: usize,
+    /// The page's length.
+    page: usize,
+}
+
+/// The page of `answer`'s reservation. The page's estimate outweighs the
+/// parse, so the reservation's peak, the document's part and the larger of
+/// the two, names it.
+fn page_reservation(answer: fn() -> CoverageResponse) -> PageReservation {
     let _serial = serial();
     let json = body(&answer());
     let bound = parsed_document_bound(&json);
+    let parse = json.len() + bound.transient;
     let rt = runtime();
+    response_budget_peak();
     let response = rt.block_on(respond(app(answer), &format!("{AREA}&f=html")));
     assert_eq!(response.status(), StatusCode::OK);
-    let page = api_edr::response_budget_metrics().0 as usize;
-    drop(response);
-    (bound.retained, json.len() + bound.transient, page)
+    let held = api_edr::response_budget_metrics().0 as usize;
+    let whole = response_budget_peak();
+    let page = rt
+        .block_on(response.into_body().collect())
+        .unwrap()
+        .to_bytes()
+        .len();
+    assert_eq!(api_edr::response_budget_metrics().0, 0);
+    let estimate = whole - bound.retained;
+    assert!(
+        estimate > parse,
+        "the page's estimate {estimate} B does not outweigh the parse {parse} B"
+    );
+    PageReservation {
+        document: bound.retained,
+        parse,
+        estimate,
+        held,
+        page,
+    }
 }
 
 /// The engine result and the document of a page of `answer`, as the heap
@@ -629,9 +677,13 @@ fn three_thousand_points() -> CoverageResponse {
 #[test]
 fn a_page_beside_a_held_page_is_refused_before_it_builds() {
     const MIB: usize = 1 << 20;
-    let (document, parse, page) = page_reservation(three_thousand_points);
-    let whole = document + parse.max(page);
-    assert!(page > MIB, "a page's part {page} B outweighs the rounding");
+    let page = page_reservation(three_thousand_points);
+    let whole = page.document + page.estimate;
+    assert!(
+        page.held > MIB,
+        "a held page {} B outweighs the rounding",
+        page.held
+    );
     let budget = whole.div_ceil(MIB).to_string();
     in_child(
         "a_page_beside_a_held_page_is_refused_before_it_builds",
@@ -667,15 +719,23 @@ fn a_page_beside_a_held_page_is_refused_before_it_builds() {
 /// its document and then find no room for its page, both a 503 after the
 /// work. A page reserves all it holds up front instead, so the one that
 /// reserves first is served and the other is the 503 before it builds:
-/// one document is built, never two. The engine releases both answers at
-/// once, so both pages are in flight together.
+/// one document is built at a time, never two. The engine releases both
+/// answers at once, so both pages are in flight together. A built page
+/// keeps only its length of the estimate (#1500), which leaves room for
+/// the other: one reserving that late, after the first is built, is served
+/// too, and still builds its document alone.
 #[test]
-fn two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503() {
+fn two_pages_at_once_that_fit_only_one_at_a_time_never_both_build() {
     const MIB: usize = 1 << 20;
-    let (document, parse, page) = page_reservation(three_thousand_points);
+    let PageReservation {
+        document,
+        parse,
+        estimate,
+        ..
+    } = page_reservation(three_thousand_points);
     // Both documents and bodies fit; both documents and a page do not.
     let both_parsed = 2 * (document + parse);
-    let both_rendering = 2 * document + page;
+    let both_rendering = 2 * document + estimate;
     assert!(
         both_rendering > both_parsed + 2 * MIB,
         "no budget sits between {both_parsed} B and {both_rendering} B"
@@ -684,7 +744,7 @@ fn two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503() {
         .div_ceil(MIB)
         .to_string();
     in_child(
-        "two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503",
+        "two_pages_at_once_that_fit_only_one_at_a_time_never_both_build",
         &[("MC_EDR_RESPONSE_MEMORY_MB", &budget)],
         || {
             let _serial = serial();
@@ -702,8 +762,13 @@ fn two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503() {
             let pair = (peak() - before) as usize;
             let mut statuses = [a.status().as_u16(), b.status().as_u16()];
             statuses.sort_unstable();
-            assert_eq!(statuses, [200, 503]);
-            println!("two at once: heap peak {pair} B, one document {document_bytes} B");
+            assert!(
+                matches!(statuses, [200, 503] | [200, 200]),
+                "one page is served, and never both refused: {statuses:?}"
+            );
+            println!(
+                "two at once: {statuses:?}, heap peak {pair} B, one document {document_bytes} B"
+            );
             assert!(
                 pair < 2 * document_bytes,
                 "both pages built a document: heap peak {pair} B"
@@ -711,6 +776,23 @@ fn two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503() {
             drop((a, b));
             assert_eq!(api_edr::response_budget_metrics().0, 0);
         },
+    );
+}
+
+/// A page's response keeps the page it holds, not the estimate it was
+/// admitted with (#1500): an events page is a fraction of its estimate, and
+/// a body held until delivery keeps only that much of the budget.
+#[test]
+fn a_held_page_keeps_its_length_not_its_estimate() {
+    let page = page_reservation(three_thousand_points);
+    println!(
+        "events page: {} B, estimate {} B, held {} B",
+        page.page, page.estimate, page.held
+    );
+    assert_eq!(page.held, page.page, "the page, shrunk to its length");
+    assert!(
+        page.held * 2 < page.estimate,
+        "an events page is a fraction of its estimate"
     );
 }
 

@@ -477,6 +477,30 @@ async fn datetime_list_without_data_at_any_instant_is_404() {
     assert_eq!(flat.calls().len(), 1);
 }
 
+/// A blank `datetime` is absent on every data query (#1500), as a blank `z`
+/// is: the query form's free-text field submits it so without JavaScript.
+#[tokio::test]
+async fn a_blank_datetime_is_absent_on_every_route() {
+    let (flat, levels) = (Recorder::new(false), Recorder::new(true));
+    let app = router(&flat, &levels);
+    for template in ROUTES {
+        for blank in ["", "%20", "+"] {
+            flat.clear();
+            let uri = format!("{}&datetime={blank}", route(template, "flat", ""));
+            let (status, body, _) = get(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+            assert_eq!(
+                flat.calls(),
+                [Call {
+                    datetime: None,
+                    z: None
+                }],
+                "{uri}"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn malformed_datetime_lists_are_400() {
     let (flat, levels) = (Recorder::new(false), Recorder::new(true));

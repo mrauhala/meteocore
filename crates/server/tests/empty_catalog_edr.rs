@@ -162,10 +162,7 @@ async fn empty_collections_answer_every_query_404_without_logging_an_error() {
         "code": "NotFound",
         "description": DataServerError::no_data_yet().to_string(),
     });
-    assert_eq!(
-        expected["description"],
-        "Location not found: No data available yet"
-    );
+    assert_eq!(expected["description"], "No data available yet");
 
     let queries = [
         "position?coords=POINT(10%2060)",

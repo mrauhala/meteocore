@@ -527,11 +527,16 @@ it never feeds the shed-requests alert. Over what is free now, the 503
 `ServerBusy`. Either way nothing is built. The reservation is then handed
 over part by part (`Reservation::split`, over `BytePermit::split`): the
 page's part to its buffer, what the body and the transient part held
-released after the parse, the document's part at the end. Never reserve
+released after the parse, the document's part at the end. The page's
+buffer is shrunk to its length as it is handed over
+(`Reservation::into_bytes`), after the document is dropped, and the rest
+of its estimate is released then: an events page is about 2.3× under its
+estimate (#1500, `a_held_page_keeps_its_length_not_its_estimate`). Shrink
+before releasing, or the budget under-counts what stays allocated. Never reserve
 more mid-way: two pages that each reserved only their document would
 build both documents and then starve each other of the page, both 503
 after the work (`html_admission_tests`'
-`two_pages_at_once_that_fit_only_one_at_a_time_are_one_200_and_one_503`). The bound models how serde_json builds
+`two_pages_at_once_that_fit_only_one_at_a_time_never_both_build`). The bound models how serde_json builds
 a `Value`, never a size per byte: an array's `Vec` from four slots by
 doubling, plus the half-size buffer its last growth moves from; with
 `preserve_order` an index map's entries at its hash table's capacity, else
@@ -551,7 +556,11 @@ reservation lives in the body's `Bytes` owner, so it is released only when
 the last clone drops: the body delivered, or the client gone. Nothing
 waits: a body that does not fit is 503 `ServerBusy` with `Retry-After: 1`
 (`api_common::JsonError` adds it to every `ServerBusy`), an expired query
-504. The HTML page lays out the `CoverageJson` body parsed back, as
+504. A `Writer` body whose next buffer, beside the one it grows from,
+passes the whole budget can never fit, nor can a CSV body past it
+(`reserve_body`): `Failure::BodyOversize`, a 400 asking for less, not
+counted among rejected admissions (#1500); `/locations` answers it as its
+own cap, the 503 `ResponseLimit`. The HTML page lays out the `CoverageJson` body parsed back, as
 `coverage_response_to_json` (`to_value`) does for tests, so the HTML page
 and the JSON cannot drift: change member order in `CoverageJson`
 only, where it is the order the `Value` builder it replaced wrote, byte for
@@ -559,7 +568,7 @@ byte under the server build's serde_json `preserve_order`. Not counted:
 PNG plots, `items`, metadata and the engine result. `/metrics` exports `edr_response_{reserved,capacity}_bytes` and
 `edr_response_rejected_total`. Pinned by `response_budget::tests`,
 `coverage_tests::the_body_streams_in_the_document_order` and
-`performance_tests`' `large_bodies_over_the_response_budget_are_503` and
+`performance_tests`' `large_bodies_over_the_whole_response_budget_are_400` and
 `a_disconnected_client_releases_its_response_bytes`, and
 `html_admission_tests`' page tests (a full grid's page on a small host's budget,
 a page over the whole budget a 400, one over a busy budget a 503).
@@ -621,9 +630,11 @@ coordinate-placed queries and their placing parameter (`coords`, a cube's
 form, JSON keeps the 400), `error_pages::error_detail` and the breadcrumbs,
 all from the matched route (`routed_query`), never the URL's last segment.
 A new data query route ends in its query name and is added to that list.
-Every field a form submits without JavaScript must parse: a blank `z` or
-`parameter-name` is absent (`parse_z`, `parse_parameter_names`), so parse
-any new form field through a helper that treats blank as absent.
+Every field a form submits without JavaScript must parse: a blank `z`,
+`parameter-name` or `datetime` is absent (`parse_z`,
+`parse_parameter_names`, `parse_datetime`; `items` through Features'
+`parse_datetime_param`, #1500), so parse any new form field through a
+helper that treats blank as absent.
 
 `params::parse_locations_query` is the one `/locations` parser (#932).
 `bbox` (`parse_cube_bbox`, heights dropped), then `datetime`, filter the

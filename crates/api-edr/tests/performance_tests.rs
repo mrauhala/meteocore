@@ -563,14 +563,15 @@ fn in_child(test: &str, env: &[(&str, &str)], body: impl FnOnce()) {
 }
 
 /// With an EDR response budget smaller than one million-value response,
-/// its CoverageJSON is a 503 to retry, and its HTML page, which no idle
-/// budget could hold either, a 400 naming the CoverageJSON before anything
-/// is built; a small response is still served, and every reservation is
-/// released once its body drops (#1041).
+/// which no idle budget that small could hold, its CoverageJSON is a 400
+/// asking for less (#1500; a 503 to retry before), and its HTML page a 400
+/// naming the CoverageJSON before anything is built, neither counted among
+/// shed requests; a small response is still served, and every reservation
+/// is released once its body drops (#1041).
 #[test]
-fn large_bodies_over_the_response_budget_are_503() {
+fn large_bodies_over_the_whole_response_budget_are_400() {
     in_child(
-        "large_bodies_over_the_response_budget_are_503",
+        "large_bodies_over_the_whole_response_budget_are_400",
         &[("MC_EDR_RESPONSE_MEMORY_MB", "4")],
         || {
             tokio::runtime::Builder::new_current_thread()
@@ -593,13 +594,8 @@ fn large_bodies_over_the_response_budget_are_503() {
                     ] {
                         let response = get(uri).await;
                         let html = uri.ends_with("html");
-                        if html {
-                            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
-                            assert!(response.headers().get("retry-after").is_none(), "{uri}");
-                        } else {
-                            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
-                            assert_eq!(response.headers()["retry-after"], "1", "{uri}");
-                        }
+                        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+                        assert!(response.headers().get("retry-after").is_none(), "{uri}");
                         let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
                             .await
                             .unwrap();
@@ -608,15 +604,18 @@ fn large_bodies_over_the_response_budget_are_503() {
                             assert!(page.contains("f=CoverageJSON"), "{page}");
                         } else {
                             let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-                            assert_eq!(error["code"], "ServerBusy");
+                            assert_eq!(error["code"], "BadRequest");
+                            let description = error["description"].as_str().unwrap();
+                            assert!(description.contains("too large"), "{description}");
+                            assert!(!description.contains("f=CoverageJSON"), "{description}");
                         }
                         assert_eq!(api_edr::response_budget_metrics().0, 0, "{uri}");
                     }
                     let (_, capacity, rejected) = api_edr::response_budget_metrics();
                     assert_eq!(capacity, 4 << 20);
-                    // The CoverageJSON was shed; the oversize page is the
-                    // client's 400, not counted among shed requests.
-                    assert_eq!(rejected, 1);
+                    // Both are the client's 400, not counted among shed
+                    // requests.
+                    assert_eq!(rejected, 0);
                     for uri in [
                         "/collections/weather/locations/small",
                         "/collections/weather/locations/small?f=html",

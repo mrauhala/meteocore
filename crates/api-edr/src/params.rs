@@ -76,8 +76,11 @@ impl DatetimeSelector {
 /// An interval that ends before it starts is a 400, as in Features, Maps
 /// and Tiles: it selects nothing, and the station engines' range lookups
 /// panic on it.
+///
+/// A blank value is absent, as a blank `z` or `parameter-name` is: the
+/// query form's free-text field submits it so without JavaScript (#1500).
 pub fn parse_datetime(raw: Option<&str>) -> Result<Option<DatetimeSelector>, DataServerError> {
-    let Some(raw) = raw else {
+    let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else {
         return Ok(None);
     };
     // An RFC 3339 date-time starts with a digit, so a leading `R` is
@@ -738,7 +741,9 @@ pub fn parse_locations_query(
                 "Duplicate query parameter '{name}'"
             )));
         }
-        if matches!(name.as_str(), "bbox" | "datetime") {
+        // A blank `datetime` is absent ([`parse_datetime`]), so the links
+        // leave it out, as they would without it.
+        if name == "bbox" || (name == "datetime" && !value.trim().is_empty()) {
             preserved.push((name, value.clone()));
         }
         *slot = Some(value);
@@ -2143,7 +2148,11 @@ mod tests {
             parse_datetime(Some("../2024-01-01T03:00:00Z")).unwrap(),
             Some(DatetimeSelector::Window(DateTime::<Utc>::MIN_UTC, at))
         );
-        assert!(parse_datetime(Some("")).is_err());
+        // Blank is absent, as the query form submits it without JavaScript
+        // (#1500); a stray comma is still a malformed list.
+        assert_eq!(parse_datetime(Some("")).unwrap(), None);
+        assert_eq!(parse_datetime(Some("  ")).unwrap(), None);
+        assert!(parse_datetime(Some(",")).is_err());
         assert!(parse_datetime(Some("not-a-date")).is_err());
         // An interval that ends before it starts selects nothing: a 400.
         let err = parse_datetime(Some("2024-01-02T00:00:00Z/2024-01-01T00:00:00Z")).unwrap_err();
@@ -2856,6 +2865,15 @@ mod tests {
         )]))
         .unwrap();
         assert!(matches!(list.datetime, Some(DatetimeSelector::Instants(ref v)) if v.len() == 2));
+        // A blank `datetime` is absent (#1500): no filter, and the links
+        // read as without it, so an unpaged list keeps the inventory's body.
+        for blank in ["", " "] {
+            let query =
+                parse_locations_query(pairs(&[("datetime", blank), ("limit", "2")])).unwrap();
+            assert_eq!(query.datetime, None, "{blank:?}");
+            assert!(!query.is_filtered(), "{blank:?}");
+            assert_eq!(query.href("b", 0), "b?limit=2", "{blank:?}");
+        }
 
         for (bad, names) in [
             (&[("bbox", "1,2,3")][..], "Invalid bbox"),
@@ -2867,7 +2885,7 @@ mod tests {
             (&[("bbox", "190,0,200,1")], "Invalid bbox"),
             (&[("bbox", "0,0,1,1"), ("bbox", "0,0,2,2")], "'bbox'"),
             (&[("datetime", "yesterday")], "datetime"),
-            (&[("datetime", "")], "datetime"),
+            (&[("datetime", ","), ("limit", "2")], "datetime"),
             (
                 &[("datetime", "2026-01-01T00:00:00Z,2026-01-02T00:00:00Z/..")],
                 "datetime",

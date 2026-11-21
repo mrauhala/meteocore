@@ -465,6 +465,42 @@ async fn datetime_on_an_engine_without_location_times_is_400() {
     assert_eq!(ids(&json), ["hel", "sto"]);
 }
 
+/// A blank `datetime`, as a form submits an empty field, is absent (#1500):
+/// the unfiltered inventory, byte for byte, even on an engine that cannot
+/// filter by time, and a page's links without it.
+#[tokio::test]
+async fn a_blank_datetime_is_absent() {
+    let app = app();
+    let raw = |uri: String| {
+        let router = app.router.clone();
+        async move {
+            let response = router
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            (
+                status,
+                response.into_body().collect().await.unwrap().to_bytes(),
+            )
+        }
+    };
+    for collection in ["obs", "plain"] {
+        let base = format!("/collections/{collection}/locations");
+        let (status, whole) = raw(base.clone()).await;
+        assert_eq!(status, StatusCode::OK);
+        for blank in ["", "%20"] {
+            let (status, body) = raw(format!("{base}?datetime={blank}")).await;
+            assert_eq!(status, StatusCode::OK, "{collection} {blank:?}");
+            assert_eq!(body, whole, "{collection} {blank:?}");
+        }
+    }
+    let (_, page) = app.get("limit=1").await;
+    let (_, blank) = app.get("datetime=&limit=1").await;
+    assert_eq!(link(&blank, "next"), link(&page, "next"));
+    assert!(!link(&blank, "self").unwrap().contains("datetime"));
+}
+
 /// A reversed interval selects nothing and is a 400 on `/locations` and on
 /// the data queries alike, as Features, Maps and Tiles answer it.
 #[tokio::test]
@@ -501,7 +537,7 @@ async fn malformed_or_repeated_filters_are_400_before_the_inventory_is_read() {
         ("bbox=10,-95,30,65", "bbox"),
         ("bbox=10,55,30,65&bbox=0,0,1,1", "'bbox'"),
         ("datetime=yesterday", "datetime"),
-        ("datetime=", "datetime"),
+        ("datetime=,", "datetime"),
         ("datetime=..", "datetime"),
         ("datetime=2026-06-01T00:00:00Z/tomorrow", "datetime"),
         (
