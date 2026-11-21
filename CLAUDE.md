@@ -1080,8 +1080,9 @@ one never implies the other.
     #661) implement this; other engines accept-and-ignore.
   - API surface: EDR `/instances` (listed newest first: the handler sorts
     it, engines and `build_instances` stay ascending), `/instances/{id}`,
-    `/instances/{id}/{position,area}` — gated on `get_instances()` being
-    non-empty; no-instance routes default to the latest run. WMS exposes
+    `/instances/{id}/{position,area,radius,cube,trajectory}` — gated on
+    `get_instances()` being non-empty; no-instance routes default to the
+    latest run. WMS exposes
     `DIM_REFERENCE_TIME` (see `crates/api-wms/CLAUDE.md`). Maps maps and map
     tiles take `subset=reference_time("<instance id>")` and advertise the
     runs as the extent's `reference_time` dimension (#337), through one

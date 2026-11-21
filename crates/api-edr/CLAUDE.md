@@ -60,9 +60,14 @@ The shared machinery is `ds_core::instances` (see root CLAUDE.md). This crate
 owns the instance-id string form:
 
 - Routes: `GET /collections/{id}/instances`, `/instances/{instanceId}`,
-  `/instances/{instanceId}/{position,area,radius,cube}`
+  `/instances/{instanceId}/{position,area,radius,cube,trajectory}`
   (`handlers::INSTANCE_QUERY_TYPES`). No-instance routes default to the
-  latest run.
+  latest run. Each instance route shares its query's `run_*_query` with the
+  collection route, which passes the run to the engine; the engine reads
+  that run alone, never another run's step (#924: GRIB, QueryData, Zarr and
+  NetCDF pin it through `select_run`, an M path included). No
+  `/instances/{instanceId}/locations`: no engine with runs has named
+  locations; route it only with one that does.
 - Collection metadata gains an `instances` data_query, and the OpenAPI spec
   advertises the instance paths — both gated on `get_instances()` being
   non-empty.

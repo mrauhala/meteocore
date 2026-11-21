@@ -447,7 +447,10 @@ fn cases() -> Vec<(String, String, StatusCode)> {
         };
         // An instance route for the queries a model run serves.
         let mut prefixes = vec![(String::new(), String::new())];
-        if matches!(query, "position" | "area" | "radius" | "cube") {
+        if matches!(
+            query,
+            "position" | "area" | "radius" | "cube" | "trajectory"
+        ) {
             prefixes.push((
                 format!("/instances/{RUN}"),
                 "/instances/{instanceId}".into(),
@@ -663,6 +666,11 @@ async fn unparsable_query_strings_are_the_json_400_naming_the_field() {
             "/edr/collections/obs/trajectory",
             "duplicate field `crs`",
         ),
+        (
+            format!("/collections/obs{run}/trajectory?{line}&{line}"),
+            "/edr/collections/obs/instances/{instanceId}/trajectory",
+            "duplicate field `coords`",
+        ),
     ];
     for (uri, path, field) in cases {
         let reply = send(&app, &uri, None).await;
@@ -787,10 +795,10 @@ async fn every_operation_lists_its_status_classes_and_parameters() {
             (&json!("form"), &json!(false))
         );
     }
-    // obs, busy, late, broken and throttled: seven query paths and four
+    // obs, busy, late, broken and throttled: seven query paths and five
     // instance routes each; grid: position, area and radius, on the
     // collection and on its run.
-    assert_eq!(queries, 5 * 11 + 2 * 3);
+    assert_eq!(queries, 5 * 12 + 2 * 3);
     for path in [
         "/edr/collections/obs/instances",
         "/edr/collections/obs/instances/{instanceId}",

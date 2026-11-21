@@ -79,6 +79,10 @@ pub fn router(state: AppState) -> Router {
             "/collections/{id}/instances/{instanceId}/cube",
             get(handlers::instance_cube_query),
         )
+        .route(
+            "/collections/{id}/instances/{instanceId}/trajectory",
+            get(handlers::instance_trajectory_query),
+        )
         // A data query asked for as HTML without its coordinates is
         // answered with its form (#1138), cached like any page.
         .layer(axum::middleware::from_fn_with_state(

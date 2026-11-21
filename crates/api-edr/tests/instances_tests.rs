@@ -2,7 +2,9 @@
 //!
 //! Exercises the instances endpoints against a mock forecast engine exposing two
 //! runs (00Z, 12Z). The mock encodes the selected run's hour into every value so
-//! a query can prove which run it hit (None ⇒ latest run = 12Z).
+//! a query can prove which run it hit (None ⇒ latest run = 12Z). Its
+//! trajectory query (#924) does the same, so an instance's trajectory
+//! proves the handler passed the run on.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +23,7 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::instances::RunInfo;
 use ds_core::model::*;
+use ds_core::trajectory::{GridSpacing, TrajectoryAxes, TrajectoryPath, TrajectoryPlan};
 
 #[path = "support/edr_schema.rs"]
 mod edr_schema;
@@ -82,7 +85,25 @@ impl EdrEngine for ForecastMock {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string()]
+        vec!["position".to_string(), "trajectory".to_string()]
+    }
+
+    /// Along the path on the selected run's steps in the window (none ⇒
+    /// 404), every value the run's hour; a pinned run that does not exist
+    /// is a 404, as on the real engines.
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        let rt = reference_time.unwrap_or_else(|| dt(LATEST_RUN_HOUR));
+        if !Self::run_times().contains(&rt) {
+            return Err(DataServerError::ReferenceTimeNotFound(rt.to_rfc3339()));
+        }
+        trajectory_on_run(coords, datetime, rt)
     }
 
     fn query_position(
@@ -134,6 +155,47 @@ impl EdrEngine for ForecastMock {
     }
 }
 
+/// A trajectory over the three hourly steps of run `rt` inside `datetime`
+/// (every step without one), each value `rt`'s hour, built by the shared
+/// plan as the real engines build it.
+fn trajectory_on_run(
+    coords: &str,
+    datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    rt: DateTime<Utc>,
+) -> Result<CoverageResponse, DataServerError> {
+    let path = TrajectoryPath::parse(coords)?;
+    let times: Vec<DateTime<Utc>> = (0..3)
+        .map(|h| rt + chrono::Duration::hours(h))
+        .filter(|t| datetime.is_none_or(|(start, end)| *t >= start && *t <= end))
+        .collect();
+    let plan = TrajectoryPlan::new(
+        &path,
+        GridSpacing::new(1.0, 1.0).unwrap(),
+        TrajectoryAxes {
+            times: &times,
+            vertical: None,
+            z: None,
+        },
+        1,
+    )?;
+    let marker = f64::from(rt.hour());
+    let values = vec![plan
+        .fields()
+        .iter()
+        .map(|field| vec![Some(marker); field.points.len()])
+        .collect()];
+    let parameters = [(
+        "temperature".to_string(),
+        ParameterDescription {
+            label: "temperature".to_string(),
+            unit: "degC".to_string(),
+            observed_property: "temperature".to_string(),
+            standard_name: None,
+        },
+    )];
+    plan.into_response(&parameters, &[ValuePrecision::F64], &values)
+}
+
 /// [`ForecastMock`] as a station collection: its position series sit at the
 /// one location it lists, so the point queries also offer EDR GeoJSON, whose
 /// `self` link names the instance the request pinned.
@@ -174,7 +236,7 @@ impl EdrEngine for StationForecastMock {
         ForecastMock.get_spatial_extent()
     }
     fn supported_query_types(&self) -> Vec<String> {
-        ForecastMock.supported_query_types()
+        vec!["position".to_string()]
     }
     fn query_position(
         &self,
@@ -217,7 +279,17 @@ impl EdrEngine for NonForecastMock {
         Some([-180.0, -90.0, 180.0, 90.0])
     }
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["position".to_string()]
+        vec!["position".to_string(), "trajectory".to_string()]
+    }
+    fn query_trajectory(
+        &self,
+        coords: &str,
+        datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>, // ignored — the engine has no runs
+    ) -> Result<CoverageResponse, DataServerError> {
+        trajectory_on_run(coords, datetime, dt(0))
     }
     fn query_position(
         &self,
@@ -706,12 +778,23 @@ async fn unknown_instance_is_404_bad_id_is_400() {
             StatusCode::NOT_FOUND,
             "{id}"
         );
+        assert_eq!(
+            get(&format!(
+                "/collections/fc/instances/{id}/trajectory?coords=LINESTRING(24%2060,25%2061)"
+            ))
+            .await
+            .0,
+            StatusCode::NOT_FOUND,
+            "{id}"
+        );
     }
-    // An unparseable instance id → 400.
-    assert_eq!(
-        get("/collections/fc/instances/not-a-time").await.0,
-        StatusCode::BAD_REQUEST
-    );
+    // An unparseable instance id → 400, on the document and its queries.
+    for uri in [
+        "/collections/fc/instances/not-a-time",
+        "/collections/fc/instances/not-a-time/trajectory?coords=LINESTRING(24%2060,25%2061)",
+    ] {
+        assert_eq!(get(uri).await.0, StatusCode::BAD_REQUEST, "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -735,18 +818,154 @@ async fn instance_query_on_non_forecast_collection_is_404() {
         StatusCode::NOT_FOUND,
         "instance query on a non-forecast collection must be 404, not 200"
     );
+    assert_eq!(
+        get("/collections/obs/instances/20260607T0000Z/trajectory?coords=LINESTRING(24%2060,25%2061)")
+            .await
+            .0,
+        StatusCode::NOT_FOUND,
+        "instance trajectory on a non-forecast collection must be 404, not 200"
+    );
     // Even an unparseable id is 404 here (no instance sub-resources at all) —
     // consistent between the metadata and query paths.
     assert_eq!(
         get("/collections/obs/instances/not-a-time").await.0,
         StatusCode::NOT_FOUND
     );
-    // The plain (no-instance) position query still works.
-    assert_eq!(
-        get("/collections/obs/position?coords=POINT(25%2060)")
-            .await
-            .0,
-        StatusCode::OK
+    // The plain (no-instance) position and trajectory queries still work.
+    for uri in [
+        "/collections/obs/position?coords=POINT(25%2060)",
+        "/collections/obs/trajectory?coords=LINESTRING(24%2060,25%2061)",
+    ] {
+        assert_eq!(get(uri).await.0, StatusCode::OK, "{uri}");
+    }
+    // The instance document of a collection without runs does not exist, so
+    // nothing advertises its trajectory either.
+    let (_, api) = get("/api").await;
+    assert!(api["paths"]
+        .get("/edr/collections/obs/instances/{instanceId}/trajectory")
+        .is_none());
+}
+
+/// A trajectory under an instance (#924) samples that run, the same query
+/// without one the latest run; both are valid CoverageJSON. The request's
+/// own rules hold on the run as on the collection, and the HTML page names
+/// the run.
+#[tokio::test]
+async fn instance_trajectory_query_samples_the_pinned_run() {
+    let line = "coords=LINESTRING(24%2060,25%2061)";
+    let covjson: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../schemas/coveragejson.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let validator = jsonschema::Validator::new(&covjson).unwrap();
+    // The run's value on every sample of every coverage, and the steps.
+    let answer = |body: &Value| -> (Vec<f64>, Vec<String>) {
+        let coverages = match body["type"].as_str() {
+            Some("CoverageCollection") => body["coverages"].as_array().unwrap().clone(),
+            _ => vec![body.clone()],
+        };
+        let values = coverages
+            .iter()
+            .flat_map(|c| {
+                c["ranges"]["temperature"]["values"]
+                    .as_array()
+                    .unwrap()
+                    .clone()
+            })
+            .map(|v| v.as_f64().unwrap())
+            .collect();
+        let steps = coverages
+            .iter()
+            .map(|c| {
+                c["domain"]["axes"]["composite"]["values"][0][0]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        (values, steps)
+    };
+    for (uri, hour) in [
+        (
+            format!("/collections/fc/instances/2026-06-07T00:00:00Z/trajectory?{line}"),
+            0,
+        ),
+        // The compact id names the same run.
+        (
+            format!("/collections/fc/instances/20260607T0000Z/trajectory?{line}"),
+            0,
+        ),
+        (
+            format!("/collections/fc/instances/2026-06-07T12:00:00Z/trajectory?{line}"),
+            LATEST_RUN_HOUR,
+        ),
+        (
+            format!("/collections/fc/trajectory?{line}"),
+            LATEST_RUN_HOUR,
+        ),
+    ] {
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}: {body}");
+        let errors: Vec<String> = validator
+            .iter_errors(&body)
+            .map(|e| e.to_string())
+            .collect();
+        assert!(errors.is_empty(), "{uri}: {errors:?}");
+        let (values, steps) = answer(&body);
+        assert!(!values.is_empty(), "{uri}");
+        assert!(
+            values.iter().all(|&v| v == f64::from(hour)),
+            "{uri}: {values:?}"
+        );
+        // One coverage per step of that run.
+        let run = dt(hour);
+        let expected: Vec<String> = (0..3)
+            .map(|h| (run + chrono::Duration::hours(h)).to_rfc3339())
+            .collect();
+        assert_eq!(steps, expected, "{uri}");
+    }
+
+    // A `datetime` selects among the pinned run's steps.
+    let (status, body) = get(&format!(
+        "/collections/fc/instances/2026-06-07T00:00:00Z/trajectory?{line}&datetime=2026-06-07T01:00:00Z"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (values, steps) = answer(&body);
+    assert!(values.iter().all(|&v| v == 0.0), "{values:?}");
+    assert_eq!(steps, ["2026-06-07T01:00:00+00:00"]);
+
+    // The path's own rules, and the formats a path offers, hold on a run:
+    // `z` with a Z path and `datetime` with an M path are 400s, so are PNG
+    // and GeoJSON along a path.
+    for query in [
+        "coords=LINESTRINGZ(24%2060%201,25%2061%201)&z=1",
+        "coords=LINESTRINGM(24%2060%201780790400,25%2061%201780794000)&datetime=2026-06-07T00:00:00Z",
+        "coords=LINESTRING(24%2060,25%2061)&f=PNG",
+        "coords=LINESTRING(24%2060,25%2061)&f=GeoJSON",
+        "coords=POINT(24%2060)",
+    ] {
+        let uri = format!("/collections/fc/instances/2026-06-07T00:00:00Z/trajectory?{query}");
+        let (status, body) = get(&uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+
+    // The HTML page names the run it answers, its links the canonical id.
+    let (status, ctype, html) = get_raw(
+        &format!("/collections/fc/instances/20260607T0000Z/trajectory?{line}&f=html"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{html}");
+    assert!(ctype.starts_with("text/html"), "{ctype}");
+    assert!(html.contains("Model run"), "{html}");
+    assert!(
+        html.contains("/edr/collections/fc/instances/2026-06-07T00:00:00Z/trajectory?"),
+        "{html}"
     );
 }
 
@@ -801,6 +1020,7 @@ async fn collection_and_instance_links_name_their_query_end_points() {
         [
             ("/edr/collections/fc/instances", "application/json"),
             ("/edr/collections/fc/position", "application/vnd.cov+json"),
+            ("/edr/collections/fc/trajectory", "application/vnd.cov+json"),
         ]
     );
     assert_eq!(
@@ -813,15 +1033,30 @@ async fn collection_and_instance_links_name_their_query_end_points() {
     let (_, instance) = get("/collections/fc/instances/2026-06-07T00:00:00Z").await;
     assert_eq!(
         data_links(&instance),
-        [(
-            "/edr/collections/fc/instances/2026-06-07T00:00:00Z/position",
-            "application/vnd.cov+json"
-        )]
+        [
+            (
+                "/edr/collections/fc/instances/2026-06-07T00:00:00Z/position",
+                "application/vnd.cov+json"
+            ),
+            (
+                "/edr/collections/fc/instances/2026-06-07T00:00:00Z/trajectory",
+                "application/vnd.cov+json"
+            ),
+        ]
+    );
+    assert_eq!(
+        instance["data_queries"]["trajectory"]["link"]["href"],
+        "/edr/collections/fc/instances/2026-06-07T00:00:00Z/trajectory"
     );
     let (_, list) = get("/collections/fc/instances").await;
     for instance in list["instances"].as_array().unwrap() {
-        assert_eq!(data_links(instance).len(), 1, "{instance}");
+        assert_eq!(data_links(instance).len(), 2, "{instance}");
     }
+    // `/api` documents each instance route the instance document links.
+    let (_, api) = get("/api").await;
+    let op = &api["paths"]["/edr/collections/fc/instances/{instanceId}/trajectory"]["get"];
+    assert_eq!(op["operationId"], "getInstanceTrajectory_fc", "{op}");
+    assert_eq!(op["parameters"][0]["name"], "instanceId", "{op}");
 }
 
 /// The HTML pages list the data queries from `data_queries`, each opening
@@ -838,6 +1073,11 @@ async fn html_pages_open_data_queries_as_their_forms() {
         (
             "/collections/fc/instances/2026-06-07T00:00:00Z?f=html",
             "/edr/collections/fc/instances/2026-06-07T00:00:00Z/position",
+        ),
+        ("/collections/fc?f=html", "/edr/collections/fc/trajectory"),
+        (
+            "/collections/fc/instances/2026-06-07T00:00:00Z?f=html",
+            "/edr/collections/fc/instances/2026-06-07T00:00:00Z/trajectory",
         ),
     ] {
         let (status, _, body) = get_raw(uri, None).await;

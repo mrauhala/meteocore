@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
@@ -668,6 +668,60 @@ fn forecast_runs_are_instances_and_selectable() {
     let err = e
         .query_position(
             "POINT(10 60)",
+            None,
+            None,
+            None,
+            Some(run0 + chrono::Duration::hours(3)),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ds_core::error::DataServerError::ReferenceTimeNotFound(_)
+        ),
+        "{err}"
+    );
+
+    // A trajectory against a run (an EDR instance trajectory, #924) reads
+    // that run's steps and values (run 1's are 1000 K higher), the latest
+    // without one; an unknown run is ReferenceTimeNotFound, never a fallback.
+    let path = "LINESTRING(10.2 59.2, 10.8 59.8)";
+    let trajectory = |run: Option<DateTime<Utc>>| -> Vec<(DateTime<Utc>, Vec<f64>)> {
+        let coverages = match e.query_trajectory(path, None, None, None, run).unwrap() {
+            CoverageResponse::Collection(coverages) => coverages,
+            CoverageResponse::Single(coverage) => vec![coverage],
+        };
+        coverages
+            .into_iter()
+            .map(|c| {
+                let ds_core::model::DomainDescription::Trajectory { nodes, .. } = &c.domain else {
+                    panic!("expected a Trajectory domain");
+                };
+                let values = c.ranges["temp"].values.iter().flatten().copied().collect();
+                (nodes[0].0, values)
+            })
+            .collect()
+    };
+    for (run, values) in [
+        (run0, celsius(0.0)..celsius(1000.0)),
+        (run1, celsius(1000.0)..celsius(2000.0)),
+    ] {
+        let steps = trajectory(Some(run));
+        let times: Vec<DateTime<Utc>> = steps.iter().map(|(t, _)| *t).collect();
+        let expected: Vec<DateTime<Utc>> =
+            (0..3).map(|h| run + chrono::Duration::hours(h)).collect();
+        assert_eq!(times, expected, "{run}: the run's own steps");
+        for (t, sampled) in &steps {
+            assert!(
+                !sampled.is_empty() && sampled.iter().all(|v| values.contains(v)),
+                "{run} {t}: {sampled:?}"
+            );
+        }
+    }
+    assert_eq!(trajectory(None), trajectory(Some(run1)), "the latest run");
+    let err = e
+        .query_trajectory(
+            path,
             None,
             None,
             None,
