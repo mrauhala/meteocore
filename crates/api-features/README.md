@@ -205,7 +205,9 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
   selects HTML; `*/*` stays JSON. Negotiated responses send `Vary: Accept`.
 - Every 200 has a weak ETag, `W/"…"`, one tag for the plain and the
   gzipped body, and `If-None-Match` gets a 304, compared weakly: `W/"x"` and
-  `"x"` match each other. The `/items` ETag ignores `timeStamp`. Cache-Control is `public, max-age=60` by default.
+  `"x"` match each other, on any line of the field. A 304 repeats the
+  200's `Vary`, `accept-encoding` included, and states no
+  `Content-Length`. The `/items` ETag ignores `timeStamp`. Cache-Control is `public, max-age=60` by default.
   An `/items` request whose closed `datetime` interval ended at least an hour
   ago gets `public, max-age=86400`.
 - Errors are `{"code", "description"}`, and a 500 never shows internal

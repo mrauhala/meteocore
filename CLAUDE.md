@@ -1071,9 +1071,11 @@ one never implies the other.
   - `build_instances(&runs, |rt, run| valid_times)`.
   - Engine contract: store runs in `BTreeMap<DateTime<Utc>, _>` keyed by
     reference time; implement `EdrEngine::get_instances()` (default empty =
-    non-forecast), with `has_instances`, `find_instance` and
-    `instance_reference_times` (the map's keys, #1006) from the same
-    snapshot; honour the trailing `reference_time` parameter on query
+    non-forecast), with `has_instances`, `find_instance`,
+    `instance_reference_times` (the map's keys, #1006) and
+    `latest_reference_time` (its last key, O(1): every data query's
+    `Cache-Control` reads it, #1500) from the same snapshot, forwarded by
+    every wrapper; honour the trailing `reference_time` parameter on query
     methods and `MapEngine::get_raster_tile` (`None` ⇒ latest); populate
     `RasterInfo.reference_times`. GRIB, QueryData, Zarr (forecast stores),
     NetCDF (`forecast_reference_time`) and Nowcast (generations = runs,

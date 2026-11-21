@@ -319,11 +319,16 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   `If-None-Match` gets a 304, compared weakly: `W/"x"` and `"x"` match each
   other. Metadata and open-ended queries get `public, max-age=60`; a data
   query whose closed `datetime` window ended at least an hour ago gets
-  `public, max-age=86400`. On a collection with model runs, only the
-  `/instances/{instanceId}/…` routes do: the routes without one answer from
-  the newest run, which a later run can replace for the same past times, so
-  they stay `max-age=60`. A data query's ETag is hashed with its body, inside
-  the query's slot.
+  `public, max-age=86400`, unless a model run can still change the answer:
+  a run is published before all its steps are in, and a later run covers
+  times from its reference time on. So on a collection with runs, an
+  `/instances/{instanceId}/…` query of the newest run, and a query without
+  an instance whose window is open or ends at or after the newest run's
+  reference time, stay `max-age=60`; an older run's, and a window ending
+  before the newest run, keep the window's policy. `items` reads no run and
+  keeps it too. A 304 repeats the 200's `Vary`, `accept-encoding` included,
+  and states no `Content-Length`. A data query's ETag is hashed with its
+  body, inside the query's slot.
 - **Value budgets.** Most answers are capped at 1 million values
   (timesteps × levels × cells × parameters), BUFR and PostGIS at 500 000
   values per response. An answer of one coverage per item, a PostGIS

@@ -433,18 +433,30 @@ the pure pieces are `ds_core::http_cache`). Policy:
   responses carry one tag, which a strong tag must not (#1500). Build
   every tag with `api_common::caching::etag`, never `etag_of`.
   `If-None-Match` compares weakly (`ds_core::http_cache::if_none_match_matches`,
-  RFC 9110 §13.1.2), so `W/"x"` and `"x"` match each other.
+  RFC 9110 §13.1.2), so `W/"x"` and `"x"` match each other, over every
+  line of the field (`api_common::caching::if_none_match`).
+- A 304 keeps the 200's `Vary` and adds the `accept-encoding` the
+  compression layer gives a 200 it compresses but never an empty 304
+  (`compressed_by_server`, RFC 9110 §15.4.5). It states no
+  `Content-Length`: axum puts `0` in the header map, hyper sends none
+  without a body (the server's `middleware` tests check the wire).
 - Default (metadata, "latest"/open-ended queries): `public, max-age=60`.
 - *Settled* data queries — closed `datetime` interval whose end is ≥1 h in
   the past — get `public, max-age=86400` via `with_data_cache_control` in the
   data-query handlers. Never `immutable`: observations back-fill and rolling
   retention prunes, so the response can still change; expiry + ETag
   revalidation bounds the staleness to a day.
-- Except on a collection with runs (`has_instances`): its no-instance routes
-  answer from the newest run covering the window, and a run published later
-  covers the same past valid times again, so they are always `max-age=60`
-  (`follows_latest_run`, #1500). Its `/instances/{id}/…` routes name their
-  run and keep the window's policy.
+- Except where a run can still change the answer, on a collection with
+  runs (`handlers::Runs`, #1500). A run is published before all its steps
+  are in (GRIB, NetCDF leads appended to a published run), and a later run
+  covers valid times from its reference time on. With `newest` the newest
+  run's reference time (`EdrEngine::latest_reference_time`, O(1)): an
+  `/instances/{id}/…` route of the newest run is never settled, nor a
+  no-instance route whose window is open or ends at or after `newest`.
+  Every other answer keeps its window's policy: an older run's, and a
+  no-instance window ending before `newest`, which no later run reaches.
+  `items` keeps the window's policy: it reads no run (a nowcast's cells
+  are fixed once a generation is taken).
 - A 304 still recomputes the query (no content cache at this layer — EDR
   query keys barely repeat, #202); it saves the transfer, and `max-age`
   saves the request.
@@ -455,9 +467,12 @@ sets the `ETag`; the middleware honours a tag it finds and passes that body
 through untouched (#1500). Hashing it there instead, on the request runtime
 after the slot is released, cost about 12 ms for a 9 MB area body. A new
 data-query format builds its response with `data_response` too;
-`caching_tests`' `data_queries_tag_their_own_bodies` serves the data routes
-without the middleware and fails on a 200 without its own tag. `items` and
-`/locations` also set theirs on the executor.
+`caching_tests`' `data_queries_tag_their_own_bodies` serves position, area,
+radius, cube, trajectory, a location and a location list, and an instance
+route, in each of position's formats, without the middleware and fails on
+a 200 without its own tag. `items` and `/locations` also set theirs on the
+executor. `items/{itemId}` (one feature, from memory) is hashed by the
+middleware.
 
 A new metadata handler needs no caching code unless its 200 body embeds a
 per-request value (a generation timestamp, a random id): a body-hash ETag

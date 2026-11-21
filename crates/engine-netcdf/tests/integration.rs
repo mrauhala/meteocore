@@ -1391,6 +1391,11 @@ fn edr_instances_are_the_runs() {
         engine.instance_reference_times(),
         [at("2026-10-15T06:00:00Z"), at("2026-10-15T09:00:00Z")]
     );
+    // The newest run, O(1) from the same catalog (#1500).
+    assert_eq!(
+        engine.latest_reference_time(),
+        Some(at("2026-10-15T09:00:00Z"))
+    );
     let six = engine.find_instance(at("2026-10-15T06:00:00Z")).unwrap();
     assert_eq!(six.valid_times.len(), 4);
     assert!(engine.find_instance(at("2026-10-15T03:00:00Z")).is_none());
@@ -1408,6 +1413,7 @@ fn edr_instances_are_the_runs() {
     assert!(!global.has_instances());
     assert!(global.get_instances().is_empty());
     assert!(global.instance_reference_times().is_empty());
+    assert_eq!(global.latest_reference_time(), None);
     // The run-less timeline answers without a run, across the seam too.
     let seam = single(
         global

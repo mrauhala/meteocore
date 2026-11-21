@@ -2293,6 +2293,9 @@ mod mvt {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        // The `Vary` the server's compression layer gives the tile's 200,
+        // which it never adds to the empty 304 (RFC 9110 §15.4.5).
+        assert_eq!(resp.headers()["vary"], "accept-encoding");
 
         // `If-None-Match` compares weakly (RFC 9110 §13.1.2, #1500): the
         // strong form of the same tag, which a client held before the tag

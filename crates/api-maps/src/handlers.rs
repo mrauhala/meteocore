@@ -1588,10 +1588,8 @@ async fn render_map(
     // for one timestep share the entry, not the header. On an engine with
     // runs only a named run the engine drew is fixed (#1421).
     let cache_control = cache_control_value(pinned, cache_key.content_version);
-    let if_none_match = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string);
+    // Every line of it (RFC 9110 §5.3), never only the first.
+    let if_none_match = api_common::caching::if_none_match_list(&headers);
 
     // Cache lookup runs BEFORE the If-None-Match check. The ETag is
     // content-derived (see `CachedRendered::new`), so a key-derived 304

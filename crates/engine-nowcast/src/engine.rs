@@ -2497,6 +2497,10 @@ impl EdrEngine for NowcastEngine {
         self.state.load().generations.keys().copied().collect()
     }
 
+    fn latest_reference_time(&self) -> Option<DateTime<Utc>> {
+        self.state.load().generations.keys().next_back().copied()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let state = self.state.load();
         Self::generation_by_instance(&state, reference_time).map(|g| RunInfo {

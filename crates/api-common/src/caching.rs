@@ -3,12 +3,22 @@
 //!
 //! The pure pieces (hashing, matching, policy strings) live in
 //! [`ds_core::http_cache`]; this module is the axum glue shared by EDR,
-//! Features and the shared OGC API root's metadata routes (#789).
+//! Features and the shared OGC API root's metadata routes (#789), and the
+//! helpers every other API's 304 uses.
 //!
 //! The ETag is weak, `W/"<16 hex>"` ([`etag`]): the server's
 //! `CompressionLayer` sits outside these routers and gzips the body after it
 //! was tagged, so one tag names the plain and the gzipped bytes (#1500).
-//! `If-None-Match` is compared weakly, as RFC 9110 §13.1.2 requires.
+//! `If-None-Match` is compared weakly, as RFC 9110 §13.1.2 requires, over
+//! every line of it ([`if_none_match`]).
+//!
+//! A 304 carries the headers its 200 would (RFC 9110 §15.4.5): the
+//! handler's `Vary`, and the `Vary: accept-encoding` the compression layer
+//! adds only to a body it would compress ([`compressed_by_server`]), never
+//! to an empty 304. Nor a `Content-Length` (§8.6), which a gzipped 200
+//! does not state: axum puts `content-length: 0` in an empty body's
+//! headers, but hyper sends no length without a body to send (the
+//! server's `middleware` tests check the wire).
 //!
 //! A handler may precompute its ETag with [`etag`], and the middleware then
 //! honours it without touching the body: Features `items` hashes its body
@@ -19,9 +29,9 @@
 //! and `Cache-Control` saves the request entirely within the freshness
 //! window.
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::Request;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
@@ -35,17 +45,74 @@ pub fn etag(bytes: &[u8]) -> HeaderValue {
     HeaderValue::try_from(weak_etag_of(bytes)).expect("a weak quoted-hex ETag is a header value")
 }
 
+/// Whether the request's `If-None-Match` matches `etag`, weakly. A client
+/// or proxy may send the field on several lines, which RFC 9110 §5.3 makes
+/// one list: every line is read, never only the first.
+pub fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| if_none_match_matches(value, etag))
+}
+
+/// Every line of the request's `If-None-Match` joined into the one list
+/// they make (RFC 9110 §5.3), for a handler that compares it after it has
+/// built its response; `None` without the field. A line that is not text
+/// is skipped.
+pub fn if_none_match_list(headers: &HeaderMap) -> Option<String> {
+    let lines: Vec<&str> = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join(", "))
+}
+
+/// Whether the server's `CompressionLayer` compresses a 200 typed
+/// `content_type` (`None`: untyped) of `len` bytes (`None`: unknown), and
+/// so adds `Vary: accept-encoding` to it, whatever the request accepts.
+/// tower-http 0.7's default predicate, which main.rs uses: not a response
+/// already encoded or a range (the caller checks those headers), not under
+/// 32 bytes, not gRPC (but gRPC-Web), not an image (but SVG), not an event
+/// stream. The server's `middleware` tests pin it against the layer.
+pub fn compressed_by_server(content_type: Option<&str>, len: Option<u64>) -> bool {
+    let content_type = content_type.unwrap_or_default();
+    let excluded = |prefix: &str, except: Option<&str>| {
+        content_type.starts_with(prefix) && except.is_none_or(|e| !content_type.starts_with(e))
+    };
+    len.is_none_or(|len| len >= 32)
+        && !excluded("application/grpc", Some("application/grpc-web"))
+        && !excluded("image/", Some("image/svg+xml"))
+        && !excluded("text/event-stream", None)
+}
+
+/// Add `Vary: accept-encoding` to a 304 whose 200 the server's compression
+/// layer compresses ([`compressed_by_server`]): the layer adds it to that
+/// 200 but never to the empty 304, and RFC 9110 §15.4.5 wants the 304 to
+/// repeat it. A `Vary` naming it already is kept as it is.
+pub fn vary_as_compressed(headers: &mut HeaderMap) {
+    let named = headers.get_all(header::VARY).iter().any(|value| {
+        value
+            .to_str()
+            .is_ok_and(|v| v.to_ascii_lowercase().contains("accept-encoding"))
+    });
+    if !named {
+        headers.append(header::VARY, HeaderValue::from_static("accept-encoding"));
+    }
+}
+
 /// Middleware wrapping every route: default `Cache-Control` to the short
 /// policy when the handler didn't set one, attach a weak content-derived
 /// ETag unless the handler set one (buffering the already in-memory body
 /// only to hash it), and short-circuit a matching `If-None-Match` to 304.
 pub async fn conditional_get(req: Request, next: Next) -> Response {
-    // Owned copy so it survives the request being consumed by `next`.
-    let if_none_match = req
-        .headers()
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
+    // Owned copies of every line, so they survive the request being
+    // consumed by `next`.
+    let mut if_none_match_lines = HeaderMap::new();
+    for value in req.headers().get_all(header::IF_NONE_MATCH) {
+        if_none_match_lines.append(header::IF_NONE_MATCH, value.clone());
+    }
     let resp = next.run(req).await;
     if resp.status() != StatusCode::OK {
         return resp;
@@ -76,17 +143,29 @@ pub async fn conditional_get(req: Request, next: Next) -> Response {
             (etag, Body::from(bytes))
         }
     };
-    let matches = if_none_match
-        .as_deref()
-        .zip(etag.to_str().ok())
-        .is_some_and(|(inm, etag)| if_none_match_matches(inm, etag));
+    let matches = etag
+        .to_str()
+        .is_ok_and(|etag| if_none_match(&if_none_match_lines, etag));
     if matches {
+        // The layer's `Vary`, from the 200 as the layer would see it.
+        let compressed = !parts.headers.contains_key(header::CONTENT_ENCODING)
+            && !parts.headers.contains_key(header::CONTENT_RANGE)
+            && compressed_by_server(
+                parts
+                    .headers
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                body.size_hint().exact(),
+            );
         // Keep the 200's headers (RFC 9110 §15.4.5 wants Cache-Control/ETag/
         // Vary repeated) but drop the payload-specific ones along with the
         // body.
         parts.status = StatusCode::NOT_MODIFIED;
         parts.headers.remove(header::CONTENT_TYPE);
         parts.headers.remove(header::CONTENT_LENGTH);
+        if compressed {
+            vary_as_compressed(&mut parts.headers);
+        }
         return Response::from_parts(parts, Body::empty());
     }
     Response::from_parts(parts, body)
@@ -160,6 +239,107 @@ mod tests {
         }
         let response = fetch(app(None), Some(&weak_etag_of(b"other"))).await;
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// `If-None-Match` sent on several lines is one list (RFC 9110 §5.3):
+    /// a tag on any line matches.
+    #[tokio::test]
+    async fn every_if_none_match_line_is_read() {
+        let weak = weak_etag_of(b"body");
+        let request = Request::builder()
+            .uri("/")
+            .header(header::IF_NONE_MATCH, "\"other\"")
+            .header(header::IF_NONE_MATCH, weak.as_str())
+            .body(Body::empty())
+            .unwrap();
+        let response = app(None).oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+
+        let mut headers = HeaderMap::new();
+        headers.append(header::IF_NONE_MATCH, HeaderValue::from_static("\"a\""));
+        assert!(!if_none_match(&headers, &weak));
+        headers.append(header::IF_NONE_MATCH, HeaderValue::from_str(&weak).unwrap());
+        assert!(if_none_match(&headers, &weak));
+        assert!(!if_none_match(&HeaderMap::new(), &weak));
+        let list = if_none_match_list(&headers).unwrap();
+        assert_eq!(list, format!("\"a\", {weak}"));
+        assert!(if_none_match_matches(&list, &weak));
+        assert_eq!(if_none_match_list(&HeaderMap::new()), None);
+    }
+
+    /// The 304 repeats the `Vary: accept-encoding` the compression layer
+    /// gives its 200 (RFC 9110 §15.4.5): for a body the layer compresses,
+    /// never for an image or a body under 32 bytes. The handler's own
+    /// `Vary` stays, and no `Content-Type` or `Content-Length` is left.
+    #[tokio::test]
+    async fn a_304_varies_as_its_compressed_200() {
+        let json = "{\"conformsTo\": [\"http://www.opengis.net/spec\"]}";
+        let app = |content_type: &'static str, body: &'static str| {
+            Router::new()
+                .route(
+                    "/",
+                    get(move || async move {
+                        (
+                            [
+                                (header::CONTENT_TYPE, content_type),
+                                (header::VARY, "accept"),
+                            ],
+                            body,
+                        )
+                    }),
+                )
+                .layer(axum::middleware::from_fn(conditional_get))
+        };
+        for (content_type, body, varies) in [
+            ("application/json", json, true),
+            ("text/html; charset=utf-8", json, true),
+            ("image/svg+xml", json, true),
+            ("image/png", json, false),
+            ("application/json", "{}", false),
+        ] {
+            let sent = weak_etag_of(body.as_bytes());
+            let request = Request::builder()
+                .uri("/")
+                .header(header::IF_NONE_MATCH, sent.as_str())
+                .body(Body::empty())
+                .unwrap();
+            let response = app(content_type, body).oneshot(request).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "{content_type}"
+            );
+            let vary: Vec<_> = response.headers().get_all(header::VARY).iter().collect();
+            let expected: &[&str] = if varies {
+                &["accept", "accept-encoding"]
+            } else {
+                &["accept"]
+            };
+            assert_eq!(vary, expected, "{content_type} {body}");
+            assert!(response.headers().get(header::CONTENT_TYPE).is_none());
+        }
+    }
+
+    /// tower-http 0.7's default predicate, as `compressed_by_server` mirrors
+    /// it; the server's `middleware` tests check the layer itself.
+    #[test]
+    fn the_server_compresses_text_above_32_bytes_but_no_image() {
+        assert!(compressed_by_server(Some("application/json"), Some(32)));
+        assert!(!compressed_by_server(Some("application/json"), Some(31)));
+        assert!(compressed_by_server(Some("application/json"), None));
+        assert!(compressed_by_server(None, Some(100)));
+        assert!(!compressed_by_server(Some("image/png"), Some(100)));
+        assert!(compressed_by_server(Some("image/svg+xml"), Some(100)));
+        assert!(!compressed_by_server(Some("application/grpc"), Some(100)));
+        assert!(compressed_by_server(
+            Some("application/grpc-web"),
+            Some(100)
+        ));
+        assert!(!compressed_by_server(Some("text/event-stream"), Some(100)));
+        assert!(compressed_by_server(
+            Some("application/vnd.mapbox-vector-tile"),
+            Some(100)
+        ));
     }
 
     /// A tag the handler set is kept, never replaced by a hash of the body,

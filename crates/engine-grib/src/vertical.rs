@@ -765,6 +765,8 @@ mod tests {
                 .map(|r| r.reference_time)
                 .collect();
             assert_eq!(view.instance_reference_times(), runs);
+            // The newest run, O(1) from the same catalog (#1500).
+            assert_eq!(view.latest_reference_time(), runs.last().copied());
         }
         assert_eq!(single.instance_reference_times()[0], new);
         assert_eq!(pressure.get_temporal_extent(), Some((old, valid)));

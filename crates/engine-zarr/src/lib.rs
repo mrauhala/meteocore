@@ -457,6 +457,10 @@ impl EdrEngine for ZarrEngine {
         self.catalog.load().runs.keys().copied().collect()
     }
 
+    fn latest_reference_time(&self) -> Option<DateTime<Utc>> {
+        self.catalog.load().runs.keys().next_back().copied()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let cat = self.catalog.load();
         cat.runs.get(&reference_time).map(|&idx| RunInfo {

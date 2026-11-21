@@ -313,6 +313,9 @@ async fn etag_round_trips_to_304() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{sent}");
+        // The `Vary` the server's compression layer gives the 200, which
+        // it never adds to the empty 304 (RFC 9110 §15.4.5).
+        assert_eq!(resp.headers()[axum::http::header::VARY], "accept-encoding");
     }
 }
 

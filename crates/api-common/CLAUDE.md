@@ -25,7 +25,15 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   so one tag names the plain and the gzipped body (#1500). A handler that
   sets its own tag uses `caching::etag` too; the middleware then leaves the
   body alone. `If-None-Match` is compared weakly
-  (`ds_core::http_cache::if_none_match_matches`), here and in every API.
+  (`ds_core::http_cache::if_none_match_matches`), here and in every API,
+  over every line of the field: `caching::if_none_match` (or
+  `if_none_match_list` to compare later), never `headers.get`. Every 304
+  repeats its 200's `Vary` (RFC 9110 §15.4.5): the compression layer adds
+  `accept-encoding` to a 200 it compresses but never to an empty 304, so a
+  304 whose 200 `compressed_by_server` (tower-http's default predicate:
+  32 bytes or more, not an image but SVG, not gRPC or an event stream)
+  gets it from `vary_as_compressed`. A 304 states no `Content-Length`:
+  hyper sends none without a body.
 - Never hard-code an API path such as `/maps/…` in a Maps/Tiles/Features link, OpenAPI key
   or HTML URL: build it from `Mount::root(base)` (the `Mount` extension added by
   `router_at`). Cross-API links use `mounts::*`. Pass the workbench a `Surface`;

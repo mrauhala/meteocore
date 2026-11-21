@@ -278,6 +278,12 @@ impl EdrEngine for Mock {
         vec![hour(0), hour(6)]
     }
 
+    /// Not the last of `instance_reference_times`, so a wrapper that
+    /// derived it instead of forwarding it would answer `hour(6)`.
+    fn latest_reference_time(&self) -> Option<DateTime<Utc>> {
+        Some(hour(12))
+    }
+
     fn query_location(
         &self,
         _: &str,
@@ -819,6 +825,7 @@ fn every_other_method_delegates() {
     assert!(wind.composites().is_empty());
     assert!(wind.has_instances());
     assert_eq!(wind.instance_reference_times(), [hour(0), hour(6)]);
+    assert_eq!(wind.latest_reference_time(), Some(hour(12)));
     assert_eq!(wind.supported_query_types(), ["position", "cube"]);
     assert_eq!(wind.trajectory_shape(), TrajectoryShape::CrossSection);
     assert_eq!(wind.get_temporal_extent(), Some((hour(0), hour(2))));

@@ -1040,10 +1040,8 @@ pub async fn wms_handler(
 
             // Read If-None-Match into an owned String so it survives the move
             // into spawn_blocking and the cache-hit/miss branches below.
-            let if_none_match = headers
-                .get(header::IF_NONE_MATCH)
-                .and_then(|h| h.to_str().ok())
-                .map(str::to_string);
+            // Every line of it (RFC 9110 §5.3), never only the first.
+            let if_none_match = api_common::caching::if_none_match_list(&headers);
 
             // Cache lookup runs BEFORE the If-None-Match check. The ETag is
             // content-derived (see `CachedRendered::new`), so a key-derived

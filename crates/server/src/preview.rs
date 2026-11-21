@@ -191,26 +191,27 @@ fn respond(
     // Conditional GET: short-circuit to `304 Not Modified` when the client
     // already has the same body. Saves the full payload on every reload of
     // a `no-cache`-marked asset.
-    if let Some(inm) = request_headers.get(header::IF_NONE_MATCH) {
-        if let Ok(inm_str) = inm.to_str() {
-            if ds_core::http_cache::if_none_match_matches(inm_str, &etag) {
-                // `nosniff` here is mostly cosmetic — browsers fold a 304's
-                // headers into the cached 200, which already carried this
-                // value — but keeping the two paths symmetric removes a
-                // class of "did we cover that header in every branch?"
-                // bookkeeping when the response shape evolves.
-                return Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, &etag)
-                    .header(header::CACHE_CONTROL, cache_control)
-                    .header(
-                        header::HeaderName::from_static("x-content-type-options"),
-                        "nosniff",
-                    )
-                    .body(Body::empty())
-                    .expect("static 304 response headers are valid");
-            }
+    if api_common::caching::if_none_match(request_headers, &etag) {
+        // `nosniff` here is mostly cosmetic — browsers fold a 304's
+        // headers into the cached 200, which already carried this
+        // value — but keeping the two paths symmetric removes a
+        // class of "did we cover that header in every branch?"
+        // bookkeeping when the response shape evolves.
+        let mut response = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, &etag)
+            .header(header::CACHE_CONTROL, cache_control)
+            .header(
+                header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            )
+            .body(Body::empty())
+            .expect("static 304 response headers are valid");
+        // The `Vary` the compression layer gives the 200 (RFC 9110 §15.4.5).
+        if api_common::caching::compressed_by_server(Some(mime), Some(body.len() as u64)) {
+            api_common::caching::vary_as_compressed(response.headers_mut());
         }
+        return response;
     }
     let mut builder = Response::builder()
         .header(header::CONTENT_TYPE, mime)
@@ -3623,6 +3624,11 @@ mod tests {
         assert_eq!(
             second.headers().get("x-content-type-options").unwrap(),
             "nosniff"
+        );
+        // The compression layer's `Vary`, which it gives the 200 only.
+        assert_eq!(
+            second.headers().get(header::VARY).unwrap(),
+            "accept-encoding"
         );
         let body = axum::body::to_bytes(second.into_body(), 1024)
             .await

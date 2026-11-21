@@ -21,14 +21,16 @@ use ds_core::error::DataServerError;
 use ds_core::model::*;
 
 /// `station_series`: serves GeoJSON and CSV as well. `runs`: a collection
-/// with one model run, 2024-01-01T00:00:00Z, as a forecast engine.
+/// with two model runs, [`OLD_RUN`] and [`NEWEST_RUN`], as a forecast
+/// engine.
 #[derive(Default)]
 struct MockEngine {
     station_series: bool,
     runs: bool,
 }
 
-const RUN: &str = "2024-01-01T00:00:00Z";
+const OLD_RUN: &str = "2024-01-01T00:00:00Z";
+const NEWEST_RUN: &str = "2024-01-01T06:00:00Z";
 
 impl MockEngine {
     fn sample_query_result() -> QueryResult {
@@ -87,12 +89,20 @@ impl MockEngine {
 
 impl EdrEngine for MockEngine {
     fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
-        Ok(Arc::new(LocationSnapshot::new(vec![Location {
-            id: "helsinki".into(),
-            label: "Helsinki".into(),
-            latitude: 60.1699,
-            longitude: 24.9384,
-        }])))
+        Ok(Arc::new(LocationSnapshot::new(vec![
+            Location {
+                id: "helsinki".into(),
+                label: "Helsinki".into(),
+                latitude: 60.1699,
+                longitude: 24.9384,
+            },
+            Location {
+                id: "tampere".into(),
+                label: "Tampere".into(),
+                latitude: 61.4978,
+                longitude: 23.7610,
+            },
+        ])))
     }
 
     fn query_location(
@@ -107,6 +117,52 @@ impl EdrEngine for MockEngine {
     }
 
     fn query_position(
+        &self,
+        _coords: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Ok(CoverageResponse::Single(Self::sample_query_result()))
+    }
+
+    fn query_area(
+        &self,
+        _coords: &str,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Ok(CoverageResponse::Single(Self::sample_query_result()))
+    }
+
+    fn query_radius(
+        &self,
+        _coords: &str,
+        _within_m: f64,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Ok(CoverageResponse::Single(Self::sample_query_result()))
+    }
+
+    fn query_cube(
+        &self,
+        _bbox: &ds_core::feature::Bbox,
+        _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _parameters: Option<&[String]>,
+        _z: Option<&[f64]>,
+        _resolution: ds_core::cube::CubeResolution,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Ok(CoverageResponse::Single(Self::sample_query_result()))
+    }
+
+    fn query_trajectory(
         &self,
         _coords: &str,
         _datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -145,7 +201,16 @@ impl EdrEngine for MockEngine {
     }
 
     fn supported_query_types(&self) -> Vec<String> {
-        vec!["locations".to_string(), "position".to_string()]
+        [
+            "locations",
+            "position",
+            "area",
+            "radius",
+            "cube",
+            "trajectory",
+        ]
+        .map(String::from)
+        .to_vec()
     }
 
     fn serves_station_series(&self) -> bool {
@@ -156,10 +221,12 @@ impl EdrEngine for MockEngine {
         if !self.runs {
             return Vec::new();
         }
-        vec![ds_core::instances::RunInfo {
-            reference_time: RUN.parse().unwrap(),
-            valid_times: Self::sample_query_result_times(),
-        }]
+        [OLD_RUN, NEWEST_RUN]
+            .map(|run| ds_core::instances::RunInfo {
+                reference_time: run.parse().unwrap(),
+                valid_times: Self::sample_query_result_times(),
+            })
+            .to_vec()
     }
 
     fn has_instances(&self) -> bool {
@@ -416,10 +483,17 @@ async fn if_none_match_compares_weakly() {
 /// The data-query routes alone, without the router's `conditional_get`
 /// middleware, so a tag on their 200s is one the handler set.
 fn handlers_only() -> axum::Router {
-    use api_edr::handlers::{instance_position_query, location_query, position_query};
+    use api_edr::handlers::{
+        area_query, cube_query, instance_position_query, location_query, position_query,
+        radius_query, trajectory_query,
+    };
     use axum::routing::get;
     axum::Router::new()
         .route("/collections/{id}/position", get(position_query))
+        .route("/collections/{id}/area", get(area_query))
+        .route("/collections/{id}/radius", get(radius_query))
+        .route("/collections/{id}/cube", get(cube_query))
+        .route("/collections/{id}/trajectory", get(trajectory_query))
         .route("/collections/{id}/locations/{loc_id}", get(location_query))
         .route(
             "/collections/{id}/instances/{instanceId}/position",
@@ -430,8 +504,9 @@ fn handlers_only() -> axum::Router {
 
 /// Every data query's body is hashed by its handler, on the query executor
 /// inside the query's slot, not by the middleware on the request runtime
-/// after it (#1500): each format's 200 carries the weak tag of its own
-/// bytes before any middleware ran, and the full router keeps that tag.
+/// after it (#1500): each query type's and each format's 200 carries the
+/// weak tag of its own bytes before any middleware ran, and the full router
+/// keeps that tag.
 #[tokio::test]
 async fn data_queries_tag_their_own_bodies() {
     let position = "/collections/weather/position?coords=POINT(24.94%2060.17)";
@@ -442,8 +517,16 @@ async fn data_queries_tag_their_own_bodies() {
         format!("{position}&f=png"),
         format!("{station}&f=geojson"),
         format!("{station}&f=csv"),
+        "/collections/weather/area?coords=POLYGON((24%2060,25%2060,25%2061,24%2061,24%2060))"
+            .to_string(),
+        "/collections/weather/radius?coords=POINT(24.94%2060.17)&within=10&within-units=km"
+            .to_string(),
+        "/collections/weather/cube?bbox=24,60,25,61".to_string(),
+        "/collections/weather/trajectory?coords=LINESTRING(24%2060,25%2061)".to_string(),
         "/collections/weather/locations/helsinki".to_string(),
-        format!("/collections/nwp/instances/{RUN}/position?coords=POINT(24.94%2060.17)"),
+        // A list of locations, answered in one response.
+        "/collections/stations/locations/helsinki,tampere?f=geojson".to_string(),
+        format!("/collections/nwp/instances/{OLD_RUN}/position?coords=POINT(24.94%2060.17)"),
     ] {
         let resp = handlers_only()
             .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
@@ -467,26 +550,58 @@ async fn data_queries_tag_their_own_bodies() {
     }
 }
 
-/// On a collection with runs, a no-instance route answers from the newest
-/// run covering the window, and a run published later can cover the same
-/// past valid times: a settled window there gets the short policy. The
-/// `/instances/{id}/…` route names its run and keeps the long one (#1500).
+/// On a collection with runs, a run can still change an answer however
+/// long ago its window ended (#1500): the newest run is published before
+/// all its steps are in, and a later run covers valid times from its
+/// reference time on. Those answers get the short policy; every other one
+/// keeps its window's.
 #[tokio::test]
-async fn latest_run_routes_are_never_settled() {
-    let query = format!("coords=POINT(24.94%2060.17)&datetime={SETTLED_WINDOW}");
+async fn answers_a_run_can_still_change_are_never_settled() {
+    const SHORT: &str = "public, max-age=60";
+    const LONG: &str = "public, max-age=86400";
+    let at = |window: &str| format!("coords=POINT(24.94%2060.17)&datetime={window}");
     for (uri, cache_control) in [
+        // The newest run starts at 06Z: a window ending before it is
+        // answered by older runs, and no later run reaches it.
         (
-            format!("/collections/nwp/position?{query}"),
-            "public, max-age=60",
+            format!(
+                "/collections/nwp/position?{}",
+                at("2024-01-01T00:00:00Z/2024-01-01T05:59:59Z")
+            ),
+            LONG,
+        ),
+        // A window reaching the newest run's reference time, or past it.
+        (
+            format!("/collections/nwp/position?{}", at(SETTLED_WINDOW)),
+            SHORT,
         ),
         (
-            format!("/collections/nwp/instances/{RUN}/position?{query}"),
-            "public, max-age=86400",
+            format!(
+                "/collections/nwp/position?{}",
+                at("2024-01-01T05:00:00Z/2024-01-01T07:00:00Z")
+            ),
+            SHORT,
+        ),
+        // The newest run itself, even for a window before it.
+        (
+            format!(
+                "/collections/nwp/instances/{NEWEST_RUN}/position?{}",
+                at("2024-01-01T00:00:00Z/2024-01-01T02:00:00Z")
+            ),
+            SHORT,
+        ),
+        // An older run keeps its window's policy, whatever the window.
+        (
+            format!(
+                "/collections/nwp/instances/{OLD_RUN}/position?{}",
+                at(SETTLED_WINDOW)
+            ),
+            LONG,
         ),
         // A collection without runs keeps the window's policy.
         (
-            format!("/collections/weather/position?{query}"),
-            "public, max-age=86400",
+            format!("/collections/weather/position?{}", at(SETTLED_WINDOW)),
+            LONG,
         ),
     ] {
         let resp = get_response(&uri, None).await;

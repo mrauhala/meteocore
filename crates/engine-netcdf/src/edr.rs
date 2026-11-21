@@ -1290,6 +1290,17 @@ impl EdrEngine for NetcdfEngine {
         self.catalog.load().runs.keys().flatten().copied().collect()
     }
 
+    /// O(1): the run-less timeline's key, `None`, sorts first.
+    fn latest_reference_time(&self) -> Option<DateTime<Utc>> {
+        self.catalog
+            .load()
+            .runs
+            .keys()
+            .next_back()
+            .copied()
+            .flatten()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let catalog = self.catalog.load();
         catalog.runs.get(&Some(reference_time)).map(|run| RunInfo {

@@ -393,12 +393,8 @@ fn binary_response(
     bytes: Bytes,
     pinned: bool,
 ) -> Response {
-    let not_modified = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-        .is_some_and(|v| ds_core::http_cache::if_none_match_matches(v, etag));
-    if not_modified {
-        return (
+    if api_common::caching::if_none_match(headers, etag) {
+        let mut response = (
             StatusCode::NOT_MODIFIED,
             [
                 (header::ETAG, etag),
@@ -406,6 +402,11 @@ fn binary_response(
             ],
         )
             .into_response();
+        // The `Vary` the compression layer gives the 200 (RFC 9110 §15.4.5).
+        if api_common::caching::compressed_by_server(Some(content_type), Some(bytes.len() as u64)) {
+            api_common::caching::vary_as_compressed(response.headers_mut());
+        }
+        return response;
     }
     (
         [
@@ -481,6 +482,9 @@ const VIEWER_CSP: &str = "default-src 'none'; \
     form-action 'none'; \
     frame-ancestors 'none'";
 
+/// The media type of [`VIEWER_JS`].
+const VIEWER_JS_CONTENT_TYPE: &str = "text/javascript; charset=utf-8";
+
 /// Weak ETag of [`VIEWER_JS`] (compressed like any script), computed once.
 static VIEWER_JS_ETAG: LazyLock<String> = LazyLock::new(|| weak_etag_of(VIEWER_JS.as_bytes()));
 
@@ -504,20 +508,24 @@ pub async fn get_viewer() -> Response {
 /// resolves the page's relative `viewer.js`) — the viewer's script.
 pub async fn get_viewer_js(headers: HeaderMap) -> Response {
     let etag = VIEWER_JS_ETAG.as_str();
-    let not_modified = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-        .is_some_and(|v| ds_core::http_cache::if_none_match_matches(v, etag));
-    if not_modified {
-        return (
+    if api_common::caching::if_none_match(&headers, etag) {
+        let mut response = (
             StatusCode::NOT_MODIFIED,
             [(header::ETAG, etag), (header::CACHE_CONTROL, "no-cache")],
         )
             .into_response();
+        // The `Vary` the compression layer gives the 200 (RFC 9110 §15.4.5).
+        if api_common::caching::compressed_by_server(
+            Some(VIEWER_JS_CONTENT_TYPE),
+            Some(VIEWER_JS.len() as u64),
+        ) {
+            api_common::caching::vary_as_compressed(response.headers_mut());
+        }
+        return response;
     }
     (
         [
-            (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
+            (header::CONTENT_TYPE, VIEWER_JS_CONTENT_TYPE),
             (header::ETAG, etag),
             (header::CACHE_CONTROL, "no-cache"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),

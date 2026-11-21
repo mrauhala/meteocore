@@ -16,7 +16,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use ds_core::http_cache::{if_none_match_matches, weak_etag_of};
+use ds_core::http_cache::weak_etag_of;
 
 /// The route the server mounts: a hash, then the file name.
 pub const ROUTE: &str = "/workbench/{version}/{file}";
@@ -115,19 +115,23 @@ pub async fn asset(Path((version, file)): Path<(String, String)>, headers: Heade
     } else {
         CACHE_STALE
     };
-    let fresh = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| if_none_match_matches(value, etag));
     let builder = Response::builder()
         .header(header::CACHE_CONTROL, cache)
         .header(header::ETAG, etag)
         .header(nosniff.0, nosniff.1);
-    if fresh {
-        return builder
+    if crate::caching::if_none_match(&headers, etag) {
+        let mut response = builder
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())
             .expect("static 304 response headers are valid");
+        // The `Vary` the compression layer gives the 200 (RFC 9110 §15.4.5).
+        if crate::caching::compressed_by_server(
+            Some(asset.media_type),
+            Some(asset.body.len() as u64),
+        ) {
+            crate::caching::vary_as_compressed(response.headers_mut());
+        }
+        return response;
     }
     builder
         .header(header::CONTENT_TYPE, asset.media_type)
@@ -203,6 +207,8 @@ mod tests {
             assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
             assert_eq!(again.headers()[header::ETAG], version.as_str());
             assert_eq!(again.headers()[header::CACHE_CONTROL], CACHE_IMMUTABLE);
+            // The compression layer's `Vary`, which it gives the 200 only.
+            assert_eq!(again.headers()[header::VARY], "accept-encoding");
             assert!(text(again).await.is_empty());
             let strong = ds_core::http_cache::etag_of(body.as_bytes());
             let again = get(path, Some(&strong)).await;

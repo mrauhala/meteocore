@@ -704,14 +704,12 @@ pub(crate) fn with_vary(mut resp: Response) -> Response {
 /// this — they fall through to the middleware's short default
 /// (`caching::conditional_get`).
 ///
-/// `latest_run` ([`follows_latest_run`]) is a route that answers from
-/// whichever run is newest: it gets the short policy whatever its window,
-/// since a run published later can cover the same past valid times
-/// (#1500).
+/// `runs` ([`Runs`]): on a collection with runs, an answer a run can still
+/// change gets the short policy whatever its window (#1500).
 fn with_data_cache_control(
     mut resp: Response,
     datetime: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
-    latest_run: bool,
+    runs: Runs,
 ) -> Response {
     let (start, end) = match datetime {
         Some((s, e)) => (
@@ -720,7 +718,7 @@ fn with_data_cache_control(
         ),
         None => (None, None),
     };
-    let cc = if latest_run {
+    let cc = if runs.may_still_change(end) {
         ds_core::http_cache::CACHE_CONTROL_SHORT
     } else {
         ds_core::http_cache::data_cache_control(start, end, chrono::Utc::now())
@@ -732,15 +730,44 @@ fn with_data_cache_control(
     resp
 }
 
-/// Whether a data query's answer comes from the engine's newest run rather
-/// than a run the request named: a no-instance route of a collection with
-/// runs (#337), which GRIB, NetCDF and the other forecast engines answer
-/// from the newest run covering the window. A later run can cover a past
-/// valid time again, so such an answer is never settled
-/// ([`with_data_cache_control`], #1500); an `/instances/{id}/…` route
-/// names its run and keeps the window's policy. O(1): `has_instances`.
-fn follows_latest_run(engine: &Arc<dyn EdrEngine>, instance_id: Option<&str>) -> bool {
-    instance_id.is_none() && engine.has_instances()
+/// What a data query's `Cache-Control` needs of the collection's model
+/// runs (#337, #1500): the newest run's reference time
+/// ([`EdrEngine::latest_reference_time`], O(1)), and the run an
+/// `/instances/{id}/…` route names.
+#[derive(Clone, Copy, Debug)]
+struct Runs {
+    newest: Option<chrono::DateTime<chrono::Utc>>,
+    named: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl Runs {
+    /// The runs of `engine` for a request naming the run `named`
+    /// (`resolve_instance`; `None` on a no-instance route).
+    fn of(engine: &Arc<dyn EdrEngine>, named: Option<chrono::DateTime<chrono::Utc>>) -> Self {
+        Self {
+            newest: engine.latest_reference_time(),
+            named,
+        }
+    }
+
+    /// Whether a run can still change the answer of a window ending at
+    /// `end` (`None`: open), however long ago that was. A run is published
+    /// before all its steps are in, so the newest run's answers can still
+    /// change; a later run covers valid times from its reference time on,
+    /// so can a no-instance route's, which answers from the newest run
+    /// covering the window, when the window ends at or after the newest
+    /// run's reference time. An older run, or a window ending before the
+    /// newest run, keeps the window's policy; so does a collection
+    /// without runs.
+    fn may_still_change(self, end: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+        let Some(newest) = self.newest else {
+            return false;
+        };
+        match self.named {
+            Some(run) => run >= newest,
+            None => end.is_none_or(|end| end >= newest),
+        }
+    }
 }
 
 /// Shared state for the EDR API: a registry of collection engines + metadata.
@@ -2967,7 +2994,7 @@ pub async fn location_query(
         location_ids: Vec::new(),
     };
     // No instance route: the engine's newest run, where it has runs.
-    let latest_run = follows_latest_run(engine, None);
+    let runs = Runs::of(engine, None);
     let engine = engine.clone();
     if !list {
         // One id, a repeat-only list included: the response it always was.
@@ -2999,7 +3026,7 @@ pub async fn location_query(
         })
         .await?;
         return Ok(with_format_vary(
-            with_data_cache_control(response, window, latest_run),
+            with_data_cache_control(response, window, runs),
             format,
         ));
     }
@@ -3035,7 +3062,7 @@ pub async fn location_query(
     })
     .await?;
     Ok(with_format_vary(
-        with_data_cache_control(response, window, latest_run),
+        with_data_cache_control(response, window, runs),
         format,
     ))
 }
@@ -3286,7 +3313,7 @@ async fn run_position_query(
     let (engine, config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "position", "position")?;
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
-    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
+    let runs = Runs::of(engine, reference_time);
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -3426,7 +3453,7 @@ async fn run_position_query(
     })
     .await?;
     Ok(with_format_vary(
-        with_data_cache_control(response, window, latest_run),
+        with_data_cache_control(response, window, runs),
         format,
     ))
 }
@@ -3489,7 +3516,7 @@ async fn run_area_query(
     request_crs(params.crs.as_deref())?;
 
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
-    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
+    let runs = Runs::of(engine, reference_time);
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -3528,7 +3555,7 @@ async fn run_area_query(
     .await?;
 
     Ok(with_format_vary(
-        with_data_cache_control(response, window, latest_run),
+        with_data_cache_control(response, window, runs),
         format,
     ))
 }
@@ -3598,7 +3625,7 @@ async fn run_radius_query(
         parse_within_metres(&params.within, &params.within_units).map_err(|e| bad_request(&e))?;
 
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
-    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
+    let runs = Runs::of(engine, reference_time);
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -3638,7 +3665,7 @@ async fn run_radius_query(
     })
     .await?;
     Ok(with_format_vary(
-        with_data_cache_control(response, window, latest_run),
+        with_data_cache_control(response, window, runs),
         format,
     ))
 }
@@ -3728,7 +3755,7 @@ async fn run_cube_query(
     }
 
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
-    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
+    let runs = Runs::of(engine, reference_time);
 
     // A datetime list runs the cube once per instant; the per-instant
     // `[t, z, y, x]` grids share x, y and z, so the merge joins them along t.
@@ -3776,7 +3803,7 @@ async fn run_cube_query(
     .await?;
 
     Ok(with_format_vary(
-        with_data_cache_control(response, window, latest_run),
+        with_data_cache_control(response, window, runs),
         format,
     ))
 }
@@ -3890,7 +3917,7 @@ async fn run_trajectory_query(
     // After the request's own checks, so an instance route rejects a
     // malformed request as the collection's route does.
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
-    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
+    let runs = Runs::of(engine, reference_time);
 
     // A cross-section engine drives its remote reads with `handle.block_on`
     // on the runtime it finds, which needs a thread outside the runtime's
@@ -3949,7 +3976,7 @@ async fn run_trajectory_query(
     })
     .await?;
     Ok(with_format_vary(
-        with_data_cache_control(response, window, latest_run),
+        with_data_cache_control(response, window, runs),
         negotiated,
     ))
 }
@@ -4482,6 +4509,41 @@ mod tests {
             description("position", false)
         );
         assert_eq!(description("cube", true), description("cube", false));
+    }
+
+    /// #1500: which answers a run can still change. The newest run's,
+    /// and a no-instance window reaching its reference time (or open);
+    /// never an older run's, a window ending before the newest run, or a
+    /// collection without runs.
+    #[test]
+    fn only_answers_a_run_can_still_change_are_never_settled() {
+        let at = |h: u32| {
+            chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+                .unwrap()
+                .and_hms_opt(h, 0, 0)
+                .unwrap()
+                .and_utc()
+        };
+        let runs = |named| Runs {
+            newest: Some(at(6)),
+            named,
+        };
+        // No instance: the newest run covering the window answers.
+        assert!(!runs(None).may_still_change(Some(at(5))));
+        assert!(runs(None).may_still_change(Some(at(6))));
+        assert!(runs(None).may_still_change(Some(at(9))));
+        assert!(runs(None).may_still_change(None));
+        // The newest run is still filling in; an older one keeps the window.
+        assert!(runs(Some(at(6))).may_still_change(Some(at(1))));
+        assert!(!runs(Some(at(0))).may_still_change(Some(at(9))));
+        assert!(!runs(Some(at(0))).may_still_change(None));
+        // No runs: the window's policy alone.
+        let none = Runs {
+            newest: None,
+            named: None,
+        };
+        assert!(!none.may_still_change(Some(at(9))));
+        assert!(!none.may_still_change(None));
     }
 
     /// A log sink a `fmt` subscriber writes its lines to.

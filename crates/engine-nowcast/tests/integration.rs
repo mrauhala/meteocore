@@ -2682,6 +2682,8 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
     assert!(engine.has_instances());
     // The run axis without valid times names the same generations (#1006).
     assert_eq!(engine.instance_reference_times(), vec![anchor]);
+    // The newest generation, O(1) from the same state (#1500).
+    assert_eq!(engine.latest_reference_time(), Some(anchor));
     assert_eq!(
         engine.find_instance(anchor).map(|r| r.valid_times),
         Some(vec![anchor])

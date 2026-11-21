@@ -1244,6 +1244,10 @@ impl EdrEngine for Derived {
         self.edr.instance_reference_times()
     }
 
+    fn latest_reference_time(&self) -> Option<DateTime<Utc>> {
+        self.edr.latest_reference_time()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         self.edr.find_instance(reference_time)
     }
