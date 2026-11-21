@@ -327,6 +327,18 @@ served render ran. No `collection` label: queue wait belongs to the shared
 slots, the per-collection tail is `render_duration_seconds`, and fixed labels
 need no reload pruning.
 
+## Request layers
+
+`admin::with_request_layers` wraps the whole router, innermost first: a
+caught handler panic (`CatchPanicLayer`), `metrics_middleware`,
+`request_logging_middleware`, `correlation_id_middleware`, CORS and
+compression. The panic layer must stay inside metrics and logging: a panic
+then answers the generic JSON 500, counted in `http_requests_total` and in
+the request log, and logged at ERROR inside the request's `http_request`
+span, which carries its request id. Outside them, a panic unwinds past both
+and the client's connection just closes (#1500 M5). A new layer that should
+see every answer goes outside the panic layer.
+
 ## Memory plan (#1306)
 
 - `cache_plan.rs` owns `/admin/cache-plan`, the INFO block and the plan

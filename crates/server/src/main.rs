@@ -71,13 +71,10 @@ pub(crate) fn poll_runtime() -> &'static tokio::runtime::Handle {
 
 use arc_swap::ArcSwap;
 use axum::body::Body;
-use axum::middleware;
 use axum::routing::{get, post};
 use axum::{Router, ServiceExt};
 use tokio::signal;
 use tower::Layer;
-use tower_http::compression::CompressionLayer;
-use tower_http::cors::CorsLayer;
 use tower_http::normalize_path::NormalizePathLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -1008,12 +1005,8 @@ async fn serve(cli: CliArgs) {
     let app = with_not_found(public.merge(admin_routes), move |headers| {
         let edr = edr_state.load();
         api_common::request_base_url(&edr.base_url, edr.trust_proxy_headers, headers)
-    })
-    .layer(middleware::from_fn(admin::metrics_middleware))
-    .layer(middleware::from_fn(admin::request_logging_middleware))
-    .layer(middleware::from_fn(admin::correlation_id_middleware))
-    .layer(CorsLayer::permissive())
-    .layer(CompressionLayer::new());
+    });
+    let app = admin::with_request_layers(app);
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
     let app = NormalizePathLayer::trim_trailing_slash().layer(app);
