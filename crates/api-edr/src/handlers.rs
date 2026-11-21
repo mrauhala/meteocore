@@ -3266,7 +3266,10 @@ async fn run_position_query(
         // One engine batch over every point for one datetime window. A
         // datetime list's instants run side by side (#1522): each counts
         // its own values here, and `run_within` holds their sum to the same
-        // budget in the instants' order.
+        // budget in the instants' order. So up to `INSTANT_CONCURRENCY`
+        // instants may each hold up to `MAX_POSITION_VALUES` before the
+        // sum refuses the list, one query slot each, as separate requests
+        // would.
         let query = {
             let (dropped, expiry) = (dropped.clone(), budget.expiry());
             move |datetime| -> Result<CoverageResponse, DataServerError> {
@@ -3763,8 +3766,11 @@ pub async fn trajectory_query(
         }
     }
 
-    // A cross-section engine drives its remote reads through an explicit
-    // runtime handle and needs a blocking thread; along-path sampling runs
+    // A cross-section engine drives its remote reads with `handle.block_on`
+    // on the runtime it finds, which needs a thread outside the runtime's
+    // workers: the blocking pool here. A `datetime` list's instants run as
+    // field jobs instead, on query-runtime workers inside `block_in_place`
+    // (#1522), where `handle.block_on` is valid too. Along-path sampling runs
     // on the query runtime's workers like position and area.
     let blocking = shape == TrajectoryShape::CrossSection;
     // The CoverageJSON and the HTML page (#971) are written on the query

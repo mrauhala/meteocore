@@ -5,8 +5,8 @@
 //! set time, a list of eight instants now keeps
 //! `api_edr::INSTANT_CONCURRENCY` reads in flight (fewer on a host whose
 //! EDR admits fewer queries: each instant past the first takes a free query
-//! slot) and answers in about eight ÷ that many delays, with the body and
-//! ETag a query of the same frames as one window gives.
+//! slot, never the last one) and answers in about eight ÷ that many delays,
+//! with the body and ETag a query of the same frames as one window gives.
 //!
 //! In a test binary of its own: every EDR query slot of the process is
 //! free, so the list gets all it wants.
@@ -101,10 +101,11 @@ async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Option<String>, Byte
 }
 
 /// The acceptance case of #1522: eight instants, every read taking
-/// 250 ms, read four at a time (or as many as EDR admits beside the
-/// list's own query, at least two) and answered in about two delays (four
-/// at two at a time), well under the eight of one instant after another;
-/// the answer is the window query's, byte for byte.
+/// 250 ms, read four at a time (one fewer than EDR admits on a host of
+/// fewer than five CPUs: three, two, or on two CPUs one at a time) and
+/// answered in about two delays (three at two at a time), well under the
+/// eight of one instant after another; the answer is the window query's,
+/// byte for byte.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_list_on_a_remote_geotiff_reads_its_instants_side_by_side() {
     let store = Arc::new(SlowReads::default());
@@ -140,15 +141,18 @@ async fn a_list_on_a_remote_geotiff_reads_its_instants_side_by_side() {
         "{values:?}"
     );
 
-    let bound = api_edr::INSTANT_CONCURRENCY.min(ds_executor::query_workers());
-    assert!(bound >= 2);
+    // Every slot is free but the list's own, and the last free one stays.
+    let bound = api_edr::INSTANT_CONCURRENCY.min(ds_executor::query_workers() - 1);
     assert_eq!(store.reads(), FRAMES, "one tile read per instant");
     assert_eq!(store.peak(), bound, "instants in flight");
     let rounds = FRAMES.div_ceil(bound) as u32;
-    assert!(
-        elapsed >= delay * rounds && elapsed < delay * FRAMES as u32 * 3 / 4,
-        "{elapsed:?} for {FRAMES} instants of {delay:?}, {bound} at a time"
-    );
+    assert!(elapsed >= delay * rounds, "{elapsed:?}");
+    if bound > 1 {
+        assert!(
+            elapsed < delay * FRAMES as u32 * 3 / 4,
+            "{elapsed:?} for {FRAMES} instants of {delay:?}, {bound} at a time"
+        );
+    }
 
     // The window over the same frames answers the same series: the same
     // body and ETag.

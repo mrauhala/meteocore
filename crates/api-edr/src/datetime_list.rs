@@ -34,6 +34,7 @@
 //! answering them in turn.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
@@ -51,14 +52,17 @@ pub const MAX_LIST_VALUES: usize = ds_core::feature::MAX_AREA_VALUES;
 
 /// The most instants of one list answered at once (#1522). An instant on
 /// GeoTIFF or an ODIM composite reads one frame, a round trip on a remote
-/// source, so only the list can overlap them; four cut a 16-instant list's
-/// round trips to four. Each instant past the first takes an EDR query slot
-/// free at the start, or runs in turn, so a list answers no more engine
-/// queries at once than EDR admits (`ds_executor::query_workers()`, 2–8),
-/// and each engine's own per-query bounds (GRIB's field memory, an ODIM
-/// composite query's one unbudgeted read, NetCDF's read plan) hold per slot
-/// as for separate requests. Four leaves the other slots of a small
-/// runtime to other queries, and is ds-executor's `FIELD_CONCURRENCY`.
+/// source, so only the list can overlap them: `n` at once cut a 16-instant
+/// list's round trips to 16 ÷ `n`. Each instant past the first takes an
+/// EDR query slot free at the start, never the last free one, or the list
+/// runs them in turn. EDR admits `ds_executor::query_workers()` queries,
+/// 2–8, so an idle server answers up to one fewer than that at once, at
+/// most 4, and one admitting two answers a list in turn, as a busy one
+/// does. So a list answers no more engine queries at once than EDR admits,
+/// always leaves a slot for the next query, and each engine's own
+/// per-query bounds (GRIB's field memory, an ODIM composite query's one
+/// unbudgeted read, NetCDF's read plan) hold per slot, as for separate
+/// requests. Four is ds-executor's `FIELD_CONCURRENCY`.
 pub const INSTANT_CONCURRENCY: usize = 4;
 
 type Window = (DateTime<Utc>, DateTime<Utc>);
@@ -121,6 +125,9 @@ pub fn run_within(
     }
 }
 
+/// What one instant answered.
+type Outcome = Result<CoverageResponse, DataServerError>;
+
 /// Query each instant as the window `(t, t)`, `concurrency` at once, and
 /// merge the answers.
 ///
@@ -132,65 +139,115 @@ pub fn run_within(
 ///
 /// The instants start in order and their answers arrive in any order. Once
 /// an answer decides the list (an error, or the values that have arrived
-/// passing the budget), no instant starts; those running finish. The
-/// answers are then taken in the instants' order, exactly as one after
-/// another were: the first instant whose error is not "no data", or whose
-/// answer takes the values past the budget, decides the error, and an
-/// instant not started means the time ran out first. So the outcome never
-/// depends on which answer arrived first, and `merge` sees the answers in
-/// the instants' order.
+/// passing the budget), no instant starts. Those running finish first, so a
+/// deciding error waits for them. The answers are then taken in the
+/// instants' order, exactly as one after another were: the first instant
+/// whose error is not "no data", or whose answer takes the values past the
+/// budget, decides the error, and an instant without an answer means the
+/// time ran out first, the 504. A list past its deadline is that 504 only
+/// when no earlier instant decided it. So the outcome never depends on
+/// which answer arrived first, and `merge` sees the answers in the
+/// instants' order.
+///
+/// Instants side by side compete for the engines' process-wide fail-fast
+/// byte budgets, which one instant at a time never shared with itself. So
+/// an instant refused with `ResourceExhausted` while others ran is not an
+/// answer: no further instant starts beside it, and once those running
+/// finish, the instants without an answer are queried one at a time, in
+/// order, until one decides the list. A refusal then is the answer.
 ///
 /// An engine that fits an area grid to the value budget fits each
 /// instant's to its share of it ([`AreaShare::answers`], #1436, entered on
 /// the thread each instant runs on): every instant then gets the same grid,
 /// so the answers join along `t`, and together they fit the list's budget
 /// instead of each filling it.
-pub fn query_instants(
+pub fn query_instants<Q>(
     instants: &[DateTime<Utc>],
     expired: impl Fn() -> bool + Sync,
     concurrency: usize,
     values: ValueBudget,
-    query: impl Fn(Window) -> Result<CoverageResponse, DataServerError> + Send + Sync + 'static,
-) -> Result<CoverageResponse, DataServerError> {
+    query: Q,
+) -> Result<CoverageResponse, DataServerError>
+where
+    Q: Fn(Window) -> Result<CoverageResponse, DataServerError> + Send + Sync + 'static,
+{
     let answers = instants.len();
-    let mut outcomes: Vec<Option<Result<CoverageResponse, DataServerError>>> = Vec::new();
-    outcomes.resize_with(answers, || None);
-    // Both read and written on the scheduler's thread, between jobs.
-    let decided = AtomicBool::new(false);
-    let mut arrived = 0usize;
-    let start = instants
-        .iter()
-        .copied()
-        .enumerate()
-        .take_while(|_| !decided.load(Ordering::Relaxed) && !expired());
-    ds_executor::field_jobs::run_field_jobs(
-        ds_executor::query_runtime(),
-        concurrency,
-        start,
+    let query = Arc::new(query);
+    let job = |query: &Arc<Q>| {
+        let query = Arc::clone(query);
         move |(index, t): (usize, DateTime<Utc>)| {
             let _share = AreaShare::answers(answers);
             Ok((index, query((t, t))))
-        },
-        |(index, answer): (usize, Result<CoverageResponse, DataServerError>)| {
-            let decides = match &answer {
+        }
+    };
+    let mut outcomes: Vec<Option<Outcome>> = Vec::new();
+    outcomes.resize_with(answers, || None);
+    let outcomes = Mutex::new(outcomes);
+    let side_by_side = concurrency > 1;
+
+    // Side by side. Both flags are read and written on the scheduler's
+    // thread, between jobs.
+    let decided = AtomicBool::new(false);
+    let contended = AtomicBool::new(false);
+    let mut arrived = 0usize;
+    let start = instants.iter().copied().enumerate().take_while(|_| {
+        !decided.load(Ordering::Relaxed) && !contended.load(Ordering::Relaxed) && !expired()
+    });
+    let ran = ds_executor::field_jobs::run_field_jobs(
+        ds_executor::query_runtime(),
+        concurrency,
+        start,
+        job(&query),
+        |(index, answer): (usize, Outcome)| {
+            match &answer {
                 Ok(response) => {
                     arrived = arrived.saturating_add(count_values(response));
-                    arrived > values.max
+                    if arrived > values.max {
+                        decided.store(true, Ordering::Relaxed);
+                    }
                 }
-                Err(DataServerError::LocationNotFound(_)) => false,
-                Err(_) => true,
-            };
-            if decides {
-                decided.store(true, Ordering::Relaxed);
+                Err(DataServerError::LocationNotFound(_)) => {}
+                Err(DataServerError::ResourceExhausted) if side_by_side => {
+                    contended.store(true, Ordering::Relaxed);
+                    return Ok(());
+                }
+                Err(_) => decided.store(true, Ordering::Relaxed),
             }
-            outcomes[index] = Some(answer);
+            lock(&outcomes)[index] = Some(answer);
             Ok(())
         },
-    )?;
+    );
+    let on_time = in_time(ran)?;
 
-    // Every instant started has answered. One that did not start comes
-    // after any answer that decided the list, which then decides it here
-    // first: past the deadline, the 504.
+    // In turn, after a refusal side by side: the instants without an
+    // answer, in order, until the answers before the next one decide.
+    if on_time && contended.load(Ordering::Relaxed) {
+        let unanswered: Vec<(usize, DateTime<Utc>)> = instants
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|&(index, _)| lock(&outcomes)[index].is_none())
+            .collect();
+        let next = unanswered.into_iter().take_while(|&(index, _)| {
+            !decides(&lock(&outcomes)[..index], values.max) && !expired()
+        });
+        let ran = ds_executor::field_jobs::run_field_jobs(
+            ds_executor::query_runtime(),
+            1,
+            next,
+            job(&query),
+            |(index, answer): (usize, Outcome)| {
+                lock(&outcomes)[index] = Some(answer);
+                Ok(())
+            },
+        );
+        in_time(ran)?;
+    }
+
+    // Every instant started has answered, unless the deadline passed. One
+    // without an answer comes after any answer that decided the list, which
+    // then decides it here first: else past the deadline, the 504.
+    let outcomes = outcomes.into_inner().unwrap_or_else(|e| e.into_inner());
     let mut responses = Vec::with_capacity(answers);
     let mut no_data = None;
     let mut total = 0usize;
@@ -216,6 +273,41 @@ pub fn query_instants(
         }));
     }
     Ok(merge(responses))
+}
+
+/// Whether the scheduler ran to the end (`true`) or stopped at the
+/// deadline (`false`), whose answers the replay then weighs; any other
+/// failure (a job that panicked) is the list's.
+fn in_time(ran: Result<(), DataServerError>) -> Result<bool, DataServerError> {
+    match ran {
+        Ok(()) => Ok(true),
+        Err(DataServerError::DeadlineExceeded) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether `outcomes`, the answers of the instants before one, decide the
+/// list in order: an error other than "no data", or values past `max`.
+fn decides(outcomes: &[Option<Outcome>], max: usize) -> bool {
+    let mut total = 0usize;
+    for outcome in outcomes {
+        match outcome {
+            Some(Ok(response)) => {
+                total = total.saturating_add(count_values(response));
+                if total > max {
+                    return true;
+                }
+            }
+            Some(Err(DataServerError::LocationNotFound(_))) => {}
+            Some(Err(_)) => return true,
+            None => return false,
+        }
+    }
+    false
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn count_values(response: &CoverageResponse) -> usize {
@@ -1083,44 +1175,60 @@ mod tests {
         }
     }
 
-    /// #1522: a list of eight instants, each taking 100 ms, runs four at a
-    /// time and answers in about two delays, not eight; with one slot it
-    /// runs them in turn. The bound is reached and never passed.
+    /// The hours of the instants in the order their answers arrived.
+    #[derive(Clone, Default)]
+    struct Arrivals(Arc<Mutex<Vec<u32>>>);
+
+    impl Arrivals {
+        fn arrived(&self, t: DateTime<Utc>) {
+            self.0.lock().unwrap().push(t.hour());
+        }
+
+        /// Whether some answer arrived before an earlier instant's.
+        fn out_of_order(&self) -> bool {
+            !self.0.lock().unwrap().is_sorted()
+        }
+    }
+
+    /// #1522: a list of eight instants runs as many at once as it may, and
+    /// never more. Every instant waits until that many run at once (or ten
+    /// seconds pass), so a scheduler holding fewer fails the peak instead of
+    /// passing on timing; with one at a time they run in turn.
     #[test]
     fn instants_run_side_by_side_within_the_bound() {
+        use std::sync::Condvar;
         let instants: Vec<_> = (1..=8).map(at).collect();
-        let delay = Duration::from_millis(100);
-        for concurrency in [INSTANT_CONCURRENCY, 1] {
-            let flight = Arc::new(InFlight::default());
-            let started = Instant::now();
-            let got = query_instants(&instants, || false, concurrency, LIST_BUDGET, {
-                let flight = flight.clone();
+        for bound in [INSTANT_CONCURRENCY, 2, 1] {
+            let gate = Arc::new((Mutex::new((0usize, false)), Condvar::new()));
+            let peak = Arc::new(AtomicUsize::new(0));
+            let got = query_instants(&instants, || false, bound, LIST_BUDGET, {
+                let (gate, peak) = (gate.clone(), peak.clone());
                 move |(t, _): Window| {
-                    flight.during(|| {
-                        std::thread::sleep(delay);
-                        Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
-                    })
+                    let (lock, changed) = &*gate;
+                    let mut state = lock.lock().unwrap();
+                    state.0 += 1;
+                    peak.fetch_max(state.0, Ordering::SeqCst);
+                    if state.0 >= bound {
+                        state.1 = true; // the bound was reached once
+                        changed.notify_all();
+                    }
+                    let (mut state, _) = changed
+                        .wait_timeout_while(state, Duration::from_secs(10), |s| !s.1)
+                        .unwrap();
+                    state.0 -= 1;
+                    Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
                 }
             })
             .unwrap();
-            let elapsed = started.elapsed();
             let CoverageResponse::Single(q) = got else {
                 panic!("one series");
             };
             assert_eq!(times(&q), instants);
-            assert_eq!(flight.peak.load(Ordering::SeqCst), concurrency);
-            let rounds = instants.len().div_ceil(concurrency) as u32;
-            assert!(elapsed >= delay * rounds, "{elapsed:?}");
-            if concurrency > 1 {
-                assert!(
-                    elapsed < delay * 4,
-                    "{elapsed:?} for 8 instants of {delay:?}"
-                );
-            }
+            assert_eq!(peak.load(Ordering::SeqCst), bound, "bound {bound}");
         }
     }
 
-    /// The answers arrive in any order, last instant first here, and the
+    /// The answers arrive in any order, later instants first here, and the
     /// list is still the one answering the instants in turn gives: the same
     /// JSON, coverage for coverage, with an instant without data among
     /// them, for a series, a station collection and grids.
@@ -1145,10 +1253,13 @@ mod tests {
         ];
         for answer in answers {
             let json = |concurrency| {
+                let arrivals = Arrivals::default();
                 let got = query_instants(&instants, || false, concurrency, LIST_BUDGET, {
+                    let arrivals = arrivals.clone();
                     move |(t, _): Window| {
                         // The later the instant, the sooner it answers.
                         std::thread::sleep(Duration::from_millis(10 * u64::from(8 - t.hour())));
+                        arrivals.arrived(t);
                         if t == at(3) {
                             return Err(DataServerError::LocationNotFound("none".into()));
                         }
@@ -1156,10 +1267,14 @@ mod tests {
                     }
                 })
                 .unwrap();
-                crate::response::coverage_response_to_json(&got).to_string()
+                let json = crate::response::coverage_response_to_json(&got).to_string();
+                (json, arrivals.out_of_order())
             };
-            let in_turn = json(1);
-            assert_eq!(json(INSTANT_CONCURRENCY), in_turn);
+            let (in_turn, shuffled) = json(1);
+            assert!(!shuffled, "one at a time, in order");
+            let (side_by_side, shuffled) = json(INSTANT_CONCURRENCY);
+            assert!(shuffled, "the premise: the answers arrived out of order");
+            assert_eq!(side_by_side, in_turn);
             assert!(!in_turn.contains(&at(3).to_rfc3339()), "{in_turn}");
         }
     }
@@ -1171,17 +1286,23 @@ mod tests {
     #[test]
     fn the_first_instant_in_turn_decides_the_error() {
         let instants: Vec<_> = (1..=4).map(at).collect();
-        let slower_first = |t: DateTime<Utc>| {
-            std::thread::sleep(Duration::from_millis(20 * u64::from(5 - t.hour())));
-        };
         let run = |query: fn(DateTime<Utc>) -> Result<CoverageResponse, DataServerError>| {
-            query_instants(&instants, || false, INSTANT_CONCURRENCY, LIST_BUDGET, {
+            let arrivals = Arrivals::default();
+            let err = query_instants(&instants, || false, INSTANT_CONCURRENCY, LIST_BUDGET, {
+                let arrivals = arrivals.clone();
                 move |(t, _): Window| {
-                    slower_first(t);
+                    // The earlier the instant, the later it answers.
+                    std::thread::sleep(Duration::from_millis(20 * u64::from(5 - t.hour())));
+                    arrivals.arrived(t);
                     query(t)
                 }
             })
-            .unwrap_err()
+            .unwrap_err();
+            assert!(
+                arrivals.out_of_order(),
+                "the premise: a later answer came first"
+            );
+            err
         };
         let err = run(|t| Err(DataServerError::InvalidParameter(t.to_rfc3339())));
         assert!(
@@ -1219,6 +1340,97 @@ mod tests {
             matches!(&err, DataServerError::QueryTooLarge(m) if m == "own"),
             "{err:?}"
         );
+    }
+
+    /// A deciding error waits for the instants running beside it, and stays
+    /// the answer when one of them outlives the deadline: the first
+    /// instant's `Unavailable` at once, the second taking 300 ms past a
+    /// 150 ms deadline, is the 503 it is in turn, not a 504. With the slow
+    /// instant first the list is the 504, as in turn: it ran out of time
+    /// before the second instant.
+    #[test]
+    fn a_deciding_error_outlives_the_deadline_of_a_running_sibling() {
+        let instants = [at(1), at(2)];
+        let list = |slow: DateTime<Utc>| {
+            let deadline = Instant::now() + Duration::from_millis(150);
+            let _deadline = ds_core::deadline::enter(Some(deadline));
+            let started = Instant::now();
+            let got = query_instants(
+                &instants,
+                move || Instant::now() >= deadline,
+                2,
+                LIST_BUDGET,
+                {
+                    move |(t, _): Window| {
+                        if t == slow {
+                            std::thread::sleep(Duration::from_millis(300));
+                            Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
+                        } else {
+                            Err(DataServerError::Unavailable("store".into()))
+                        }
+                    }
+                },
+            );
+            (got.unwrap_err(), started.elapsed())
+        };
+        let (err, elapsed) = list(at(2));
+        assert!(matches!(err, DataServerError::Unavailable(_)), "{err:?}");
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "the error waited for its running sibling: {elapsed:?}"
+        );
+        let (err, _) = list(at(1));
+        assert!(matches!(err, DataServerError::DeadlineExceeded), "{err:?}");
+    }
+
+    /// Instants side by side compete for a fail-fast byte budget that one
+    /// at a time never shared (#1522 review): here one that fits one
+    /// instant. The instants it refused while others ran are asked again
+    /// in turn after them, so the list answers as it does in turn, every
+    /// instant included; a refusal in turn is the answer.
+    #[test]
+    fn instants_refused_beside_others_are_asked_again_in_turn() {
+        let instants: Vec<_> = (1..=6).map(at).collect();
+        let budget = Arc::new(AtomicUsize::new(0));
+        let refused = Arc::new(AtomicUsize::new(0));
+        let list = |concurrency| {
+            query_instants(&instants, || false, concurrency, LIST_BUDGET, {
+                let (budget, refused) = (budget.clone(), refused.clone());
+                move |(t, _): Window| {
+                    if budget.fetch_add(1, Ordering::SeqCst) > 0 {
+                        budget.fetch_sub(1, Ordering::SeqCst);
+                        refused.fetch_add(1, Ordering::SeqCst);
+                        return Err(DataServerError::ResourceExhausted);
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    budget.fetch_sub(1, Ordering::SeqCst);
+                    Ok(CoverageResponse::Single(series(24.0, &[(t.hour(), 1.0)])))
+                }
+            })
+            .map(|got| crate::response::coverage_response_to_json(&got).to_string())
+        };
+        let in_turn = list(1).unwrap();
+        assert_eq!(refused.load(Ordering::SeqCst), 0);
+        let side_by_side = list(INSTANT_CONCURRENCY).unwrap();
+        assert!(
+            refused.load(Ordering::SeqCst) > 0,
+            "the premise: refusals side by side"
+        );
+        assert_eq!(side_by_side, in_turn);
+
+        // A budget that refuses every instant: in turn the first refusal is
+        // the answer, after the four refused side by side and that one.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let err = query_instants(&instants, || false, INSTANT_CONCURRENCY, LIST_BUDGET, {
+            let calls = calls.clone();
+            move |_: Window| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(DataServerError::ResourceExhausted)
+            }
+        })
+        .unwrap_err();
+        assert!(matches!(err, DataServerError::ResourceExhausted), "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), INSTANT_CONCURRENCY + 1);
     }
 
     /// An answer deciding the list stops it: no instant starts after it,

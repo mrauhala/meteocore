@@ -613,8 +613,8 @@ the catalog's order.
   share, and eight area frames at once would starve them, the #240/#243
   convoy.
 - **A `datetime` list** (#1522): api-edr queries its instants side by
-  side, up to 4, each an engine query of one frame in an EDR query slot of
-  its own. So a list reads as many frames at once as that many separate
+  side, up to 4 (fewer on a host with fewer EDR query slots), each an
+  engine query of one frame in an EDR query slot of its own. So a list reads as many frames at once as that many separate
   requests would, an area's on the tile pool included, never more than EDR
   admits.
 
