@@ -1,3 +1,4 @@
+use api_common::map_frame::NO_READ_WINDOW;
 use chrono::{DateTime, Utc};
 use ds_core::map_engine::OutputCrs;
 use serde::Deserialize;
@@ -754,13 +755,6 @@ fn parse_bbox(bbox_str: &str, crs: &str) -> Result<([f64; 4], OutputCrs), WmsErr
         }
     }
 }
-
-/// The WGS84 read window of a projected BBOX wholly outside its CRS's valid
-/// area, which has none: NaN, which names no place. Never read: the frame's
-/// [`OutputCrs::domain_rows`] is `None`, so GetMap serves the empty image
-/// without calling the engine (#1089). The rendered cache keys a projected
-/// frame on its metres, not on this.
-const NO_READ_WINDOW: [f64; 4] = [f64::NAN; 4];
 
 /// Convert EPSG:3857 (Web Mercator) metres to WGS84 (lon/lat degrees) via the
 /// shared [`ds_core::web_mercator`] conversions (single source of truth, #452).
