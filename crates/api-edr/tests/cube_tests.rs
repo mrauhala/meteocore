@@ -489,7 +489,11 @@ async fn a_datetime_list_is_one_cube_per_instant_joined_along_t() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let windows: Vec<_> = engine.calls().iter().map(|c| c.datetime).collect();
+    // A list's instants run concurrently in spare query slots (#1522), so
+    // the engine sees them in any order; the answer's `t` axis below is in
+    // order whatever the calls were.
+    let mut windows: Vec<_> = engine.calls().iter().map(|c| c.datetime).collect();
+    windows.sort();
     assert_eq!(windows, [Some((run(), run())), Some((later, later))]);
     assert_eq!(body["type"], "Coverage");
     assert_eq!(
