@@ -7894,6 +7894,10 @@ fn remote_radar(c: &CollectionConfig) -> bool {
         })
 }
 
+/// Whether a remote radar source is still to load: its own entry, under its
+/// configured id, is not `Ready`. A PVOL site's entry (`{base}-{nod}`) is no
+/// configured id, so a site whose volumes left the catalog, `Degraded` in
+/// `/health` ([`RADAR_SITE_ABSENT`]), starts no recovery pass (#1511).
 pub(crate) fn has_pending_radar(
     collections: &[CollectionConfig],
     health: &[CollectionHealth],
@@ -8008,9 +8012,12 @@ pub(crate) fn recover_radar_once(state: &AdminState) -> Result<RecoveryOutcome, 
     let outcome = apply_load(state, inputs, true)?;
     // A partial reload can be accepted while a source is still down. Keep the
     // backoff in that case too, instead of hammering it every base interval.
+    // A radar site whose volumes are away is no source down: a poll brings
+    // it back, and backing off would only delay the next site's pass.
     if outcome.health.iter().any(|h| {
         h.status != CollectionStatus::Ready
             && matches!(h.engine_type.as_str(), "odim" | "odim-volume")
+            && !is_absent_radar_site(h)
     }) {
         return Ok(RecoveryOutcome::Pending);
     }
@@ -8274,7 +8281,9 @@ fn apply_load(
     // Push a `Degraded` entry so monitoring can see it — but only when the
     // site's base source is still configured (a fully-removed source is a
     // config change, not a data gap). Degraded, so it doesn't affect the
-    // `ready` guard above.
+    // `ready` guard above. A recovery pass, which never drops a site, keeps
+    // the entry of one an explicit reload dropped until it serves the site
+    // again (#1511).
     {
         let old_health = state.health.read().unwrap_or_else(|e| e.into_inner());
         let new_ids: std::collections::HashSet<&str> =
@@ -8284,9 +8293,12 @@ fn apply_load(
             .iter()
             .map(|e| e.collection_id().to_string())
             .collect();
-        let vanished: Vec<String> = old_health
+        let vanished: Vec<(String, bool)> = old_health
             .iter()
-            .filter(|h| h.engine_type == "odim-volume" && h.status == CollectionStatus::Ready)
+            .filter(|h| {
+                (h.engine_type == "odim-volume" && h.status == CollectionStatus::Ready)
+                    || (recovery && is_absent_radar_site(h))
+            })
             .filter(|h| !new_ids.contains(h.id.as_str()))
             .filter(|h| {
                 // `{base}-{nod}` where `nod` is plain alphanumeric (no `-`).
@@ -8303,17 +8315,16 @@ fn apply_load(
                     })
                 })
             })
-            .map(|h| h.id.clone())
+            .map(|h| (h.id.clone(), h.status == CollectionStatus::Ready))
             .collect();
         drop(old_health);
-        for id in vanished {
-            tracing::warn!("Reload: radar site collection '{id}' is no longer present in the scan");
-            result.health.push(CollectionHealth {
-                id,
-                engine_type: "odim-volume".into(),
-                status: CollectionStatus::Degraded,
-                error: Some("site no longer present in the latest scan".into()),
-            });
+        for (id, newly) in vanished {
+            if newly {
+                tracing::warn!(
+                    "Reload: radar site collection '{id}' is no longer present in the scan"
+                );
+            }
+            result.health.push(absent_radar_site(id));
         }
     }
 
@@ -8797,7 +8808,71 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
         }
     }
 
+    // PVOL radar sites (#1511): a site whose volumes left its source's
+    // catalog keeps its collection (#1462) but serves no data, so it is
+    // `Degraded` with the message an explicit reload gives the site it
+    // drops, and `Ready` again once a poll finds its volumes. Live only:
+    // the snapshot keeps a registered site `Ready`, so neither the
+    // zero-`Ready` reload guard nor the recovery loop's back-off counts it.
+    {
+        let present: HashMap<String, HashSet<String>> = state
+            .odim_volume_engines
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|e| {
+                let nods = e.sites().into_iter().map(|(nod, _)| nod).collect();
+                (e.collection_id().to_owned(), nods)
+            })
+            .collect();
+        let absent: HashSet<String> = state
+            .pvol_sites
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(|(base, sites)| Some((base, sites, present.get(base)?)))
+            .flat_map(|(base, sites, present)| {
+                sites
+                    .keys()
+                    .filter(|nod| !present.contains(*nod))
+                    .map(move |nod| format!("{base}-{nod}"))
+            })
+            .collect();
+        for h in health.iter_mut().filter(|h| {
+            h.engine_type == "odim-volume"
+                && h.status == CollectionStatus::Ready
+                && absent.contains(&h.id)
+        }) {
+            *h = absent_radar_site(std::mem::take(&mut h.id));
+        }
+    }
+
     health
+}
+
+/// Why `/health` lists a radar site `Degraded`: no volume of it is in its
+/// source's catalog. One message (#1511), whether the site kept its
+/// collection ([`effective_health`]) or an explicit reload dropped it
+/// ([`apply_load`]).
+pub(crate) const RADAR_SITE_ABSENT: &str = "site no longer present in the latest scan";
+
+/// The `/health` entry of radar site collection `id` while its volumes are
+/// absent from the catalog ([`RADAR_SITE_ABSENT`]).
+fn absent_radar_site(id: String) -> CollectionHealth {
+    CollectionHealth {
+        id,
+        engine_type: "odim-volume".into(),
+        status: CollectionStatus::Degraded,
+        error: Some(RADAR_SITE_ABSENT.into()),
+    }
+}
+
+/// Whether `h` is an [`absent_radar_site`] entry: a radar site whose volumes
+/// are away, which no recovery pass can bring back.
+fn is_absent_radar_site(h: &CollectionHealth) -> bool {
+    h.engine_type == "odim-volume"
+        && h.status == CollectionStatus::Degraded
+        && h.error.as_deref() == Some(RADAR_SITE_ABSENT)
 }
 
 /// A postgis collection's entry in the load/reload snapshot: degraded only

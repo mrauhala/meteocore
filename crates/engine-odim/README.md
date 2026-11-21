@@ -265,7 +265,10 @@ discovery), `radar-fi-volume-s3-h5` (polar volumes on public S3). The
   radar that appears after load, in a local or a remote source, becomes a
   collection within about 30 s of the poll that finds it, with no reload,
   also when the source held no radar at load. A radar whose volumes leave
-  the source keeps its collection, which then has no data, until a reload.
+  the source keeps its collection until a reload, `degraded` in `/health`.
+  Until its volumes return it has no data: WMS lists one layer with the
+  default style, no quantity layers and no time dimension, its maps are an
+  error, and EDR answers 404.
 
 ## Testing
 
