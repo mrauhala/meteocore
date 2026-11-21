@@ -106,16 +106,26 @@ unlike GeoTIFF's one band per collection.
   images still revalidate. A failed selection returns the catalog's
   version. `map_message` runs on every map request, cache hits included:
   keep it free of key copies (no `ParameterKeys` clone; `map_level` reads
-  the run's first level directly without `z`).
-- Upper-air queries use exact levels, with no canonical-level fallback.
+  the parameter's levels in the run in place, its first without `z`).
+- Upper-air EDR queries use exact levels, with no canonical-level fallback.
   Missing parameter/level pairs are null in EDR and errors in Maps. Pressure/
   model labels omit a fixed-level qualifier. The shared vertical descriptor
   feeds both EDR and Maps; single-level fields retain their label qualifiers.
-- A map draws the requested level, else the selected run's own first level
-  (`map_level`), which need not be the first of the advertised union.
-  `render_field` and `MapEngine::resolve_elevation` share `map_level` and
-  `select_run_step`, so WMS GetFeatureInfo asks the position query for the
-  level the map shows (#1064).
+- A map draws the level nearest the requested one among the drawn
+  parameter's own levels in the selected run (#1477, WMS
+  `nearestValue="1"`; midway the one nearer the ground,
+  `ds_core::vertical::nearest`), else its own first level (`map_level`
+  over `Catalog::parameter_levels`, built per run and parameter at scan
+  time), never a level only other parameters, or only another run, have.
+  `render_field`, `content_version_for` (through `map_message`) and
+  `MapEngine::resolve_elevation` share `map_level` and `select_run_step`,
+  so WMS keys its caches on, and GetFeatureInfo asks the position query
+  for, the level the map shows (#1064). The run and step do not depend on
+  the level; the level is resolved after them. A parameter without levels
+  in the run is `None` from `resolve_elevation`, WMS's
+  `InvalidDimensionValue`. EDR `z` stays exact (`selected_levels`). Pinned
+  by `vertical.rs` `a_map_draws_the_selected_runs_nearest_level` and
+  `a_map_draws_the_nearest_of_the_parameters_own_levels`.
 - New families register through the server's background registration/recovery
   loop using the accepted config. Config reserves all enabled derived IDs.
 

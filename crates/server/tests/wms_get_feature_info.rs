@@ -726,7 +726,8 @@ async fn netcdf_pressure_level_pixels(wms: axum::Router, edr: axum::Router) {
 
 /// OGC API Maps `elevation` on pressure levels (#1067 PR 8): a map without
 /// it draws the bottom level, as `elevation=1000` does, `elevation=300`
-/// another image, and a level the collection lacks is a 400.
+/// another image, and a value between levels the nearest level's image
+/// (#1477), as WMS draws it: 600 is 500 hPa.
 #[test]
 fn a_netcdf_pressure_level_map_draws_the_elevation_asked_for() {
     let id = "meps-pl";
@@ -773,8 +774,12 @@ fn a_netcdf_pressure_level_map_draws_the_elevation_asked_for() {
             let (status, top) = map("&elevation=300").await;
             assert_eq!(status, StatusCode::OK);
             assert_ne!(default, top, "300 hPa is another image");
-            let (status, body) = map("&elevation=600").await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+            let (status, between) = map("&elevation=600").await;
+            assert_eq!(status, StatusCode::OK, "{between:?}");
+            let (status, at_500) = map("&elevation=500").await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(between, at_500, "600 is drawn at 500 hPa");
+            assert_ne!(at_500, top);
         });
 }
 

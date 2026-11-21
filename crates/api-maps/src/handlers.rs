@@ -1325,7 +1325,7 @@ pub async fn get_styled_map(
     render_map(&id, &style_id, params, &subsets, headers, state).await
 }
 
-/// The time step and model run a map draws (#507, #521):
+/// The time step, model run and level a map draws (#507, #521, #1477):
 /// [`subset::resolve_frame`], shared with map tiles. A time that selects no
 /// time step is a 404 here (`/req/datetime/subset-definition` D).
 fn drawn_frame(
@@ -1335,8 +1335,15 @@ fn drawn_frame(
     info: &RasterInfo,
     parameter: Option<&str>,
 ) -> Result<subset::DrawnFrame, MapsError> {
-    subset::resolve_frame(request.time.as_ref(), run, engine, info, parameter)
-        .map_err(|none| MapsError::NotFound(none.0))
+    subset::resolve_frame(
+        request.time.as_ref(),
+        run,
+        request.z,
+        engine,
+        info,
+        parameter,
+    )
+    .map_err(|none| MapsError::NotFound(none.0))
 }
 
 /// A map render's outcome: the encoded image, `None` for an all-nodata view,
@@ -1480,6 +1487,7 @@ async fn render_map(
     let subset::DrawnFrame {
         time,
         reference_time,
+        z,
         pinned,
     } = drawn_frame(
         &validated,
@@ -1537,7 +1545,9 @@ async fn render_map(
         height: view.height,
         time,
         parameter: effective_parameter.clone(),
-        z: validated.z.map(ds_render::quantize_z),
+        // The level drawn (#1477): `elevation` values drawing one level, and
+        // the default, share one entry, as WMS's `ELEVATION` values do.
+        z: z.map(ds_render::quantize_z),
         // The run drawn, resolved above (#521): the one named, or the
         // engine's pick for the time when none is.
         reference_time,
@@ -1548,7 +1558,7 @@ async fn render_map(
             effective_parameter.as_deref(),
             time,
             reference_time,
-            validated.z,
+            z,
         ),
         // The default (transparent, no `bgcolor`) keys as WMS
         // `TRANSPARENT=TRUE` does, and `transparent=false` as WMS's opaque
@@ -1652,7 +1662,7 @@ async fn render_map(
     let fill = rendered_cache.fill_timer();
 
     let render_parameter = effective_parameter;
-    let render_z = validated.z;
+    let render_z = z;
 
     // An all-nodata view's image: its background, solid, encoded once per
     // (w, h, fill, format) and shared across WMS/Maps/Tiles (#171), unless

@@ -480,7 +480,8 @@ fn a_height_tile_is_the_geopotential_tile_over_g0() {
     );
     mock.tiles.lock().unwrap().clear();
     // Unpinned: still exactly what the engine is asked for z, no run is
-    // picked on its behalf.
+    // picked on its behalf; the level is the one the engine draws z at by
+    // default, resolved once for every input (#1477).
     derived
         .get_raster_tile(
             [0.0, 0.0, 1.0, 1.0],
@@ -495,7 +496,7 @@ fn a_height_tile_is_the_geopotential_tile_over_g0() {
         .unwrap();
     assert_eq!(
         *mock.tiles.lock().unwrap(),
-        [("z".to_string(), None, None, None)]
+        [("z".to_string(), None, Some(500.0), None)]
     );
 }
 

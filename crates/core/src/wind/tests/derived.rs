@@ -228,7 +228,12 @@ impl MapEngine for Mock {
         }
     }
 
-    /// Without `z`, `10u` is drawn at 925 hPa and the rest at 1000 hPa.
+    /// The level each parameter is drawn at, as a pressure-level engine
+    /// draws it (#1477): the nearest of its own levels, bottom first, and
+    /// without `z` the first. `10u` is on 925, 850 and 700 hPa, `10v` on
+    /// 1000, 925, 875, 850 and 600, the rest on 1000 and 850. So at 880
+    /// hPa `10u` alone is drawn at 850 and `10v` alone at 875, and at 650
+    /// `10u` at 700, which `10v` lacks.
     fn resolve_elevation(
         &self,
         parameter: Option<&str>,
@@ -236,10 +241,20 @@ impl MapEngine for Mock {
         _time: Option<DateTime<Utc>>,
         _reference_time: Option<DateTime<Utc>>,
     ) -> Option<f64> {
-        z.or(match parameter {
-            Some("10u") => Some(925.0),
-            _ => Some(1000.0),
-        })
+        let levels = levels(parameter.unwrap_or("2t"));
+        match z {
+            Some(z) => crate::vertical::nearest_level(levels, z).map(|i| levels[i]),
+            None => levels.first().copied(),
+        }
+    }
+}
+
+/// [`Mock`]'s levels of `parameter`, bottom first.
+fn levels(parameter: &str) -> &'static [f64] {
+    match parameter {
+        "10u" => &[925.0, 850.0, 700.0],
+        "10v" => &[1000.0, 925.0, 875.0, 850.0, 600.0],
+        _ => &[1000.0, 850.0],
     }
 }
 
@@ -506,7 +521,79 @@ fn a_derived_speed_is_drawn_at_its_u_components_level() {
     let level = |parameter, z| wind.resolve_elevation(Some(parameter), z, None, None);
     assert_eq!(level("10si", None), Some(925.0));
     assert_eq!(level("10si", Some(850.0)), Some(850.0));
+    assert_eq!(level("10si", Some(800.0)), Some(850.0));
     assert_eq!(level("2t", None), Some(1000.0));
+}
+
+/// #1477: a `z` between levels is resolved once, to the level the engine
+/// draws u at, which v must draw too, and both components are drawn and
+/// versioned at that level: never u at its nearest level and v at another
+/// of its own. A `z` whose u level v lacks has no level to draw; without
+/// `z`, both are drawn at u's default.
+#[test]
+fn components_between_levels_are_drawn_at_one_level() {
+    let mock = Mock::new(VectorFrame::Earth);
+    let (wind, _) = wrap(&mock);
+    let at = |z: Option<f64>| {
+        wind.get_raster_tile(
+            [0.0, 0.0, 1.0, 1.0],
+            2,
+            2,
+            Some(hour(1)),
+            &OutputCrs::WebMercator,
+            Some("10si"),
+            z,
+            Some(hour(0)),
+        )
+    };
+    let call = |p: &str, z| (p.to_string(), Some(hour(1)), Some(z), Some(hour(0)));
+    // Each on its own, the engine would draw u at 850 hPa and v at 875.
+    assert_eq!(
+        mock.resolve_elevation(Some("10v"), Some(880.0), None, None),
+        Some(875.0)
+    );
+    for (z, level) in [(Some(880.0), 850.0), (Some(850.0), 850.0), (None, 925.0)] {
+        let speed = at(z).unwrap();
+        assert_eq!(
+            speed.values.iter_values().collect::<Vec<_>>(),
+            [Some(4.0), Some(3.0), Some(0.0), None]
+        );
+        assert_eq!(
+            std::mem::take(&mut *mock.tiles.lock().unwrap()),
+            [call("10u", level), call("10v", level)],
+            "{z:?}"
+        );
+        assert_eq!(
+            wind.resolve_elevation(Some("10si"), z, Some(hour(1)), Some(hour(0))),
+            Some(level),
+            "{z:?}"
+        );
+        mock.versions.lock().unwrap().clear();
+        wind.content_version_for(Some("10si"), Some(hour(1)), Some(hour(0)), z);
+        assert_eq!(
+            *mock.versions.lock().unwrap(),
+            [call("10u", level), call("10v", level)],
+            "{z:?}: versioned at the level drawn"
+        );
+    }
+
+    // At 650 hPa u is drawn at 700, which v does not have: no level, and
+    // nothing drawn, rather than u at 700 and v at 600.
+    assert_eq!(
+        wind.resolve_elevation(Some("10si"), Some(650.0), Some(hour(1)), Some(hour(0))),
+        None
+    );
+    assert!(matches!(
+        at(Some(650.0)),
+        Err(DataServerError::InvalidParameter(m)) if m.contains("'10v'")
+    ));
+    assert!(mock.tiles.lock().unwrap().is_empty());
+    mock.versions.lock().unwrap().clear();
+    assert_eq!(
+        wind.content_version_for(Some("10si"), Some(hour(1)), Some(hour(0)), Some(650.0)),
+        mock.content_version()
+    );
+    assert!(mock.versions.lock().unwrap().is_empty());
 }
 
 #[test]

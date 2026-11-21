@@ -133,9 +133,11 @@ compares engines.
   Maps and Tiles). No time draws the newest run's last step. A parameter
   present at only some steps (hour-window aggregates, maxima) has its own
   time axis and renders from the run and step that carry it.
-- **Levels.** On pressure and model views, EDR `z` and Maps/Tiles
-  `elevation` (WMS `ELEVATION`) select levels exactly. A map without one
-  draws the selected run's largest level value.
+- **Levels.** On pressure and model views, EDR `z` selects levels exactly.
+  A map's WMS `ELEVATION` or Maps/Tiles `elevation` draws the nearest of
+  the parameter's own levels in the selected run (#1477), midway the one
+  nearer the ground; a map without one draws its largest level value
+  there. The map APIs key their caches on the level drawn.
 - **Wind.** The engine reports each u/v message's triple, level and earth-
   or grid-relative flag. The server's shared wrapper derives speed (`10si`,
   `WIND`, …) on every API and direction in EDR, unless the collection sets

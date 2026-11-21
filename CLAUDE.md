@@ -648,13 +648,25 @@ gh issue create --title "..." --label "bug,priority: high" --milestone "v0.2"
    `resolve_reference_time` name only the step drawn, so the engine MUST
    move `content_version` when the other step changes under the same
    (time, run), such as a lead filled in inside a run.
-   **If the engine's map layers have levels** (`RasterInfo.vertical`) and
-   it draws another level than the requested `z`, or than the first
-   advertised level without one, it MUST override
-   `MapEngine::resolve_elevation` with the SAME selection
-   `get_raster_tile` uses (GRIB: the run's own first level; ODIM PVOL: the
-   nearest sweep carrying the quantity). WMS GetFeatureInfo passes that
-   level to the position query as `z` (#1064).
+   **If the engine's map layers have levels** (`RasterInfo.vertical`), a
+   map passed a `z` between them draws the nearest level it can draw
+   (WMS declares `nearestValue="1"`), selected through
+   `ds_core::vertical::nearest`, whose tie rule (midway: the level nearer
+   the ground) every engine shares (#1477). If it draws another level than
+   the requested `z`, or than the first advertised level without one, it
+   MUST override `MapEngine::resolve_elevation` with the SAME selection
+   `get_raster_tile` uses (NetCDF: the nearest level; GRIB: the nearest,
+   else first, of the parameter's own levels in the selected run; ODIM
+   PVOL: the nearest sweep carrying the quantity), `None` where it has no
+   level to draw. WMS, Maps and Tiles all resolve every layer's level
+   through it after the run and time (Maps and Tiles in
+   `api_common::subset::resolve_frame`), render at that level and key the
+   no-TTL caches on it (#1477, the level twin of #507); a `None` for a WMS
+   `ELEVATION` is `InvalidDimensionValue`. A derived parameter's inputs
+   are all drawn at its first input's level (`ds_core::derive`). A per-frame
+   `content_version_for` selects the level with the same helper. WMS
+   GetFeatureInfo passes that level to the position query as `z` (#1064).
+   EDR `z` stays exact.
    **If a map layer is an overlay** whose values the engine's EDR position
    query does not answer (ODIM `CELLS`), override
    `MapEngine::layer_shows_values` (O(1)) to return `false` for it.

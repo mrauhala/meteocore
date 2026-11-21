@@ -3,8 +3,9 @@ title = "MEPS Pressure Levels (CF-NetCDF, local sample)"
 description = "MetCoOp MEPS 2.5 km forecast on pressure levels, control member, read from MET Norway's per-lead CF-NetCDF files on their Lambert conformal conic grid. A committed sample: every 100th grid point at 1000, 850, 500 and 300 hPa of two runs (2026-10-15 06Z leads 0-2, 09Z leads 0-1)."
 engine_type = "netcdf"
 # The pressure levels are the collection's vertical axis (hPa, bottom first):
-# WMS ELEVATION, Maps/Tiles `elevation` and EDR `z` select them, and a map
-# without one draws the bottom level, 1000 hPa. EDR position, area and
+# WMS ELEVATION, Maps/Tiles `elevation` and EDR `z` select them; a map
+# between levels draws the nearest one, and without one the bottom level,
+# 1000 hPa. EDR position, area and
 # radius, model runs as instances; the WMS layers answer GetFeatureInfo at
 # the level drawn. The wind speed on each level is derived from its
 # grid-relative x/y components (`wind_speed_pl`), and in EDR its direction,

@@ -130,10 +130,14 @@ around `ds-storage` calls (Critical Rules 6–7).
   `COMPOSITE_CACHE`. Pinned by `composite_read_failure_tests` and
   `a_wait_for_another_composite_fetch_ends_at_the_deadline`.
 - **The sweep a map draws is `drawn_sweep`**: among the sweeps carrying the
-  quantity, the one nearest `z`, else the lowest. `polar_sample` and the
-  site view's `MapEngine::resolve_elevation` share it, so WMS GetFeatureInfo
-  asks the position query for that sweep's rounded angle and reads the
-  sweep the map shows (#1064). The position query matches `z` to one sweep
+  quantity, the one nearest `z` (`ds_core::vertical::nearest`: midway, the
+  lower sweep), else the lowest. `polar_sample` and the site view's
+  `MapEngine::resolve_elevation` share it, so WMS keys its caches on that
+  sweep's rounded angle, renders at it (every `ELEVATION` drawing one sweep
+  shares one entry, #1477), and GetFeatureInfo asks the position query for
+  it and reads the sweep the map shows (#1064). A volume none of whose
+  sweeps carries the quantity resolves to `None`, WMS's
+  `InvalidDimensionValue`; a site without volumes echoes `z`. The position query matches `z` to one sweep
   exactly (`resolve_levels`), so the advertised first angle would read
   nothing on a split-cut scan whose lowest sweep lacks the quantity.
 - **Pixel pre-warm** (`[odim] prewarm_sweeps`, default `1`; #461/#472).

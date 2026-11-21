@@ -1314,42 +1314,58 @@ impl GribEngine {
         self.fetch_grid_by_entry(step_file.message_url(entry), entry, GridFill::Insert)
     }
 
-    /// The level a map field of `run` is drawn at: the requested `z`, which
-    /// the run must have, else the run's own first level; `None` on a view
-    /// without a vertical axis. `render_field` and `resolve_elevation`
-    /// share it, so WMS GetFeatureInfo queries the level GetMap draws
-    /// (#1064).
+    /// The level a map of `name` in `run` is drawn at: the level of the
+    /// parameter's own in the run nearest the requested `z` (#1477: WMS
+    /// declares `nearestValue="1"`; midway between two, the lower one,
+    /// nearer the ground, by `ds_core::vertical::nearest`'s tie rule), else
+    /// its own first level; `None` on a view without a vertical axis. Of
+    /// the parameter's own levels in the run
+    /// ([`Catalog::parameter_levels`], built at scan time), never the run's
+    /// union over every parameter nor the union every run together
+    /// advertises: a level only other parameters, or only an older run,
+    /// have would draw nothing. `render_field`, `content_version_for`
+    /// (through `map_message`) and `resolve_elevation` share it, so the map
+    /// APIs key their caches on, and GetFeatureInfo queries, the level the
+    /// map draws (#1064). EDR's `z` stays exact
+    /// ([`Self::selected_levels`]). A parameter without a level in the run
+    /// is a 400.
     fn map_level(
         &self,
         catalog: &Catalog,
         run: DateTime<Utc>,
+        name: &str,
         z: Option<f64>,
     ) -> Result<Option<f64>, DataServerError> {
-        // Without `z`: the run's first level, the first `selected_levels`
-        // keeps, as a run's levels are a set. Read directly: every map
-        // request, cache hits included, selects its frame's message through
-        // here (#1334), and listing a model view's 137 levels copies them
-        // all.
-        if z.is_none() {
-            if self.vertical_kind().is_none() {
-                return Ok(None);
-            }
-            if let Some(&first) = catalog.levels.get(&run).and_then(|levels| levels.first()) {
-                return Ok(Some(first));
-            }
+        if self.vertical_kind().is_none() {
+            return match z {
+                None => Ok(None),
+                Some(_) => Err(DataServerError::InvalidParameter(
+                    "This collection has no vertical axis".into(),
+                )),
+            };
         }
-        let requested = z.map(|v| [v]);
-        let levels =
-            self.selected_levels(catalog, run, requested.as_ref().map(|a| a.as_slice()))?;
-        Ok(levels[0])
+        // Read in place: every map request, cache hits included, selects
+        // its frame's message through here (#1334), and copying a model
+        // view's 137 levels would cost each of them. Bottom first.
+        let available = catalog.parameter_levels(&run, name);
+        let level = match z {
+            None => available.first().copied(),
+            Some(z) => ds_core::vertical::nearest(available, z, |&&level| level).copied(),
+        };
+        level.map(Some).ok_or_else(|| {
+            DataServerError::InvalidParameter(format!(
+                "Parameter '{name}' has no level in this run to draw at; its levels: \
+                 {available:?}"
+            ))
+        })
     }
 
     /// The message a map field of `run`'s `step_file` draws: `parameter`,
-    /// else the step's default product, at the run's canonical key moved to
-    /// the map level ([`Self::map_level`]). `render_field` and
-    /// `content_version_for` share it, so a frame's cache-key version names
-    /// the message rendered (#1334). From the snapshot, without copying the
-    /// run's keys.
+    /// else the step's default product ([`map_name`]), at the run's
+    /// canonical key moved to the map level ([`Self::map_level`]).
+    /// `render_field` and `content_version_for` share it, so a frame's
+    /// cache-key version names the message rendered (#1334). From the
+    /// snapshot, without copying the run's keys.
     fn map_message<'a>(
         &self,
         catalog: &'a Catalog,
@@ -1358,14 +1374,8 @@ impl GribEngine {
         parameter: Option<&'a str>,
         z: Option<f64>,
     ) -> Result<MapMessage<'a>, DataServerError> {
-        let level = self.map_level(catalog, run.reference_time, z)?;
-        // Without a parameter: the first near-surface product.
-        let name = parameter.unwrap_or_else(|| {
-            step_file
-                .default_message()
-                .map(|m| m.param.as_str())
-                .unwrap_or("2t")
-        });
+        let name = map_name(step_file, parameter);
+        let level = self.map_level(catalog, run.reference_time, name, z)?;
         let key = catalog
             .parameter_keys(&run.reference_time)
             .and_then(|keys| keys.get(name));
@@ -1378,7 +1388,8 @@ impl GribEngine {
     }
 
     /// One map field of `run`'s `step_file`: `parameter` (else the step's
-    /// default product) at the requested or the run's first level,
+    /// default product) at the level `map_level` selects: the parameter's
+    /// own level in the run nearest the requested one, else its first,
     /// resampled onto the request in display units.
     fn render_field(
         &self,
@@ -1676,6 +1687,18 @@ fn canonical_message<'a>(
                 "Parameter '{param}' at its canonical level not found in forecast step"
             ))
         })
+}
+
+/// The parameter a map of `step_file` draws: `parameter`, else the step's
+/// first near-surface product. `map_message` and `resolve_elevation` share
+/// it, so the level is selected among the drawn parameter's own.
+fn map_name<'a>(step_file: &'a StepFile, parameter: Option<&'a str>) -> &'a str {
+    parameter.unwrap_or_else(|| {
+        step_file
+            .default_message()
+            .map(|m| m.param.as_str())
+            .unwrap_or("2t")
+    })
 }
 
 /// The run+step a map render (WMS/Maps/Tiles) of `parameters` reads at
@@ -2390,11 +2413,15 @@ impl MapEngine for GribEngine {
             .or(time)
     }
 
-    /// The level `get_raster_tile` draws, through the SAME `select_run_step`
-    /// and `map_level`: without `z`, the selected run's own first level,
-    /// which need not be the first of the levels every run together
-    /// advertise. A failed selection echoes `z`: the render, and the
-    /// position query GetFeatureInfo runs at it, fail the same way.
+    /// The level `get_raster_tile` draws, through the SAME `select_run_step`,
+    /// `map_name` and `map_level`: the drawn parameter's own level in the
+    /// selected run nearest `z` (#1477), without `z` its first, which need
+    /// not be the first of the levels every run together advertise. The level depends on the run, and the
+    /// run and step do not depend on the level, so it is resolved after
+    /// them, as WMS resolves it. A failed run or step selection echoes `z`:
+    /// the render, and the position query GetFeatureInfo runs at it, fail
+    /// the same way. A parameter without a level to draw in the run is
+    /// `None`, WMS's `InvalidDimensionValue`.
     fn resolve_elevation(
         &self,
         parameter: Option<&str>,
@@ -2403,9 +2430,18 @@ impl MapEngine for GribEngine {
         reference_time: Option<DateTime<Utc>>,
     ) -> Option<f64> {
         let catalog = self.catalog();
-        select_run_step(&catalog, parameter.as_slice(), reference_time, time)
-            .and_then(|(run, _, _)| self.map_level(&catalog, run.reference_time, z))
-            .unwrap_or(z)
+        match select_run_step(&catalog, parameter.as_slice(), reference_time, time) {
+            Ok((run, _, step_file)) => self
+                .map_level(
+                    &catalog,
+                    run.reference_time,
+                    map_name(step_file, parameter),
+                    z,
+                )
+                .ok()
+                .flatten(),
+            Err(_) => z,
+        }
     }
 
     /// The valid times of the steps carrying `parameter` (#1005), over

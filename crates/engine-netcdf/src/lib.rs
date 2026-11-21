@@ -1761,6 +1761,28 @@ impl MapEngine for NetcdfEngine {
         }
     }
 
+    /// The level `get_raster_tile` draws, through the SAME
+    /// [`Layout::map_level`]: the level nearest `z`, else the bottom one
+    /// (#1477). Every variable is on the one axis, at every step and run,
+    /// so neither the parameter nor the frame changes it. `None` without
+    /// an axis, or for a `z` that selects no level; before the first
+    /// layout, `z`, whose render fails as it would.
+    fn resolve_elevation(
+        &self,
+        _parameter: Option<&str>,
+        z: Option<f64>,
+        _time: Option<DateTime<Utc>>,
+        _reference_time: Option<DateTime<Utc>>,
+    ) -> Option<f64> {
+        let catalog = self.catalog.load();
+        let Some(layout) = catalog.layout.as_ref() else {
+            return z;
+        };
+        let vertical = layout.vertical.as_ref()?;
+        let level = layout.map_level(z).ok()?;
+        vertical.levels.get(level).copied()
+    }
+
     /// Moves when a catalogued file is replaced (#1067 decision 7): found
     /// by a poll, or by a remote read at once. The rendered caches key on
     /// it.

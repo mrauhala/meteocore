@@ -96,7 +96,7 @@ with that parameter's style. An unknown parameter is `LayerNotDefined`.
 | Dimension | Parameter | Advertised |
 |---|---|---|
 | `time` | `TIME` | ISO 8601 values, `nearestValue="1"`; default the latest, or one the engine sets (CAP: now, as of its latest rebuild) |
-| `elevation` | `ELEVATION` | The vertical levels in their unit, `nearestValue="1"`; default the first |
+| `elevation` | `ELEVATION` | The vertical levels in their unit, `nearestValue="1"`: a value between levels draws the nearest one ([GetMap](#getmap)); default the first |
 | `reference_time` | `DIM_REFERENCE_TIME` | A forecast layer's model runs; default the latest; exact match |
 
 A `time` or `reference_time` axis of more than 500 values is written in
@@ -126,7 +126,7 @@ takes its first value. Parameters the server does not use are ignored,
 | `TRANSPARENT` | no | `FALSE` (default): an opaque image, nodata in `BGCOLOR`. `TRUE`: nodata stays transparent in PNG and WebP. An overlay needs `TRUE` |
 | `BGCOLOR` | no | `0xRRGGBB`, default `0xFFFFFF`: the background for `TRANSPARENT=FALSE` and for JPEG |
 | `TIME` | no | One instant: RFC 3339, or `YYYY-MM-DDThh:mm[:ss]` as UTC. Each layer's engine resolves it to the timestep it draws (GeoTIFF: the latest not after it). Unparseable: `InvalidDimensionValue` |
-| `ELEVATION` | no | One finite level; a list or another value is `InvalidDimensionValue` |
+| `ELEVATION` | no | One finite number. The layer is drawn at the nearest level its engine can draw, rounded, not truncated (WMS 1.3.0 C.4.3): `ELEVATION=851` on 1000, 850, 500 and 300 hPa draws 850 hPa. Exactly midway between two levels, the one nearer the ground: 925 draws 1000 hPa, 1.0° between radar sweeps of 0.5° and 1.5° the 0.5° sweep. Of the levels the engine can draw at that time and run: the parameter's own levels in a GRIB run, the sweeps of a radar volume that carry the quantity, the levels every input of a derived parameter has. Every value drawing one level shares that level's cached image, ETag included. A list, another value, or a value the layer has no level to draw at (a radar volume none of whose sweeps carries the quantity, a derived parameter whose inputs share no level there) is `InvalidDimensionValue`, naming the parameter and time |
 | `DIM_REFERENCE_TIME` | no | A model run, RFC 3339 or an EDR instance id. A run the layer does not have is `InvalidDimensionValue` |
 | `QUALITY` | no | Vendor: 1 to 100 for `image/jpeg` (default 85) and `image/webp` (1–99 lossy, 100 lossless; default the collection's `[wms] webp_quality`, else lossless). With PNG, or out of range: `InvalidParameterValue` |
 
@@ -168,7 +168,8 @@ lightning events, station symbols, radar volumes.
   GetMap of that layer alone uses. The combined image is never in the
   rendered-image cache, and its `Cache-Control` is `immutable` only when
   every layer draws exactly the `TIME` from a fixed run, over content its
-  engine never revises in place.
+  engine never revises in place, and takes no `ELEVATION` or one that is
+  the level it draws.
 - **WebP quality.** Without `QUALITY`, WebP is lossy only when every listed
   collection sets `[wms] webp_quality`, at the highest of them.
 
@@ -275,10 +276,11 @@ answers the same question elsewhere:
 Each layer is read at the time, model run and level GetMap draws it at: an
 omitted `TIME` is the layer's default, and a `TIME` between timesteps is the
 timestep GetMap draws for it. The level is the one the engine draws, which
-is not always `ELEVATION` or the first advertised level (GRIB without
-`ELEVATION` draws the run's own first level; an ODIM volume the nearest
-sweep that carries the quantity). The answer reports the resolved time, and
-the run and level when the layer has them.
+is not always `ELEVATION` or the first advertised level: an `ELEVATION`
+between levels reads the nearest level, GRIB without `ELEVATION` the
+parameter's own first level in the run, an ODIM volume the nearest sweep
+that carries the quantity. The answer reports the resolved time, and the run and level when
+the layer has them.
 
 `application/json` is a GeoJSON FeatureCollection: a Point for each value
 read, one per queried layer and one per band of a composite, and each
@@ -405,7 +407,7 @@ A request error is a WMS 1.3.0 `ServiceExceptionReport` served as
 | `StyleNotDefined` | A style the layer does not offer |
 | `InvalidCRS` | A CRS other than the five above |
 | `InvalidFormat` | Unsupported `FORMAT` or `INFO_FORMAT` |
-| `InvalidDimensionValue` | Malformed `TIME`, `ELEVATION` or `DIM_REFERENCE_TIME`; an `ELEVATION` or `DIM_REFERENCE_TIME` no listed layer has; a run the layer does not have |
+| `InvalidDimensionValue` | Malformed `TIME`, `ELEVATION` or `DIM_REFERENCE_TIME`; an `ELEVATION` or `DIM_REFERENCE_TIME` no listed layer has; an `ELEVATION` a layer has no level to draw at; a run the layer does not have |
 | `LayerNotQueryable` | GetFeatureInfo on a layer that is not queryable |
 | `InvalidPoint` | GetFeatureInfo `I` or `J` outside the image |
 | `MissingParameterValue` | A required parameter is missing |
@@ -466,8 +468,8 @@ server log, at WARN for the last.
 
 | Response | `Cache-Control` |
 |---|---|
-| GetMap with a `TIME` the engine draws exactly from a fixed run, on content never revised in place | `public, max-age=86400, immutable` |
-| GetMap otherwise (no `TIME`, a `TIME` snapped to another time step, a layer with model runs and no `DIM_REFERENCE_TIME` it draws, CAP alerts, BUFR and PostGIS station symbols, PostGIS lightning until an hour before the newest strike, station grids, the error image) | `public, max-age=60, must-revalidate` |
+| GetMap with a `TIME` the engine draws exactly from a fixed run, on content never revised in place, and either no `ELEVATION` or one that is the level drawn | `public, max-age=86400, immutable` |
+| GetMap otherwise (no `TIME`, a `TIME` snapped to another time step, an `ELEVATION` drawn at the nearest level, a layer with model runs and no `DIM_REFERENCE_TIME` it draws, CAP alerts, BUFR and PostGIS station symbols, PostGIS lightning until an hour before the newest strike, station grids, the error image) | `public, max-age=60, must-revalidate` |
 | GetFeatureInfo | As GetMap, and an empty answer (a null value or band, no feature) always revalidates |
 | GetLegendGraphic | `public, max-age=86400` |
 
@@ -476,7 +478,12 @@ snaps it to (`nearestValue="1"`), but its URL draws another frame once one
 lands or the window slides, so it revalidates. `TIME` is compared as an
 instant, not as text: a step written with an offset is exact. The header is
 each request's own: a snapped and an exact request share the step's cached
-image.
+image. So with `ELEVATION`: one between levels shares the nearest level's
+image and revalidates, as a GRIB run still filling in may gain the level
+asked for. An `ELEVATION` that is a level, or none, leaves the header to
+`TIME` and the run, as before. Without one the layer draws the engine's
+default level, which on a GRIB run still filling in can change as well:
+the header does not judge it.
 
 On a layer with model runs (GRIB, QueryData, Zarr and NetCDF forecasts,
 nowcast generations), a `TIME` is drawn from the run the engine picks, and a

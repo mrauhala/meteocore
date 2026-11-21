@@ -83,17 +83,21 @@ curvilinear grids placed by 2-D latitude/longitude (#1174).
   is `RasterInfo.vertical` (built once per poll) and
   `EdrEngine::get_vertical_extent` (from the same snapshot).
 - **Map level:** `Layout::map_level(z)`, the one selection behind
-  `get_raster_tile(s)`: `z` matched exactly (else `InvalidParameter` naming
-  the levels), `None` ⇒ index 0, the bottom level. That is exactly the
-  default `MapEngine::resolve_elevation` (`z`, else `levels[0]`), so there
-  is no override and GetFeatureInfo queries the level GetMap draws; the
-  rendered caches key on the requested `z`, one level per key. Pinned by
-  `tests/integration.rs` `a_map_without_elevation_draws_the_level_get_feature_info_queries`
-  and the server's `wms_get_feature_info`
-  `a_netcdf_pressure_level_pixel_reads_the_level_get_map_draws` (GetMap
-  bytes and GetFeatureInfo's reported level). Exact, as GRIB, though WMS
-  capabilities say `nearestValue="1"` on every `ELEVATION` dimension (a
-  radar volume does draw the nearest sweep).
+  `get_raster_tile(s)` and the engine's `MapEngine::resolve_elevation`:
+  the level nearest `z` (#1477, WMS `nearestValue="1"`), midway the one
+  nearer the ground (`ds_core::vertical::nearest_level`), `None` ⇒ index 0,
+  the bottom level; only a non-finite `z` is `InvalidParameter` naming the
+  levels. Every variable is on the one axis, so neither the parameter nor
+  the step changes it. WMS, Maps and Tiles key their caches on the
+  resolved level and GetFeatureInfo queries it. `content_version` is the
+  collection's, the same at every level, so a frame cached at any `z`
+  moves with any file replaced. Pinned by `tests/integration.rs`
+  `each_pressure_level_draws_its_own_field` (nearest and tie),
+  `a_map_without_elevation_draws_the_level_get_feature_info_queries`, the
+  server's `wms_get_feature_info`
+  `a_netcdf_pressure_level_pixel_reads_the_level_get_map_draws` and
+  `wms_elevation` (851 hPa is 850's image and ETag). EDR `z` stays exact
+  (next bullet).
 - **EDR levels:** `Layout::query_levels(z)`: `z`'s levels kept in the
   axis's order, bottom first, each once, whatever the list's order
   (`ds_core::vertical::in_axis_order`, #1434: a CoverageJSON axis is

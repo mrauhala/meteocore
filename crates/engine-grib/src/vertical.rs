@@ -826,7 +826,8 @@ mod tests {
     }
 
     /// The newest run lacks the first level the runs together advertise.
-    /// Without `z`, a map draws the run's own first level, and
+    /// Without `z`, a map draws the parameter's own first level in that run,
+    /// and
     /// `resolve_elevation` names that level, so WMS GetFeatureInfo asks the
     /// position query for a level the run has and reads the drawn value
     /// (#1064). The advertised first level would be a 400.
@@ -906,8 +907,7 @@ mod tests {
         ));
 
         // The older run has both and draws its own first; a level the run
-        // has stays itself, and one it lacks is echoed, failing the render
-        // and the query alike.
+        // has stays itself.
         assert_eq!(
             pressure.resolve_elevation(Some("TMP"), None, Some(old), Some(old)),
             Some(850.0)
@@ -916,9 +916,188 @@ mod tests {
             pressure.resolve_elevation(Some("TMP"), Some(500.0), Some(old), Some(old)),
             Some(500.0)
         );
+        // One the run lacks draws the run's own nearest level (#1477): the
+        // newest run's only level, though the older run has 850 hPa.
         assert_eq!(
             pressure.resolve_elevation(Some("TMP"), Some(850.0), time, run),
-            Some(850.0)
+            Some(500.0)
         );
+    }
+
+    /// #1477: a parameter draws the nearest of its own levels in the run,
+    /// never a level only another parameter has: the run carries `TMP` at
+    /// 1000, 850 and 500 hPa and `CLMR` at 1000 and 500 only, so `CLMR` at
+    /// 851 hPa draws 1000, where the run's union would pick 850 and find no
+    /// message. Without `z`, its own first level.
+    #[test]
+    fn a_map_draws_the_nearest_of_the_parameters_own_levels() {
+        let source = TestSource::new();
+        let field = |kelvin: f32, hpa: u32| message(0, kelvin, [0; 4], 100, hpa * 100);
+        source.write_run(
+            "run",
+            "2026040500",
+            &[
+                ("TMP", "850 mb", "anl", field(270.0, 850)),
+                ("TMP", "500 mb", "anl", field(250.0, 500)),
+                ("CLMR", "1000 mb", "anl", field(280.0, 1000)),
+                ("CLMR", "500 mb", "anl", field(260.0, 500)),
+            ],
+        );
+        let engine = GribEngine::new("forecast", &split_config(&source)).unwrap();
+        let views = engine.level_collections();
+        let [pressure] = views.as_slice() else {
+            panic!()
+        };
+        assert_eq!(
+            pressure
+                .raster_info_shared()
+                .vertical
+                .as_ref()
+                .unwrap()
+                .levels,
+            [1000.0, 850.0, 500.0]
+        );
+        let run: DateTime<Utc> = "2026-04-05T00:00:00Z".parse().unwrap();
+        let level =
+            |parameter, z| pressure.resolve_elevation(Some(parameter), z, Some(run), Some(run));
+        let version = |parameter, z: Option<f64>| {
+            pressure.content_version_for(Some(parameter), Some(run), Some(run), z)
+        };
+        let drawn = |parameter, z: Option<f64>| {
+            pressure
+                .get_raster_tile(
+                    [0.0, 0.0, 1.0, 1.0],
+                    1,
+                    1,
+                    Some(run),
+                    &OutputCrs::Wgs84,
+                    Some(parameter),
+                    z,
+                    Some(run),
+                )
+                .map(|tile| tile.values.value_at(0).unwrap() as f32)
+        };
+        for (parameter, z, hpa, celsius) in [
+            ("TMP", Some(851.0), 850.0, -3.15),
+            ("TMP", Some(1000.0), 850.0, -3.15),
+            ("TMP", None, 850.0, -3.15),
+            ("CLMR", Some(851.0), 1000.0, 6.85),
+            ("CLMR", Some(700.0), 500.0, -13.15),
+            ("CLMR", None, 1000.0, 6.85),
+        ] {
+            assert_eq!(level(parameter, z), Some(hpa), "{parameter} {z:?}");
+            assert_eq!(drawn(parameter, z).unwrap(), celsius, "{parameter} {z:?}");
+            assert_eq!(
+                version(parameter, z),
+                version(parameter, Some(hpa)),
+                "{parameter} {z:?}"
+            );
+        }
+        assert_ne!(version("CLMR", Some(851.0)), pressure.content_version());
+    }
+
+    /// #1477: a map `ELEVATION` between levels draws the selected run's own
+    /// nearest level, rounded rather than truncated, midway the lower one;
+    /// the image is the one that level draws, `resolve_elevation` and
+    /// `content_version_for` name it, also for a `z` as sent, and EDR's `z`
+    /// stays exact.
+    #[test]
+    fn a_map_draws_the_selected_runs_nearest_level() {
+        let source = TestSource::new();
+        let tmp = |kelvin: f32, hpa: u32| message(0, kelvin, [0; 4], 100, hpa * 100);
+        source.write_run(
+            "old",
+            "2026040500",
+            &[
+                ("TMP", "1000 mb", "anl", tmp(285.0, 1000)),
+                ("TMP", "850 mb", "anl", tmp(270.0, 850)),
+                ("TMP", "500 mb", "anl", tmp(250.0, 500)),
+            ],
+        );
+        source.write_run(
+            "new",
+            "2026040506",
+            &[
+                ("TMP", "1000 mb", "anl", tmp(280.0, 1000)),
+                ("TMP", "500 mb", "anl", tmp(240.0, 500)),
+            ],
+        );
+        let engine = GribEngine::new("forecast", &split_config(&source)).unwrap();
+        let views = engine.level_collections();
+        let [pressure] = views.as_slice() else {
+            panic!()
+        };
+        let old: DateTime<Utc> = "2026-04-05T00:00:00Z".parse().unwrap();
+        let new = old + chrono::Duration::hours(6);
+        let drawn = |z: Option<f64>, run: DateTime<Utc>| {
+            pressure
+                .get_raster_tile(
+                    [0.0, 0.0, 1.0, 1.0],
+                    1,
+                    1,
+                    Some(run),
+                    &OutputCrs::Wgs84,
+                    Some("TMP"),
+                    z,
+                    Some(run),
+                )
+                .map(|tile| tile.values.value_at(0).unwrap() as f32)
+        };
+        let level =
+            |z: Option<f64>, run| pressure.resolve_elevation(Some("TMP"), z, Some(run), Some(run));
+        let version = |z: Option<f64>, run| {
+            pressure.content_version_for(Some("TMP"), Some(run), Some(run), z)
+        };
+
+        // The older run: 851 is 850 hPa, 924 too, 925 midway the bottom one.
+        for (z, hpa, celsius) in [
+            (851.0, 850.0, -3.15),
+            (924.0, 850.0, -3.15),
+            (925.0, 1000.0, 11.85),
+            (600.0, 500.0, -23.15),
+        ] {
+            assert_eq!(drawn(Some(z), old).unwrap(), celsius, "{z}");
+            assert_eq!(level(Some(z), old), Some(hpa), "{z}");
+            assert_eq!(version(Some(z), old), version(Some(hpa), old), "{z}");
+        }
+        // The newest run lacks 850 hPa: 851 is its nearest own level, 1000
+        // hPa, never the older run's 850 the advertised axis lists.
+        assert_eq!(drawn(Some(851.0), new).unwrap(), 6.85);
+        assert_eq!(level(Some(851.0), new), Some(1000.0));
+        assert_eq!(version(Some(851.0), new), version(Some(1000.0), new));
+        assert_ne!(version(Some(851.0), new), version(Some(500.0), new));
+
+        // Maps and Tiles version a frame at the `elevation` as sent: 851
+        // hPa versions the message it draws, never the catalog's fallback
+        // an exact-match miss gave. A late file adding 850 hPa to the newest
+        // run moves it, so a frame cached at 851 cannot outlive its level's
+        // message; 1000 hPa's frame keeps its version.
+        let catalog = pressure.content_version();
+        assert_ne!(version(Some(851.0), new), catalog);
+        let (at_851, at_1000) = (version(Some(851.0), new), version(Some(1000.0), new));
+        source.write_run(
+            "new-late",
+            "2026040506",
+            &[("TMP", "850 mb", "anl", tmp(265.0, 850))],
+        );
+        engine.scan_once().unwrap();
+        assert_eq!(level(Some(851.0), new), Some(850.0));
+        assert_eq!(drawn(Some(851.0), new).unwrap(), -8.15);
+        assert_ne!(version(Some(851.0), new), at_851);
+        assert_eq!(version(Some(851.0), new), version(Some(850.0), new));
+        assert_eq!(version(Some(1000.0), new), at_1000);
+
+        // EDR `z` stays exact: 851 hPa selects no level.
+        let tmp = ["TMP".to_string()];
+        assert!(matches!(
+            pressure.query_position(
+                "POINT(0.5 0.5)",
+                Some((old, old)),
+                Some(&tmp),
+                Some(&[851.0]),
+                Some(old),
+            ),
+            Err(DataServerError::InvalidParameter(_))
+        ));
     }
 }

@@ -189,7 +189,8 @@ built-in default their name and served unit select.
 **Pressure levels.** A dimension whose coordinate has pressure units
 (`Pa`, `hPa`, `mbar`, …) and is not a parametric coordinate is the
 collection's vertical axis, in hPa, bottom first. WMS `ELEVATION` and
-Maps/Tiles `elevation` must name a level exactly; a map without one draws
+Maps/Tiles `elevation` draw the nearest level (#1477), midway the one
+nearer the ground, and key their caches on it; a map without one draws
 the bottom level. EDR `z` drops levels the collection lacks (a 400 when
 none remain); without `z` it reads every level. A collection has one
 vertical axis, so a pressure-level family (MEPS `pl`) is a collection

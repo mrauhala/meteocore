@@ -100,7 +100,7 @@ pages come from [api-common](../api-common/README.md).
 | `width`, `height` | Image size over the tile's area, ≤ 8000 a side, ≤ 64 M px | 400 |
 | `scale-denominator` | Image size from the scale at the tile centre; not with `width`/`height` | 400 |
 | `parameter-name` | A parameter or RGB composite; unknown: 400 listing valid names (single-band: ignored) | 400 |
-| `elevation` | Vertical level; 400 on a collection without one | 400 |
+| `elevation` | Vertical level; between levels the nearest the engine draws, sharing that level's cached tile, not `immutable` (#1477); 400 on a collection without one | 400 |
 | `quality` | 1–100 for JPEG and WebP; 400 for PNG | 400 |
 | `bgcolor`, `transparent`, `void-color`, `void-transparent` | The Maps Background parameters, as on a map ([api-maps](../api-maps/README.md#map-parameters)); a tile never reaches outside its CRS, so the void ones change no pixel | 400 |
 
