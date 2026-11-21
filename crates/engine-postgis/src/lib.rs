@@ -27,4 +27,5 @@ pub use schema::{
 mod catalog;
 mod indexes;
 mod privileges;
+mod statement_deadline;
 mod validation;

@@ -2,10 +2,12 @@
 //! of a [`deadpool_postgres`] pool and a [`MetadataCache`].
 //!
 //! DB work is async; the trait is sync. The bridge is
-//! `tokio::task::block_in_place(|| Handle::current().block_on(..))` — safe
-//! from axum handlers because axum runs on a multi-thread runtime. The
-//! engine never calls `block_on` from an async context without first
-//! entering `block_in_place`.
+//! `tokio::task::block_in_place(|| Handle::current().block_on(..))` on the
+//! shared query runtime, where EDR, Features and GetFeatureInfo run these
+//! calls. The engine never calls `block_on` from an async context without
+//! first entering `block_in_place`. Every statement path goes through
+//! [`Checkouts::block_on`], which ends the call's statements at the
+//! request deadline and cancels them in the database (#1500).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -43,6 +45,7 @@ use crate::query::{
     MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
 };
 use crate::schema::{EventsShape, ObservationSchema};
+use crate::statement_deadline::Checkouts;
 use crate::station_map::StationSymbols;
 
 /// Time-ordered observation values for a single parameter. Exists to
@@ -1490,22 +1493,15 @@ fn run_queries_budgeted_sync(
     pool: &Pool,
     mut queries: Vec<BuiltQuery>,
 ) -> Result<Vec<Vec<Row>>, DataServerError> {
-    let pool = pool.clone();
-    block_on_async(async move {
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+    let checkouts = Checkouts::current();
+    checkouts.block_on(async {
+        let client = checkouts.get(pool).await?;
         let mut remaining = MAX_RESPONSE_VALUES;
         let mut out = Vec::with_capacity(queries.len());
         for q in &mut queries {
             let per_row = q.values_per_row.max(1);
             q.set_row_limit(remaining / per_row + 1);
-            let refs = params_as_refs(&q.params);
-            let rows = client
-                .query(&q.sql, &refs)
-                .await
-                .map_err(|e| map_pg_error(e, q))?;
+            let rows = client.rows(q).await?;
             let values = rows.len() * per_row;
             if values > remaining {
                 return Err(budget_exceeded());
@@ -1574,10 +1570,10 @@ fn run_area_fanout(
     let decoder = RowDecoder::new(config, source_keys, false)?;
     let decoder = &decoder;
     let spent = AtomicUsize::new(0);
-    let pool = pool.clone();
-    let results: Vec<Option<QueryResult>> = block_on_async(async {
+    let checkouts = Checkouts::current();
+    let checkouts = &checkouts;
+    let results: Vec<Option<QueryResult>> = checkouts.block_on(async {
         futures::stream::iter(stations.iter().map(|station| {
-            let pool = pool.clone();
             let config = Arc::clone(config);
             let limiter = Arc::clone(&limiter);
             let spent = &spent;
@@ -1594,10 +1590,7 @@ fn run_area_fanout(
                     MAX_OBSERVATION_ROWS,
                 )
                 .map_err(|e| DataServerError::Engine(format!("build_location: {e}")))?;
-                let client = pool
-                    .get()
-                    .await
-                    .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+                let client = checkouts.get(pool).await?;
                 let mut rows_per_query = Vec::with_capacity(queries.len());
                 for q in &queries {
                     // A sibling already breached the budget — don't add
@@ -1605,11 +1598,7 @@ fn run_area_fanout(
                     if spent.load(Ordering::Relaxed) > MAX_RESPONSE_VALUES {
                         return Err(budget_exceeded());
                     }
-                    let refs = params_as_refs(&q.params);
-                    let rows = client
-                        .query(&q.sql, &refs)
-                        .await
-                        .map_err(|e| map_pg_error(e, q))?;
+                    let rows = client.rows(q).await?;
                     if rows.len() >= MAX_OBSERVATION_ROWS {
                         // Report VALUES, not rows: a wide-shape row carries
                         // one value per selected column.
@@ -1712,42 +1701,45 @@ fn run_area_set(
         .take(stations.len())
         .collect();
     let limiter = fanout_limiter(pool_key, fanout_width(pool));
-    let pool = pool.clone();
-    let unmatched = block_on_async(async {
+    let checkouts = Checkouts::current();
+    let unmatched = checkouts.block_on(async {
         let _permit = limiter
             .acquire()
             .await
             .map_err(|_| DataServerError::Engine("fanout limiter closed".into()))?;
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+        let client = checkouts.get(pool).await?;
         let mut remaining = MAX_RESPONSE_VALUES;
         let mut unmatched = 0usize;
         for i in 0..queries.len() {
             let per_row = queries[i].values_per_row.max(1);
             queries[i].set_row_limit(remaining / per_row + 1);
             let q = &queries[i];
-            let rows = client
-                .query_raw(&q.sql, params_as_refs(&q.params))
-                .await
-                .map_err(|e| map_pg_error(e, q))?;
-            futures::pin_mut!(rows);
-            while let Some(row) = rows.try_next().await.map_err(|e| map_pg_error(e, q))? {
-                if per_row > remaining {
-                    return Err(budget_exceeded());
-                }
-                remaining -= per_row;
-                let id: &str = row
-                    .try_get(0)
-                    .map_err(|e| DataServerError::Engine(format!("decode station: {e}")))?;
-                let Some(&at) = index.get(id) else {
-                    unmatched += 1;
-                    continue;
-                };
-                let station = series[at].get_or_insert_with(|| decoder.station(&queries));
-                decoder.push(station, q, &row)?;
-            }
+            // The statement runs until its last row is read.
+            client
+                .run(q, async {
+                    let rows = client
+                        .query_raw(&q.sql, params_as_refs(&q.params))
+                        .await
+                        .map_err(|e| map_pg_error(e, q))?;
+                    futures::pin_mut!(rows);
+                    while let Some(row) = rows.try_next().await.map_err(|e| map_pg_error(e, q))? {
+                        if per_row > remaining {
+                            return Err(budget_exceeded());
+                        }
+                        remaining -= per_row;
+                        let id: &str = row
+                            .try_get(0)
+                            .map_err(|e| DataServerError::Engine(format!("decode station: {e}")))?;
+                        let Some(&at) = index.get(id) else {
+                            unmatched += 1;
+                            continue;
+                        };
+                        let station = series[at].get_or_insert_with(|| decoder.station(&queries));
+                        decoder.push(station, q, &row)?;
+                    }
+                    Ok::<_, DataServerError>(())
+                })
+                .await?;
         }
         Ok::<_, DataServerError>(unmatched)
     })?;
@@ -1779,18 +1771,8 @@ fn run_area_set(
 /// events area path — a single statement, no fan-out, no budget rewrite
 /// (the LIMIT bind already carries the budget sentinel).
 fn run_single_query_sync(pool: &Pool, built: BuiltQuery) -> Result<Vec<Row>, DataServerError> {
-    let pool = pool.clone();
-    block_on_async(async move {
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
-        let refs = params_as_refs(&built.params);
-        client
-            .query(&built.sql, &refs)
-            .await
-            .map_err(|e| map_pg_error(e, &built))
-    })
+    let checkouts = Checkouts::current();
+    checkouts.block_on(async { checkouts.get(pool).await?.rows(&built).await })
 }
 
 /// An event key's id bound in its column's type (#503).
@@ -1846,14 +1828,11 @@ fn run_event_by_key_sync(
     text: BuiltQuery,
     id: &str,
 ) -> Result<Vec<Row>, DataServerError> {
-    let pool = pool.clone();
-    block_on_async(async move {
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
+    let checkouts = Checkouts::current();
+    checkouts.block_on(async {
+        let client = checkouts.get(pool).await?;
         let statement = client
-            .prepare(&column.sql)
+            .run(&column, client.prepare(&column.sql))
             .await
             .map_err(|e| map_pg_error(e, &column))?;
         let bind = statement
@@ -1865,15 +1844,12 @@ fn run_event_by_key_sync(
                 let mut refs = params_as_refs(&column.params);
                 refs[1] = bind.as_sql();
                 client
-                    .query(&statement, &refs)
+                    .run(&column, client.query(&statement, &refs))
                     .await
                     .map_err(|e| map_pg_error(e, &column))
             }
             Some(None) => Ok(Vec::new()),
-            None => client
-                .query(&text.sql, &params_as_refs(&text.params))
-                .await
-                .map_err(|e| map_pg_error(e, &text)),
+            None => client.rows(&text).await,
         }
     })
 }
@@ -1885,42 +1861,33 @@ fn run_stations_in_polygon_sync(
 ) -> Result<Vec<Location>, DataServerError> {
     let built = build_stations_in_polygon(cfg, polygon_wkt)
         .map_err(|e| DataServerError::Engine(format!("build_stations_in_polygon: {e}")))?;
-    let pool = engine.pool.clone();
-    block_on_async(async move {
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
-        let refs = params_as_refs(&built.params);
-        let rows = client
-            .query(&built.sql, &refs)
-            .await
-            .map_err(|e| map_pg_error(e, &built))?;
+    let checkouts = Checkouts::current();
+    let rows =
+        checkouts.block_on(async { checkouts.get(&engine.pool).await?.rows(&built).await })?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for row in &rows {
-            engine.check_geometry_row(row)?;
-            let id: String = row
-                .try_get("id")
-                .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
-            let label: String = row
-                .try_get("label")
-                .map_err(|e| DataServerError::Engine(format!("decode station label: {e}")))?;
-            let lat: f64 = row
-                .try_get("lat")
-                .map_err(|e| DataServerError::Engine(format!("decode lat: {e}")))?;
-            let lon: f64 = row
-                .try_get("lon")
-                .map_err(|e| DataServerError::Engine(format!("decode lon: {e}")))?;
-            out.push(Location {
-                id,
-                label,
-                latitude: lat,
-                longitude: lon,
-            });
-        }
-        Ok(out)
-    })
+    let mut out = Vec::with_capacity(rows.len());
+    for row in &rows {
+        engine.check_geometry_row(row)?;
+        let id: String = row
+            .try_get("id")
+            .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
+        let label: String = row
+            .try_get("label")
+            .map_err(|e| DataServerError::Engine(format!("decode station label: {e}")))?;
+        let lat: f64 = row
+            .try_get("lat")
+            .map_err(|e| DataServerError::Engine(format!("decode lat: {e}")))?;
+        let lon: f64 = row
+            .try_get("lon")
+            .map_err(|e| DataServerError::Engine(format!("decode lon: {e}")))?;
+        out.push(Location {
+            id,
+            label,
+            latitude: lat,
+            longitude: lon,
+        });
+    }
+    Ok(out)
 }
 
 fn resolve_nearest_station(
@@ -1931,28 +1898,19 @@ fn resolve_nearest_station(
 ) -> Result<String, DataServerError> {
     let built = build_position(cfg, lon, lat, DEFAULT_POSITION_RADIUS_M)
         .map_err(|e| DataServerError::Engine(format!("build_position: {e}")))?;
-    let pool = engine.pool.clone();
-    block_on_async(async move {
-        let client = pool
-            .get()
-            .await
-            .map_err(|e| DataServerError::Engine(format!("pool acquire failed: {e}")))?;
-        let refs = params_as_refs(&built.params);
-        let opt = client
-            .query_opt(&built.sql, &refs)
-            .await
-            .map_err(|e| map_pg_error(e, &built))?;
-        let Some(row) = opt else {
-            return Err(DataServerError::LocationNotFound(format!(
-                "no station within {DEFAULT_POSITION_RADIUS_M:.0} m of ({lon}, {lat})"
-            )));
-        };
-        engine.check_geometry_row(&row)?;
-        let id: String = row
-            .try_get("id")
-            .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
-        Ok(id)
-    })
+    let checkouts = Checkouts::current();
+    let row =
+        checkouts.block_on(async { checkouts.get(&engine.pool).await?.row_opt(&built).await })?;
+    let Some(row) = row else {
+        return Err(DataServerError::LocationNotFound(format!(
+            "no station within {DEFAULT_POSITION_RADIUS_M:.0} m of ({lon}, {lat})"
+        )));
+    };
+    engine.check_geometry_row(&row)?;
+    let id: String = row
+        .try_get("id")
+        .map_err(|e| DataServerError::Engine(format!("decode station id: {e}")))?;
+    Ok(id)
 }
 
 // ─── in-memory station selection (observations-derived modes) ──────────────
@@ -2400,27 +2358,6 @@ fn wide_coverage(
         },
         parameters: param_descs,
         ranges,
-    }
-}
-
-// ─── sync ↔ async bridge ───────────────────────────────────────────────────
-
-fn block_on_async<F, T>(fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(fut)),
-        Err(_) => {
-            // No current runtime — spin up a temporary one. Used in unit
-            // tests outside tokio, never in production where axum always
-            // provides one.
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("build tokio runtime")
-                .block_on(fut)
-        }
     }
 }
 

@@ -218,7 +218,8 @@ renders with. A collection's `crs` list is exactly what `/items` accepts.
   (`ResourceExhausted`, `DeadlineExceeded`: a station grid whose residuals
   are still being computed, a PostGIS collection no refresh has checked
   yet, a PostGIS statement the database canceled for its
-  `statement_timeout`) is a 503 with `Retry-After: 1`; an object
+  `statement_timeout` or still running at the 30 s deadline, which the
+  engine then cancels) is a 503 with `Retry-After: 1`; an object
   store that kept refusing the read (`Unavailable`) is a 503
   `SourceUnavailable` with `Retry-After: 10`; a missing feature, or any
   other resource the engine reports absent, is a 404; anything else is a
