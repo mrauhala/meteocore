@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use axum::extract::{Query, State};
+use axum::extract::{FromRef, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 
@@ -188,6 +188,26 @@ pub struct WmsState {
 }
 
 pub type AppState = Arc<ArcSwap<WmsState>>;
+
+/// What the WMS router's handler reads: the state a reload swaps, and the
+/// GetCapabilities documents, which outlive it (#1482).
+#[derive(Clone)]
+pub(crate) struct Services {
+    pub(crate) state: AppState,
+    pub(crate) capabilities: Arc<crate::capabilities_cache::CapabilitiesCache>,
+}
+
+impl FromRef<Services> for AppState {
+    fn from_ref(services: &Services) -> Self {
+        services.state.clone()
+    }
+}
+
+impl FromRef<Services> for Arc<crate::capabilities_cache::CapabilitiesCache> {
+    fn from_ref(services: &Services) -> Self {
+        services.capabilities.clone()
+    }
+}
 
 /// Resolve the absolute base URL for the current request, honouring reverse-proxy
 /// forwarding headers when `trust_proxy_headers` is enabled (#12).
@@ -922,29 +942,19 @@ pub async fn wms_handler(
     headers: HeaderMap,
     Query(query): Query<WmsQuery>,
     State(state): State<AppState>,
+    State(capabilities): State<Arc<crate::capabilities_cache::CapabilitiesCache>>,
 ) -> Result<impl IntoResponse, WmsError> {
     let state = state.load_full();
 
     match query.request_type()? {
+        // The document of this state for this request's base URL, built
+        // within the cache's window, on the blocking pool (#1482). It
+        // depends on nothing else in the request.
         WmsRequestType::GetCapabilities => {
-            let xml = crate::capabilities::get_capabilities_xml(
-                &state.engines,
-                &state.collections,
-                &state.styles,
-                &state.point_engines,
-                &request_base_url(&state, &headers),
-            );
-            Ok((
-                [
-                    (header::CONTENT_TYPE, "text/xml"),
-                    (
-                        header::HeaderName::from_static("x-content-type-options"),
-                        "nosniff",
-                    ),
-                ],
-                xml,
-            )
-                .into_response())
+            let document = capabilities
+                .document(&state, request_base_url(&state, &headers))
+                .await?;
+            Ok(document.response(&headers))
         }
         // Every layer of `LAYERS` drawn with its style, time, level and run,
         // bottom first (WMS 1.3.0 §7.3.3.3), into one image encoded once.

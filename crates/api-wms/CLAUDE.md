@@ -500,6 +500,60 @@ parent layer). They have no `StyleInfo`: `composite_layer` in
 - ODIM per-site layers: `<Title>` is prefixed with the site place name via
   `RasterInfo.layer_subtitle` so flat clients can tell per-site layers apart.
 
+## Capabilities cache (#1482)
+
+`capabilities_cache::CapabilitiesCache`, one per router (`router`), which
+outlives the states a reload swaps in. GetCapabilities never builds on the
+handler's task.
+
+- **Key: the base URL only.** `request_base_url` is the one input besides
+  the state: the handler reads no other parameter for GetCapabilities. A
+  parameter that changes the document (`UPDATESEQUENCE`, a format, a
+  language) must join the key, or the cache must refuse that variant.
+  Keying on the base URL keeps links from crossing hosts with
+  `trust_proxy_headers`.
+- **Bounds: documents and builds, not bytes.** At most `MAX_BASE_URLS` (4)
+  documents, the oldest dropped first, and `BUILD_PERMITS` (2) builds at
+  once, a permit taken asynchronously inside the fill. Forged forwarding
+  headers cycle the slots and queue for the permits. Every link repeats
+  the base URL, so a long forged host makes a long document: the bound is
+  four of them, never a byte count.
+- **Reload: at once.** A slot holds a `Weak<WmsState>` of the state it was
+  built from, and the first lookup under another state drops every other
+  state's slots. Compare through the `Weak` (`Weak::as_ptr`), whose
+  allocation no later state can reuse; never by a stored address alone.
+- **New data: within `CAPABILITIES_TTL` (5 s)** of the slot's making, at
+  or before the build's start, on tokio's clock (tests pause it). An
+  engine adds time steps, a PVOL site its layers, without a reload. A test
+  that changes an engine and asks again at once builds per request:
+  `router_with_capabilities_ttl(state, Duration::ZERO)`.
+- **Single flight, no parked worker.** Concurrent misses wait on one
+  `tokio::sync::OnceCell`, asynchronously, while the build and its gzip run
+  on `spawn_blocking`. Not `ds_cache`'s `get_or_insert_with_until`: its wait
+  parks the thread, a request worker here (root Critical Rule 7, #1200).
+- **The fill is a task of its own** (`tokio::spawn`), and a request awaits
+  its `JoinHandle`. A client that disconnects drops only its wait; were the
+  fill in the request's future, the cell would hand the init to the next
+  waiter while the first build ran on, and every disconnect would start
+  another build.
+- **Gzip once.** Level 6, the server `CompressionLayer`'s. Bytes the
+  handler gzipped carry `Content-Encoding`, which tower-http never
+  recompresses, so they pass it as they are. The handler sets
+  `Vary: Accept-Encoding` on every answer, 304 included: the layer adds it
+  to a response its predicate would compress, identity ones too, but never
+  to one that already has a `Content-Encoding`, nor to a 304's empty body,
+  and the router must be right without the layer. `accepts_gzip` follows
+  tower-http 0.7.1's negotiation (without `*` a coding's best listing,
+  with `*` its first), pinned by the server's
+  `getcapabilities_passes_the_layer_as_the_handler_encoded_it`; a server
+  that compresses another coding must revisit it.
+- **ETag**: weak, `W/` + `ds_core::http_cache::etag_of` of the document, so
+  it changes with the bytes and names the plain and gzipped forms alike; a
+  matching `If-None-Match` is 304. No `Cache-Control`.
+- Not in the memory plan and no `/metrics` family: at most four documents,
+  each the size its layers and base URL give it (about 1 MB plain and
+  gzipped for 443 layers), no byte budget for the plan to size.
+
 ## GetFeatureInfo (#1064)
 
 `feature_info.rs`. The value is the collection's EDR position query at the

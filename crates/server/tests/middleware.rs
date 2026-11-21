@@ -228,6 +228,56 @@ mod compression {
             "PNG response should not be gzip-compressed"
         );
     }
+
+    /// GetCapabilities is gzipped by the WMS handler, once per cached
+    /// document (#1482), and the layer passes its answer through as it is:
+    /// never compressed twice, never left uncompressed where the layer
+    /// would have compressed it, and with one `Vary: Accept-Encoding`. The
+    /// handler reads `Accept-Encoding` as the layer does, a coding listed
+    /// twice included, so with and without the layer every request gets the
+    /// same bytes and encoding.
+    #[tokio::test]
+    async fn getcapabilities_passes_the_layer_as_the_handler_encoded_it() {
+        for accept in [
+            None,
+            Some("gzip"),
+            Some("gzip, deflate, br"),
+            Some("br;q=1.0, gzip;q=0.8, *;q=0.1"),
+            Some("gzip;q=0.5"),
+            Some("*"),
+            Some("identity"),
+            Some("gzip;q=0"),
+            Some("identity;q=1, gzip;q=0.5"),
+            Some("*;q=0.5, identity"),
+            Some("deflate"),
+            Some("gzip;q=0, gzip"),
+            Some("gzip;q=0.5, identity;q=0, identity"),
+        ] {
+            let headers: Vec<(&str, &str)> =
+                accept.iter().map(|a| ("accept-encoding", *a)).collect();
+            let (status, layered, layered_body) =
+                wms_request(build_compressed_router(), WMS_GETCAP, headers.clone()).await;
+            let (_, bare, bare_body) = wms_request(build_wms_router(), WMS_GETCAP, headers).await;
+            assert_eq!(status, StatusCode::OK, "{accept:?}");
+            assert_eq!(layered_body, bare_body, "{accept:?}");
+            let encodings = |h: &axum::http::HeaderMap| -> Vec<String> {
+                h.get_all(header::CONTENT_ENCODING)
+                    .iter()
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .collect()
+            };
+            assert_eq!(encodings(&layered), encodings(&bare), "{accept:?}");
+            assert!(encodings(&layered).len() <= 1, "{accept:?}");
+            let vary: Vec<_> = layered.get_all(header::VARY).iter().collect();
+            assert_eq!(vary, ["accept-encoding"], "{accept:?}");
+            let gzipped = layered_body.starts_with(&[0x1f, 0x8b]);
+            assert_eq!(
+                gzipped,
+                encodings(&layered) == ["gzip"],
+                "{accept:?}: the body is gzipped exactly when it says so"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

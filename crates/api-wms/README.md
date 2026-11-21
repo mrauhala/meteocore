@@ -506,9 +506,21 @@ server log, at WARN for the last.
   without background, so opaque and transparent views share them.
   `[server] metatile_cache_mb`, default 1024; `0` turns meta-tiling off and
   every map renders directly. Only WMS uses it.
+- **Capabilities.** The GetCapabilities document, one per base URL its
+  links are written with (with `trust_proxy_headers`, the one the
+  request's forwarding headers give): at most four documents, the oldest
+  dropped first. Each is served for 5 seconds: a time step an engine adds
+  shows within that, as does a CAP layer's `time` default, which moves with
+  each catalog rebuild. A reload shows at once. A miss is built and
+  gzipped on the blocking pool, two builds at most at a time, once however
+  many requests arrive while it builds, and a client that disconnects does
+  not stop it. A client accepting gzip gets those bytes with
+  `Content-Encoding: gzip`, another the document as is, both with
+  `Vary: Accept-Encoding`.
 - **HTTP.** GetMap carries a content-derived `ETag` and answers a matching
   `If-None-Match` with 304. `x-cache` tells `HIT`, `MISS`, `EMPTY` or
-  `ERROR`.
+  `ERROR`. GetCapabilities carries a weak `ETag` of the document and
+  answers a matching `If-None-Match` with 304 too.
 
 | Response | `Cache-Control` |
 |---|---|

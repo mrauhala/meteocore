@@ -421,7 +421,9 @@ async fn a_kept_site_serves_one_layer_until_its_volumes_return() {
     deliver(&volumes, "test");
     deliver(&volumes, "tes2");
     let (state, engine) = pvol_server(root.path(), BASE, &volumes);
-    let wms = api_wms::router(state.wms.clone());
+    // Capabilities built per request: the site's layers change with a poll,
+    // and the test asks again at once, inside the server's window (#1482).
+    let wms = api_wms::router_with_capabilities_ttl(state.wms.clone(), Duration::ZERO);
     let edr = api_edr::router(state.edr.clone());
     let shared = api_common::shared::router(api_common::shared::SharedApi::new(
         "",

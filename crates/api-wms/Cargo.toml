@@ -13,14 +13,20 @@ arc-swap = "1"
 axum = "0.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
+# GetCapabilities is gzipped once per cached document (#1482); already in
+# the graph through ds-wis2 and tower-http.
+flate2 = "1"
 quick-xml = "0.42"
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["sync"] }
+# `rt`: a GetCapabilities miss builds on the blocking pool, `time`: its
+# window on tokio's clock (#1482).
+tokio = { version = "1", features = ["sync", "rt", "time"] }
 tracing = "0.1"
 
 [dev-dependencies]
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util`: the capabilities window on a paused clock (#1482).
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "test-util"] }
 tower = { version = "0.5", features = ["util"] }
 # Capture log lines: an `Internal` error's detail is logged exactly once (#1484).
 tracing-subscriber = "0.3"
