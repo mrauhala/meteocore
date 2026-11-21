@@ -663,7 +663,13 @@ pub(crate) fn frame_centre(geo_transform: &GeoTransform) -> Option<f64> {
 /// a geographic raster stored past 180° (0–360°, or across the
 /// antimeridian) finds its columns for -170°.
 pub(crate) fn source_longitude(geo_transform: &GeoTransform, lon: f64) -> f64 {
-    frame_centre(geo_transform).map_or(lon, |centre| lon_within_half_turn(lon, centre))
+    in_frame(frame_centre(geo_transform), lon)
+}
+
+/// [`source_longitude`] round a frame centre found once: a map's grid
+/// places every node by it (`map_read`, #1540).
+pub(crate) fn in_frame(centre: Option<f64>, lon: f64) -> f64 {
+    centre.map_or(lon, |centre| lon_within_half_turn(lon, centre))
 }
 
 /// The source CRS's central longitude in degrees, where it has one.

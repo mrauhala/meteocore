@@ -521,37 +521,56 @@ moves the view into the raster's own frame by the EDR queries' rules
 (#1442), in `map_read`, so GetFeatureInfo (EDR position) answers what
 GetMap, Maps and Tiles drew:
 
-- **Geographic source:** the coarse grid maps the view's longitudes to
-  columns as they come, continuous across the raster's seam
-  (`map_read::source_pixel`). Never move each node into the frame: on a
-  0–360° raster every view across 0° would put a turn's jump between two
-  nodes. The windows are `area::native_windows` of the view (one, or two
-  across the seam, its last columns then its first), and `resample_nearest`
-  takes a column no window holds a whole turn on or back
-  (`MapRead::col_period`). The byte path reads every window as bytes or
-  none.
-- **Projected source:** each node's longitude goes through
-  `area::source_longitude`, as EDR position's point does, so a Lambert cone
-  centred on 180° draws -179.9° from its own side (#1114). Its one window
-  is `bbox_to_pixels` of the view moved by whole turns
-  (`area::whole_turns`) to within half a turn of the CRS's central
+- **Geographic source:** every node of the coarse grid moves by the same
+  whole turns, those that bring the view's middle within half a turn of
+  the raster's middle (`MapRead::source_pixel`), so its columns are
+  continuous across the raster's seam and lie on the raster. Never move
+  each node into the frame on its own: on a 0–360° raster every view across
+  0° would put a turn's jump between two nodes. Never leave a world copy's
+  nodes where the view puts them either: a turn off the raster,
+  `ProjectionGrid::estimate_error` skips every probe (it counts only those
+  within a raster's size of it), the grid never refines, and a Web
+  Mercator copy drew up to 70 % of its pixels unlike its twin
+  (`a_geographic_world_copy_draws_as_its_twin`,
+  `a_global_raster_two_turns_away_draws_the_edr_position`). The windows are
+  `area::native_windows` of the view (one, or two across the seam, its
+  last columns then its first). Where the moved view meets a copy of the
+  raster a turn from its own columns (across its seam, or a view wider
+  than a turn), `resample_nearest` takes a column no window holds a whole
+  turn on or back (`MapRead::col_period`). The byte path reads every
+  window as bytes or none.
+- **Projected source:** each node's longitude goes within half a turn of
+  the CRS's central longitude (`area::in_frame`, the rule of
+  `area::source_longitude`, the centre found once per read), as EDR
+  position's point does, so a Lambert cone centred on 180° draws -179.9°
+  from its own side (#1114). Its one window is `bbox_to_pixels` of the view
+  moved by whole turns (`area::whole_turns`) to within half a turn of that
   longitude.
 - **Overviews:** each level counts the pixels of the windows a render of it
   reads (`TiffMetadata::select_overview_by` over `MapRead::dims`), and two
   full-resolution windows hold `MAX_MAP_PIXELS` together
   (`reader::check_map_pixels`). Counted by `bbox_to_pixels`, a whole-world
   view of a 0–360° raster took half its columns and read full resolution.
-- **Footprint guard:** on geographic and Web Mercator output the envelope
-  moves by whole turns to the view, and the copies a turn either side count
-  too, joined: a raster across the antimeridian draws in a view from 180°W
-  and on both edges of a whole-world view, and a world copy (a WMS
-  meta-tile past ±180°) draws as its twin (`world_copies_draw_as_their_twins`).
+- **Footprint guard** (`map_read::footprint_window`): on geographic and Web
+  Mercator output the envelope moves by whole turns to the view, the
+  nearest copy as the guard always took it, joined with the copies a turn
+  either side whose longitudes meet the view's. A raster across the
+  antimeridian draws in a view from 180°W and on both edges of a
+  whole-world view, and a world copy (a WMS meta-tile past ±180°) draws as
+  its twin, geographic or projected (`world_copies_draw_as_their_twins`).
+  Never test a copy by the guard's margin: a copy just past the view's edge
+  joined a window across the whole view and the grid refined all of it
+  (`a_copy_past_the_view_edge_joins_no_window`). Where both copies do meet
+  a view, its whole width is refined: a whole-world view of a Lambert cone
+  on 180° makes several times the projections one edge did.
 - **Unchanged inside the frame:** a view inside the raster's frame reads the
-  window it read before and moves no column. `map_read_tests` pins 80 such
-  renders of rasters from 180°W, and regional ones, by the hashes of their
-  tiles before #1540, through every output CRS and the byte path. Its seam
-  tests compare a raster from 0° with one from 180°W, and each pixel with
-  EDR position.
+  window it read before, moves no node or column, and `resample_nearest`
+  takes its one-window loop, the loop before #1540: a lookup through the
+  windows and a turn per pixel cost the byte path 5–12 %, now within noise.
+  `map_read_tests` pins 80 such renders of rasters from 180°W, and regional
+  ones, by the hashes of their tiles before #1540, through every output CRS
+  and the byte path. Its seam tests compare a raster from 0° with one from
+  180°W, and each pixel with EDR position.
 
 ## EDR
 

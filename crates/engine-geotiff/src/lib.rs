@@ -3026,7 +3026,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             // footprint's pixels are read, so only their error counts:
             // outside it the forward folds and refining for it never
             // converges (#1110, #1129). A node's longitude goes to the
-            // source as `map_read::source_pixel` takes it (#1540).
+            // source as `MapRead::source_pixel` takes it (#1540).
             let grid = ds_core::resample::ProjectionGrid::build_2d_within_quiet(
                 width,
                 height,
@@ -3037,7 +3037,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 |lon, lat| {
                     #[cfg(test)]
                     SOURCE_PROJECTIONS.with(|n| n.set(n.get() + 1));
-                    map_read::source_pixel(&gt, lon, lat)
+                    read.source_pixel(&gt, lon, lat)
                 },
             );
             if let Some(error_px) = grid.capped_error() {
@@ -3228,6 +3228,10 @@ impl Drop for HealthNote<'_> {
 /// geographic level's columns per turn, a column no window holds as the
 /// grid gives it takes the one a whole number of turns on that a window
 /// holds (`map_read`, #1540): the raster's own frame.
+///
+/// One window without `col_period`, every render inside the raster's frame,
+/// takes the loop it took before #1540: a lookup through the windows and a
+/// turn per pixel cost the byte path 5–12 %.
 #[allow(clippy::too_many_arguments)]
 fn resample_nearest<T: Copy>(
     grid: &ds_core::resample::ProjectionGrid,
@@ -3239,6 +3243,35 @@ fn resample_nearest<T: Copy>(
     (px_lo, px_hi, py_lo, py_hi): (u32, u32, u32, u32),
     out: &mut Vec<T>,
 ) {
+    if let ([window], None) = (windows, col_period) {
+        // The window's fields in locals, as the loop had them before.
+        let [col_start, row_start, col_end, row_end] = window.bounds;
+        let (first_col, first_row) = window.start;
+        let (pixels, columns) = (window.pixels, window.columns);
+        for oy in 0..height {
+            let in_y = oy >= py_lo && oy <= py_hi;
+            for ox in 0..width {
+                if !in_y || ox < px_lo || ox > px_hi {
+                    out.push(fill);
+                    continue;
+                }
+                let (col_f, row_f) = grid.sample(ox, oy);
+                if !col_f.is_finite() || !row_f.is_finite() {
+                    out.push(fill);
+                    continue;
+                }
+                let col = col_f.floor();
+                let row = row_f.floor();
+                if col >= col_start && col < col_end && row >= row_start && row < row_end {
+                    let idx = (row as usize - first_row) * columns + (col as usize - first_col);
+                    out.push(pixels.get(idx).copied().unwrap_or(fill));
+                } else {
+                    out.push(fill);
+                }
+            }
+        }
+        return;
+    }
     for oy in 0..height {
         let in_y = oy >= py_lo && oy <= py_hi;
         for ox in 0..width {
@@ -3254,12 +3287,12 @@ fn resample_nearest<T: Copy>(
             let row = row_f.floor();
             let value = windows
                 .iter()
-                .find_map(|window| window.at(col_f, row, fill))
+                .find_map(|window| window.at(col_f.floor(), row, fill))
                 .or_else(|| {
                     let period = col_period?;
-                    windows
-                        .iter()
-                        .find_map(|window| window.at(window.turned(col_f, period), row, fill))
+                    windows.iter().find_map(|window| {
+                        window.at(window.turned(col_f, period).floor(), row, fill)
+                    })
                 });
             out.push(value.unwrap_or(fill));
         }

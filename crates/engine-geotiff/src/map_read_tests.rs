@@ -243,6 +243,18 @@ fn tile_hash(tile: &RasterTile) -> u64 {
     hash
 }
 
+/// A render with the source projections its coarse grid made.
+fn render_counted(
+    engine: &GeoTiffEngine,
+    bbox: [f64; 4],
+    crs: &OutputCrs,
+    size: (u32, u32),
+) -> (RasterTile, usize) {
+    crate::SOURCE_PROJECTIONS.with(|n| n.set(0));
+    let tile = render(engine, bbox, crs, size);
+    (tile, crate::SOURCE_PROJECTIONS.with(|n| n.get()))
+}
+
 fn render(
     engine: &GeoTiffEngine,
     bbox: [f64; 4],
@@ -838,4 +850,140 @@ fn a_lambert_cone_centred_on_180_draws_its_own_side() {
             "{what}: {west} pixels drawn at its west end, {east} at its east end"
         );
     }
+}
+
+/// A regional geographic raster, 10°W–40°E and 22–72°N in pixels of
+/// 0.15625°, bytes `(7c + 3 row) mod 250` with an overview of 192 × 192.
+fn regional() -> Fixture {
+    let level = |side: u32, level: u32| Level {
+        dims: (side, side),
+        samples: Samples::U8(
+            (0..side * side)
+                .map(|i| ((7 * (i % side) + 3 * (i / side) + 50 * level) % 250) as u8)
+                .collect(),
+        ),
+    };
+    Fixture::levels(
+        "regional-copies",
+        geographic(),
+        (-10.0, 72.0),
+        50.0 / 320.0,
+        &[level(320, 0), level(192, 1)],
+    )
+}
+
+/// A world copy of a geographic raster, the view a turn or two west or
+/// east of its twin, draws its twin pixel for pixel from as many
+/// projections, at every level of the WMS meta-tiling up to 4 and from both
+/// of the raster's levels. Its grid nodes move by the view's whole turns
+/// onto the raster, where the grid measures its error: left a turn off it,
+/// no probe counted, the grid never refined, and every copy drew unlike its
+/// twin, at level 3 col 1 row 0 8 300 of 65 536 pixels, from 337
+/// projections, not 5 635.
+#[test]
+fn a_geographic_world_copy_draws_as_its_twin() {
+    let fixture = regional();
+    let [west, south, east, north] = [-10.0, 22.0, 40.0, 72.0];
+    let merc = OutputCrs::WebMercator;
+    let mut twins = 0;
+    for level in 0..=4 {
+        let per_turn = 2f64.powf(f64::from(level) / 2.0);
+        for row in 0..per_turn.ceil() as i64 {
+            for col in 0..per_turn.ceil() as i64 {
+                let twin = meta_tile(level, col, row);
+                let [w, s, e, n] = twin;
+                if w >= east || e <= west || s >= north || n <= south || w >= 180.0 {
+                    continue;
+                }
+                twins += 1;
+                let (expected, projections) =
+                    render_counted(&fixture.engine, twin, &merc, (256, 256));
+                let drawn = expected.values.iter_values().flatten().count();
+                assert!(drawn > 0, "level {level} col {col} row {row} draws nothing");
+                for turns in [-720.0, -360.0, 360.0, 720.0] {
+                    let what = format!("level {level} col {col} row {row}, {turns}°");
+                    let copy = [w + turns, s, e + turns, n];
+                    let (tile, copy_projections) =
+                        render_counted(&fixture.engine, copy, &merc, (256, 256));
+                    assert!(
+                        tile.values.iter_values().eq(expected.values.iter_values()),
+                        "{what} moved pixels"
+                    );
+                    assert_eq!(copy_projections, projections, "{what}: projections");
+                }
+            }
+        }
+    }
+    assert_eq!(twins, 10, "tiles holding the raster");
+}
+
+/// A global raster two turns away, Web Mercator level 0 col ±2, draws the
+/// world as the tile in it does, from as many projections, and each pixel
+/// as EDR position reads it. Before, its unrefined grid drew 45 568 of
+/// 65 536 pixels unlike the tile in the world, from 1 105 projections, not
+/// 22 963.
+#[test]
+fn a_global_raster_two_turns_away_draws_the_edr_position() {
+    let fixture = global("two-turns", 0.0, false, false);
+    let merc = OutputCrs::WebMercator;
+    let size = (256, 256);
+    let world = meta_tile(0, 0, 0);
+    let (expected, projections) = render_counted(&fixture.engine, world, &merc, size);
+    for col in [-2, 2] {
+        let what = format!("level 0 col {col}");
+        let bbox = meta_tile(0, col, 0);
+        let (tile, copy_projections) = render_counted(&fixture.engine, bbox, &merc, size);
+        assert!(
+            tile.values.iter_values().eq(expected.values.iter_values()),
+            "{what} moved pixels"
+        );
+        assert_eq!(copy_projections, projections, "{what}: projections");
+        let drawn = assert_draws_the_position(&fixture, &tile, (&what, bbox, &merc, size), 2);
+        assert_eq!(drawn, 128 * 128, "{what}");
+    }
+}
+
+/// A copy of the footprint a turn on joins the guard's window only where
+/// its longitudes meet the view's. A raster at 147.5–179.5°E has a copy at
+/// 212.5–180.5°W, just past a world view's west edge: by the guard's margin
+/// it joined a window across the whole view, and the grid refined all of
+/// it. Copies that do meet the view still join: a raster across the
+/// antimeridian fills both edges of it.
+#[test]
+fn a_copy_past_the_view_edge_joins_no_window() {
+    let pacific = [147.5, -40.0, 179.5, 40.0];
+    let views: [View; 3] = [
+        (
+            "CRS:84 world",
+            [-180.0, -90.0, 180.0, 90.0],
+            OutputCrs::Wgs84,
+            (512, 256),
+        ),
+        (
+            "quad 0/0/0",
+            quad_tile(0, 0, 0),
+            OutputCrs::WebMercator,
+            (256, 256),
+        ),
+        (
+            "CRS:84 to 150°E",
+            [-180.0, -60.0, 150.0, 60.0],
+            OutputCrs::Wgs84,
+            (330, 120),
+        ),
+    ];
+    for (what, bbox, crs, (w, h)) in &views {
+        let own = crs.footprint_window_in_image(*bbox, pacific, *w, *h);
+        assert!(own.is_some(), "{what}");
+        assert_eq!(
+            crate::map_read::footprint_window(crs, *bbox, pacific, *w, *h),
+            own,
+            "{what}: a copy past the view joined"
+        );
+    }
+    // Across the antimeridian, both copies meet a world view.
+    let seam = [170.0, -40.0, 190.0, 40.0];
+    let (_, bbox, crs, (w, h)) = &views[0];
+    let joined = crate::map_read::footprint_window(crs, *bbox, seam, *w, *h).unwrap();
+    assert_eq!((joined.0, joined.1), (0, w - 1), "both edges");
 }
