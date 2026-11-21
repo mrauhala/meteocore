@@ -6,7 +6,8 @@
 //!
 //! The fixtures are written here: small tiled float32 GeoTIFFs whose every
 //! pixel holds its own index `row × width + col`, so a value names the
-//! pixel it came from.
+//! pixel it came from. The map tests (`map_read_tests`, #1540) write theirs
+//! with the same writer ([`write_levels`]): byte samples, overview levels.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,14 +22,14 @@ use crate::area::{lon_arc, AreaGrid, AreaPlan};
 use crate::GeoTiffEngine;
 
 /// Tile side of the written fixtures; their sizes are multiples of it.
-const TILE: u32 = 64;
+pub(crate) const TILE: u32 = 64;
 /// The interpolation budget of `ds_core::resample::ProjectionGrid`, in
 /// source pixels: a cell centre nearer a pixel edge than this may take the
 /// pixel across it.
 const EDGE_PX: f64 = 0.2;
 
 /// A temporary directory, removed on drop.
-struct TempDir(PathBuf);
+pub(crate) struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(name: &str) -> Self {
@@ -87,8 +88,8 @@ impl Field {
 }
 
 /// A projected CRS as GeoKeys, and as ds-core's `Crs` to place a fixture.
-struct Projection {
-    crs: Crs,
+pub(crate) struct Projection {
+    pub(crate) crs: Crs,
     geokeys: Vec<u16>,
     doubles: Vec<f64>,
 }
@@ -103,7 +104,7 @@ fn epsg(code: u16, crs: Crs) -> Projection {
 }
 
 /// EPSG:3067, ETRS89 / TM35FIN.
-fn tm35fin() -> Projection {
+pub(crate) fn tm35fin() -> Projection {
     epsg(
         3067,
         Crs::TransverseMercator {
@@ -118,7 +119,7 @@ fn tm35fin() -> Projection {
 }
 
 /// EPSG:3035, ETRS89-extended / LAEA Europe.
-fn laea_europe() -> Projection {
+pub(crate) fn laea_europe() -> Projection {
     epsg(
         3035,
         Crs::LambertAzimuthalEqualArea {
@@ -133,7 +134,7 @@ fn laea_europe() -> Projection {
 
 /// A UTM-like Transverse Mercator on WGS84 with its central meridian at
 /// `lon0` degrees, from its parameter GeoKeys.
-fn tm_at(lon0: f64) -> Projection {
+pub(crate) fn tm_at(lon0: f64) -> Projection {
     Projection {
         crs: Crs::TransverseMercator {
             lat0: 0.0,
@@ -160,7 +161,7 @@ fn tm_at(lon0: f64) -> Projection {
 }
 
 /// EPSG:4326, a geographic raster.
-fn geographic() -> Projection {
+pub(crate) fn geographic() -> Projection {
     Projection {
         crs: Crs::Wgs84,
         geokeys: vec![
@@ -174,7 +175,7 @@ fn geographic() -> Projection {
 }
 
 /// A Lambert conformal conic (2SP) on WGS84, from its parameter GeoKeys.
-fn lcc(lat1: f64, lat2: f64, lat0: f64, lon0: f64) -> Projection {
+pub(crate) fn lcc(lat1: f64, lat2: f64, lat0: f64, lon0: f64) -> Projection {
     Projection {
         crs: Crs::LambertConformalConic {
             lat1: lat1.to_radians(),
@@ -210,90 +211,161 @@ fn write_geotiff(
     pixel: f64,
     (width, height): (u32, u32),
 ) {
-    assert!(width % TILE == 0 && height % TILE == 0);
+    let index = (0..width * height).map(|i| i as f32).collect();
+    write_levels(
+        path,
+        projection,
+        origin,
+        pixel,
+        &[Level {
+            dims: (width, height),
+            samples: Samples::F32(index),
+        }],
+    );
+}
+
+/// One image of a written fixture: its `(width, height)` and its row-major
+/// samples. The first is full resolution, any after it an overview over
+/// the same extent.
+pub(crate) struct Level {
+    pub(crate) dims: (u32, u32),
+    pub(crate) samples: Samples,
+}
+
+/// A level's samples. Float32 writes nodata -9999, bytes 255: an integer
+/// byte sentinel, so a local map render takes the u8 path (#206).
+pub(crate) enum Samples {
+    F32(Vec<f32>),
+    U8(Vec<u8>),
+}
+
+impl Samples {
+    /// `(BitsPerSample, SampleFormat, GDAL_NODATA)`.
+    fn kind(&self) -> (u16, u16, &'static str) {
+        match self {
+            Samples::F32(_) => (32, 3, "-9999"),
+            Samples::U8(_) => (8, 1, "255"),
+        }
+    }
+
+    /// Sample `index`'s little-endian bytes.
+    fn push(&self, index: usize, out: &mut Vec<u8>) {
+        match self {
+            Samples::F32(values) => out.extend_from_slice(&values[index].to_le_bytes()),
+            Samples::U8(values) => out.push(values[index]),
+        }
+    }
+}
+
+/// Write a tiled, uncompressed GeoTIFF of `levels`, each an image of
+/// `pixel`-metre pixels at full resolution, its top-left corner at
+/// `origin`; the GeoKeys go in the first image's directory, as a COG's do.
+pub(crate) fn write_levels(
+    path: &Path,
+    projection: &Projection,
+    origin: (f64, f64),
+    pixel: f64,
+    levels: &[Level],
+) {
     let mut tiff = b"II\x2a\x00\0\0\0\0".to_vec();
-    let (mut offsets, mut counts) = (Vec::new(), Vec::new());
-    for tile_row in 0..height / TILE {
-        for tile_col in 0..width / TILE {
-            offsets.push(tiff.len() as u32);
-            counts.push(TILE * TILE * 4);
-            for r in 0..TILE {
-                for c in 0..TILE {
-                    let (row, col) = (tile_row * TILE + r, tile_col * TILE + c);
-                    let value = (row * width + col) as f32;
-                    tiff.extend_from_slice(&value.to_le_bytes());
+    // Where the previous directory's next-directory offset goes.
+    let mut next_at = 4;
+    for (level, Level { dims, samples }) in levels.iter().enumerate() {
+        let (width, height) = *dims;
+        assert!(width % TILE == 0 && height % TILE == 0);
+        let (bits, format, nodata) = samples.kind();
+        let (mut offsets, mut counts) = (Vec::new(), Vec::new());
+        for tile_row in 0..height / TILE {
+            for tile_col in 0..width / TILE {
+                offsets.push(tiff.len() as u32);
+                counts.push(TILE * TILE * u32::from(bits) / 8);
+                for r in 0..TILE {
+                    for c in 0..TILE {
+                        let (row, col) = (tile_row * TILE + r, tile_col * TILE + c);
+                        samples.push((row * width + col) as usize, &mut tiff);
+                    }
                 }
             }
         }
-    }
-    let mut fields = vec![
-        (256, Field::Long(vec![width])),
-        (257, Field::Long(vec![height])),
-        (258, Field::Short(vec![32])),
-        (259, Field::Short(vec![1])),
-        (262, Field::Short(vec![1])),
-        (277, Field::Short(vec![1])),
-        (284, Field::Short(vec![1])),
-        (322, Field::Short(vec![TILE as u16])),
-        (323, Field::Short(vec![TILE as u16])),
-        (324, Field::Long(offsets)),
-        (325, Field::Long(counts)),
-        (339, Field::Short(vec![3])),
-        (33550, Field::Double(vec![pixel, pixel, 0.0])),
-        (
-            33922,
-            Field::Double(vec![0.0, 0.0, 0.0, origin.0, origin.1, 0.0]),
-        ),
-        (34735, Field::Short(projection.geokeys.clone())),
-    ];
-    if !projection.doubles.is_empty() {
-        fields.push((34736, Field::Double(projection.doubles.clone())));
-    }
-    fields.push((42113, Field::Ascii("-9999")));
-
-    // Out-of-line values, then the IFD.
-    let mut entries = Vec::new();
-    for (tag, field) in &fields {
-        let (kind, count, bytes) = field.encode();
-        let value = if bytes.len() <= 4 {
-            let mut inline = bytes.clone();
-            inline.resize(4, 0);
-            inline
-        } else {
-            if tiff.len() % 2 == 1 {
-                tiff.push(0);
+        let mut fields = Vec::new();
+        if level > 0 {
+            // NewSubfileType: a reduced-resolution image.
+            fields.push((254, Field::Long(vec![1])));
+        }
+        fields.extend([
+            (256, Field::Long(vec![width])),
+            (257, Field::Long(vec![height])),
+            (258, Field::Short(vec![bits])),
+            (259, Field::Short(vec![1])),
+            (262, Field::Short(vec![1])),
+            (277, Field::Short(vec![1])),
+            (284, Field::Short(vec![1])),
+            (322, Field::Short(vec![TILE as u16])),
+            (323, Field::Short(vec![TILE as u16])),
+            (324, Field::Long(offsets)),
+            (325, Field::Long(counts)),
+            (339, Field::Short(vec![format])),
+        ]);
+        if level == 0 {
+            fields.extend([
+                (33550, Field::Double(vec![pixel, pixel, 0.0])),
+                (
+                    33922,
+                    Field::Double(vec![0.0, 0.0, 0.0, origin.0, origin.1, 0.0]),
+                ),
+                (34735, Field::Short(projection.geokeys.clone())),
+            ]);
+            if !projection.doubles.is_empty() {
+                fields.push((34736, Field::Double(projection.doubles.clone())));
             }
-            let offset = tiff.len() as u32;
-            tiff.extend_from_slice(&bytes);
-            offset.to_le_bytes().to_vec()
-        };
-        entries.push((*tag, kind, count, value));
+        }
+        fields.push((42113, Field::Ascii(nodata)));
+
+        // Out-of-line values, then the IFD.
+        let mut entries = Vec::new();
+        for (tag, field) in &fields {
+            let (kind, count, bytes) = field.encode();
+            let value = if bytes.len() <= 4 {
+                let mut inline = bytes.clone();
+                inline.resize(4, 0);
+                inline
+            } else {
+                if tiff.len() % 2 == 1 {
+                    tiff.push(0);
+                }
+                let offset = tiff.len() as u32;
+                tiff.extend_from_slice(&bytes);
+                offset.to_le_bytes().to_vec()
+            };
+            entries.push((*tag, kind, count, value));
+        }
+        if tiff.len() % 2 == 1 {
+            tiff.push(0);
+        }
+        let ifd = tiff.len() as u32;
+        tiff[next_at..next_at + 4].copy_from_slice(&ifd.to_le_bytes());
+        tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, kind, count, value) in entries {
+            tiff.extend_from_slice(&u16::to_le_bytes(tag));
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value);
+        }
+        next_at = tiff.len();
+        tiff.extend_from_slice(&0u32.to_le_bytes());
     }
-    if tiff.len() % 2 == 1 {
-        tiff.push(0);
-    }
-    let ifd = tiff.len() as u32;
-    tiff[4..8].copy_from_slice(&ifd.to_le_bytes());
-    tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    for (tag, kind, count, value) in entries {
-        tiff.extend_from_slice(&u16::to_le_bytes(tag));
-        tiff.extend_from_slice(&kind.to_le_bytes());
-        tiff.extend_from_slice(&count.to_le_bytes());
-        tiff.extend_from_slice(&value);
-    }
-    tiff.extend_from_slice(&0u32.to_le_bytes());
     std::fs::write(path, tiff).unwrap();
 }
 
 /// A one-file collection on a `pixel`-metre grid of `projection` reaching
 /// a few pixels past the lon/lat box `cover` (its east may lie past 180°).
-struct Fixture {
+pub(crate) struct Fixture {
     _dir: TempDir,
-    engine: GeoTiffEngine,
+    pub(crate) engine: GeoTiffEngine,
 }
 
 impl Fixture {
-    fn new(name: &str, projection: Projection, cover: [f64; 4], pixel: f64) -> Self {
+    pub(crate) fn new(name: &str, projection: Projection, cover: [f64; 4], pixel: f64) -> Self {
         let [w, s, e, n] = cover;
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for i in 0..=100 {
@@ -320,7 +392,7 @@ impl Fixture {
 
     /// A one-file collection of `dims` pixels of `pixel` CRS units on
     /// `projection`, its top-left corner at `origin`.
-    fn at(
+    pub(crate) fn at(
         name: &str,
         projection: Projection,
         origin: (f64, f64),
@@ -335,6 +407,32 @@ impl Fixture {
             pixel,
             dims,
         );
+        Self::load(name, dir, projection)
+    }
+
+    /// A one-file collection of `levels` ([`write_levels`]) on
+    /// `projection`, `pixel` CRS units at full resolution, its top-left
+    /// corner at `origin`.
+    pub(crate) fn levels(
+        name: &str,
+        projection: Projection,
+        origin: (f64, f64),
+        pixel: f64,
+        levels: &[Level],
+    ) -> Self {
+        let dir = TempDir::new(name);
+        write_levels(
+            &dir.0.join("area_20261108T1200Z.tif"),
+            &projection,
+            origin,
+            pixel,
+            levels,
+        );
+        Self::load(name, dir, projection)
+    }
+
+    /// The engine over the one file written to `dir`.
+    fn load(name: &str, dir: TempDir, projection: Projection) -> Self {
         let config: ds_core::config::GeoTiffConfig = serde_json::from_value(serde_json::json!({
             "filename_template": "area_%Y%m%dT%H%MZ.tif", "parameter": "value", "unit": "1"
         }))
@@ -351,7 +449,7 @@ impl Fixture {
         fixture
     }
 
-    fn geo_transform(&self) -> GeoTransform {
+    pub(crate) fn geo_transform(&self) -> GeoTransform {
         let catalog = self.engine.catalog.load();
         let entry = catalog.entries.values().next().unwrap();
         entry.metadata().unwrap().geo_transform.clone()
@@ -365,7 +463,7 @@ impl Fixture {
     }
 
     /// The EDR position query's value at `(lon, lat)`.
-    fn position(&self, lon: f64, lat: f64) -> Option<f64> {
+    pub(crate) fn position(&self, lon: f64, lat: f64) -> Option<f64> {
         let point = self.engine.query_point(lat, lon, None, None).unwrap();
         point.ranges["value"].values[0]
     }

@@ -139,9 +139,8 @@ fn whole_tile_render(
                 &grid,
                 size,
                 size,
-                &window.data,
-                (c1 - c0) as usize,
-                (c0, r0, c1, r1),
+                &[map_read::ReadWindow::new((c0, r0, c1, r1), &window.data)],
+                None,
                 window.nodata,
                 crs.footprint_pixel_window(bbox, gt.footprint_envelope().unwrap(), size, size),
                 &mut data,
@@ -175,6 +174,8 @@ fn values(tile: &RasterTile) -> Vec<Option<f64>> {
 /// (#1130), so the whole-tile path now refines that tile in 1105
 /// projections; the footprint path still takes none. A projected tile far
 /// from the source, an EPSG:3035 one over Iberia, is answered the same way.
+/// One more tile past ±180°, level 2 col -1 row 0, holds a world copy of
+/// the source and draws it (#1540): `world_copies_draw_as_their_twins`.
 #[test]
 fn off_world_meta_tiles_read_and_project_nothing() {
     let engine = engine();
@@ -182,7 +183,6 @@ fn off_world_meta_tiles_read_and_project_nothing() {
     let laea = projected_output_crs("EPSG:3035").unwrap();
     let iberia = [3_072_000.0, 1_024_000.0, 4_096_000.0, 2_048_000.0];
     let mut tiles: Vec<(String, [f64; 4], OutputCrs)> = [
-        (2, -1, 0),
         (2, 2, 0),
         (3, -1, 2),
         (3, 3, 2),
@@ -213,6 +213,28 @@ fn off_world_meta_tiles_read_and_project_nothing() {
     }
     let (_, before) = whole_tile_render(&engine, meta_tile(3, 3, 2), 256, &merc);
     assert_eq!(before, 1105, "the whole tile's projections");
+}
+
+/// The meta-tiles a turn west of the source, past -180°, hold a world copy
+/// of it: each draws, pixel for pixel, what the tile a turn east draws, with
+/// as many projections (#1540). Each grid node's longitude moves to within
+/// half a turn of the source's meridian, where its forward is meant to be
+/// evaluated, and the footprint guard to the copy. Before, the guard left
+/// them empty.
+#[test]
+fn world_copies_draw_as_their_twins() {
+    let engine = engine();
+    let merc = OutputCrs::WebMercator;
+    // At level 2 a tile is half a turn wide, at level 4 a quarter.
+    for (level, col, row, twin) in [(2, -1, 0, 1), (4, -2, 1, 2), (4, -2, 0, 2)] {
+        let name = format!("level {level} col {col} row {row}");
+        let (copy, projections) = render(&engine, meta_tile(level, col, row), 256, &merc);
+        let (twin, twin_projections) = render(&engine, meta_tile(level, twin, row), 256, &merc);
+        let drawn = values(&copy).iter().filter(|v| v.is_some()).count();
+        assert!(drawn > 400, "{name} draws {drawn} pixels");
+        assert!(values(&copy) == values(&twin), "{name} moved pixels");
+        assert_eq!(projections, twin_projections, "{name}");
+    }
 }
 
 /// Tiles the footprint covers, in Web Mercator, CRS:84 and EPSG:3067, draw

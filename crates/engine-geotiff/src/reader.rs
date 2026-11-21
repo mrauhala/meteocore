@@ -1025,6 +1025,11 @@ impl TiffMetadata {
     /// that the output is at/near native resolution and `None` is returned so the
     /// caller reads full resolution. Also returns `None` when the bbox misses the
     /// raster or full resolution already fits the output.
+    ///
+    /// Each level's pixels are `GeoTransform::bbox_to_pixels`' window of the
+    /// bbox. A map render counts the windows it reads in the raster's own
+    /// frame instead ([`Self::select_overview_by`], #1540).
+    #[cfg(test)]
     pub fn select_overview(
         &self,
         bbox_west: f64,
@@ -1034,18 +1039,29 @@ impl TiffMetadata {
         output_width: u32,
         output_height: u32,
     ) -> Option<&OverviewLevel> {
+        self.select_overview_by(output_width, output_height, |gt| {
+            gt.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north)
+                .map(|(c0, r0, c1, r1)| (c1 - c0, r1 - r0))
+        })
+    }
+
+    /// [`Self::select_overview`] with each level's source pixels counted by
+    /// `pixels`: the `(columns, rows)` a read of that level's transform
+    /// takes, `None` when it takes none. A map render counts the windows it
+    /// reads in the raster's own longitude frame (`map_read::MapRead`,
+    /// #1540), two of them across the raster's seam.
+    pub(crate) fn select_overview_by(
+        &self,
+        output_width: u32,
+        output_height: u32,
+        pixels: impl Fn(&GeoTransform) -> Option<(u32, u32)>,
+    ) -> Option<&OverviewLevel> {
         if self.overviews.is_empty() {
             return None;
         }
 
-        // Check how many full-res pixels the bbox covers
-        let full_range = self
-            .geo_transform
-            .bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north);
-        let (full_cols, full_rows) = match full_range {
-            Some((c0, r0, c1, r1)) => ((c1 - c0), (r1 - r0)),
-            None => return None, // bbox doesn't intersect
-        };
+        // Check how many full-res pixels the bbox covers; none: it misses.
+        let (full_cols, full_rows) = pixels(&self.geo_transform)?;
 
         // If full resolution already fits the output, no need for overviews
         if full_cols <= output_width && full_rows <= output_height {
@@ -1062,10 +1078,8 @@ impl TiffMetadata {
         let mut best: Option<&OverviewLevel> = None;
         for ov in &self.overviews {
             let ov_gt = self.overview_geo_transform(ov);
-            match ov_gt.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north) {
-                Some((c0, r0, c1, r1))
-                    if (c1 - c0) >= output_width && (r1 - r0) >= output_height =>
-                {
+            match pixels(&ov_gt) {
+                Some((cols, rows)) if cols >= output_width && rows >= output_height => {
                     best = Some(ov);
                 }
                 // Stop at the first level that doesn't qualify. Overviews are
@@ -1099,11 +1113,10 @@ impl TiffMetadata {
         // requests instead of every retina viewport just above an overview.
         const MIN_OVERVIEW_FRACTION: f64 = 0.5; // accept up to a 2× nearest-neighbour upscale
         let largest = self.overviews.first()?;
-        let lg = self.overview_geo_transform(largest);
-        let (c0, r0, c1, r1) = lg.bbox_to_pixels(bbox_west, bbox_south, bbox_east, bbox_north)?;
+        let (cols, rows) = pixels(&self.overview_geo_transform(largest))?;
         let min_cols = (output_width as f64 * MIN_OVERVIEW_FRACTION).ceil() as u32;
         let min_rows = (output_height as f64 * MIN_OVERVIEW_FRACTION).ceil() as u32;
-        if (c1 - c0) >= min_cols && (r1 - r0) >= min_rows {
+        if cols >= min_cols && rows >= min_rows {
             Some(largest)
         } else {
             None
@@ -2240,11 +2253,8 @@ pub fn read_bbox_u8(
     // `read_bbox_overview` does NOT — the caller's overview selection
     // deliberately accepts an over-cap read of the coarsest overview as
     // "the smallest available source" rather than failing.
-    if overview.is_none() && total_pixels > MAX_MAP_PIXELS {
-        return Err(DataServerError::InvalidParameter(format!(
-            "Map render source area {} pixels exceeds maximum {}.",
-            total_pixels, MAX_MAP_PIXELS
-        )));
+    if overview.is_none() {
+        check_map_pixels(total_pixels)?;
     }
 
     let tile_col_start = col_start / level_meta.tile_width;
@@ -2352,6 +2362,19 @@ pub fn max_map_pixels() -> usize {
     MAX_MAP_PIXELS
 }
 
+/// The 400 of a full-resolution map read of `total_pixels` source pixels
+/// over [`MAX_MAP_PIXELS`]: one window's, or the sum of the two a map reads
+/// across a raster's seam (#1540).
+pub(crate) fn check_map_pixels(total_pixels: usize) -> Result<(), DataServerError> {
+    if total_pixels > MAX_MAP_PIXELS {
+        return Err(DataServerError::InvalidParameter(format!(
+            "Map render source area {} pixels exceeds maximum {}.",
+            total_pixels, MAX_MAP_PIXELS
+        )));
+    }
+    Ok(())
+}
+
 /// Read a bbox for map rendering with a higher pixel limit.
 /// Used by MapEngine::get_raster_tile where output size is already bounded.
 #[allow(clippy::too_many_arguments)]
@@ -2369,13 +2392,7 @@ pub fn read_bbox_map(
     let nx = (col_end - col_start) as usize;
     let ny = (row_end - row_start) as usize;
     let total_pixels = nx * ny;
-
-    if total_pixels > MAX_MAP_PIXELS {
-        return Err(DataServerError::InvalidParameter(format!(
-            "Map render source area {} pixels exceeds maximum {}.",
-            total_pixels, MAX_MAP_PIXELS
-        )));
-    }
+    check_map_pixels(total_pixels)?;
 
     read_bbox_inner(
         source,
