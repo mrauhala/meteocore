@@ -644,6 +644,10 @@ impl PostgisEngine {
     /// disc a map frame at `pick.time` draws over the picked pixel. The
     /// frame's window is the render's, `(end - window, end]` with `end` from
     /// [`crate::maps::resolve_window_end`]; no data yet is an empty answer.
+    /// The pick reads the table on every request while the frame draws a
+    /// cached read, so on an unsettled frame it can list a strike written
+    /// late that the frame draws only from the next refresh bringing a
+    /// newer strike (#1432); a settled frame and its picks agree.
     /// The place is [`crate::maps::pick_region`]: the picked pixel grown by
     /// the disc each strike is drawn as, on the map's grid, so a click
     /// anywhere on a drawn disc finds its strike. One statement
@@ -667,10 +671,8 @@ impl PostgisEngine {
         else {
             return Ok(PickedFeatures::default());
         };
-        let window = self
-            .config
-            .events_default_window
-            .unwrap_or_else(|| chrono::Duration::hours(crate::config::DEFAULT_EVENTS_WINDOW_HOURS));
+        // The window the frame draws (`maps::window_key`).
+        let window = crate::maps::frame_window(&self.config);
         let source_keys = resolve_source_keys(&self.config, None)?;
         let key_refs: Vec<&str> = source_keys.iter().map(String::as_str).collect();
         let built = build_events_pick(
@@ -3839,6 +3841,94 @@ mod tests {
             engine.content_version_for(None, engine.resolve_time(None, None), None, None),
             0
         );
+    }
+
+    /// #1432: an unsettled events frame's version, and the strike window it
+    /// is read under, move with the newest strike the snapshot holds, so a
+    /// refresh that brings a newer strike reads the frame again instead of
+    /// drawing its first read until it settles. A refresh that found
+    /// nothing new keeps both. Settling changes the key to version `0`,
+    /// which no read made before the frame settled holds, and a settled
+    /// frame keeps that key over every later refresh, so the long tail's
+    /// windows and renders are never orphaned. `content_version_for` and
+    /// the window key report the same version.
+    #[test]
+    fn an_unsettled_events_frame_follows_the_newest_strike() {
+        use crate::maps::window_key;
+        use ds_core::map_engine::MapEngine;
+        let at = |s: &str| -> DateTime<Utc> { s.parse().unwrap() };
+        let cfg = events_engine_config();
+        let shape = cfg.events().expect("events shape").clone();
+        let engine = engine_with(cfg.clone());
+        let refresh = |newest: &str, version: u64| {
+            engine.cache().store(CollectionMeta::build(
+                &cfg,
+                crate::metadata::LocationSet::default(),
+                crate::metadata::TemporalRead {
+                    extent: Some((at(newest) - chrono::Duration::days(3), at(newest))),
+                    future_latest: None,
+                },
+                version,
+            ));
+        };
+        // The frame at 20:00, asked for as 20:00:30; one an hour and a half
+        // older; one past the newest strike.
+        let frame = at("2026-07-11T20:00:00Z");
+        let older = at("2026-07-11T18:30:00Z");
+        let future = at("2026-07-12T06:00:00Z");
+        // The version the API layers key the frame on, and the strike
+        // window `get_raster_tile` reads, which carries the same version.
+        let keyed = |end: DateTime<Utc>| {
+            let resolved = engine.resolve_parameter_time(None, Some(end), None);
+            let version = engine.content_version_for(None, resolved, None, None);
+            let key = window_key(&engine, &shape, &engine.cache().load(), end);
+            assert_eq!(key.3, version, "the window key and the frame agree");
+            assert_eq!(key.2 - key.1, chrono::Duration::hours(1), "the window");
+            (version, key)
+        };
+        assert_eq!(
+            engine.resolve_parameter_time(None, Some(at("2026-07-11T20:00:30Z")), None),
+            Some(frame)
+        );
+
+        // No strike yet: nothing settled, one version.
+        let (empty, _) = keyed(frame);
+        assert_ne!(empty, 0);
+
+        // 20:20:37: the frame is unsettled.
+        refresh("2026-07-11T20:20:37Z", 1);
+        let (first, first_key) = keyed(frame);
+        let (older_version, older_key) = keyed(older);
+        let (future_first, _) = keyed(future);
+        assert_ne!(first, 0);
+        assert_ne!(first, empty, "the first strike moves it");
+        assert_ne!(future_first, 0);
+        assert_eq!(older_version, 0, "settled");
+
+        // A refresh that found nothing new keeps the version and the key.
+        refresh("2026-07-11T20:20:37Z", 2);
+        assert_eq!(keyed(frame), (first, first_key.clone()));
+
+        // A newer strike, 20:40: still unsettled, read again.
+        refresh("2026-07-11T20:40:00Z", 3);
+        let (second, second_key) = keyed(frame);
+        let (future_second, _) = keyed(future);
+        assert_ne!(second, 0);
+        assert_ne!(second, first, "a newer strike moves the version");
+        assert_ne!(second_key, first_key, "and the window is read again");
+        assert_ne!(future_second, future_first, "a future frame too");
+
+        // 21:00, an hour after the frame: settled, a key no earlier read has.
+        refresh("2026-07-11T21:00:00Z", 4);
+        let (settled, settled_key) = keyed(frame);
+        assert_eq!(settled, 0);
+        assert_ne!(settled_key, first_key);
+        assert_ne!(settled_key, second_key);
+
+        // Later strikes move neither a settled frame nor an older one.
+        refresh("2026-07-12T02:00:00Z", 5);
+        assert_eq!(keyed(frame), (0, settled_key));
+        assert_eq!(keyed(older), (0, older_key));
     }
 
     /// #1063, #507: a station layer renders the instant `resolve_time` and

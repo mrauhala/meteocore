@@ -269,11 +269,16 @@ source publishes, when it publishes it. So a frame is settled only once its
 window ends an hour or more before the newest event the last refresh read
 (the hour EDR and Features responses use for late observations). Until
 then, an explicit `TIME`, a future one included, revalidates
-(`max-age=60, must-revalidate`) rather than being `immutable`, and keeps the
-events its first read found. Once settled it is read again, and its
-responses are `immutable`. With no events yet no frame settles, and while
-ingest is stalled none within that hour of the newest event, or after it,
-does.
+(`max-age=60, must-revalidate`) rather than being `immutable`, and the
+frame is read again after each refresh that finds a newer event: one window
+read per refresh for each such frame a client asks for again, at most 60
+frames at the one-minute step plus any past the newest event. The frame's
+earlier window and renders stay in their caches until evicted. An event
+written late while no newer one arrives is drawn once one does, or once
+the frame settles. A settling frame is read once more, its responses are
+`immutable`, and later refreshes keep its read. With no events yet no
+frame settles, and while ingest is stalled none within that hour of the
+newest event, or after it, does.
 
 WMS GetFeatureInfo answers the events of the frame's window whose drawn
 disc covers the clicked pixel, newest first, with their time, id, the

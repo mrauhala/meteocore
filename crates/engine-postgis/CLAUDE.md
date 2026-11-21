@@ -437,6 +437,17 @@ in step when changing this lifecycle.
   Features ones plus `feature_id` last, its `<id>@<time>` key
   (`EventRecord::into_picked`, #1446), so a client can read it back at
   `/items/{featureId}`. Never change the pick's id itself.
+- **An events frame's version is `maps::frame_version` (#1421, #1432)**,
+  the one value `content_version_for` reports and the strike-window cache
+  keys on (`maps::window_key`): `0` once the frame ends an hour or more
+  before the snapshot's newest strike (settled; the only `immutable` frame,
+  its key kept over every later refresh), else the newest strike's time in
+  microseconds (never `0`), so each refresh that brings a newer strike
+  reads an unsettled frame again, and `1` before any strike. From the
+  snapshot, never a query. Settling always changes the key, so a window
+  read before a frame settled is never the one it draws `immutable`. Never
+  key the window or report the version any other way: they would drift.
+  `maps::frame_window` is the window both the frame and the pick read.
 
 ## Features on the events shape (#503)
 
@@ -516,6 +527,12 @@ in step when changing this lifecycle.
   station layer through `MapEngine::get_raster_tile` on a blocking thread:
   latest value within `max_age`, no marker without one, a late row moving
   `content_version` and then drawn, `draw_missing` nodata markers.
+- `events_frames_follow_late_strikes_until_settled` (#1432,
+  `mc1432_events`) renders the lightning layer the same way: a strike
+  written late into an unsettled frame is drawn from the refresh that
+  brings a newer strike (a refresh without one keeps the version and the
+  read), a settling frame is read again under version `0`, and later
+  refreshes keep it.
 - `value_filters_{long,wide,per_parameter}_shape` (#1210, `mc1210_*`
   schemas): a sentinel inside the range, an out-of-range value and NaN are
   null in the location query's and both area paths' series with their times

@@ -24,19 +24,18 @@
 //! `get_raster_tile` up to ~200 times per viewport, so per-tile queries
 //! would hammer the pool. [`strike_window_cache`] (byte-bounded, #480,
 //! single-flight) holds decoded strike windows keyed
-//! `(collection, start, end, settled)`. A frame is settled an hour before
-//! the newest strike ([`frame_is_settled`], #1421): strikes can land late
-//! until then, so a window read earlier is never reused for the settled
-//! frame, which keeps content version `0` and is the only frame the API
-//! layers pin `immutable`. Staleness bounds for the live edge: an EXPLICIT
-//! TIME frame is bounded by the 1-minute quantum (a new minute ⇒ a new key),
-//! while a TIME-omitted request resolves to the latest ADVERTISED step —
-//! rebuilt on the metadata refresh cadence (`metadata_refresh_secs`,
-//! default 300; set 60 for a live lightning collection). Real-time
-//! clients should pass explicit TIME, like the animation clients do. An
-//! unsettled frame keeps the strikes its first read found until it
-//! settles: its responses revalidate, but get those same strikes until
-//! then.
+//! `(collection, start, end, version)`, the frame's content version
+//! ([`frame_version`]). A frame is settled an hour before the newest strike
+//! ([`frame_is_settled`], #1421) and then keeps version `0`, the only frame
+//! the API layers pin `immutable`. Until then strikes can land late, so its
+//! version moves with the newest strike the metadata snapshot holds
+//! (#1432): each refresh that brings a newer strike reads a frame a client
+//! asks for again, and a window read before the frame settled is never
+//! reused for it. Staleness bound for the live edge: an unsettled frame
+//! draws what its first read since the last refresh that brought a newer
+//! strike found (`metadata_refresh_secs`, default 300; set 60 for a live
+//! lightning collection), and a TIME-omitted request resolves to the
+//! latest ADVERTISED step, rebuilt on each refresh.
 
 use std::sync::{Arc, OnceLock};
 
@@ -186,11 +185,46 @@ pub(crate) fn resolve_window_end(
     ds_core::station_map::resolve_frame_end(&meta.wms_times, time, step)
 }
 
-/// The content version of an events frame strikes can still land in
-/// (#1421): never `0`, so the API layers send it with a short, revalidating
-/// `Cache-Control`. One value for every such frame, so its cached renders
-/// are not orphaned while it waits; it changes once, to `0`, as it settles.
-const UNSETTLED_FRAME_VERSION: u64 = 1;
+/// The strikes one events frame draws, and GetFeatureInfo picks from: those
+/// of the `default_datetime` window ending at the frame's end, one hour
+/// unless configured.
+pub(crate) fn frame_window(cfg: &PostgisEngineConfig) -> Duration {
+    cfg.events_default_window
+        .unwrap_or_else(|| Duration::hours(crate::config::DEFAULT_EVENTS_WINDOW_HOURS))
+}
+
+/// The content version of every events frame while the table holds no
+/// strike (#1421): no frame is settled then, and none has a newest strike
+/// to follow.
+const NO_STRIKE_FRAME_VERSION: u64 = 1;
+
+/// The content version of the events frame ending at `end`: what
+/// `content_version_for` reports for it, and what its strike window is
+/// cached under ([`window_key`]). From the snapshot alone, so O(1) on the
+/// render path (root CLAUDE.md Critical Rule 10).
+///
+/// - `0` once the frame is settled ([`frame_is_settled`], #1421): the
+///   only frame the API layers pin `immutable`. It never moves again, so a
+///   settled frame keeps its cached renders and window across refreshes.
+/// - While strikes can still land in it, the newest strike's time in
+///   microseconds, never `0` (#1432). It moves with each refresh that
+///   brings a newer strike, so a frame a client asks for again is read
+///   again and its renders keyed anew, and it holds over a refresh that
+///   found nothing new. A strike written late while no newer one arrives
+///   moves nothing: the frame draws it once a newer strike comes in, or
+///   once it settles.
+/// - [`NO_STRIKE_FRAME_VERSION`] before the first strike.
+///
+/// Settling therefore always changes the key: a window read before a frame
+/// settled, under a nonzero version, is never the one its `immutable`
+/// responses draw.
+pub(crate) fn frame_version(meta: &CollectionMeta, end: DateTime<Utc>) -> u64 {
+    match meta.temporal_extent {
+        None => NO_STRIKE_FRAME_VERSION,
+        Some(_) if frame_is_settled(meta, end) => 0,
+        Some((_, newest)) => (newest.timestamp_micros() as u64).max(1),
+    }
+}
 
 /// Whether the events frame ending at `end` is settled (#1421): it ends at
 /// least [`ds_core::http_cache::settled_horizon`] (an hour, the late-arrival
@@ -213,11 +247,13 @@ pub(crate) fn frame_is_settled(meta: &CollectionMeta, end: DateTime<Utc>) -> boo
 /// sharing the process AND invalidates naturally when a reload repoints a
 /// collection id at a different table or database — the collection id alone
 /// would keep serving the old table's cached windows until eviction.
-/// The last component is whether the window's frame was settled when it was
-/// read ([`frame_is_settled`], #1421): a settled frame, which the API layers
-/// pin `immutable`, never draws a window read while strikes could still land
-/// in it. Weight: see [`strike_window_weight`].
-type WindowKey = (String, DateTime<Utc>, DateTime<Utc>, bool);
+/// The last component is the frame's content version when the window was
+/// read ([`frame_version`]): `0` once settled (#1421), so a settled frame,
+/// which the API layers pin `immutable`, never draws a window read while
+/// strikes could still land in it; the newest strike's time before that
+/// (#1432), so a refresh that brings a newer strike reads an unsettled frame
+/// again. Weight: see [`strike_window_weight`].
+type WindowKey = (String, DateTime<Utc>, DateTime<Utc>, u64);
 
 /// The cache-key source component: collection id + qualified table + pool
 /// identity (`<user>@<host>:<port>/<db>` or the configured `pool_label`).
@@ -228,6 +264,24 @@ fn window_key_source(engine: &PostgisEngine, shape: &EventsShape) -> String {
         shape.table.schema,
         shape.table.table,
         engine.pool_key_label()
+    )
+}
+
+/// The strike window the events frame ending at `end` draws, `(end −
+/// window, end]`, under the snapshot `meta`: the key [`fetch_window`] reads
+/// it by, versioned by the same [`frame_version`] the frame's
+/// `content_version_for` reports.
+pub(crate) fn window_key(
+    engine: &PostgisEngine,
+    shape: &EventsShape,
+    meta: &CollectionMeta,
+    end: DateTime<Utc>,
+) -> WindowKey {
+    (
+        window_key_source(engine, shape),
+        end - frame_window(engine.config()),
+        end,
+        frame_version(meta, end),
     )
 }
 
@@ -306,18 +360,16 @@ pub(crate) fn block_on_from_blocking<F: std::future::Future>(
     }
 }
 
-/// Fetch (or reuse) the strike window `(start, end]` for this collection.
-/// Single-flight per key: concurrent meta-tile renders of one frame share
-/// one DB query. `settled` is [`frame_is_settled`] for the frame.
+/// Fetch (or reuse) the strike window `(start, end]` of `key`
+/// ([`window_key`]). Single-flight per key: concurrent meta-tile renders of
+/// one frame share one DB query.
 fn fetch_window(
     engine: &PostgisEngine,
     shape: &EventsShape,
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    settled: bool,
+    key: WindowKey,
 ) -> Result<Arc<Vec<Strike>>, DataServerError> {
     engine.require_validated()?;
-    let key: WindowKey = (window_key_source(engine, shape), start, end, settled);
+    let (_, start, end, _) = key;
     strike_window_cache().get_or_insert_with(&key, || {
         let built = build_events_window(
             shape,
@@ -477,12 +529,7 @@ impl MapEngine for PostgisEngine {
         let end = resolve_window_end(&meta, time, EVENTS_TIME_STEP).ok_or_else(|| {
             DataServerError::Engine("no event data available for the requested time".into())
         })?;
-        let window = self
-            .config()
-            .events_default_window
-            .unwrap_or_else(|| Duration::hours(crate::config::DEFAULT_EVENTS_WINDOW_HOURS));
-        let settled = frame_is_settled(&meta, end);
-        let strikes = fetch_window(self, &shape, end - window, end, settled)?;
+        let strikes = fetch_window(self, &shape, window_key(self, &shape, &meta, end))?;
         Ok(splat_strikes(
             &strikes, end, bbox, width, height, output_crs,
         ))
@@ -533,11 +580,13 @@ impl MapEngine for PostgisEngine {
         }
     }
 
-    /// An events frame is `0` once settled ([`frame_is_settled`]), and
-    /// [`UNSETTLED_FRAME_VERSION`] while strikes can still land in it, so
-    /// only a settled frame is ever `immutable` (#1421). `time` is the
-    /// window end the API layers resolved with `resolve_time`. The station
-    /// layers keep their collection-wide fingerprint.
+    /// An events frame's [`frame_version`], the version its strike window
+    /// is read under: `0` once settled, so only a settled frame is ever
+    /// `immutable` (#1421), and while strikes can still land in it a value
+    /// that moves with the newest strike (#1432). `time` is the window end
+    /// the API layers resolved with `resolve_time`, the one
+    /// `get_raster_tile` draws. The station layers keep their
+    /// collection-wide fingerprint.
     fn content_version_for(
         &self,
         _parameter: Option<&str>,
@@ -549,8 +598,9 @@ impl MapEngine for PostgisEngine {
             return self.content_version();
         }
         match time {
-            Some(end) if frame_is_settled(&self.cache().load(), end) => 0,
-            _ => UNSETTLED_FRAME_VERSION,
+            Some(end) => frame_version(&self.cache().load(), end),
+            // No frame to draw yet: the render errors and caches nothing.
+            None => NO_STRIKE_FRAME_VERSION,
         }
     }
 
@@ -597,7 +647,7 @@ mod tests {
             "lightning|public.strikes|pool".into(),
             ts("2026-07-11T20:00:00Z"),
             ts("2026-07-11T20:20:00Z"),
-            true,
+            0,
         );
         // Reserved for 100 rows; 40 had an empty geometry and were skipped.
         let mut strikes = Vec::with_capacity(100);
