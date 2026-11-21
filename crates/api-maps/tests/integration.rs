@@ -4921,6 +4921,35 @@ mod part1 {
         }
     }
 
+    /// A projected box wholly outside its CRS's valid area is the empty map,
+    /// as WMS GetMap answers it, drawn without calling the engine; one whose
+    /// edges miss the LAEA disk inside it stays a 400 (#1101).
+    #[tokio::test]
+    async fn a_box_outside_its_projection_is_the_empty_map() {
+        let engine = radar();
+        let app = build_router_with_engine(engine.clone());
+        for (crs, bbox) in [
+            ("EPSG:3035", "20000000,20000000,21000000,21000000"),
+            ("EPSG:3067", "0,21000000,1000000,22000000"),
+        ] {
+            let uri = format!(
+                "/collections/radar/map?crs={crs}&bbox-crs={crs}&bbox={bbox}&width=64&height=48"
+            );
+            let (status, headers, body) = fetch(&app, &uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(png_size(&body), (64, 48), "{uri}");
+            assert_eq!(header(&headers, "content-bbox"), Some(bbox), "{uri}");
+        }
+        assert!(engine.renders().is_empty(), "{:?}", engine.renders().len());
+        let (status, _, _) = fetch(
+            &app,
+            "/collections/radar/map?crs=EPSG:3035&bbox-crs=EPSG:3035\
+             &bbox=-20000000,-20000000,30000000,30000000&width=64&height=64",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     /// One side given: the other keeps square pixels over the area.
     #[tokio::test]
     async fn an_omitted_side_keeps_square_pixels() {
@@ -6274,6 +6303,16 @@ mod background {
                 assert_eq!(reply.status, StatusCode::OK, "{uri}");
                 assert_eq!(reply.x_cache, "EMPTY", "{uri}");
                 assert_eq!(pixels(&reply.body), vec![void; 32], "{uri}");
+                // A projected box wholly outside its CRS is all void too
+                // (#1101), with no read window to paint from.
+                let outside = format!(
+                    "/collections/radar/map?crs=EPSG:3035&bbox-crs=EPSG:3035\
+                     &bbox=20000000,20000000,21000000,21000000&width=8&height=4{query}"
+                );
+                let reply = fetch(&app, &outside).await;
+                assert_eq!(reply.status, StatusCode::OK, "{outside}");
+                assert_eq!(reply.x_cache, "EMPTY", "{outside}");
+                assert_eq!(pixels(&reply.body), vec![void; 32], "{outside}");
             }
         }
     }

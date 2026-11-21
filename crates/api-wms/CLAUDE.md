@@ -118,7 +118,9 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   `wgs84_envelope`, which samples the box's edges and adds a pole the box
   holds and, for EPSG:3067, where its area's edges enter and leave it
   (`geo::area_edge_points`). Wholly outside is the empty image, with read
-  window `NO_READ_WINDOW` (NaN, never read). An envelope of `None` for any
+  window `NO_READ_WINDOW` (NaN, never read), which `api_common::map_frame`
+  holds: OGC API Maps answers such a frame with the empty map too, through
+  `Frame::render_target` (#1101). An envelope of `None` for any
   other box means the edges miss a valid area inside it: an EPSG:3035 box
   wider than the disk, or a tall one crossing the disk between samples.
   That stays `InvalidParameterValue`: there is no read window, and a global

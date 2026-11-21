@@ -263,6 +263,13 @@ pub struct Frame {
     rect: [f64; 4],
 }
 
+/// The WGS84 read window of a projected frame wholly outside its CRS's
+/// valid area, which has none: NaN, which names no place. Never read: the
+/// frame's `OutputCrs::domain_rows` is `None`, so WMS GetMap and Maps draw
+/// the empty map without calling the engine (#1089, #1101). The rendered
+/// cache keys a projected frame on its metres, not on this.
+pub const NO_READ_WINDOW: [f64; 4] = [f64::NAN; 4];
+
 /// Why a box has no frame in the requested CRS.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameError {
@@ -272,8 +279,9 @@ pub enum FrameError {
     /// LAEA disk. Both projected CRSs' inverses are `None` past their area,
     /// EPSG:3067's past a pole's northing or an easting k₀ times a quarter
     /// meridian from its meridian (#1113, #1130), so no box wholly outside
-    /// has an envelope, here or in [`Frame::render_target`], and Maps
-    /// answers 400 for it. Every EPSG:3067 box that meets the area has one,
+    /// has an envelope here, and Maps answers 400 for a box it cannot
+    /// frame. A frame already in its CRS that lies wholly outside is the
+    /// empty map instead ([`Frame::render_target`]). Every EPSG:3067 box that meets the area has one,
     /// a box around the whole area too: the area's edges bound it
     /// (`geo::area_edge_points`).
     OutsideDomain,
@@ -374,15 +382,28 @@ impl Frame {
 
     /// The `get_raster_tile` viewport and output CRS: for a projected CRS the
     /// longitude/latitude envelope the engine reads, with the metres frame
-    /// carried in [`OutputCrs::Projected`]. `None` when the frame's edge
-    /// samples all miss its CRS's valid area, as for [`FrameError::OutsideDomain`].
+    /// carried in [`OutputCrs::Projected`].
+    ///
+    /// A projected frame wholly outside its CRS's valid area
+    /// ([`geo::outside_projection_domain`]) is an empty map, as WMS GetMap
+    /// serves (#1089, #1101): its read window is [`NO_READ_WINDOW`], and its
+    /// `OutputCrs::domain_rows` is `None`, so the map is drawn without
+    /// calling the engine. `None` when the frame meets the valid area but
+    /// its edge samples all miss it, which lies inside the frame then: an
+    /// EPSG:3035 box wider than the LAEA disk. The edges give no read
+    /// window, and a global one would read whole datasets.
     pub fn render_target(&self) -> Option<([f64; 4], OutputCrs)> {
         match self.crs {
             MapCrs::Crs84 | MapCrs::Epsg4326 => Some((self.rect, OutputCrs::Wgs84)),
             MapCrs::Epsg3857 => Some((self.rect, OutputCrs::WebMercator)),
             MapCrs::Epsg3067 | MapCrs::Epsg3035 => {
                 let crs = self.crs.projection()?;
-                let read = geo::wgs84_envelope(&crs, self.rect)?;
+                // Asked before the envelope, which such a frame has none of.
+                let read = if geo::outside_projection_domain(&crs, self.rect) {
+                    NO_READ_WINDOW
+                } else {
+                    geo::wgs84_envelope(&crs, self.rect)?
+                };
                 Some((
                     read,
                     OutputCrs::Projected {

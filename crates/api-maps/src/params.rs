@@ -884,11 +884,16 @@ impl MapRequest {
                 out.code()
             ))
         })?;
-        // None means the projected frame is entirely outside the CRS's valid
-        // domain — reject (400) rather than reading a global window.
-        let (bbox, output_crs) = frame
-            .render_target()
-            .ok_or_else(|| bad("bbox is outside the valid area of the requested crs"))?;
+        // A frame wholly outside its CRS's valid area is the empty map
+        // (#1101). `None` means the frame's edges miss a valid area that lies
+        // inside it: reject (400) rather than reading a global window.
+        let (bbox, output_crs) = frame.render_target().ok_or_else(|| {
+            bad(format!(
+                "the map area's edges miss the valid area of {} inside it: request a smaller \
+                 bbox",
+                out.code()
+            ))
+        })?;
         Ok(MapView {
             frame,
             width,
@@ -1280,8 +1285,10 @@ mod tests {
 
     /// EPSG:3067's inverse ends at the poles' northings and at eastings
     /// 9 997 964.943 m from 27°E's 500 000 m (#1113, #1130). A box wholly
-    /// past that has no read window: 400, as for an EPSG:3035 box past the
-    /// LAEA disk. A box holding a pole reads up to it and 90° either side of
+    /// past that has no read window and is the empty map, drawn without the
+    /// engine, as is an EPSG:3035 box past the LAEA disk (#1101). One that
+    /// encloses the disk is a 400: its edges give no read window. A box
+    /// holding a pole reads up to it and 90° either side of
     /// 27°E, and the default map of a global collection, whose frame holds
     /// both and the area's east and west edges, reads the whole area. A box
     /// the area's east edge crosses reads up to it. Its bounds are PROJ
@@ -1305,14 +1312,30 @@ mod tests {
             ("EPSG:3067", "11000000,6500000,12000000,7000000"),
             ("EPSG:3035", "20000000,20000000,21000000,21000000"),
         ] {
-            let Err(MapsError::BadRequest(message)) = view(in_crs(crs, bbox), &NONE) else {
-                panic!("{crs} {bbox}: no 400");
+            let view = view(in_crs(crs, bbox), &NONE).unwrap();
+            assert!(view.bbox.iter().all(|v| v.is_nan()), "{crs} {bbox}");
+            let plane: Vec<f64> = bbox.split(',').map(|v| v.parse().unwrap()).collect();
+            let OutputCrs::Projected { bbox: frame, .. } = view.output_crs else {
+                panic!("{crs} {bbox}: not projected");
             };
-            assert_eq!(
-                message, "bbox is outside the valid area of the requested crs",
-                "{crs} {bbox}"
-            );
+            assert_eq!(frame.to_vec(), plane, "{crs} {bbox}");
+            assert!(view
+                .output_crs
+                .domain_rows(view.bbox, view.height)
+                .is_none());
         }
+        // Wider than the LAEA disk all round: its edges miss the disk inside.
+        let Err(MapsError::BadRequest(message)) = view(
+            in_crs("EPSG:3035", "-20000000,-20000000,30000000,30000000"),
+            &NONE,
+        ) else {
+            panic!("a box around the LAEA disk: no 400");
+        };
+        assert_eq!(
+            message,
+            "the map area's edges miss the valid area of EPSG:3035 inside it: request a \
+             smaller bbox"
+        );
         let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
         let polar = view(
             in_crs("EPSG:3067", "-1000000,6000000,2000000,10500000"),
