@@ -72,7 +72,7 @@ runtime).
   `&[f32]` field would cost a full-field strided read per tile.
 - A global lat/lon grid on a tile holding a pole meets its map's budget by
   splitting only the cells around the pole, down to a pixel: beside the
-  pole the bilinear column map converges only linearly. About 30 k
+  pole the bilinear column map converges only linearly. About 37 k
   projections per 256 px tile where refining the whole grid took 1.49 M
   (#1195); the cost is `ProjectionGrid`'s, shared by engine-grib and every
   `SourceGrid` (see `engine/global_tests.rs`).

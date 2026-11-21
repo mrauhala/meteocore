@@ -20,8 +20,8 @@
 //! [`MAX_INTERP_ERROR_PX`] — well under the 0.5 px that nearest-neighbour
 //! resampling can resolve. See the `grid_matches_exact_*` tests. A global
 //! source's grid ([`ProjectionGrid::build_2d_periodic`]) refines the cells
-//! near a pole on their own, splitting each in four until it meets the
-//! budget, rather than refining the whole grid for them (#1195).
+//! near a pole on their own, splitting each in four until it meets a
+//! tighter estimate, rather than refining the whole grid for them (#1195).
 //!
 //! The grid is engine-agnostic: it interpolates only the output→source
 //! *coordinate* map, never the data values (so nearest-neighbour callers stay
@@ -68,6 +68,17 @@ const BOUNDARY_STEP_PX: f64 = 2.0;
 /// once the estimated error over the on-raster region drops below this. Kept
 /// well under the 0.5 px resolution of nearest-neighbour resampling.
 const MAX_INTERP_ERROR_PX: f64 = 0.2;
+
+/// The estimated error a cell split near a pole is split down to
+/// ([`ProjectionGrid::refine_locally`]), in output pixels: two thirds of
+/// [`MAX_INTERP_ERROR_PX`] (#1195). Beside a pole the error grows as the
+/// inverse of the distance to it, so it peaks on a cell's side nearest the
+/// pole, past the outermost probes ([`PROBE_FRACS`]): there a cell meeting
+/// the estimate was measured up to 1.34 times it. Refined as a whole, every
+/// cell near a pole was split so far that this never showed; split on its
+/// own, each would stop at the estimate. A third in hand keeps the true
+/// error within the budget.
+const NEAR_POLE_ERROR_PX: f64 = MAX_INTERP_ERROR_PX * 2.0 / 3.0;
 
 /// The smallest cell [`ProjectionGrid::refine_locally`] splits, in output
 /// pixels. A cell a pixel wide holds one pixel centre along that axis, so
@@ -156,9 +167,9 @@ pub struct ProjectionGrid {
     /// The quadtrees of the cells refined locally.
     quads: Vec<Quad>,
     /// The estimated interpolation error, in the budget's units, when
-    /// refinement stopped at [`MAX_CELLS`] above [`MAX_INTERP_ERROR_PX`], or
-    /// a periodic grid's local refinement stopped above it.
-    capped: Option<f64>,
+    /// refinement stopped above [`MAX_INTERP_ERROR_PX`], and what stopped
+    /// it.
+    capped: Option<(f64, Limits)>,
 }
 
 /// A node of a locally refined cell's quadtree ([`ProjectionGrid::refine_locally`]).
@@ -233,25 +244,76 @@ fn unwrap_cols(mut corners: [(f64, f64); 4], col_period: Option<f64>) -> [(f64, 
     corners
 }
 
-/// Whether a cell's corners `[c00, c10, c01, c11]` bracket a pole of a
-/// periodic column axis: some edge turns more than a quarter of the period.
-/// Around a pole every longitude meets, so the column is singular there and
-/// has no bilinear interpolant — a cell enclosing one winds a whole turn,
-/// and one with the pole on an edge turns half a turn along it. Refining
-/// never resolves such a cell (the geometry is self-similar around the
-/// pole), so it is left out of the error estimate and split down to the
-/// smallest local cell ([`ProjectionGrid::refine_locally`]), confining the
-/// singularity to a pixel. Always `false` without a period or with a
-/// non-finite corner.
-fn brackets_pole(corners: &[(f64, f64); 4], col_period: Option<f64>) -> bool {
-    let Some(p) = col_period else {
-        return false;
-    };
-    let [c00, c10, c01, c11] = corners.map(|c| c.0);
-    [(c00, c10), (c10, c11), (c11, c01), (c01, c00)]
-        .iter()
-        .any(|&(a, b)| wrap_half(b - a, p).abs() > p / 4.0)
+/// Whether column `col`, a fraction `t` of the way along a side whose
+/// column runs from `from` and turns `turn`, strays from the line between
+/// its ends by more than a 64th of the turn, modulo the period `p`: beside a
+/// pole it strays by at least a 22nd ([`ProjectionGrid::brackets_pole`]).
+/// A non-finite column strays.
+fn strays(col: f64, from: f64, turn: f64, t: f64, p: f64) -> bool {
+    let off = wrap_half(col - (from + t * turn), p).abs();
+    off.is_nan() || off > turn.abs() / 64.0
 }
+
+/// What stopped a grid's refinement over budget ([`ProjectionGrid::capped_error`]):
+/// every limit that left a cell over it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Limits {
+    /// The whole grid reached [`MAX_CELLS`].
+    cells: bool,
+    /// A cell near a pole could not be split further: it is
+    /// [`MIN_LOCAL_CELL_PX`] wide, or beside a domain edge.
+    smallest: bool,
+    /// The local splits near a pole spent their projections.
+    splits: bool,
+}
+
+/// One of [`Limits`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Limit {
+    Cells,
+    Smallest,
+    Splits,
+}
+
+/// A cell [`ProjectionGrid::refine_locally`] has yet to split, ordered so
+/// the worst comes first and a cell bracketing a pole before any other.
+struct Pending {
+    /// The estimated error, `None` bracketing a pole.
+    error: Option<f64>,
+    /// Its leaf in [`ProjectionGrid::quads`].
+    quad: u32,
+    /// Its column, row and depth.
+    cell: (usize, usize, u32),
+    corners: [(f64, f64); 4],
+}
+
+impl Pending {
+    fn key(&self) -> f64 {
+        self.error.unwrap_or(f64::INFINITY)
+    }
+}
+
+impl Ord for Pending {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key()
+            .total_cmp(&other.key())
+            .then_with(|| other.quad.cmp(&self.quad))
+    }
+}
+
+impl PartialOrd for Pending {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Pending {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Pending {}
 
 impl ProjectionGrid {
     /// Build the grid for an output image of `out_width`×`out_height` pixels
@@ -349,11 +411,16 @@ impl ProjectionGrid {
     /// [`MAX_CELLS`], a million and a half projections, to resolve a few
     /// pixels around it (#1195). So the whole grid refines only until every
     /// cell farther than [`POLE_REACH`] from a pole meets the budget; the
-    /// cells nearer it that do not, and the cells bracketing it, which are
-    /// left out of the estimate, are split on their own
-    /// ([`Self::refine_locally`]). The budget holds everywhere but in the
-    /// pixel-sized cells that bracket the pole. A grid without a pole is
-    /// refined as a whole, cell for cell as before.
+    /// cells nearer it over [`NEAR_POLE_ERROR_PX`], and the cells bracketing
+    /// it, which are left out of the estimate, are split on their own
+    /// ([`Self::refine_locally`]), and domain edges near it get sub-grids
+    /// as fine. A pole is found by a cell bracketing it
+    /// ([`Self::brackets_pole`]) or by the row or column of nodes it lies
+    /// beside ([`Self::node_pole_sites`]); one just past a corner of the
+    /// image is not, and refines the whole grid as before. The budget holds
+    /// everywhere, measured per pixel, but in the pixel-sized cells that
+    /// bracket the pole. A grid without a pole is refined as a whole, cell
+    /// for cell as before.
     pub fn build_2d_periodic(
         out_width: u32,
         out_height: u32,
@@ -443,7 +510,7 @@ impl ProjectionGrid {
     /// the grid met it. In source pixels, or output pixels on a periodic
     /// column axis ([`Self::build_2d_periodic`]).
     pub fn capped_error(&self) -> Option<f64> {
-        self.capped
+        self.capped.map(|(error, _)| error)
     }
 
     /// Report a capped grid on stderr, for every constructor but
@@ -452,10 +519,19 @@ impl ProjectionGrid {
     /// tens of degrees) and the consequence is sub-pixel-ish
     /// misregistration, not a failure.
     fn warn_if_capped(self) -> Self {
-        if let Some(error) = self.capped {
+        if let Some((error, limits)) = self.capped {
+            let limit = [
+                (limits.cells, "hit the MAX_CELLS cap"),
+                (limits.smallest, "split cells near a pole as far as they go"),
+                (limits.splits, "spent its split budget near a pole"),
+            ]
+            .into_iter()
+            .filter_map(|(hit, what)| hit.then_some(what))
+            .collect::<Vec<_>>()
+            .join(" and ");
             eprintln!(
-                "WARN ds_core::resample: projection grid hit the MAX_CELLS \
-                 cap with interpolation error {error:.3} px > budget \
+                "WARN ds_core::resample: projection grid {limit} with \
+                 interpolation error {error:.3} px > budget \
                  {MAX_INTERP_ERROR_PX} px; rendered output may be slightly \
                  misregistered for this viewport"
             );
@@ -497,11 +573,13 @@ impl ProjectionGrid {
             );
             let errors =
                 grid.cell_errors((src_cols, src_rows), read, &out_to_world, &world_to_src_px);
-            // Where the cells bracketing a pole lie, in output pixels.
-            let poles: Vec<_> = (0..errors.len())
+            // Where the cells bracketing a pole lie, in output pixels, and
+            // the nodes a pole lies beside.
+            let mut poles: Vec<_> = (0..errors.len())
                 .filter(|&k| errors[k].is_none())
                 .map(|k| grid.cell_site(k % grid.cells_x, k / grid.cells_x))
                 .collect();
+            poles.extend(grid.node_pole_sites(&out_to_world, &world_to_src_px));
             // Once its cells are small enough, a cell near a pole is left to
             // `refine_locally` (#1195): there the error falls only as fast
             // as a cell's size, and refining the whole grid pays for every
@@ -537,8 +615,14 @@ impl ProjectionGrid {
             &out_to_world,
             &world_to_src_px,
         );
-        grid.capped = (error > MAX_INTERP_ERROR_PX).then_some(error);
-        grid.refine_boundary(out_width, out_height, read, &out_to_world, &world_to_src_px);
+        grid.capped = (error.0 > MAX_INTERP_ERROR_PX).then_some(error);
+        grid.refine_boundary(
+            (out_width, out_height),
+            read,
+            (&poles, reach),
+            &out_to_world,
+            &world_to_src_px,
+        );
         grid
     }
 
@@ -552,6 +636,58 @@ impl ProjectionGrid {
         )
     }
 
+    /// The sites of the nodes a pole lies beside, with no cell bracketing
+    /// it: a pole just past a node on the image's edge, or on the edge of
+    /// the output CRS's domain, as EPSG:3067's pole is on a tile centred on
+    /// its central meridian. The two sides of a row or a column meeting at
+    /// such a node turn more than a quarter turn between them, though
+    /// neither does alone, and their column does not run linearly from end
+    /// to end (see [`Self::brackets_pole`]): two projections, at the sides'
+    /// midpoints, for each such pair, none for any other. A site's reach is
+    /// half a cell's diagonal.
+    fn node_pole_sites(
+        &self,
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> Vec<(f64, f64, f64)> {
+        let Some(p) = self.col_period else {
+            return Vec::new();
+        };
+        let reach = self.cell_w.hypot(self.cell_h) / 2.0;
+        let (nx, ny) = (self.cells_x as f64, self.cells_y as f64);
+        let column = |i: usize, j: usize| self.nodes[j * self.stride + i].0;
+        let mut sites = Vec::new();
+        for j in 0..=self.cells_y {
+            for i in 0..=self.cells_x {
+                let mut pairs = Vec::with_capacity(2);
+                if i > 0 && i < self.cells_x {
+                    pairs.push(((i - 1, j), (i + 1, j)));
+                }
+                if j > 0 && j < self.cells_y {
+                    pairs.push(((i, j - 1), (i, j + 1)));
+                }
+                let beside = pairs.into_iter().any(|((i0, j0), (i1, j1))| {
+                    let (a, m, b) = (column(i0, j0), column(i, j), column(i1, j1));
+                    let turn = wrap_half(m - a, p) + wrap_half(b - m, p);
+                    turn.abs() > p / 4.0
+                        && [0.25, 0.75].iter().any(|&t| {
+                            let (x, y) = (
+                                i0 as f64 + 2.0 * t * (i1 as f64 - i0 as f64) / 2.0,
+                                j0 as f64 + 2.0 * t * (j1 as f64 - j0 as f64) / 2.0,
+                            );
+                            let (lon, lat) = out_to_world(x / nx, y / ny);
+                            let col = world_to_src_px(lon, lat).0;
+                            strays(col, a, turn, t, p)
+                        })
+                });
+                if beside {
+                    sites.push((i as f64 * self.cell_w, j as f64 * self.cell_h, reach));
+                }
+            }
+        }
+        sites
+    }
+
     /// Whether some pixel of cell `(cx, cy)` lies within `reach` output
     /// pixels ([`POLE_REACH`]) of a cell bracketing a pole, `poles` their
     /// [`Self::cell_site`]s.
@@ -563,9 +699,11 @@ impl ProjectionGrid {
     }
 
     /// Split the cells bracketing a pole of a periodic column axis, and the
-    /// cells near one ([`Self::near_pole`]) over budget, in four, then
-    /// their children over budget, until every cell meets it or is
-    /// [`MIN_LOCAL_CELL_PX`] wide (#1195). `errors` are the grid's
+    /// cells near one ([`Self::near_pole`]) over [`NEAR_POLE_ERROR_PX`], in
+    /// four, then their children over it, until every cell meets it or is
+    /// [`MIN_LOCAL_CELL_PX`] wide (#1195). The worst cell is split first,
+    /// a cell bracketing a pole before any, so a spent budget leaves the
+    /// least error it can and never a pole's cells coarse. `errors` are the grid's
     /// [`Self::cell_errors`], `poles` the [`Self::cell_site`]s of the cells
     /// bracketing a pole, and `reach` [`POLE_REACH`] in output pixels. A
     /// child is the cell of the grid refined as a whole that it covers, with
@@ -581,7 +719,8 @@ impl ProjectionGrid {
     /// of [`MAX_CELLS`], whichever is more, so this stays a coarse mapping
     /// (Critical Rule 5). A cell whose new nodes are not all finite stays
     /// whole. Returns the largest estimated error of the cells not split
-    /// and of the leaves, but for those bracketing a pole.
+    /// and of the leaves, but for those bracketing a pole, and every limit
+    /// that left one over budget.
     fn refine_locally(
         &mut self,
         (out_width, out_height): (u32, u32),
@@ -590,93 +729,107 @@ impl ProjectionGrid {
         (poles, reach): (&[(f64, f64, f64)], f64),
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
-    ) -> f64 {
+    ) -> (f64, Limits) {
         let finite = |(c, r): (f64, f64)| c.is_finite() && r.is_finite();
         let floor = |out: u32| (f64::from(out) / f64::from(MAX_CELLS)).min(MIN_LOCAL_CELL_PX);
         let (floor_w, floor_h) = (floor(out_width), floor(out_height));
         let cap = MAX_CELLS as usize * MAX_CELLS as usize;
         let mut budget = (out_width as usize * out_height as usize).max(cap) / 4;
-        let mut worst = 0.0_f64;
+        // The largest error left, and what left a cell over budget.
+        let mut worst = (0.0_f64, Limits::default());
+        let mut leave = |error: Option<f64>, limit: Limit| {
+            let error = error.unwrap_or(0.0);
+            worst.0 = worst.0.max(error);
+            if error > MAX_INTERP_ERROR_PX {
+                let limits = &mut worst.1;
+                match limit {
+                    Limit::Cells => limits.cells = true,
+                    Limit::Smallest => limits.smallest = true,
+                    Limit::Splits => limits.splits = true,
+                }
+            }
+        };
         let mut roots = Vec::new();
         for (k, &error) in errors.iter().enumerate() {
             let (cx, cy) = (k % self.cells_x, k / self.cells_x);
             let corners = self.corners(cx, cy);
             let split = match error {
                 None => true,
-                Some(e) => e > MAX_INTERP_ERROR_PX && self.near_pole(cx, cy, poles, reach),
+                Some(e) => e > NEAR_POLE_ERROR_PX && self.near_pole(cx, cy, poles, reach),
             };
             if split && corners.into_iter().all(finite) {
                 roots.push((k, corners, error));
             } else {
-                worst = worst.max(error.unwrap_or(0.0));
+                leave(error, Limit::Cells);
             }
         }
         if roots.is_empty() {
             return worst;
         }
-        // Cells to split at this depth: quad, column and row at this
-        // depth, corners, and estimated error (`None` around a pole).
         let mut local = vec![NO_QUAD; self.cells_x * self.cells_y];
-        let mut work = Vec::with_capacity(roots.len());
+        let mut work = std::collections::BinaryHeap::with_capacity(roots.len());
         for (k, corners, error) in roots {
             local[k] = self.quads.len() as u32;
             self.quads.push(Quad::Leaf(corners));
-            work.push((local[k], k % self.cells_x, k / self.cells_x, corners, error));
+            work.push(Pending {
+                error,
+                quad: local[k],
+                cell: (k % self.cells_x, k / self.cells_x, 0),
+                corners,
+            });
         }
-        let mut depth = 0;
-        while !work.is_empty() {
+        while let Some(Pending {
+            error,
+            quad,
+            cell: (cx, cy, depth),
+            corners: [c00, c10, c01, c11],
+        }) = work.pop()
+        {
             let scale = f64::from(1_u32 << depth);
-            let splits = self.cell_w / scale > floor_w || self.cell_h / scale > floor_h;
+            if self.cell_w / scale <= floor_w && self.cell_h / scale <= floor_h {
+                leave(error, Limit::Smallest);
+                continue;
+            }
+            if budget < SPLIT_COST {
+                leave(error, Limit::Splits);
+                continue;
+            }
+            budget -= SPLIT_COST;
             let (nx, ny) = (
                 (self.cells_x << (depth + 1)) as f64,
                 (self.cells_y << (depth + 1)) as f64,
             );
-            let mut next = Vec::new();
-            for (q, cx, cy, [c00, c10, c01, c11], error) in work {
-                if !splits || budget < SPLIT_COST {
-                    worst = worst.max(error.unwrap_or(0.0));
-                    continue;
-                }
-                budget -= SPLIT_COST;
-                let node = |i: usize, j: usize| {
-                    let (lon, lat) =
-                        out_to_world((2 * cx + i) as f64 / nx, (2 * cy + j) as f64 / ny);
-                    world_to_src_px(lon, lat)
-                };
-                let (top, left_mid, centre, right, bottom) =
-                    (node(1, 0), node(0, 1), node(1, 1), node(2, 1), node(1, 2));
-                if ![top, left_mid, centre, right, bottom]
-                    .into_iter()
-                    .all(finite)
-                {
-                    worst = worst.max(error.unwrap_or(0.0));
-                    continue;
-                }
-                self.quads[q as usize] = Quad::Split(self.quads.len() as u32);
-                for (i, j, corners) in [
-                    (0, 0, [c00, top, left_mid, centre]),
-                    (1, 0, [top, c10, centre, right]),
-                    (0, 1, [left_mid, centre, c01, bottom]),
-                    (1, 1, [centre, right, bottom, c11]),
-                ] {
-                    let (cx, cy) = (2 * cx + i, 2 * cy + j);
-                    let error = self.cell_error(
-                        src,
-                        (cx, cy, depth + 1),
+            let node = |i: usize, j: usize| {
+                let (lon, lat) = out_to_world((2 * cx + i) as f64 / nx, (2 * cy + j) as f64 / ny);
+                world_to_src_px(lon, lat)
+            };
+            let (top, left, centre, right, bottom) =
+                (node(1, 0), node(0, 1), node(1, 1), node(2, 1), node(1, 2));
+            if ![top, left, centre, right, bottom].into_iter().all(finite) {
+                leave(error, Limit::Smallest);
+                continue;
+            }
+            self.quads[quad as usize] = Quad::Split(self.quads.len() as u32);
+            for (i, j, corners) in [
+                (0, 0, [c00, top, left, centre]),
+                (1, 0, [top, c10, centre, right]),
+                (0, 1, [left, centre, c01, bottom]),
+                (1, 1, [centre, right, bottom, c11]),
+            ] {
+                let cell = (2 * cx + i, 2 * cy + j, depth + 1);
+                let error = self.cell_error(src, cell, corners, &out_to_world, &world_to_src_px);
+                let quad = self.quads.len() as u32;
+                self.quads.push(Quad::Leaf(corners));
+                match error {
+                    Some(e) if e <= NEAR_POLE_ERROR_PX => leave(error, Limit::Smallest),
+                    _ => work.push(Pending {
+                        error,
+                        quad,
+                        cell,
                         corners,
-                        &out_to_world,
-                        &world_to_src_px,
-                    );
-                    let child = self.quads.len() as u32;
-                    self.quads.push(Quad::Leaf(corners));
-                    match error {
-                        Some(e) if e <= MAX_INTERP_ERROR_PX => worst = worst.max(e),
-                        _ => next.push((child, cx, cy, corners, error)),
-                    }
+                    }),
                 }
             }
-            work = next;
-            depth += 1;
         }
         self.local = local;
         worst
@@ -717,7 +870,10 @@ impl ProjectionGrid {
     /// or from past the grid or the cells `read` holds, where the cell's
     /// own side is probed at the sub-grid spacing. A cell bracketing a
     /// pole is not on a boundary: its corners are finite, and it is
-    /// refined locally ([`Self::refine_locally`]).
+    /// refined locally ([`Self::refine_locally`]). A boundary cell near a
+    /// pole ([`Self::near_pole`]) gets a sub-grid at the smallest local
+    /// cell's spacing instead, as fine as the cells around it: EPSG:3067's
+    /// domain ends on the line through its pole.
     ///
     /// This stays a coarse-grid mapping (Critical Rule 5): a boundary curve
     /// crosses O(perimeter / cell) cells, each costing
@@ -731,21 +887,33 @@ impl ProjectionGrid {
     /// gets none.
     fn refine_boundary(
         &mut self,
-        out_width: u32,
-        out_height: u32,
+        (out_width, out_height): (u32, u32),
         read: Option<(u32, u32, u32, u32)>,
+        (poles, reach): (&[(f64, f64, f64)], f64),
         out_to_world: impl Fn(f64, f64) -> (f64, f64),
         world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
     ) {
         let finite = |(c, r): (f64, f64)| c.is_finite() && r.is_finite();
         let (cells_x, cells_y, stride) = (self.cells_x, self.cells_y, self.stride);
-        let sub_x = (self.cell_w / BOUNDARY_STEP_PX).ceil().max(1.0) as usize;
-        let sub_y = (self.cell_h / BOUNDARY_STEP_PX).ceil().max(1.0) as usize;
-        let per_cell = (sub_x + 1) * (sub_y + 1);
+        // A cell's sub-grid size: steps of `BOUNDARY_STEP_PX`, or, near a
+        // pole, of the smallest local cell, as fine as the cells around it.
+        let floor = |out: u32| (f64::from(out) / f64::from(MAX_CELLS)).min(MIN_LOCAL_CELL_PX);
+        let sub = |cx: usize, cy: usize| {
+            let (step_x, step_y) = if self.near_pole(cx, cy, poles, reach) {
+                (floor(out_width), floor(out_height))
+            } else {
+                (BOUNDARY_STEP_PX, BOUNDARY_STEP_PX)
+            };
+            (
+                (self.cell_w / step_x).ceil().max(1.0) as usize,
+                (self.cell_h / step_y).ceil().max(1.0) as usize,
+            )
+        };
         let mut budget = (out_width as usize * out_height as usize / 4).max(4096);
         let corners = |cx: usize, cy: usize| self.corners(cx, cy);
         // Sub-grid node (i, j) of cell (cx, cy).
         let node = |cx: usize, cy: usize, i: usize, j: usize| {
+            let (sub_x, sub_y) = sub(cx, cy);
             let fx = (cx as f64 + i as f64 / sub_x as f64) / cells_x as f64;
             let fy = (cy as f64 + j as f64 / sub_y as f64) / cells_y as f64;
             let (lon, lat) = out_to_world(fx, fy);
@@ -753,7 +921,7 @@ impl ProjectionGrid {
         };
         // A cell's sides, top, bottom, left and right: the sub-grid nodes
         // between its corners, and the read cell across, if any.
-        let side = |s: usize| -> Vec<(usize, usize)> {
+        let side = |(sub_x, sub_y): (usize, usize), s: usize| -> Vec<(usize, usize)> {
             match s {
                 0 => (1..sub_x).map(|i| (i, 0)).collect(),
                 1 => (1..sub_x).map(|i| (i, sub_y)).collect(),
@@ -783,7 +951,7 @@ impl ProjectionGrid {
                     // The domain can reach in only across a side no other
                     // cell's sub-grid runs along.
                     0 => (0..4).filter(|&s| across(cx, cy, s).is_none()).any(|s| {
-                        let probes = side(s);
+                        let probes = side(sub(cx, cy), s);
                         if probes.len() > budget {
                             return false;
                         }
@@ -803,6 +971,8 @@ impl ProjectionGrid {
         let mut next = 0;
         while let Some(&(cx, cy)) = work.get(next) {
             next += 1;
+            let (sub_x, sub_y) = sub(cx, cy);
+            let per_cell = (sub_x + 1) * (sub_y + 1);
             if per_cell > budget {
                 break;
             }
@@ -822,7 +992,7 @@ impl ProjectionGrid {
                 if queued[y * cells_x + x] || corners(x, y).into_iter().any(finite) {
                     continue;
                 }
-                if side(s)
+                if side((sub_x, sub_y), s)
                     .into_iter()
                     .any(|(i, j)| finite(nodes[j * (sub_x + 1) + i]))
                 {
@@ -915,11 +1085,70 @@ impl ProjectionGrid {
         errors
     }
 
+    /// Whether cell `(i, j)` of this grid refined `depth` times as a whole
+    /// brackets a pole of a periodic column axis. Around a pole every
+    /// longitude meets, so the column is singular there and has no
+    /// bilinear interpolant: a cell enclosing one winds a whole turn, and
+    /// one beside it, with the pole on or just past an edge, turns more than
+    /// a quarter turn along that edge. Refining never resolves such a cell
+    /// (the geometry is self-similar around the pole), so it is left out of
+    /// the error estimate and split down to the smallest local cell
+    /// ([`Self::refine_locally`]), confining the singularity to a pixel.
+    ///
+    /// A cell wide in longitude turns as far with no pole near it, as in a
+    /// geographic view a few cells across a turn, but its column runs
+    /// linearly along the edge. So an edge turning more than a quarter turn
+    /// is the pole's only when its column, two projections at a quarter and
+    /// three quarters of the way, strays from the line between its corners
+    /// by more than a 64th of the turn; beside a pole it strays by at least a
+    /// 22nd. `corners` are unwrapped as [`Self::sample`] interpolates them.
+    /// Always `false` without a period or with a non-finite corner.
+    fn brackets_pole(
+        &self,
+        (i, j, depth): (usize, usize, u32),
+        corners: &[(f64, f64); 4],
+        out_to_world: impl Fn(f64, f64) -> (f64, f64),
+        world_to_src_px: impl Fn(f64, f64) -> (f64, f64),
+    ) -> bool {
+        let Some(p) = self.col_period else {
+            return false;
+        };
+        let [c00, c10, c01, c11] = corners.map(|c| c.0);
+        let (x, y) = (i as f64, j as f64);
+        // The sides in order around the cell, from corner to corner.
+        let sides = [
+            (c00, c10, (x, y), (x + 1.0, y)),
+            (c10, c11, (x + 1.0, y), (x + 1.0, y + 1.0)),
+            (c11, c01, (x + 1.0, y + 1.0), (x, y + 1.0)),
+            (c01, c00, (x, y + 1.0), (x, y)),
+        ];
+        let winding: f64 = sides.iter().map(|&(a, b, ..)| wrap_half(b - a, p)).sum();
+        if winding.abs() > p / 2.0 {
+            return true;
+        }
+        let (cells_x, cells_y) = (
+            (self.cells_x << depth) as f64,
+            (self.cells_y << depth) as f64,
+        );
+        sides.iter().any(|&(a, b, (x0, y0), (x1, y1))| {
+            let turn = b - a;
+            turn.abs() > p / 4.0
+                && [0.25, 0.75].iter().any(|&t| {
+                    let (lon, lat) = out_to_world(
+                        (x0 + t * (x1 - x0)) / cells_x,
+                        (y0 + t * (y1 - y0)) / cells_y,
+                    );
+                    let col = world_to_src_px(lon, lat).0;
+                    strays(col, a, turn, t, p)
+                })
+        })
+    }
+
     /// Estimate the worst-case bilinear-interpolation error, in source
     /// pixels, of cell `(i, j)` of this grid refined `depth` times as a
     /// whole, `cells_x << depth` by `cells_y << depth` cells, whose corner
     /// nodes are `corners`; `None` when it brackets a pole of a periodic
-    /// column axis ([`brackets_pole`]).
+    /// column axis ([`Self::brackets_pole`]).
     ///
     /// It compares the bilinearly-interpolated value against the exact
     /// mapping at a dense regular grid of interior probe points (the
@@ -956,7 +1185,7 @@ impl ProjectionGrid {
         let in_window =
             |c: f64, r: f64| (periodic || (c > -w && c < 2.0 * w)) && r > -h && r < 2.0 * h;
         let corners = unwrap_cols(corners, self.col_period);
-        if brackets_pole(&corners, self.col_period) {
+        if self.brackets_pole((i, j, depth), &corners, &out_to_world, &world_to_src_px) {
             return None;
         }
         // The cells at this depth: halving a size is exact, so these are
@@ -1558,6 +1787,13 @@ mod tests {
         let whole = ProjectionGrid::build_2d(size, size, 100, 100, node, map);
         assert_eq!(within.capped_error(), Some(error));
         assert_eq!(whole.capped_error(), Some(error));
+        assert_eq!(
+            quiet.capped.map(|(_, limits)| limits),
+            Some(Limits {
+                cells: true,
+                ..Limits::default()
+            })
+        );
         // Read short of the jump, the grid meets the budget.
         let short = ProjectionGrid::build_2d_within_quiet(
             size,
@@ -1589,11 +1825,12 @@ mod tests {
     ///
     /// #1195: refined as a whole, the grid met its budget only at
     /// `MAX_CELLS`, 1 485 934 projections (0.45 s in release) to resolve the
-    /// pixels beside the pole. It stops at 32 × 32 cells and splits the 72
-    /// around the pole down to pixel-sized cells: 29 586 projections. Each
-    /// pixel reads the cell of the grid refined as a whole that its leaf
-    /// is, bit for bit, so the pixels beside the pole are the 256-cell
-    /// grid's, and every other pixel is within the budget's estimate.
+    /// pixels beside the pole. It stops at 32 × 32 cells and splits the
+    /// cells around the pole down to pixel-sized cells: 36 644 projections.
+    /// Each pixel reads the cell of the grid refined as a whole that its
+    /// leaf is, bit for bit, so the pixels beside the pole are the 256-cell
+    /// grid's. Its per-pixel error is pinned with the other polar tiles'
+    /// (`polar_tiles_meet_the_budget_at_every_pixel`).
     #[test]
     fn periodic_grid_registers_a_global_source_over_the_pole() {
         use crate::map_engine::OutputCrs;
@@ -1613,7 +1850,7 @@ mod tests {
         let grid =
             ProjectionGrid::build_2d_periodic(size, size, 1440, 721, Some(1440.0), node, to_src);
         assert!(
-            projections.get() < 35_000,
+            projections.get() < 40_000,
             "{} projections",
             projections.get()
         );
@@ -1678,22 +1915,133 @@ mod tests {
                 at(ox, oy)
             );
         }
-        // Every pixel within a quarter of a texel of the exact per-pixel
-        // mapping (the inverse itself is pinned to PROJ in geo's LAEA
-        // test), 0.24 at most, where the budget's estimate is 0.2. Within a
-        // pixel of the pole, its cells interpolated across the singularity,
-        // within one texel: 0.70 at most, as refined as a whole.
-        for oy in 0..size {
-            for ox in 0..size {
-                let (fx, fy) = (ox as f64 + 0.5, oy as f64 + 0.5);
-                let exact = node(fx / size as f64, fy / size as f64);
-                let km = ground_km(at(ox, oy), exact);
-                let limit = if (fx - 56.25).hypot(fy - 205.57) < 1.0 {
-                    4.0
-                } else {
-                    1.0
-                };
-                assert!(km < limit, "pixel ({ox}, {oy}) {km:.2} km off (texel 4 km)");
+    }
+
+    /// #1195: on 256 px tiles of 4 km texels around the North Pole, a global
+    /// 0.25° lat/lon source's grid places every pixel within the 0.2 px
+    /// budget of the exact per-pixel mapping, measured, not estimated, and
+    /// costs a fortieth of refining the whole grid, as it did, to 256 cells
+    /// (1.49 M projections each). Within a pixel of a pole the tile holds,
+    /// its cells are interpolated across the singularity: there within a
+    /// pixel, as refined as a whole (0.72 at most). The tiles: #323's; the
+    /// pole on a node, where four cells meet; the pole 1.5 px past the
+    /// image's left edge, where no cell holds it; and EPSG:3067's tile
+    /// centred on its central meridian, the pole on the edge of the
+    /// projection's domain and on a node column at every density, where
+    /// only the row of nodes below it shows it (`node_pole_sites`).
+    #[test]
+    fn polar_tiles_meet_the_budget_at_every_pixel() {
+        use crate::map_engine::OutputCrs;
+        use std::cell::Cell;
+        let size = 256_u32;
+        let texel = 4000.0;
+        let unit = |(lon, lat): (f64, f64)| {
+            let (l, p) = (lon.to_radians(), lat.to_radians());
+            [p.cos() * l.cos(), p.cos() * l.sin(), p.sin()]
+        };
+        for (epsg, pole, ceiling) in [
+            ("EPSG:3035", (56.25, 205.57), 40_000),
+            ("EPSG:3035", (64.0, 192.0), 40_000),
+            ("EPSG:3035", (-1.5, 128.3), 32_000),
+            ("EPSG:3067", (128.0, 100.6), 35_000),
+        ] {
+            let crs = crate::geo::projected_output_crs(epsg).unwrap();
+            // The tile whose pixel (`pole`) is where the pole projects.
+            let (e, n) = crs.forward(0.0, 90.0);
+            let (west, north) = (e - pole.0 * texel, n + pole.1 * texel);
+            let side = f64::from(size) * texel;
+            let out = OutputCrs::Projected {
+                crs,
+                bbox: [west, north - side, west + side, north],
+            };
+            let node = |fx: f64, fy: f64| out.project_node([0.0; 4], fx, fy);
+            let projections = Cell::new(0_usize);
+            let to_src = |lon: f64, lat: f64| {
+                projections.set(projections.get() + 1);
+                (lon / 0.25, (90.0 - lat) / 0.25)
+            };
+            let grid = ProjectionGrid::build_2d_periodic(
+                size,
+                size,
+                1440,
+                721,
+                Some(1440.0),
+                node,
+                to_src,
+            );
+            let label = format!("{epsg} pole at {pole:?}");
+            assert!(
+                projections.get() < ceiling,
+                "{label}: {} projections",
+                projections.get()
+            );
+            assert_eq!(grid.capped_error(), None, "{label}");
+            let mut drawn = 0;
+            for oy in 0..size {
+                for ox in 0..size {
+                    let (fx, fy) = (f64::from(ox) + 0.5, f64::from(oy) + 0.5);
+                    let exact = node(fx / f64::from(size), fy / f64::from(size));
+                    let (col, row) = grid.sample(ox, oy);
+                    if !exact.0.is_finite() {
+                        // Past EPSG:3067's domain, which ends on the line
+                        // through its pole.
+                        assert!(
+                            !(col.is_finite() && row.is_finite()),
+                            "{label}: ({ox}, {oy})"
+                        );
+                        continue;
+                    }
+                    if !(col.is_finite() && row.is_finite()) {
+                        // Within a boundary sub-grid's step of that edge.
+                        assert!(
+                            fy - pole.1 < BOUNDARY_STEP_PX,
+                            "{label}: ({ox}, {oy}) empty"
+                        );
+                        continue;
+                    }
+                    let (a, b) = (unit((col * 0.25, 90.0 - row * 0.25)), unit(exact));
+                    let px =
+                        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2))
+                            .sqrt()
+                            * 6_371_000.0
+                            / texel;
+                    let limit = if (fx - pole.0).hypot(fy - pole.1) < 1.0 {
+                        1.0
+                    } else {
+                        MAX_INTERP_ERROR_PX
+                    };
+                    assert!(px <= limit, "{label}: ({ox}, {oy}) {px:.3} px off");
+                    drawn += 1;
+                }
+            }
+            assert!(drawn > 20_000, "{label}: {drawn} pixels drawn");
+        }
+    }
+
+    /// A geographic view a few cells across a turn of longitude holds no
+    /// pole, though each cell's top and bottom turn more than a quarter
+    /// turn: 4 × 4 cells over 400°. Its column runs linearly along them, so
+    /// each cell is interpolated whole, exactly as the mapping is affine,
+    /// with no split and no sub-grid (#1195).
+    #[test]
+    fn a_wide_geographic_view_holds_no_pole() {
+        let to_src = |lon: f64, lat: f64| (lon / 0.25, (90.0 - lat) / 0.25);
+        let world = |fx: f64, fy: f64| (-200.0 + 400.0 * fx, 90.0 - 180.0 * fy);
+        let grid =
+            ProjectionGrid::build_2d_periodic(100, 50, 1440, 721, Some(1440.0), world, to_src);
+        assert_eq!((grid.cells_x, grid.cells_y), (4, 4));
+        assert!(grid.local.is_empty() && grid.boundary.is_empty());
+        for oy in 0..50 {
+            for ox in 0..100 {
+                let (c, r) = grid.sample(ox, oy);
+                let (ec, er) = to_src(
+                    -200.0 + 4.0 * (ox as f64 + 0.5),
+                    90.0 - 3.6 * (oy as f64 + 0.5),
+                );
+                assert!(
+                    (c - ec).abs() < 1e-9 && (r - er).abs() < 1e-9,
+                    "({ox}, {oy})"
+                );
             }
         }
     }
@@ -1702,11 +2050,13 @@ mod tests {
     /// budget. A synthetic polar view, the pole at the image's centre and
     /// 80° of latitude to its corners, its rows jumping 37 on a
     /// checkerboard within 51 px of the pole, which no cell size
-    /// interpolates across: the splits follow the jumps until they have cost
-    /// a quarter of the projections of a grid of `MAX_CELLS`, then the grid
-    /// records its error. Cells far from the pole are not split. The same
-    /// jump on a periodic grid without a pole is refined as a whole, as on
-    /// any other grid, to `MAX_CELLS`.
+    /// interpolates across: the splits, worst first and the pole's before
+    /// any, take the pole's cells down to a pixel, then follow the jumps
+    /// until they have cost a quarter of the projections of a grid of
+    /// `MAX_CELLS`, and the grid records its error and why it stopped.
+    /// Cells far from the pole are not split. The same jump on a periodic
+    /// grid without a pole is refined as a whole, as on any other grid, to
+    /// `MAX_CELLS`.
     #[test]
     fn local_refinement_is_budgeted() {
         let size = 256_u32;
@@ -1726,6 +2076,7 @@ mod tests {
         assert_eq!((grid.cells_x, grid.cells_y), (32, 32));
         let error = grid.capped_error().expect("the jumps cap the grid");
         assert!(error > MAX_INTERP_ERROR_PX, "capped at {error}");
+        assert!(grid.capped.is_some_and(|(_, limits)| limits.splits));
         let splits = grid
             .quads
             .iter()
@@ -1736,13 +2087,12 @@ mod tests {
             splits * SPLIT_COST <= budget && (splits + 1) * SPLIT_COST > budget,
             "{splits} splits"
         );
-        // Split breadth first: the budget runs out a depth or two down.
-        let deepest = (0..size)
-            .flat_map(|oy| (0..size).map(move |ox| (ox, oy)))
-            .map(|(ox, oy)| grid.local_depth(ox, oy))
-            .max();
-        assert_eq!(deepest, Some(2));
-        assert!(grid.local_depth(128, 128) >= 1);
+        // The pole is on the node at the centre: the cells that bracket it
+        // were split first, from 8 px down to a pixel, before the jumps
+        // spent the budget.
+        let around = [(127, 127), (128, 127), (127, 128), (128, 128)];
+        let depths = around.map(|(ox, oy)| grid.local_depth(ox, oy));
+        assert!(depths.contains(&3), "{depths:?}");
         for (ox, oy) in [(0, 0), (255, 0), (0, 255), (255, 255), (128, 0), (0, 128)] {
             assert_eq!(grid.local_depth(ox, oy), 0, "({ox}, {oy})");
         }
