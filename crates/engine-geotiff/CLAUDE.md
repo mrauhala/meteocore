@@ -23,7 +23,7 @@ apply here.
   Fixtures: `tm_airy.tif` (GDAL axis keys), `laea_bessel_code.tif` (code
   only, crafted with `listgeo` + `geotifcp -g`). Extent and footprint guard:
   `bbox_with_poles` / `footprint_envelope`, never `bbox()`; a full-turn
-  footprint bounds latitude only (`every_longitude_near`). LCC 2SP
+  footprint bounds latitude only (`map_read::footprint_window`). LCC 2SP
   takes its origin from the false-origin GeoKeys (3084-3087), the
   natural-origin ones (3080-3083) only as a fallback.
 - **Reprojection:** `bbox_to_pixels()` samples 20 points per edge to capture
@@ -505,10 +505,72 @@ depends on the kind:
 - **u8 fast path (#206):** the map-render path produces `RasterValues::U8`
   for local u8 sources with an integer u8 nodata (`reader::read_bbox_u8`,
   self-gating with `Ok(None)` → boxed-f64 fallback).
-- Low-zoom domain guard: `OutputCrs::footprint_pixel_window` (ghosts, #453);
+- Low-zoom domain guard: `OutputCrs::footprint_pixel_window` (ghosts, #453),
+  through `map_read::footprint_window` (see Map longitudes below);
   `ProjectionGrid` error probing must reach tile edges (#448 — the curtain
   bug was invisible on low-res fixtures; reproduce at production
   resolution).
+
+## Map longitudes (#1540)
+
+A map's longitudes are the view's: within ±180° in CRS84, past 180° where
+Maps unwraps a box across the antimeridian (#828) or the WMS meta-tiling
+passes a tile past it, a turn on in a world copy, EPSG:3035's inverse frame
+(170°W to 190°E). `get_raster_tile` unwraps a `west > east` box first, then
+moves the view into the raster's own frame by the EDR queries' rules
+(#1442), in `map_read`, so GetFeatureInfo (EDR position) answers what
+GetMap, Maps and Tiles drew:
+
+- **Geographic source:** every node of the coarse grid moves by the same
+  whole turns, those that bring the view's middle within half a turn of
+  the raster's middle (`MapRead::source_pixel`), so its columns are
+  continuous across the raster's seam and lie on the raster. Never move
+  each node into the frame on its own: on a 0–360° raster every view across
+  0° would put a turn's jump between two nodes. Never leave a world copy's
+  nodes where the view puts them either: a turn off the raster,
+  `ProjectionGrid::estimate_error` skips every probe (it counts only those
+  within a raster's size of it), the grid never refines, and a Web
+  Mercator copy drew up to 70 % of its pixels unlike its twin
+  (`a_geographic_world_copy_draws_as_its_twin`,
+  `a_global_raster_two_turns_away_draws_the_edr_position`). The windows are
+  `area::native_windows` of the view (one, or two across the seam, its
+  last columns then its first). Where the moved view meets a copy of the
+  raster a turn from its own columns (across its seam, or a view wider
+  than a turn), `resample_nearest` takes a column no window holds a whole
+  turn on or back (`MapRead::col_period`). The byte path reads every
+  window as bytes or none.
+- **Projected source:** each node's longitude goes within half a turn of
+  the CRS's central longitude (`area::in_frame`, the rule of
+  `area::source_longitude`, the centre found once per read), as EDR
+  position's point does, so a Lambert cone centred on 180° draws -179.9°
+  from its own side (#1114). Its one window is `bbox_to_pixels` of the view
+  moved by whole turns (`area::whole_turns`) to within half a turn of that
+  longitude.
+- **Overviews:** each level counts the pixels of the windows a render of it
+  reads (`TiffMetadata::select_overview_by` over `MapRead::dims`), and two
+  full-resolution windows hold `MAX_MAP_PIXELS` together
+  (`reader::check_map_pixels`). Counted by `bbox_to_pixels`, a whole-world
+  view of a 0–360° raster took half its columns and read full resolution.
+- **Footprint guard** (`map_read::footprint_window`): on geographic and Web
+  Mercator output the envelope moves by whole turns to the view, the
+  nearest copy as the guard always took it, joined with the copies a turn
+  either side whose longitudes meet the view's. A raster across the
+  antimeridian draws in a view from 180°W and on both edges of a
+  whole-world view, and a world copy (a WMS meta-tile past ±180°) draws as
+  its twin, geographic or projected (`world_copies_draw_as_their_twins`).
+  Never test a copy by the guard's margin: a copy just past the view's edge
+  joined a window across the whole view and the grid refined all of it
+  (`a_copy_past_the_view_edge_joins_no_window`). Where both copies do meet
+  a view, its whole width is refined: a whole-world view of a Lambert cone
+  on 180° makes several times the projections one edge did.
+- **Unchanged inside the frame:** a view inside the raster's frame reads the
+  window it read before, moves no node or column, and `resample_nearest`
+  takes its one-window loop, the loop before #1540: a lookup through the
+  windows and a turn per pixel cost the byte path 5–12 %, now within noise.
+  `map_read_tests` pins 80 such renders of rasters from 180°W, and regional
+  ones, by the hashes of their tiles before #1540, through every output CRS
+  and the byte path. Its seam tests compare a raster from 0° with one from
+  180°W, and each pixel with EDR position.
 
 ## EDR
 
@@ -579,11 +641,9 @@ selection.
   (`area::source_longitude`: `ds_core::geo::lon_within_half_turn` round
   `area::frame_centre`, the CRS's central longitude or a geographic
   raster's middle), so -179.9° on a Lambert cone centred on 180° reads the
-  pixel there, not one a turn away on the cone (#1442). EDR only, with
-  WMS GetFeatureInfo, which asks position: the map path (`bbox_to_pixels`
-  of the CRS84 bbox, `world_to_pixel_f64` as given) does not move its
-  longitudes yet, so a 0–360° raster draws nodata at -170° where
-  GetFeatureInfo there answers a value (map follow-up #1540).
+  pixel there, not one a turn away on the cone (#1442). WMS
+  GetFeatureInfo asks position, and the map path follows the same frame
+  (see Map longitudes above, #1540).
 
 `AreaGrid::new` settles the answer's extent and cell count without
 allocating either; `AreaGrid::plan` runs every budget on them before the

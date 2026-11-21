@@ -79,12 +79,11 @@ fn pixel_centre(ox: u32, oy: u32, (width, height): (u32, u32)) -> (f64, f64) {
 /// grid. The periodic map meets its budget, the engine samples it as it is
 /// built, and every pixel is on the grid, where sampling per pixel puts it.
 ///
-/// It costs as much: 1 485 934 projections, the 256-cell density. Beside
-/// the pole the bilinear column map converges only linearly, its error
-/// about an eighth of a cell a ring out, so a uniform grid meets 0.2 px
-/// only at 1 px cells; the pole's own cell gets a sub-grid, its
-/// neighbours do not. That is `ProjectionGrid`'s, shared by every global
-/// lat/lon source, and the bound below holds it.
+/// Beside the pole the bilinear column map converges only linearly, its
+/// error about an eighth of a cell a ring out, so a uniform grid met
+/// 0.2 px only at 1 px cells: 1 485 934 projections. `ProjectionGrid`, shared
+/// by every global lat/lon source, now splits only the cells around the
+/// pole down to a pixel (#1195): 36 644, and the bound below holds it.
 #[test]
 fn a_global_grid_is_registered_over_the_pole() {
     let (engine, _dir) = global_engine();
@@ -121,7 +120,7 @@ fn a_global_grid_is_registered_over_the_pole() {
         },
     );
     assert!(
-        projections.get() <= 1_500_000,
+        projections.get() < 40_000,
         "{} projections",
         projections.get()
     );

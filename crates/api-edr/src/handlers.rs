@@ -114,9 +114,10 @@ fn data_response(content_type: &'static str, body: impl Into<axum::body::Bytes>)
 /// The error of a response body the EDR response budget stopped (#1041):
 /// a body that does not fit now is a 503 `ServerBusy` to retry, an HTML
 /// page that could not fit even an idle budget a 400 naming its
-/// CoverageJSON, a query past its deadline the 504. Any other failure
-/// (`None`, a body that could not be built, or a size cap only
-/// `/locations` has and maps itself) is a 500, after `log`.
+/// CoverageJSON, any other body that could not a 400 asking for less
+/// (#1500), a query past its deadline the 504. Any other failure (`None`,
+/// a body that could not be built, or a size cap only `/locations` has and
+/// maps itself) is a 500, after `log`.
 fn response_budget_error(
     failure: Option<crate::response_budget::Failure>,
     log: impl FnOnce(),
@@ -133,6 +134,11 @@ fn response_budget_error(
         Some(Failure::Oversize) => bad_request(&DataServerError::QueryTooLarge(
             "This answer is too large for an HTML page: request it with f=CoverageJSON, or \
              narrow the area, the datetime window or the parameters"
+                .into(),
+        )),
+        Some(Failure::BodyOversize) => bad_request(&DataServerError::QueryTooLarge(
+            "This answer is too large for the server to send: narrow the area, the datetime \
+             window or the parameters, or set limit"
                 .into(),
         )),
         Some(Failure::Limit | Failure::Internal) | None => {
@@ -465,11 +471,18 @@ fn render_station_csv(
     req: &GeoJsonRequest,
 ) -> Result<Response, HandlerError> {
     let names = req.station_names()?;
+    // Why the budget refused the counted body, which the writer reports as
+    // `Busy`: a body past the whole budget is a 400, not a 503 (#1500).
+    let refusal = std::cell::Cell::new(crate::response_budget::Failure::Memory);
     let (body, reservation) = crate::csv::write_station_series(
         result,
         |i, q| names.identify(i, q),
         crate::csv::MAX_BYTES,
-        |size| crate::response_budget::reserve(size).ok(),
+        |size| {
+            crate::response_budget::reserve_body(size)
+                .map_err(|failure| refusal.set(failure))
+                .ok()
+        },
     )
     .map_err(|e| match e {
         crate::csv::CsvError::TooLarge => bad_request(&DataServerError::QueryTooLarge(format!(
@@ -486,9 +499,7 @@ fn render_station_csv(
             );
             server_error()
         }
-        crate::csv::CsvError::Busy => {
-            response_budget_error(Some(crate::response_budget::Failure::Memory), || ())
-        }
+        crate::csv::CsvError::Busy => response_budget_error(Some(refusal.get()), || ()),
     })?;
     let body = reservation
         .into_bytes(body.into_bytes())
@@ -2806,8 +2817,13 @@ pub async fn locations(
             });
             locations_to_writer(page_locs, &ctx, page.as_ref(), &mut writer).map_err(Into::into)
         };
+        // A body past the whole budget is past a smaller cap: the same
+        // answer, which names how to page it, as its own cap's.
         written.map_err(|_| match writer.failure {
-            Some(crate::response_budget::Failure::Limit) => JsonError(
+            Some(
+                crate::response_budget::Failure::Limit
+                | crate::response_budget::Failure::BodyOversize,
+            ) => JsonError(
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({"code": "ResponseLimit", "description": too_large})),
             ),

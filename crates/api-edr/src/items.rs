@@ -31,7 +31,7 @@ use serde_json::{json, Value};
 
 use api_common::JsonError;
 use api_features::crs::ResponseCrs;
-use api_features::params::{parse_bbox, parse_datetime};
+use api_features::params::{parse_bbox, parse_datetime_param};
 use api_features::response::{
     feature_page_to_geojson, feature_to_geojson, preserved_query, Annotations,
 };
@@ -107,7 +107,8 @@ impl ItemsParams {
             }
             match name.as_str() {
                 "bbox" => params.bbox = Some(parse_bbox(&value)?),
-                "datetime" => params.datetime = Some(parse_datetime(&value)?),
+                // Blank is absent, as Features' `/items` reads it (#1500).
+                "datetime" => params.datetime = parse_datetime_param(Some(&value))?,
                 "limit" => params.limit = parse_limit(&value)?,
                 "offset" => {
                     params.offset = value.parse().map_err(|_| {

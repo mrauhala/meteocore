@@ -266,6 +266,17 @@ pub fn parse_bbox_values(s: &str) -> Result<[f64; 4], DataServerError> {
     })
 }
 
+/// The `datetime` of an `/items` request, Features' and EDR's: absent or
+/// blank is no filter, as a form submits an empty field (#1500), and
+/// anything else is [`parse_datetime`]'s.
+pub fn parse_datetime_param(
+    raw: Option<&str>,
+) -> Result<Option<DatetimeInterval>, DataServerError> {
+    raw.filter(|raw| !raw.trim().is_empty())
+        .map(parse_datetime)
+        .transpose()
+}
+
 /// Parse an OGC datetime parameter value.
 /// Supports: instant ("2024-01-01T00:00:00Z"), interval ("start/end"),
 /// and open intervals ("../end", "start/..", "../..").
@@ -409,5 +420,19 @@ mod tests {
     #[test]
     fn parse_datetime_invalid() {
         assert!(parse_datetime("not-a-date").is_err());
+    }
+
+    /// A blank `datetime` is no filter (#1500); any other value is
+    /// [`parse_datetime`]'s, its errors included.
+    #[test]
+    fn a_blank_datetime_param_is_absent() {
+        assert_eq!(parse_datetime_param(None).unwrap(), None);
+        assert_eq!(parse_datetime_param(Some("")).unwrap(), None);
+        assert_eq!(parse_datetime_param(Some(" ")).unwrap(), None);
+        assert_eq!(
+            parse_datetime_param(Some("2024-01-01T00:00:00Z")).unwrap(),
+            Some(parse_datetime("2024-01-01T00:00:00Z").unwrap())
+        );
+        assert!(parse_datetime_param(Some("not-a-date")).is_err());
     }
 }

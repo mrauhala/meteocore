@@ -15,6 +15,9 @@ mod gone;
 mod gone_object_tests;
 #[cfg(all(test, unix))]
 mod local_removal_tests;
+mod map_read;
+#[cfg(test)]
+mod map_read_tests;
 mod parse;
 mod prewarm;
 #[cfg(test)]
@@ -2762,27 +2765,6 @@ fn crs_label(crs: &ds_core::geo::Crs) -> String {
     }
 }
 
-/// A footprint `envelope` spanning every longitude (a grid holding a
-/// pole) on a geographic output: over `bbox`'s own longitudes, which OGC
-/// API Maps unwraps past ±180° across the antimeridian (#828), so the guard
-/// bounds latitude only, as the shared sampler's does
-/// (`ds_core::resample::SourceGrid`). Walked as −180…180, it clipped the
-/// view past the seam. Any other envelope as it is: a regional grid is not
-/// moved by whole turns into a view of another one.
-fn every_longitude_near(
-    envelope: [f64; 4],
-    bbox: [f64; 4],
-    output_crs: &ds_core::map_engine::OutputCrs,
-) -> [f64; 4] {
-    let [w, s, e, n] = envelope;
-    if e - w < 360.0 || matches!(output_crs, ds_core::map_engine::OutputCrs::Projected { .. }) {
-        return envelope;
-    }
-    let [west, _, east, _] = bbox;
-    let east = if east < west { east + 360.0 } else { east };
-    [west, s, east, n]
-}
-
 /// A map request's output CRS for a log line: its code, and for a projected
 /// one its request rectangle in metres (the logged `bbox` is the WGS84 read
 /// envelope).
@@ -2876,7 +2858,15 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             .get_key_value(&target_timestamp)
             .ok_or_else(|| DataServerError::Engine("Entry disappeared after loading".into()))?;
 
-        let [west, south, east, north] = bbox;
+        // A box across the antimeridian comes either way, `west > east`
+        // or unwrapped with `east` past 180° as OGC API Maps and the WMS
+        // meta-tiling pass it (#828): unwrapped from here on, so the
+        // output's longitudes run east from `west` (#1540).
+        let bbox = {
+            let [west, south, east, north] = bbox;
+            let east = if west > east { east + 360.0 } else { east };
+            [west, south, east, north]
+        };
         let total_pixels = (width as usize) * (height as usize);
 
         // A STAC item whose asset its load found gone (#1119) has nothing to
@@ -2925,15 +2915,12 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // empties. Every level shares the full-resolution extent, so its
         // envelope serves whichever level is read. The envelope reaches a
         // pole the grid holds and runs on past 180° across the
-        // antimeridian (`GeoTransform::footprint_envelope`, #1194); with
-        // none, every pixel may draw.
+        // antimeridian (`GeoTransform::footprint_envelope`, #1194), and is
+        // moved by whole turns to the view, every copy of it the view
+        // meets (`map_read::footprint_window`, #1540); with none, every
+        // pixel may draw.
         let footprint = match metadata.geo_transform.footprint_envelope() {
-            Some(envelope) => output_crs.footprint_window_in_image(
-                bbox,
-                every_longitude_near(envelope, bbox, output_crs),
-                width,
-                height,
-            ),
+            Some(envelope) => map_read::footprint_window(output_crs, bbox, envelope, width, height),
             None => (width > 0 && height > 0).then(|| (0, width - 1, 0, height - 1)),
         };
         let Some(footprint) = footprint else {
@@ -2952,10 +2939,14 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
         // Select the best overview level for the output resolution.
         // This avoids reading millions of full-resolution pixels for zoomed-out views.
         // If no overview matches but full res is too large, force the smallest overview.
+        // Each level counts the pixels of the windows a render of it reads,
+        // in the raster's own longitude frame (#1540): two across its seam.
+        let level_pixels =
+            |gt: &ds_core::geo::GeoTransform| map_read::MapRead::new(gt, bbox).dims();
         let overview = metadata
-            .select_overview(west, south, east, north, width, height)
+            .select_overview_by(width, height, level_pixels)
             .or_else(|| {
-                // select_overview returned None, which now means one of: no
+                // select_overview_by returned None, which now means one of: no
                 // overviews exist; full resolution already fits the output; or
                 // the output exceeds the biggest overview by more than the
                 // bounded-upscale factor (i.e. it is at/near native resolution).
@@ -2965,11 +2956,8 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 // cap overrides the soft 2× quality preference (an over-cap
                 // upscale is still logged by the `Using overview …` debug below).
                 // Pick the finest overview that fits under the limit.
-                if let Some((c0, r0, c1, r1)) = metadata
-                    .geo_transform
-                    .bbox_to_pixels(west, south, east, north)
-                {
-                    let full_pixels = ((c1 - c0) as usize) * ((r1 - r0) as usize);
+                if let Some((cols, rows)) = level_pixels(&metadata.geo_transform) {
+                    let full_pixels = (cols as usize) * (rows as usize);
                     if full_pixels > reader::max_map_pixels() {
                         // Pick the finest overview that fits under the limit.
                         // Overviews are sorted finest-first, so iterate in order
@@ -2977,10 +2965,8 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                         // within the pixel budget.
                         for ov in &metadata.overviews {
                             let ov_gt = metadata.overview_geo_transform(ov);
-                            if let Some((oc0, or0, oc1, or1)) =
-                                ov_gt.bbox_to_pixels(west, south, east, north)
-                            {
-                                let ov_pixels = ((oc1 - oc0) as usize) * ((or1 - or0) as usize);
+                            if let Some((ov_cols, ov_rows)) = level_pixels(&ov_gt) {
+                                let ov_pixels = (ov_cols as usize) * (ov_rows as usize);
                                 if ov_pixels <= reader::max_map_pixels() {
                                     return Some(ov);
                                 }
@@ -3010,22 +2996,26 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             metadata.geo_transform.clone()
         };
 
-        // Compute the source pixel range in the selected level
-        let source_range = gt.bbox_to_pixels(west, south, east, north);
+        // The windows of the selected level, in the raster's own longitude
+        // frame (#1540): one, or two across a geographic raster's seam.
+        let read = map_read::MapRead::new(&gt, bbox);
 
-        let values = if let Some((col_start, row_start, col_end, row_end)) = source_range {
-            let src_nx = (col_end - col_start) as usize;
-
-            tracing::debug!(
-                "Reading source pixels: cols {}..{} ({}), rows {}..{} ({}), total {} px",
-                col_start,
-                col_end,
-                col_end - col_start,
-                row_start,
-                row_end,
-                row_end - row_start,
-                src_nx * ((row_end - row_start) as usize)
-            );
+        let values = if read.windows().is_empty() {
+            // Bbox doesn't intersect raster at all — all nodata
+            ds_core::map_engine::RasterValues::F64(vec![None; total_pixels])
+        } else {
+            for &(col_start, row_start, col_end, row_end) in read.windows() {
+                tracing::debug!(
+                    "Reading source pixels: cols {}..{} ({}), rows {}..{} ({}), total {} px",
+                    col_start,
+                    col_end,
+                    col_end - col_start,
+                    row_start,
+                    row_end,
+                    row_end - row_start,
+                    ((col_end - col_start) as usize) * ((row_end - row_start) as usize)
+                );
+            }
 
             // Map output pixels to source pixels through a coarse projection
             // grid instead of projecting every pixel: the CRS forward transform
@@ -3035,7 +3025,8 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             // handled here without per-engine axis math (#160). Only the
             // footprint's pixels are read, so only their error counts:
             // outside it the forward folds and refining for it never
-            // converges (#1110, #1129).
+            // converges (#1110, #1129). A node's longitude goes to the
+            // source as `MapRead::source_pixel` takes it (#1540).
             let grid = ds_core::resample::ProjectionGrid::build_2d_within_quiet(
                 width,
                 height,
@@ -3046,7 +3037,7 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                 |lon, lat| {
                     #[cfg(test)]
                     SOURCE_PROJECTIONS.with(|n| n.set(n.get() + 1));
-                    gt.world_to_pixel_f64(lon, lat)
+                    read.source_pixel(&gt, lon, lat)
                 },
             );
             if let Some(error_px) = grid.capped_error() {
@@ -3062,6 +3053,11 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                      this render may be slightly misregistered"
                 );
             }
+            // Each read holds the cap itself; two across the seam hold it
+            // together.
+            if overview.is_none() && read.windows().len() > 1 {
+                reader::check_map_pixels(read.pixels())?;
+            }
 
             // Native u8 fast path (#206): keep raw bytes end to end — window
             // read, nearest resample, and (in ds-render) a 256-entry-LUT
@@ -3069,41 +3065,53 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
             // `Option<f64>`. `read_bbox_u8` gates itself (local source,
             // u8 chunks, integer u8 nodata) and returns `None` to fall back;
             // both branches render pixel-identically by construction.
-            let native = reader::read_bbox_u8(
-                source,
-                metadata,
-                overview,
-                col_start,
-                row_start,
-                col_end,
-                row_end,
-                self.band_index,
-            )?;
-            match native {
-                Some(window) => {
-                    let mut data = Vec::with_capacity(total_pixels);
-                    resample_nearest(
-                        &grid,
-                        width,
-                        height,
-                        &window.data,
-                        src_nx,
-                        (col_start, row_start, col_end, row_end),
-                        window.nodata,
-                        footprint,
-                        &mut data,
-                    );
-                    ds_core::map_engine::RasterValues::U8 {
-                        data,
-                        nodata: Some(window.nodata),
-                        gain: metadata.scale.unwrap_or(1.0),
-                        offset: metadata.offset.unwrap_or(0.0),
-                    }
+            let mut native = Vec::with_capacity(read.windows().len());
+            for &(col_start, row_start, col_end, row_end) in read.windows() {
+                match reader::read_bbox_u8(
+                    source,
+                    metadata,
+                    overview,
+                    col_start,
+                    row_start,
+                    col_end,
+                    row_end,
+                    self.band_index,
+                )? {
+                    Some(window) => native.push(window),
+                    None => break,
                 }
-                None => {
-                    // Boxed fallback: read from overview or full resolution.
-                    let tile_cache = self.request_tile_cache();
-                    let pixels = if let Some(ov) = overview {
+            }
+            if native.len() == read.windows().len() {
+                let nodata = native[0].nodata;
+                let windows: Vec<_> = read
+                    .windows()
+                    .iter()
+                    .zip(&native)
+                    .map(|(&window, read)| map_read::ReadWindow::new(window, &read.data))
+                    .collect();
+                let mut data = Vec::with_capacity(total_pixels);
+                resample_nearest(
+                    &grid,
+                    width,
+                    height,
+                    &windows,
+                    read.col_period(),
+                    nodata,
+                    footprint,
+                    &mut data,
+                );
+                ds_core::map_engine::RasterValues::U8 {
+                    data,
+                    nodata: Some(nodata),
+                    gain: metadata.scale.unwrap_or(1.0),
+                    offset: metadata.offset.unwrap_or(0.0),
+                }
+            } else {
+                // Boxed fallback: read from overview or full resolution.
+                let tile_cache = self.request_tile_cache();
+                let mut reads = Vec::with_capacity(read.windows().len());
+                for &(col_start, row_start, col_end, row_end) in read.windows() {
+                    reads.push(if let Some(ov) = overview {
                         reader::read_bbox_overview(
                             source,
                             metadata,
@@ -3128,25 +3136,27 @@ impl ds_core::map_engine::MapEngine for GeoTiffEngine {
                             &entry.path,
                             self.band_index,
                         )
-                    }?;
-                    let mut values = Vec::with_capacity(total_pixels);
-                    resample_nearest(
-                        &grid,
-                        width,
-                        height,
-                        &pixels,
-                        src_nx,
-                        (col_start, row_start, col_end, row_end),
-                        None,
-                        footprint,
-                        &mut values,
-                    );
-                    ds_core::map_engine::RasterValues::F64(values)
+                    }?);
                 }
+                let windows: Vec<_> = read
+                    .windows()
+                    .iter()
+                    .zip(&reads)
+                    .map(|(&window, pixels)| map_read::ReadWindow::new(window, pixels))
+                    .collect();
+                let mut values = Vec::with_capacity(total_pixels);
+                resample_nearest(
+                    &grid,
+                    width,
+                    height,
+                    &windows,
+                    read.col_period(),
+                    None,
+                    footprint,
+                    &mut values,
+                );
+                ds_core::map_engine::RasterValues::F64(values)
             }
-        } else {
-            // Bbox doesn't intersect raster at all — all nodata
-            ds_core::map_engine::RasterValues::F64(vec![None; total_pixels])
         };
 
         Ok(ds_core::map_engine::RasterTile {
@@ -3209,24 +3219,59 @@ impl Drop for HealthNote<'_> {
     }
 }
 
-/// Nearest-neighbour resample of a source window into the output grid,
+/// Nearest-neighbour resample of source windows into the output grid,
 /// generic over the sample representation (`Option<f64>` boxed path, raw
 /// `u8` native path — #206). Byte-for-byte the same mapping in both: out-of
 /// -footprint, non-finite-grid, and out-of-window pixels get `fill` (the
 /// nodata representation of `T`), everything else copies the enclosing
-/// source sample.
+/// source sample of the window holding it. With `col_period`, a
+/// geographic level's columns per turn, a column no window holds as the
+/// grid gives it takes the one a whole number of turns on that a window
+/// holds (`map_read`, #1540): the raster's own frame.
+///
+/// One window without `col_period`, every render inside the raster's frame,
+/// takes the loop it took before #1540: a lookup through the windows and a
+/// turn per pixel cost the byte path 5–12 %.
 #[allow(clippy::too_many_arguments)]
 fn resample_nearest<T: Copy>(
     grid: &ds_core::resample::ProjectionGrid,
     width: u32,
     height: u32,
-    window: &[T],
-    src_nx: usize,
-    (col_start, row_start, col_end, row_end): (u32, u32, u32, u32),
+    windows: &[map_read::ReadWindow<'_, T>],
+    col_period: Option<f64>,
     fill: T,
     (px_lo, px_hi, py_lo, py_hi): (u32, u32, u32, u32),
     out: &mut Vec<T>,
 ) {
+    if let ([window], None) = (windows, col_period) {
+        // The window's fields in locals, as the loop had them before.
+        let [col_start, row_start, col_end, row_end] = window.bounds;
+        let (first_col, first_row) = window.start;
+        let (pixels, columns) = (window.pixels, window.columns);
+        for oy in 0..height {
+            let in_y = oy >= py_lo && oy <= py_hi;
+            for ox in 0..width {
+                if !in_y || ox < px_lo || ox > px_hi {
+                    out.push(fill);
+                    continue;
+                }
+                let (col_f, row_f) = grid.sample(ox, oy);
+                if !col_f.is_finite() || !row_f.is_finite() {
+                    out.push(fill);
+                    continue;
+                }
+                let col = col_f.floor();
+                let row = row_f.floor();
+                if col >= col_start && col < col_end && row >= row_start && row < row_end {
+                    let idx = (row as usize - first_row) * columns + (col as usize - first_col);
+                    out.push(pixels.get(idx).copied().unwrap_or(fill));
+                } else {
+                    out.push(fill);
+                }
+            }
+        }
+        return;
+    }
     for oy in 0..height {
         let in_y = oy >= py_lo && oy <= py_hi;
         for ox in 0..width {
@@ -3239,20 +3284,17 @@ fn resample_nearest<T: Copy>(
                 out.push(fill);
                 continue;
             }
-            let col = col_f.floor();
             let row = row_f.floor();
-            if col >= col_start as f64
-                && col < col_end as f64
-                && row >= row_start as f64
-                && row < row_end as f64
-            {
-                let sc = col as usize - col_start as usize;
-                let sr = row as usize - row_start as usize;
-                let idx = sr * src_nx + sc;
-                out.push(window.get(idx).copied().unwrap_or(fill));
-            } else {
-                out.push(fill);
-            }
+            let value = windows
+                .iter()
+                .find_map(|window| window.at(col_f.floor(), row, fill))
+                .or_else(|| {
+                    let period = col_period?;
+                    windows.iter().find_map(|window| {
+                        window.at(window.turned(col_f, period).floor(), row, fill)
+                    })
+                });
+            out.push(value.unwrap_or(fill));
         }
     }
 }

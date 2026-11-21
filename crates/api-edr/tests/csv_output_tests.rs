@@ -626,6 +626,48 @@ async fn csv_over_the_byte_cap_is_a_400() {
     assert!(body.len() < 1 << 20, "{}", body.len());
 }
 
+/// A body larger than the whole response budget can never be admitted:
+/// CSV, like CoverageJSON and GeoJSON, is a 400 asking for less, not the
+/// 503 to retry it was, and is not counted among shed requests (#1500).
+/// The budget is process-wide and read once, so this runs in a child
+/// process; a budget of 0 holds no body.
+#[test]
+fn bodies_over_the_whole_response_budget_are_400() {
+    const TEST: &str = "bodies_over_the_whole_response_budget_are_400";
+    const CHILD: &str = "MC_TEST_CSV_RESPONSE_BUDGET_CHILD";
+    if std::env::var(CHILD).is_err() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(CHILD, "1")
+            .env("MC_EDR_RESPONSE_MEMORY_MB", "0")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{TEST} child failed");
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for f in ["CSV", "CoverageJSON", "GeoJSON"] {
+            let uri = format!("/collections/obs/locations/helsinki?f={f}");
+            let (status, headers, body) = request(&uri, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{f}: {body}");
+            assert!(headers.get(header::RETRY_AFTER).is_none(), "{f}");
+            let error: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(error["code"], "BadRequest", "{f}");
+            let description = error["description"].as_str().unwrap();
+            assert!(
+                description.contains("too large for the server to send"),
+                "{f}: {description}"
+            );
+        }
+        let (used, capacity, rejected) = api_edr::response_budget_metrics();
+        assert_eq!((used, capacity, rejected), (0, 0, 0));
+    });
+}
+
 /// Position, radius and area answer CSV on a station collection, by `f`
 /// (the token or the media type) or by `Accept`.
 #[tokio::test]

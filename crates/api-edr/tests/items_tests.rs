@@ -491,6 +491,26 @@ async fn unknown_repeated_and_malformed_parameters_are_400() {
     }
 }
 
+/// A blank `datetime`, as a form submits an empty field, is absent
+/// (#1500): the whole list, links without it, and no 400 on a collection
+/// without time.
+#[tokio::test]
+async fn a_blank_datetime_is_absent() {
+    let (_, all) = get("/collections/stations/items?limit=2").await;
+    for blank in ["", "%20"] {
+        let (status, doc) = get(&format!(
+            "/collections/stations/items?datetime={blank}&limit=2"
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{blank:?}: {doc}");
+        assert_eq!(doc["numberMatched"], all["numberMatched"], "{blank:?}");
+        assert_eq!(ids(&doc), ids(&all), "{blank:?}");
+        assert_eq!(link(&doc, "next"), link(&all, "next"), "{blank:?}");
+        let (status, doc) = get(&format!("/collections/timeless/items?datetime={blank}")).await;
+        assert_eq!(status, StatusCode::OK, "{blank:?}: {doc}");
+    }
+}
+
 #[tokio::test]
 async fn datetime_on_a_collection_without_time_is_400() {
     let (status, err) = get("/collections/timeless/items?datetime=2026-01-01T00:00:00Z").await;
