@@ -289,24 +289,31 @@ async fn content_pnts_is_valid_and_etagged() {
     assert!(headers.contains_key(axum::http::header::ETAG));
 }
 
+/// The tag is weak, since the server's compression layer gzips the content
+/// after it was tagged, and revalidates in either form: `If-None-Match`
+/// compares weakly (RFC 9110 §13.1.2, #1500).
 #[tokio::test]
 async fn etag_round_trips_to_304() {
-    let (_s, _b, headers) = get("/collections/radar-fivih/content.pnts").await;
+    let (_s, body, headers) = get("/collections/radar-fivih/content.pnts").await;
     let etag = headers[axum::http::header::ETAG]
         .to_str()
         .unwrap()
         .to_string();
-    let resp = router()
-        .oneshot(
-            Request::builder()
-                .uri("/collections/radar-fivih/content.pnts")
-                .header(axum::http::header::IF_NONE_MATCH, &etag)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(etag, ds_core::http_cache::weak_etag_of(&body));
+    let strong = etag.trim_start_matches("W/").to_string();
+    for sent in [&etag, &strong] {
+        let resp = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/collections/radar-fivih/content.pnts")
+                    .header(axum::http::header::IF_NONE_MATCH, sent)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{sent}");
+    }
 }
 
 #[tokio::test]

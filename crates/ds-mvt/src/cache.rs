@@ -9,7 +9,6 @@ use ds_cache::ByteBoundedCache;
 use ds_core::feature::DatetimeInterval;
 
 use crate::encode::TmsKind;
-use crate::hash::{fnv1a_mix, FNV1A_OFFSET};
 
 /// Cache key for an encoded vector tile.
 ///
@@ -51,7 +50,7 @@ pub struct VectorTileKey {
 pub struct CachedTile {
     pub bytes: Bytes,
     /// Private so the only path that sets it is `CachedTile::new`, which seals
-    /// the invariant `etag == FNV-1a(bytes)`. Without this seal, a workspace
+    /// the invariant `etag == W/FNV-1a(bytes)`. Without this seal, a workspace
     /// crate could construct `CachedTile { bytes, etag: "wrong".into() }` and
     /// silently break `If-None-Match` for that entry (a browser holding the
     /// real ETag would get a full 200 response instead of 304, or vice
@@ -61,19 +60,19 @@ pub struct CachedTile {
 
 impl CachedTile {
     /// Build a cache entry from encoded bytes, deriving the ETag from the
-    /// content via FNV-1a. Format matches `ds_render::CacheKey::etag()` so the
-    /// same `etag_matches` helper works for both raster and vector responses.
-    /// FNV-1a (not `DefaultHasher`) so the ETag is stable across rustc
-    /// versions — a binary rebuild against unchanged content keeps the same
-    /// ETag and browser caches survive the redeploy.
+    /// content: `ds_core::http_cache::weak_etag_of`, FNV-1a marked weak. A
+    /// vector tile is gzipped by the server's `CompressionLayer` after the
+    /// handler tagged it, so one tag names the plain and the gzipped bytes
+    /// (#1500). FNV-1a (not `DefaultHasher`) so the ETag is stable across
+    /// rustc versions — a binary rebuild against unchanged content keeps
+    /// the same ETag and browser caches survive the redeploy.
     pub fn new(bytes: Bytes) -> Self {
-        let mut h = FNV1A_OFFSET;
-        fnv1a_mix(&mut h, bytes.as_ref());
-        let etag = format!("\"{h:016x}\"");
+        let etag = ds_core::http_cache::weak_etag_of(&bytes);
         Self { bytes, etag }
     }
 
-    /// Quoted hex16 ETag string suitable for the `ETag` response header.
+    /// Weak `W/"<16 hex>"` ETag string for the `ETag` response header,
+    /// compared by `ds_core::http_cache::if_none_match_matches`.
     pub fn etag(&self) -> &str {
         &self.etag
     }
@@ -320,8 +319,10 @@ mod tests {
         // is invalidated — coordinate with operators) or accidentally
         // regressed to `DefaultHasher`, which mutates silently across rustc
         // versions and would re-key every browser cache on a binary upgrade.
+        // Weak (#1500): the compression layer encodes the tile after the
+        // handler tagged it.
         let t = CachedTile::new(Bytes::from_static(b"hello"));
-        assert_eq!(t.etag, "\"a430d84680aabd0b\"");
+        assert_eq!(t.etag, "W/\"a430d84680aabd0b\"");
     }
 
     #[test]

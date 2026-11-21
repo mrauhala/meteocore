@@ -359,10 +359,7 @@ async fn if_none_match_is_answered_with_304_until_the_document_changes() {
     let first = get(&app, &[]).await;
     let etag = first.header(header::ETAG).unwrap().to_string();
     assert!(etag.starts_with("W/\""), "{etag}");
-    assert_eq!(
-        etag,
-        format!("W/{}", ds_core::http_cache::etag_of(&first.body))
-    );
+    assert_eq!(etag, ds_core::http_cache::weak_etag_of(&first.body));
 
     for accept in [None, Some("gzip")] {
         let mut headers = vec![("if-none-match", etag.as_str())];

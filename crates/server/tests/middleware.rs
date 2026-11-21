@@ -280,6 +280,66 @@ mod compression {
     }
 }
 
+/// An EDR router with no collections, wrapped in CompressionLayer as
+/// main.rs wraps every router: its metadata is JSON the layer compresses.
+fn build_compressed_edr_router() -> axum::Router {
+    let state = Arc::new(ArcSwap::from_pointee(api_edr::handlers::EdrState {
+        engines: HashMap::new(),
+        feature_engines: HashMap::new(),
+        collections: HashMap::new(),
+        styles: HashMap::new(),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+        discovery: Default::default(),
+    }));
+    api_edr::router(state).layer(CompressionLayer::new())
+}
+
+mod edr_compression {
+    use super::*;
+
+    /// The EDR (and Features) ETag is set inside the router and the body
+    /// gzipped outside it, so the plain and the gzipped responses carry one
+    /// tag: it is weak, `W/"…"`, since a strong tag would name two
+    /// different byte sequences as one (#1500). Either response's tag
+    /// revalidates the other, in either form.
+    #[tokio::test]
+    async fn gzip_and_identity_carry_one_weak_tag() {
+        const URI: &str = "/conformance?f=json";
+        let (status, plain, plain_body) =
+            wms_request(build_compressed_edr_router(), URI, vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(plain.get(header::CONTENT_ENCODING).is_none());
+        let (status, gzipped, gzipped_body) = wms_request(
+            build_compressed_edr_router(),
+            URI,
+            vec![("accept-encoding", "gzip")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(gzipped[header::CONTENT_ENCODING], "gzip");
+        assert_ne!(plain_body, gzipped_body);
+        let etag = plain[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(gzipped[header::ETAG], etag.as_str());
+        assert_eq!(etag, ds_core::http_cache::weak_etag_of(&plain_body));
+
+        let strong = etag.trim_start_matches("W/").to_string();
+        for accept in ["identity", "gzip"] {
+            for sent in [&etag, &strong] {
+                let (status, headers, body) = wms_request(
+                    build_compressed_edr_router(),
+                    URI,
+                    vec![("accept-encoding", accept), ("if-none-match", sent)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_MODIFIED, "{accept} {sent}");
+                assert_eq!(headers[header::ETAG], etag.as_str(), "{accept} {sent}");
+                assert!(body.is_empty(), "{accept} {sent}");
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conditional requests (304 Not Modified)
 // ---------------------------------------------------------------------------

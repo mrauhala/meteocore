@@ -210,8 +210,8 @@ impl Document {
             &state.point_engines,
             base_url,
         );
-        let etag = HeaderValue::try_from(format!("W/{}", ds_core::http_cache::etag_of(&xml)))
-            .expect("a quoted hex ETag is a header value");
+        let etag = HeaderValue::try_from(ds_core::http_cache::weak_etag_of(&xml))
+            .expect("a weak quoted-hex ETag is a header value");
         let gzip = match gzip(&xml) {
             Ok(gzip) => Some(Bytes::from(gzip)),
             Err(e) => {
@@ -239,7 +239,9 @@ impl Document {
             .get(header::IF_NONE_MATCH)
             .and_then(|value| value.to_str().ok())
             .zip(self.etag.to_str().ok())
-            .is_some_and(|(if_none_match, etag)| ds_render::etag_matches(if_none_match, etag));
+            .is_some_and(|(if_none_match, etag)| {
+                ds_core::http_cache::if_none_match_matches(if_none_match, etag)
+            });
         if not_modified {
             return (
                 StatusCode::NOT_MODIFIED,

@@ -41,7 +41,7 @@ Engines never use this crate.
 | `JsonQuery`, `JsonError` | Query extraction and errors that answer with a JSON `{code, description}` body, with the reason recorded for the request log |
 | `Mount`, `mounts`, `rel`, `openapi_tags`, `ApiKind` | Link roots, per-API paths, registered OGC relations, OpenAPI tags, API label for logs and metrics |
 | `shared` | The shared OGC API root, composed from building blocks |
-| `caching` | `conditional_get` middleware: `Cache-Control`, ETag, 304 |
+| `caching` | `conditional_get` middleware: `Cache-Control`, weak ETag (`etag`), 304 on a weak `If-None-Match` match |
 | `errors` | HTML error pages for browsers, the 404 fallback, JSON-only routes |
 | `subset`, `map_frame` | Request rules that Maps and Tiles share |
 | `workbench` | Server-rendered HTML pages for all four APIs |
@@ -415,7 +415,8 @@ resource as currently filtered and paged.
   mounts `workbench::assets::router()` at its root and serves them at
   `{base}/workbench/{hash}/{file}`, where the hash is the FNV-1a hash of
   the file's bytes. That URL is answered `public, max-age=31536000,
-  immutable` with a strong ETag, and `If-None-Match` gets a 304. Another
+  immutable` with a weak ETag (the server gzips the file), and
+  `If-None-Match` gets a 304, compared weakly. Another
   build's hash still gets the current bytes, but `no-cache`. Pages on
   every API mount and on the shared root link the same URLs, so the
   browser keeps one copy. Only `theme.js`, which sets the theme before the

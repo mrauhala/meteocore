@@ -450,7 +450,7 @@ pub async fn items(
         if format.format == EdrFormat::Html {
             let page = html_page(&doc, &root, &id, &title, raw_query.as_deref());
             let mut html = crate::html::features_page(&doc, &page, true);
-            let etag = ds_core::http_cache::etag_of(html.as_bytes());
+            let etag = api_common::caching::etag(html.as_bytes());
             // Filled in place: no second copy of the page.
             if let Some(at) = html.find(crate::html::TIMESTAMP_SLOT) {
                 let filled = format!("<time data-generated>{time_stamp}</time>");
@@ -458,17 +458,14 @@ pub async fn items(
             }
             return Ok((crate::html::response(html), etag));
         }
-        let etag = ds_core::http_cache::etag_of(serialize(&doc)?.as_bytes());
+        let etag = api_common::caching::etag(serialize(&doc)?.as_bytes());
         doc["timeStamp"] = json!(time_stamp);
         Ok((geojson_response(serialize(&doc)?), etag))
     })
     .await?;
 
     let mut resp = with_format_vary(body, format);
-    resp.headers_mut().insert(
-        header::ETAG,
-        HeaderValue::from_str(&etag).expect("quoted-hex etag is a valid header value"),
-    );
+    resp.headers_mut().insert(header::ETAG, etag);
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control),

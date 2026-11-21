@@ -19,6 +19,13 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
 - Adapters supply metadata and extents from their registry snapshot. Time bounds
   and advertised collection metadata must agree. Preserve EDR's distinct extent
   representation. Do not infer a sampling grid from feature interval endpoints.
+- `caching::conditional_get` is the one conditional-GET middleware (EDR,
+  Features, the shared root's metadata). Its ETag is weak, `caching::etag`
+  (`W/` + FNV-1a): the server's `CompressionLayer` gzips outside the router,
+  so one tag names the plain and the gzipped body (#1500). A handler that
+  sets its own tag uses `caching::etag` too; the middleware then leaves the
+  body alone. `If-None-Match` is compared weakly
+  (`ds_core::http_cache::if_none_match_matches`), here and in every API.
 - Never hard-code an API path such as `/maps/…` in a Maps/Tiles/Features link, OpenAPI key
   or HTML URL: build it from `Mount::root(base)` (the `Mount` extension added by
   `router_at`). Cross-API links use `mounts::*`. Pass the workbench a `Surface`;
@@ -98,7 +105,8 @@ but not engines or the concrete API crates. Keep framework-free policy in ds-cor
   a query parameter: `/items` rejects unknown ones (#1143).
 - Static assets (#1220): `style.css`, `map.css`, `app.js` and `map.js` are
   served by `workbench::assets::router()` (server root) at
-  `{base}/workbench/{fnv-hash}/{file}`, immutable with a strong ETag. Pages
+  `{base}/workbench/{fnv-hash}/{file}`, immutable with a weak ETag of the
+  same hash (gzipped by the server's compression layer, #1500). Pages
   link them via `assets::href(base, name)` from the base URL, never a mount;
   never inline them. Only `theme.js` and the request-bar fold stay inline.
 - The map's look (#1220): every map colour is a `--map-*` token in

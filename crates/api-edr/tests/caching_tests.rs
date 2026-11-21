@@ -1,8 +1,8 @@
 //! Cache-Control + ETag / If-None-Match behavior (#499).
 //!
 //! Every 200 must carry an explicit `Cache-Control` (short for metadata and
-//! "latest" queries, long for settled past windows) and a strong ETag that
-//! answers `If-None-Match` with 304.
+//! "latest" queries, long for settled past windows) and a weak ETag that
+//! answers `If-None-Match` with 304, compared weakly (#1500).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +20,15 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::model::*;
 
-struct MockEngine;
+/// `station_series`: serves GeoJSON and CSV as well. `runs`: a collection
+/// with one model run, 2024-01-01T00:00:00Z, as a forecast engine.
+#[derive(Default)]
+struct MockEngine {
+    station_series: bool,
+    runs: bool,
+}
+
+const RUN: &str = "2024-01-01T00:00:00Z";
 
 impl MockEngine {
     fn sample_query_result() -> QueryResult {
@@ -139,48 +147,61 @@ impl EdrEngine for MockEngine {
     fn supported_query_types(&self) -> Vec<String> {
         vec!["locations".to_string(), "position".to_string()]
     }
+
+    fn serves_station_series(&self) -> bool {
+        self.station_series
+    }
+
+    fn get_instances(&self) -> Vec<ds_core::instances::RunInfo> {
+        if !self.runs {
+            return Vec::new();
+        }
+        vec![ds_core::instances::RunInfo {
+            reference_time: RUN.parse().unwrap(),
+            valid_times: Self::sample_query_result_times(),
+        }]
+    }
+
+    fn has_instances(&self) -> bool {
+        self.runs
+    }
 }
 
-fn build_router() -> axum::Router {
-    let engine: Arc<dyn EdrEngine> = Arc::new(MockEngine);
+impl MockEngine {
+    fn sample_query_result_times() -> Vec<DateTime<Utc>> {
+        match Self::sample_query_result().domain {
+            DomainDescription::PointSeries { t, .. } => t,
+            _ => unreachable!(),
+        }
+    }
+}
+
+/// `weather` (observations), `stations` (station series, for GeoJSON and
+/// CSV) and `nwp` (a forecast collection with runs).
+fn build_state() -> api_edr::handlers::AppState {
     let mut engines: HashMap<String, Arc<dyn EdrEngine>> = HashMap::new();
     let mut collections = HashMap::new();
-    engines.insert("weather".to_string(), engine);
-    collections.insert(
-        "weather".to_string(),
-        CollectionConfig {
-            id: "weather".to_string(),
-            title: "Weather".to_string(),
-            description: "Test collection".to_string(),
-            data_path: None,
-            apis: vec!["edr".to_string()],
-            engine_type: "csv".to_string(),
-            keywords: Vec::new(),
-            license: None,
-            geotiff: None,
-            querydata: None,
-            wms: None,
-            grib: None,
-            zarr: None,
-            odim: None,
-            cap: None,
-            postgis: None,
-            nowcast: None,
-            station_grid: None,
-            period: None,
-            bufr: None,
-            satellite: None,
-            netcdf: None,
-            csv: None,
-            preview: None,
-            derive_wind: None,
-            derive_geopotential_height: None,
-            discovery: None,
-            derive_humidity: None,
-            expected_interval: None,
-        },
-    );
-    api_edr::router(Arc::new(ArcSwap::from_pointee(EdrState {
+    for (id, engine) in [
+        ("weather", MockEngine::default()),
+        (
+            "stations",
+            MockEngine {
+                station_series: true,
+                ..MockEngine::default()
+            },
+        ),
+        (
+            "nwp",
+            MockEngine {
+                runs: true,
+                ..MockEngine::default()
+            },
+        ),
+    ] {
+        engines.insert(id.to_string(), Arc::new(engine));
+        collections.insert(id.to_string(), collection(id));
+    }
+    Arc::new(ArcSwap::from_pointee(EdrState {
         engines,
         feature_engines: HashMap::new(),
         collections,
@@ -188,7 +209,45 @@ fn build_router() -> axum::Router {
         base_url: String::new(),
         trust_proxy_headers: false,
         discovery: Default::default(),
-    })))
+    }))
+}
+
+fn build_router() -> axum::Router {
+    api_edr::router(build_state())
+}
+
+fn collection(id: &str) -> CollectionConfig {
+    CollectionConfig {
+        id: id.to_string(),
+        title: "Weather".to_string(),
+        description: "Test collection".to_string(),
+        data_path: None,
+        apis: vec!["edr".to_string()],
+        engine_type: "csv".to_string(),
+        keywords: Vec::new(),
+        license: None,
+        geotiff: None,
+        querydata: None,
+        wms: None,
+        grib: None,
+        zarr: None,
+        odim: None,
+        cap: None,
+        postgis: None,
+        nowcast: None,
+        station_grid: None,
+        period: None,
+        bufr: None,
+        satellite: None,
+        netcdf: None,
+        csv: None,
+        preview: None,
+        derive_wind: None,
+        derive_geopotential_height: None,
+        discovery: None,
+        derive_humidity: None,
+        expected_interval: None,
+    }
 }
 
 async fn get_response(uri: &str, if_none_match: Option<&str>) -> axum::response::Response {
@@ -229,8 +288,10 @@ async fn metadata_endpoints_carry_short_cache_control_and_etag() {
         let etag = header_str(&resp, header::ETAG)
             .expect("etag present")
             .to_owned();
+        // Weak (#1500): the server's compression layer gzips the body
+        // after the middleware tagged it, so one tag names both forms.
         assert!(
-            etag.starts_with('"') && etag.ends_with('"'),
+            etag.starts_with("W/\"") && etag.ends_with('"'),
             "{uri}: {etag}"
         );
     }
@@ -331,4 +392,109 @@ async fn error_responses_are_left_alone() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     assert!(resp.headers().get(header::ETAG).is_none());
     assert!(resp.headers().get(header::CACHE_CONTROL).is_none());
+}
+
+/// `If-None-Match` compares weakly (RFC 9110 §13.1.2, #1500): the strong
+/// form of a data query's tag, as a client held it before the tags turned
+/// weak, and the weak tag in a list are both a 304.
+#[tokio::test]
+async fn if_none_match_compares_weakly() {
+    let uri = format!(
+        "/collections/weather/position?coords=POINT(24.94%2060.17)&datetime={SETTLED_WINDOW}"
+    );
+    let first = get_response(&uri, None).await;
+    let etag = header_str(&first, header::ETAG).unwrap().to_owned();
+    assert!(etag.starts_with("W/\""), "{etag}");
+    let strong = etag.trim_start_matches("W/").to_owned();
+    for sent in [strong, format!("\"aaa\", {etag}")] {
+        let resp = get_response(&uri, Some(&sent)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED, "{sent}");
+        assert_eq!(header_str(&resp, header::ETAG), Some(etag.as_str()));
+    }
+}
+
+/// The data-query routes alone, without the router's `conditional_get`
+/// middleware, so a tag on their 200s is one the handler set.
+fn handlers_only() -> axum::Router {
+    use api_edr::handlers::{instance_position_query, location_query, position_query};
+    use axum::routing::get;
+    axum::Router::new()
+        .route("/collections/{id}/position", get(position_query))
+        .route("/collections/{id}/locations/{loc_id}", get(location_query))
+        .route(
+            "/collections/{id}/instances/{instanceId}/position",
+            get(instance_position_query),
+        )
+        .with_state(build_state())
+}
+
+/// Every data query's body is hashed by its handler, on the query executor
+/// inside the query's slot, not by the middleware on the request runtime
+/// after it (#1500): each format's 200 carries the weak tag of its own
+/// bytes before any middleware ran, and the full router keeps that tag.
+#[tokio::test]
+async fn data_queries_tag_their_own_bodies() {
+    let position = "/collections/weather/position?coords=POINT(24.94%2060.17)";
+    let station = "/collections/stations/position?coords=POINT(24.94%2060.17)";
+    for uri in [
+        position.to_string(),
+        format!("{position}&f=html"),
+        format!("{position}&f=png"),
+        format!("{station}&f=geojson"),
+        format!("{station}&f=csv"),
+        "/collections/weather/locations/helsinki".to_string(),
+        format!("/collections/nwp/instances/{RUN}/position?coords=POINT(24.94%2060.17)"),
+    ] {
+        let resp = handlers_only()
+            .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let etag = header_str(&resp, header::ETAG)
+            .unwrap_or_else(|| panic!("{uri}: no ETag from the handler"))
+            .to_owned();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(etag, ds_core::http_cache::weak_etag_of(&body), "{uri}");
+
+        let routed = get_response(&uri, None).await;
+        assert_eq!(
+            header_str(&routed, header::ETAG),
+            Some(etag.as_str()),
+            "{uri}"
+        );
+        let revalidated = get_response(&uri, Some(&etag)).await;
+        assert_eq!(revalidated.status(), StatusCode::NOT_MODIFIED, "{uri}");
+    }
+}
+
+/// On a collection with runs, a no-instance route answers from the newest
+/// run covering the window, and a run published later can cover the same
+/// past valid times: a settled window there gets the short policy. The
+/// `/instances/{id}/…` route names its run and keeps the long one (#1500).
+#[tokio::test]
+async fn latest_run_routes_are_never_settled() {
+    let query = format!("coords=POINT(24.94%2060.17)&datetime={SETTLED_WINDOW}");
+    for (uri, cache_control) in [
+        (
+            format!("/collections/nwp/position?{query}"),
+            "public, max-age=60",
+        ),
+        (
+            format!("/collections/nwp/instances/{RUN}/position?{query}"),
+            "public, max-age=86400",
+        ),
+        // A collection without runs keeps the window's policy.
+        (
+            format!("/collections/weather/position?{query}"),
+            "public, max-age=86400",
+        ),
+    ] {
+        let resp = get_response(&uri, None).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        assert_eq!(
+            header_str(&resp, header::CACHE_CONTROL),
+            Some(cache_control),
+            "{uri}"
+        );
+    }
 }

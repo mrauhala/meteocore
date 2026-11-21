@@ -16,7 +16,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::Response;
 use axum::routing::get;
 use axum::Router;
-use ds_core::http_cache::{etag_of, if_none_match_matches};
+use ds_core::http_cache::{if_none_match_matches, weak_etag_of};
 
 /// The route the server mounts: a hash, then the file name.
 pub const ROUTE: &str = "/workbench/{version}/{file}";
@@ -57,15 +57,22 @@ const ASSETS: [Asset; 4] = [
     },
 ];
 
-/// Each asset's strong ETag, `"<16 hex>"`, whose hex is also its URL's
-/// version. FNV-1a is stable across toolchains and instances
-/// (`ds_core::http_cache::etag_of`), so every server of one build links the
-/// same URLs. Hashed once, on first use.
+/// Each asset's ETag, `W/"<16 hex>"`, whose hex is also its URL's version.
+/// Weak because the server's `CompressionLayer` gzips the file after it was
+/// tagged, so the tag names the plain and the gzipped bytes (#1500). FNV-1a
+/// is stable across toolchains and instances
+/// (`ds_core::http_cache::weak_etag_of`), so every server of one build links
+/// the same URLs. Hashed once, on first use.
 static ETAGS: LazyLock<[String; 4]> = LazyLock::new(|| {
     ASSETS
         .each_ref()
-        .map(|asset| etag_of(asset.body.as_bytes()))
+        .map(|asset| weak_etag_of(asset.body.as_bytes()))
 });
+
+/// The URL version an ETag of [`ETAGS`] carries: its hex.
+fn version_of(etag: &str) -> &str {
+    etag.trim_start_matches("W/").trim_matches('"')
+}
 
 fn find(name: &str) -> Option<(&'static Asset, &'static str)> {
     let index = ASSETS.iter().position(|asset| asset.name == name)?;
@@ -78,7 +85,7 @@ fn find(name: &str) -> Option<(&'static Asset, &'static str)> {
 /// For a name that is not one of the workbench's assets: a programming error.
 pub fn href(base: &str, name: &str) -> String {
     let (asset, etag) = find(name).unwrap_or_else(|| panic!("no workbench asset {name}"));
-    format!("{base}/workbench/{}/{}", etag.trim_matches('"'), asset.name)
+    format!("{base}/workbench/{}/{}", version_of(etag), asset.name)
 }
 
 /// The router serving the assets at [`ROUTE`], for the server's root.
@@ -103,7 +110,7 @@ pub async fn asset(Path((version, file)): Path<(String, String)>, headers: Heade
             .body(Body::from("Not Found"))
             .expect("static 404 response headers are valid");
     };
-    let cache = if etag.trim_matches('"') == version {
+    let cache = if version_of(etag) == version {
         CACHE_IMMUTABLE
     } else {
         CACHE_STALE
@@ -152,8 +159,8 @@ mod tests {
     }
 
     /// The URL carries the content hash; it is answered `immutable` with
-    /// the file's bytes, its media type and a strong ETag that a
-    /// revalidation matches with a 304.
+    /// the file's bytes, its media type and a weak ETag that a
+    /// revalidation matches with a 304, in either form (#1500).
     #[tokio::test]
     async fn a_versioned_url_is_immutable_and_revalidates_by_etag() {
         for (name, media_type, body) in [
@@ -180,11 +187,8 @@ mod tests {
         ] {
             let href = href("https://example.test/prefix", name);
             let path = href.strip_prefix("https://example.test/prefix").unwrap();
-            let version = etag_of(body.as_bytes());
-            assert_eq!(
-                path,
-                format!("/workbench/{}/{name}", version.trim_matches('"'))
-            );
+            let version = weak_etag_of(body.as_bytes());
+            assert_eq!(path, format!("/workbench/{}/{name}", version_of(&version)));
             let response = get(path, None).await;
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(response.headers()[header::CONTENT_TYPE], media_type);
@@ -200,6 +204,9 @@ mod tests {
             assert_eq!(again.headers()[header::ETAG], version.as_str());
             assert_eq!(again.headers()[header::CACHE_CONTROL], CACHE_IMMUTABLE);
             assert!(text(again).await.is_empty());
+            let strong = ds_core::http_cache::etag_of(body.as_bytes());
+            let again = get(path, Some(&strong)).await;
+            assert_eq!(again.status(), StatusCode::NOT_MODIFIED, "{strong}");
         }
     }
 

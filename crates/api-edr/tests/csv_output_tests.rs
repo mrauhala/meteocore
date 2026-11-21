@@ -469,7 +469,7 @@ async fn location_csv_carries_the_coveragejson_values() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(content_type(&headers), CONTENT_TYPE);
     assert!(!varies_on_accept(&headers), "an explicit f does not vary");
-    // The caching of every data query: a strong ETag, and a settled window
+    // The caching of every data query: a weak ETag, and a settled window
     // keeps its long policy.
     assert!(headers.contains_key(header::ETAG));
     assert_eq!(headers[header::CACHE_CONTROL], "public, max-age=86400");

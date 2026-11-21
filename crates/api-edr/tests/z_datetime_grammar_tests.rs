@@ -448,9 +448,17 @@ async fn datetime_list_queries_each_instant_and_merges() {
             serde_json::json!([1.0, 3.0]),
             "{uri}"
         );
-        // Every listed instant is long past: the settled policy.
+        // Every listed instant is long past: the settled policy, on the
+        // route that names its run. `flat` has runs, so the routes without
+        // one answer from the newest run, which a later run can replace:
+        // the short policy (#1500).
+        let max_age = if uri.contains("/instances/") {
+            "86400"
+        } else {
+            "max-age=60"
+        };
         assert!(
-            cache_control.as_deref().unwrap_or("").contains("86400"),
+            cache_control.as_deref().unwrap_or("").contains(max_age),
             "{uri}: {cache_control:?}"
         );
     }

@@ -2097,7 +2097,7 @@ async fn render_vector_tile(
     // would let stale browser caches survive a server fix indefinitely.
     if let Some(cached) = state.vector_tile_cache.get(&cache_key) {
         if let Some(ref inm) = if_none_match {
-            if ds_render::etag_matches(inm, cached.etag()) {
+            if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
                 return Ok(axum::response::Response::builder()
                     .status(StatusCode::NOT_MODIFIED)
                     .header(header::ETAG, cached.etag())
@@ -2191,7 +2191,7 @@ async fn render_vector_tile(
     fill.finish();
 
     if let Some(ref inm) = if_none_match {
-        if ds_render::etag_matches(inm, cached.etag()) {
+        if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
             return Ok(axum::response::Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, cached.etag())
@@ -2766,7 +2766,7 @@ async fn render_tile(
     let render_start = std::time::Instant::now();
     if let Some(cached) = state.rendered_cache.get(&cache_key) {
         if let Some(ref inm) = if_none_match {
-            if ds_render::etag_matches(inm, cached.etag()) {
+            if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
                 // 304 from the cache-HIT branch. The `x-cache: HIT` header
                 // lets the regression test (and curious clients) distinguish
                 // this from a post-render MISS→304, which the handler also
@@ -3016,7 +3016,7 @@ async fn render_tile(
     // not a misleading `MISS`. This matters for any tile viewer
     // panning over out-of-coverage areas.
     if let Some(ref inm) = if_none_match {
-        if ds_render::etag_matches(inm, cached.etag()) {
+        if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
             return Ok(with_datetime(axum::response::Response::builder())
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, cached.etag())

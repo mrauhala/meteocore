@@ -3,6 +3,7 @@
 //! Items responses carry a per-request `timeStamp`, so their ETag is
 //! precomputed over the document with the timestamp excluded — otherwise
 //! revalidation could never match. The other endpoints hash the body as-is.
+//! Every tag is weak, `W/"…"`, and compared weakly (#1500).
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
@@ -227,7 +228,8 @@ async fn items_etag_excludes_the_response_timestamp() {
     let mut doc: Value = serde_json::from_slice(&body).unwrap();
     assert!(doc["timeStamp"].as_str().is_some_and(|t| !t.is_empty()));
     doc["timeStamp"] = json!("");
-    let recomputed = ds_core::http_cache::etag_of(serde_json::to_string(&doc).unwrap().as_bytes());
+    let recomputed =
+        ds_core::http_cache::weak_etag_of(serde_json::to_string(&doc).unwrap().as_bytes());
     assert_eq!(etag, recomputed);
 
     // And it revalidates: a second request (new timeStamp) still 304s.
@@ -235,6 +237,12 @@ async fn items_etag_excludes_the_response_timestamp() {
     assert_eq!(second.status(), StatusCode::NOT_MODIFIED);
     let body = second.into_body().collect().await.unwrap().to_bytes();
     assert!(body.is_empty());
+
+    // Weakly (RFC 9110 §13.1.2, #1500): the strong form of the tag, as a
+    // client held it before the tags turned weak, matches too.
+    let strong = etag.trim_start_matches("W/");
+    let third = get_response("/collections/cities/items", Some(strong)).await;
+    assert_eq!(third.status(), StatusCode::NOT_MODIFIED);
 }
 
 #[tokio::test]
@@ -407,7 +415,7 @@ async fn items_html_of_large_polygons_stays_within_a_byte_budget() {
     let (stamp, tail) = rest.split_once("</time>").unwrap();
     assert!(!stamp.is_empty(), "the page states its generation time");
     let blank = format!("{head}<time></time>{tail}");
-    assert_eq!(etag, ds_core::http_cache::etag_of(blank.as_bytes()));
+    assert_eq!(etag, ds_core::http_cache::weak_etag_of(blank.as_bytes()));
 
     let second = get_response(uri, None).await;
     assert_eq!(header_str(&second, header::ETAG), Some(etag.as_str()));

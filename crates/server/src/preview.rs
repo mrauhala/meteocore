@@ -61,16 +61,18 @@ const PREVIEW_CSP: &str = "default-src 'self'; \
                            frame-ancestors 'none'";
 
 /// Format the `[u8; 32]` SHA-256 hash that `rust-embed` exposes per asset
-/// into a quoted hex ETag (`"hexhexhex..."`, 64 hex chars + quotes).
-/// Stable across binary rebuilds for the same asset bytes; changes the
-/// moment the embedded content does.
+/// into a weak quoted hex ETag (`W/"hexhexhex..."`, 64 hex chars). Weak, as
+/// `index.html`'s: the server's `CompressionLayer` gzips the asset after it
+/// was tagged, so one tag names both forms (#1500). Stable across binary
+/// rebuilds for the same asset bytes; changes the moment the embedded
+/// content does.
 ///
 /// `write!` straight onto the `String` avoids the 32 temporary
 /// `format!(...)` heap allocations the obvious push-loop would do.
 fn sha256_etag(hash: &[u8; 32]) -> String {
     use std::fmt::Write as _;
-    let mut out = String::with_capacity(2 + 64);
-    out.push('"');
+    let mut out = String::with_capacity(4 + 64);
+    out.push_str("W/\"");
     for b in hash {
         // `write!` into a String never fails — `Write` impl for String is
         // infallible — so unwrapping is safe and the compiler optimises
@@ -116,7 +118,7 @@ fn serve_index(state: &AdminState, request_headers: &axum::http::HeaderMap) -> R
     let Some(html) = index_html(ds_core::proxy::path_of(&base)) else {
         return not_found();
     };
-    let etag = ds_core::http_cache::etag_of(html.as_bytes());
+    let etag = ds_core::http_cache::weak_etag_of(html.as_bytes());
     respond("index.html", html.into_bytes(), etag, request_headers)
 }
 
@@ -191,7 +193,7 @@ fn respond(
     // a `no-cache`-marked asset.
     if let Some(inm) = request_headers.get(header::IF_NONE_MATCH) {
         if let Ok(inm_str) = inm.to_str() {
-            if ds_render::etag_matches(inm_str, &etag) {
+            if ds_core::http_cache::if_none_match_matches(inm_str, &etag) {
                 // `nosniff` here is mostly cosmetic — browsers fold a 304's
                 // headers into the cached 200, which already carried this
                 // value — but keeping the two paths symmetric removes a
@@ -3630,6 +3632,17 @@ mod tests {
             "304 must have an empty body, got {} bytes",
             body.len()
         );
+        // Weak, as the compression layer gzips the page after it was
+        // tagged; the strong form of the tag revalidates too (#1500).
+        let etag = etag.to_str().unwrap();
+        assert!(etag.starts_with("W/\""), "{etag}");
+        let mut req_headers = axum::http::HeaderMap::new();
+        req_headers.insert(
+            header::IF_NONE_MATCH,
+            etag.trim_start_matches("W/").parse().unwrap(),
+        );
+        let third = index_handler(axum::extract::State(asset_state()), req_headers).await;
+        assert_eq!(third.status(), StatusCode::NOT_MODIFIED);
     }
 
     #[tokio::test]

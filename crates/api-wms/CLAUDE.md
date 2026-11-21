@@ -547,7 +547,7 @@ handler's task.
   with `*` its first), pinned by the server's
   `getcapabilities_passes_the_layer_as_the_handler_encoded_it`; a server
   that compresses another coding must revisit it.
-- **ETag**: weak, `W/` + `ds_core::http_cache::etag_of` of the document, so
+- **ETag**: weak, `ds_core::http_cache::weak_etag_of` of the document, so
   it changes with the bytes and names the plain and gzipped forms alike; a
   matching `If-None-Match` is 304. No `Cache-Control`.
 - Not in the memory plan and no `/metrics` family: at most four documents,

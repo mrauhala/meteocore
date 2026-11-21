@@ -86,11 +86,29 @@ fn coverage_json_response(
             tracing::error!("{label} CoverageJSON serialise error: {e}");
         }));
     }
-    Ok((
-        [(header::CONTENT_TYPE, COVERAGE_JSON_MEDIA_TYPE)],
-        writer.into_bytes(),
+    Ok(data_response(COVERAGE_JSON_MEDIA_TYPE, writer.into_bytes()))
+}
+
+/// A data query's 200: `body`, typed `content_type`, with its ETag
+/// ([`api_common::caching::etag`]) hashed here, on the query executor
+/// inside the query's slot, and never by `caching::conditional_get` on the
+/// request runtime after the slot is released (#1500): a 9 MB area body is
+/// about 12 ms of hashing. The middleware honours the tag it finds. Every
+/// data-query body, in every format, goes through here; `items` and
+/// `/locations` tag theirs on the executor too.
+fn data_response(content_type: &'static str, body: impl Into<axum::body::Bytes>) -> Response {
+    let body = body.into();
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static(content_type),
+            ),
+            (header::ETAG, api_common::caching::etag(&body)),
+        ],
+        body,
     )
-        .into_response())
+        .into_response()
 }
 
 /// The error of a response body the EDR response budget stopped (#1041):
@@ -434,11 +452,10 @@ fn render_station_geojson(
             tracing::error!("EDR GeoJSON serialise error: {e}");
         }),
     })?;
-    Ok((
-        [(header::CONTENT_TYPE, EdrFormat::GeoJson.media_type())],
+    Ok(data_response(
+        EdrFormat::GeoJson.media_type(),
         writer.into_bytes(),
-    )
-        .into_response())
+    ))
 }
 
 /// Encode a station-series result as CSV (#1066), each coverage's rows named
@@ -476,7 +493,7 @@ fn render_station_csv(
     let body = reservation
         .into_bytes(body.into_bytes())
         .map_err(|failure| response_budget_error(Some(failure), || ()))?;
-    Ok(([(header::CONTENT_TYPE, crate::csv::CONTENT_TYPE)], body).into_response())
+    Ok(data_response(crate::csv::CONTENT_TYPE, body))
 }
 
 /// Serialise an EDR coverage response in the requested output format.
@@ -512,7 +529,7 @@ fn render_coverage_response(
                 tracing::error!("EDR plot render error: {e}");
                 server_error()
             })?;
-            Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+            Ok(data_response("image/png", png))
         }
         EdrFormat::Html => {
             let locations = geojson.html_locations(&result, number_matched)?;
@@ -522,7 +539,7 @@ fn render_coverage_response(
                 locations.as_ref(),
                 expired,
             )
-            .map(crate::html::response)
+            .map(|page| data_response(crate::html::CONTENT_TYPE, page))
             .map_err(|failure| response_budget_error(Some(failure), || ()))
         }
     }
@@ -686,9 +703,15 @@ pub(crate) fn with_vary(mut resp: Response) -> Response {
 /// [`ds_core::http_cache::data_cache_control`]. Metadata endpoints don't call
 /// this — they fall through to the middleware's short default
 /// (`caching::conditional_get`).
+///
+/// `latest_run` ([`follows_latest_run`]) is a route that answers from
+/// whichever run is newest: it gets the short policy whatever its window,
+/// since a run published later can cover the same past valid times
+/// (#1500).
 fn with_data_cache_control(
     mut resp: Response,
     datetime: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
+    latest_run: bool,
 ) -> Response {
     let (start, end) = match datetime {
         Some((s, e)) => (
@@ -697,12 +720,27 @@ fn with_data_cache_control(
         ),
         None => (None, None),
     };
-    let cc = ds_core::http_cache::data_cache_control(start, end, chrono::Utc::now());
+    let cc = if latest_run {
+        ds_core::http_cache::CACHE_CONTROL_SHORT
+    } else {
+        ds_core::http_cache::data_cache_control(start, end, chrono::Utc::now())
+    };
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
         axum::http::HeaderValue::from_static(cc),
     );
     resp
+}
+
+/// Whether a data query's answer comes from the engine's newest run rather
+/// than a run the request named: a no-instance route of a collection with
+/// runs (#337), which GRIB, NetCDF and the other forecast engines answer
+/// from the newest run covering the window. A later run can cover a past
+/// valid time again, so such an answer is never settled
+/// ([`with_data_cache_control`], #1500); an `/instances/{id}/…` route
+/// names its run and keeps the window's policy. O(1): `has_instances`.
+fn follows_latest_run(engine: &Arc<dyn EdrEngine>, instance_id: Option<&str>) -> bool {
+    instance_id.is_none() && engine.has_instances()
 }
 
 /// Shared state for the EDR API: a registry of collection engines + metadata.
@@ -2749,7 +2787,7 @@ pub async fn locations(
             failure => response_budget_error(failure, || ()),
         })?;
         let body = writer.into_bytes();
-        let etag = ds_core::http_cache::etag_of(&body);
+        let etag = api_common::caching::etag(&body);
         Ok((body, etag))
     })
     .await?;
@@ -2760,7 +2798,10 @@ pub async fn locations(
     Ok(with_format_vary(
         (
             [
-                (header::CONTENT_TYPE, content_type.to_owned()),
+                (
+                    header::CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static(content_type),
+                ),
                 (header::ETAG, etag),
             ],
             body,
@@ -2925,6 +2966,8 @@ pub async fn location_query(
         offered,
         location_ids: Vec::new(),
     };
+    // No instance route: the engine's newest run, where it has runs.
+    let latest_run = follows_latest_run(engine, None);
     let engine = engine.clone();
     if !list {
         // One id, a repeat-only list included: the response it always was.
@@ -2956,7 +2999,7 @@ pub async fn location_query(
         })
         .await?;
         return Ok(with_format_vary(
-            with_data_cache_control(response, window),
+            with_data_cache_control(response, window, latest_run),
             format,
         ));
     }
@@ -2992,7 +3035,7 @@ pub async fn location_query(
     })
     .await?;
     Ok(with_format_vary(
-        with_data_cache_control(response, window),
+        with_data_cache_control(response, window, latest_run),
         format,
     ))
 }
@@ -3243,6 +3286,7 @@ async fn run_position_query(
     let (engine, config) = lookup_collection(&state, &id)?;
     require_query_type(engine, &id, "position", "position")?;
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
+    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -3382,7 +3426,7 @@ async fn run_position_query(
     })
     .await?;
     Ok(with_format_vary(
-        with_data_cache_control(response, window),
+        with_data_cache_control(response, window, latest_run),
         format,
     ))
 }
@@ -3445,6 +3489,7 @@ async fn run_area_query(
     request_crs(params.crs.as_deref())?;
 
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
+    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -3483,7 +3528,7 @@ async fn run_area_query(
     .await?;
 
     Ok(with_format_vary(
-        with_data_cache_control(response, window),
+        with_data_cache_control(response, window, latest_run),
         format,
     ))
 }
@@ -3553,6 +3598,7 @@ async fn run_radius_query(
         parse_within_metres(&params.within, &params.within_units).map_err(|e| bad_request(&e))?;
 
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
+    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
 
     let datetime = request_datetime(params.datetime.as_deref())?;
     let window = datetime.as_ref().map(DatetimeSelector::envelope);
@@ -3592,7 +3638,7 @@ async fn run_radius_query(
     })
     .await?;
     Ok(with_format_vary(
-        with_data_cache_control(response, window),
+        with_data_cache_control(response, window, latest_run),
         format,
     ))
 }
@@ -3682,6 +3728,7 @@ async fn run_cube_query(
     }
 
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
+    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
 
     // A datetime list runs the cube once per instant; the per-instant
     // `[t, z, y, x]` grids share x, y and z, so the merge joins them along t.
@@ -3729,7 +3776,7 @@ async fn run_cube_query(
     .await?;
 
     Ok(with_format_vary(
-        with_data_cache_control(response, window),
+        with_data_cache_control(response, window, latest_run),
         format,
     ))
 }
@@ -3843,6 +3890,7 @@ async fn run_trajectory_query(
     // After the request's own checks, so an instance route rejects a
     // malformed request as the collection's route does.
     let reference_time = resolve_instance(engine, request.instance_id.as_deref())?;
+    let latest_run = follows_latest_run(engine, request.instance_id.as_deref());
 
     // A cross-section engine drives its remote reads with `handle.block_on`
     // on the runtime it finds, which needs a thread outside the runtime's
@@ -3884,7 +3932,7 @@ async fn run_trajectory_query(
                 crate::html::coverage_page(&result, &page.html_page(&result), None, &|| {
                     budget.expired()
                 })
-                .map(crate::html::response)
+                .map(|page| data_response(crate::html::CONTENT_TYPE, page))
                 .map_err(|failure| response_budget_error(Some(failure), || ()))
             }
             (EdrFormat::Png, _) => render_section_png(&result, &state.styles, &id, width, height),
@@ -3901,7 +3949,7 @@ async fn run_trajectory_query(
     })
     .await?;
     Ok(with_format_vary(
-        with_data_cache_control(response, window),
+        with_data_cache_control(response, window, latest_run),
         negotiated,
     ))
 }
@@ -3935,7 +3983,7 @@ fn render_section_png(
         tracing::error!("Trajectory PNG render error: {e}");
         server_error()
     })?;
-    Ok(([(header::CONTENT_TYPE, "image/png")], png).into_response())
+    Ok(data_response("image/png", png))
 }
 
 /// The data queries with an `/instances/{instanceId}/…` route, so the only

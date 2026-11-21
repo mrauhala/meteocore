@@ -24,9 +24,9 @@ use bytes::Bytes;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ds_core::config::CollectionConfig;
 use ds_core::geo::geodetic_to_ecef;
-// Strong content-derived ETag; shared with api-edr/api-features so the
-// implementations cannot drift (#499).
-use ds_core::http_cache::etag_of;
+// Weak content-derived ETag, as every gzipped response's (#1500); shared
+// with api-edr/api-features so the implementations cannot drift (#499).
+use ds_core::http_cache::weak_etag_of;
 use ds_core::volume::VolumeEngine;
 use ds_render::{ColorMap, ColorStop, LutColorMap};
 use serde::Deserialize;
@@ -376,13 +376,16 @@ fn exact_volume_time(info: &ds_core::volume::VolumeInfo, time: Option<DateTime<U
     time.is_some_and(|t| info.times.binary_search(&t).is_ok())
 }
 
-/// Build a binary content response with strong-ETag conditional handling: a
-/// matching `If-None-Match` (or `*`) yields 304, otherwise 200 with the bytes.
+/// Build a content response with conditional handling: a matching
+/// `If-None-Match` (or `*`) yields 304, otherwise 200 with the bytes.
 ///
-/// The bytes/ETag normally come from [`crate::cache::CONTENT_CACHE`], so a
-/// revalidation that hits the cache is two lookups — not a recompute. `pinned`
-/// selects the [`cache_control`] policy. RFC 7232 §3.2: `If-None-Match` may be
-/// `*` or a comma-separated list.
+/// The ETag is weak (`ds_core::http_cache::weak_etag_of`): the server's
+/// `CompressionLayer` gzips JSON and binary content after it was tagged, so
+/// one tag names both forms (#1500), and `If-None-Match` compares weakly
+/// (RFC 9110 §13.1.2). The bytes/ETag normally come from
+/// [`crate::cache::CONTENT_CACHE`], so a revalidation that hits the cache is
+/// two lookups — not a recompute. `pinned` selects the [`cache_control`]
+/// policy. `If-None-Match` may be `*` or a comma-separated list.
 fn binary_response(
     headers: &HeaderMap,
     content_type: &'static str,
@@ -478,8 +481,8 @@ const VIEWER_CSP: &str = "default-src 'none'; \
     form-action 'none'; \
     frame-ancestors 'none'";
 
-/// Strong ETag of [`VIEWER_JS`], computed once.
-static VIEWER_JS_ETAG: LazyLock<String> = LazyLock::new(|| etag_of(VIEWER_JS.as_bytes()));
+/// Weak ETag of [`VIEWER_JS`] (compressed like any script), computed once.
+static VIEWER_JS_ETAG: LazyLock<String> = LazyLock::new(|| weak_etag_of(VIEWER_JS.as_bytes()));
 
 /// `GET /viewer` — interactive CesiumJS viewer. It calls this same API
 /// (same-origin by default), so it works on any deployment. `no-cache`: the
@@ -746,7 +749,7 @@ pub async fn get_content(
                 let cloud = engine.read_point_cloud(quantity.as_deref(), time, min_value, None)?;
                 let bytes = ds_3dtiles::encode_pnts(&cloud, colormap.as_ref())
                     .map_err(|e| Tiles3dError::Internal(format!("pnts encode failed: {e}")))?;
-                let etag = etag_of(&bytes);
+                let etag = weak_etag_of(&bytes);
                 Ok((bytes, etag))
             })
             .await
@@ -934,7 +937,7 @@ pub async fn get_content_glb(
                     }
                     other => Tiles3dError::Internal(format!("{product} encode failed: {other}")),
                 })?;
-                let etag = etag_of(&bytes);
+                let etag = weak_etag_of(&bytes);
                 Ok((bytes, etag))
             })
             .await
@@ -1034,7 +1037,7 @@ pub async fn get_voxel_tileset(
     // `content.pnts`/`content.glb` handlers).
     let pinned = exact_volume_time(&info, time);
     let bytes = Bytes::from(tileset.into_bytes());
-    let etag = etag_of(&bytes);
+    let etag = weak_etag_of(&bytes);
     Ok(binary_response(
         &headers,
         "application/json",
@@ -1079,7 +1082,7 @@ pub async fn get_voxel_subtree(
             .map_err(|e| Tiles3dError::Internal(format!("voxel subtree build failed: {e}")))?
             .into_bytes(),
     );
-    let etag = etag_of(&bytes);
+    let etag = weak_etag_of(&bytes);
     Ok(binary_response(
         &headers,
         "application/json",
@@ -1178,7 +1181,7 @@ pub async fn get_voxel_content(
                     )),
                     other => Tiles3dError::Internal(format!("voxel encode failed: {other}")),
                 })?;
-                let etag = etag_of(&bytes);
+                let etag = weak_etag_of(&bytes);
                 Ok((bytes, etag))
             })
             .await
