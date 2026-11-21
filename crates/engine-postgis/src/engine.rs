@@ -20,8 +20,8 @@ use deadpool_postgres::Pool;
 use ds_core::edr_engine::EdrEngine;
 use ds_core::error::DataServerError;
 use ds_core::feature::{
-    check_mask_budget, parse_area_coords, Feature, FeaturePage, FeatureQuery, Geometry,
-    PropertyValue, QueryPolygon, MAX_AREA_POINT_COVERAGES,
+    check_area_station_count, check_mask_budget, parse_area_coords, Feature, FeaturePage,
+    FeatureQuery, Geometry, PropertyValue, QueryPolygon, MAX_AREA_POINT_COVERAGES,
 };
 use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::model::{
@@ -1297,10 +1297,10 @@ impl PostgisEngine {
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 /// The observations-derived area prefilter: cached stations inside the
-/// polygon (exact point-in-polygon, boundary inclusive; #671). Stops at the
-/// cap + nothing more — mirrors the SQL path's `LIMIT MAX_STATIONS_IN_POLYGON`,
-/// so a huge polygon over a dense dataset never materialises an unbounded
-/// Vec just to error out.
+/// polygon (exact point-in-polygon, boundary inclusive; #671). Stops one
+/// past the coverage cap — mirrors the SQL path's `LIMIT
+/// MAX_STATIONS_IN_POLYGON`, so a huge polygon over a dense dataset never
+/// materialises an unbounded Vec just to error out.
 fn stations_in_polygon(locations: &[Location], polygon: &QueryPolygon) -> Vec<Location> {
     locations
         .iter()
@@ -1330,19 +1330,15 @@ fn distinct_stations(mut stations: Vec<Location>) -> Vec<Location> {
     stations
 }
 
-/// Both area prefilters (SQL `LIMIT`, in-memory `.take`) fetch one station
-/// past the [`MAX_STATIONS_IN_POLYGON`] memory guard; a full batch means the
-/// polygon matched more stations than it allows. The gate on a request's
-/// size is the response-value budget (#1062): this only bounds the
-/// prefilter buffer and the station id list. `QueryTooLarge` → HTTP 400.
+/// Both area prefilters (SQL `LIMIT`, in-memory `.take`) fetch
+/// [`MAX_STATIONS_IN_POLYGON`] stations, one past
+/// [`MAX_AREA_POINT_COVERAGES`]; a full batch means the polygon matched more
+/// stations than an answer may hold coverages (#1501), refused here before
+/// any observation is read. Within it, the response-value budget bounds the
+/// values (#1062). `QueryTooLarge` → HTTP 400 naming the cap.
 fn check_station_count(matched: usize) -> Result<(), DataServerError> {
-    if matched >= MAX_STATIONS_IN_POLYGON {
-        return Err(DataServerError::QueryTooLarge(format!(
-            "area query matched more than the {} station ceiling — narrow the polygon",
-            MAX_STATIONS_IN_POLYGON - 1
-        )));
-    }
-    Ok(())
+    const { assert!(MAX_STATIONS_IN_POLYGON == MAX_AREA_POINT_COVERAGES + 1) };
+    check_area_station_count(matched)
 }
 
 /// The path an area query takes when the caller does not force one (#1062).
@@ -3425,22 +3421,50 @@ mod tests {
 
     #[test]
     fn station_cap_maps_to_query_too_large_not_engine_error() {
-        // The guard sits at 200 000 stations (#1062), far above the old
-        // 10 000 ceiling a 20 000-station network used to hit.
-        const { assert!(MAX_STATIONS_IN_POLYGON > 20_000) };
+        // #1501: the cap is the coverage cap, 100 000 stations, still far
+        // above the old 10 000 ceiling a 20 000-station network used to hit
+        // (#1062).
+        assert_eq!(MAX_AREA_POINT_COVERAGES, 100_000);
         assert!(check_station_count(20_000).is_ok());
-        // A full-ceiling batch stays under the limit untouched.
-        assert!(check_station_count(MAX_STATIONS_IN_POLYGON - 1).is_ok());
+        // Exactly the cap is answered.
+        assert!(check_station_count(MAX_AREA_POINT_COVERAGES).is_ok());
 
-        // A full sentinel batch signals the ceiling was breached →
-        // QueryTooLarge (HTTP 400 with the message), never Engine
-        // (opaque HTTP 500).
+        // A full prefilter batch, one past the cap, is QueryTooLarge (HTTP
+        // 400 with the message naming the cap), never Engine (opaque HTTP
+        // 500).
         match check_station_count(MAX_STATIONS_IN_POLYGON).unwrap_err() {
             DataServerError::QueryTooLarge(msg) => {
-                assert!(msg.contains("narrow the polygon"), "message: {msg}")
+                assert!(msg.contains("100000 stations"), "message: {msg}");
+                assert!(msg.contains("narrow the polygon"), "message: {msg}");
             }
             other => panic!("expected QueryTooLarge, got: {other:?}"),
         }
+    }
+
+    /// #1501: the observations-derived prefilter stops one past the coverage
+    /// cap, however many cached stations the polygon holds.
+    #[test]
+    fn stations_in_polygon_takes_one_past_the_coverage_cap() {
+        let held = MAX_AREA_POINT_COVERAGES + 10;
+        let stations: Vec<Location> = (0..held)
+            .map(|n| {
+                loc(
+                    &n.to_string(),
+                    (n % 1000) as f64 * 0.001,
+                    (n / 1000) as f64 * 0.001,
+                )
+            })
+            .collect();
+        let all = parse_area_coords("-1,-1,2,2").unwrap();
+        let found = stations_in_polygon(&stations, &all);
+        assert_eq!(found.len(), MAX_STATIONS_IN_POLYGON);
+        assert_eq!(found.last().map(|l| l.id.as_str()), Some("100000"));
+        assert!(check_station_count(found.len()).is_err());
+        // Rows 0..=99 of the grid: exactly the cap, answered.
+        let at_cap = parse_area_coords("-0.0005,-0.0005,1,0.0995").unwrap();
+        let found = stations_in_polygon(&stations, &at_cap);
+        assert_eq!(found.len(), MAX_AREA_POINT_COVERAGES);
+        assert!(check_station_count(found.len()).is_ok());
     }
 
     /// #1062: a stations view without a unique id lists a station twice.

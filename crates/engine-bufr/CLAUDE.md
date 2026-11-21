@@ -152,12 +152,18 @@ no opt-out, as for GRIB; a client wanting kelvin converts back.
 - `position` = nearest station within `position_radius_km` (25) by
   `ds_core::geo::great_circle_distance_m` — never a local haversine;
   `area` = `parse_area_coords` + `check_mask_budget` + exact
-  `QueryPolygon::contains`, bounded only by the `MAX_RESPONSE_VALUES`
-  (500 000) budget → `QueryTooLarge` (400) naming it. No station ceiling
-  (#1062): the store already bounds the stations (`max_stations`), and
-  every station of a 20 000-station network at one instant must fit. An
-  empty area is an empty `CoverageCollection`, not 404; `radius` is the
-  trait default (point + `within` → area).
+  `QueryPolygon::contains`, bounded by the `MAX_RESPONSE_VALUES` (500 000)
+  budget and by coverages, each a `QueryTooLarge` (400) naming its limit:
+  a polygon matching more than `ds_core::feature::MAX_AREA_POINT_COVERAGES`
+  (100 000) stations, reports in the window or not, is
+  `check_area_station_count`'s 400 before any coverage is built (#1501),
+  since each station's coverage may hold one value; the count stops one
+  past the cap. Every station of a 20 000-station network at one instant
+  must still fit (#1062). `[bufr] max_stations` has no upper bound at
+  load: the query cap bounds the answers, and a new load error could stop
+  a deployed config from restarting. An empty area is an empty
+  `CoverageCollection`, not 404; `radius` is the trait default (point +
+  `within` → area).
 - Features: `bbox` = station point inside; `datetime` = station has a
   report inside the interval — the snapshot's `[first_report, last_report]`
   overlap is only the prefilter, the rows decide (one store read lock per

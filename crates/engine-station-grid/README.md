@@ -269,8 +269,9 @@ cadence = "PT1H"
   a station's without a stated one, are the terrain at that resolution.
   A station beyond the widened terrain grid with no stated height is left
   out of corrected parameters.
-- A CSV source answers an area of at most 500 stations, so a grid whose
-  search box holds more fails to compute.
+- A CSV source answers an area of at most 500 stations, and a BUFR or
+  PostGIS source one of at most 100 000, so a grid whose search box holds
+  more fails to compute.
 - Without a lapse-rate correction a residual is in the field's own space,
   so a station on a hill reads as an outlier in a temperature field.
 - Late reports are found within one poll for the latest `precompute`

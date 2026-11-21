@@ -486,7 +486,12 @@ query admission bounds how many are built at once, and an HTML page of a
 large answer is admitted, or refused, by the response budget before its
 document is built. The value budgets do not bound it, since a coverage may
 hold one value. A new engine answering a coverage per item applies it at
-its source, as engine-postgis does in its statement's `LIMIT`.
+its source, as engine-postgis does in its statement's `LIMIT`. A station
+collection's area (PostGIS stations, BUFR: a `PointSeries` per station) is
+bounded the same way, by the stations the polygon matches, data or not,
+through `ds_core::feature::check_area_station_count` before any
+observation is read (#1501); engine-postgis's prefilters read one station
+past the cap.
 
 Range values (#1341) are written at `NdArray::precision` through
 `ds_core::model::RangeValue`: `F32` with `serialize_f32` (a value `f32`

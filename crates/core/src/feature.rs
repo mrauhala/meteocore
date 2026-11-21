@@ -380,7 +380,28 @@ pub const MAX_AREA_VALUES: usize = 1_000_000;
 /// document is built. An engine
 /// reads at most one item past the limit, so a larger answer is refused
 /// after reading that many.
+///
+/// A station collection's area answers a `PointSeries` coverage per
+/// station, which an instant `datetime` leaves with one value each, so its
+/// engines bound it here too, by the stations the polygon matches
+/// ([`check_area_station_count`]).
 pub const MAX_AREA_POINT_COVERAGES: usize = 100_000;
+
+/// Refuse an EDR area or radius query whose polygon matched more stations
+/// than [`MAX_AREA_POINT_COVERAGES`]: a station collection answers a
+/// coverage per station, so this bounds its answer before any observation
+/// is read (engine-postgis, engine-bufr; #1501). `matched` counts every
+/// station inside the polygon, data or not, so an engine can stop counting
+/// one past the cap. `QueryTooLarge`, a 400 with its message.
+pub fn check_area_station_count(matched: usize) -> Result<(), DataServerError> {
+    if matched > MAX_AREA_POINT_COVERAGES {
+        return Err(DataServerError::QueryTooLarge(format!(
+            "area query matched more than {MAX_AREA_POINT_COVERAGES} stations, the most one \
+             answer may hold — narrow the polygon"
+        )));
+    }
+    Ok(())
+}
 
 /// The most area cells an engine places on a projected or curvilinear
 /// source one by one, each with its own forward transform or inverse
@@ -2890,6 +2911,21 @@ mod tests {
             check_mask_budget(MAX_MASK_EDGE_TESTS / tri.vertex_count() + 1, &tri),
             Err(DataServerError::QueryTooLarge(_))
         ));
+    }
+
+    /// #1501: a station area holds at most `MAX_AREA_POINT_COVERAGES`
+    /// stations; one more is the 400 naming the cap.
+    #[test]
+    fn area_station_count_is_bounded_by_the_coverage_cap() {
+        assert!(check_area_station_count(0).is_ok());
+        assert!(check_area_station_count(MAX_AREA_POINT_COVERAGES).is_ok());
+        match check_area_station_count(MAX_AREA_POINT_COVERAGES + 1) {
+            Err(DataServerError::QueryTooLarge(msg)) => {
+                assert!(msg.contains("100000 stations"), "{msg}");
+                assert!(msg.contains("narrow the polygon"), "{msg}");
+            }
+            other => panic!("expected QueryTooLarge, got {other:?}"),
+        }
     }
 
     #[test]

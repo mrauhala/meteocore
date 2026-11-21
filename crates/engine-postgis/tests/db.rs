@@ -35,7 +35,8 @@ use ds_core::model::{CoverageResponse, DomainDescription, QueryResult};
 use engine_postgis::engine::AreaPath;
 use engine_postgis::pool::PoolRegistry;
 use engine_postgis::query::{
-    build_area_set, params_as_refs, MAX_AREA_QUERIES, MAX_RESPONSE_VALUES, SET_BASED_MAX_WINDOW,
+    build_area_set, build_stations_in_polygon, params_as_refs, MAX_AREA_QUERIES,
+    MAX_RESPONSE_VALUES, MAX_STATIONS_IN_POLYGON, SET_BASED_MAX_WINDOW,
 };
 use engine_postgis::security::quote_ident;
 use engine_postgis::{PostgisEngine, PostgisEngineConfig};
@@ -1593,6 +1594,211 @@ async fn events_area_answers_are_bounded_by_events() {
         .expect("a request's events answer");
     assert_eq!(events.len(), held);
     assert_eq!(time(&events[0]), Some(after(held)));
+    exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
+}
+
+/// The stations table of [`station_areas_are_bounded_by_coverages`], filled
+/// by [`STATION_CAP_ROWS`].
+const STATION_CAP: &str = "
+DROP SCHEMA IF EXISTS __S__ CASCADE;
+CREATE SCHEMA __S__;
+CREATE TABLE __S__.stations (
+    id text PRIMARY KEY,
+    name text NOT NULL,
+    n integer NOT NULL,
+    geom geometry(Point, 4326) NOT NULL
+);
+";
+
+/// `$1` stations on a grid of 1 000 columns 0.001° apart from (0°, 0°),
+/// northwards, in one `INSERT … SELECT`: rows 0 to 99 hold the first
+/// 100 000.
+const STATION_CAP_ROWS: &str = "
+INSERT INTO __S__.stations (id, name, n, geom)
+SELECT 's' || lpad(n::text, 6, '0'), 'Station ' || n, n,
+       ST_SetSRID(ST_MakePoint(((n - 1) % 1000) * 0.001::float8,
+                               ((n - 1) / 1000) * 0.001::float8), 4326)
+FROM generate_series(1, $1::integer) AS n
+";
+
+/// A `long` table with geometry: every station reports `t2m` = `n` an hour
+/// before `t0()`, and every 10 000th also at `t0()`, in one
+/// `INSERT … SELECT`.
+const STATION_CAP_OBS: &str = "
+CREATE INDEX ON __S__.stations USING gist (geom);
+CREATE TABLE __S__.obs (
+    station_id text NOT NULL,
+    obstime timestamptz NOT NULL,
+    param text NOT NULL,
+    value double precision,
+    geom geometry(Point, 4326) NOT NULL
+);
+INSERT INTO __S__.obs
+SELECT id, TIMESTAMPTZ '2026-01-01 05:00:00+00', 't2m', n, geom FROM __S__.stations
+UNION ALL
+SELECT id, TIMESTAMPTZ '2026-01-01 06:00:00+00', 't2m', n, geom FROM __S__.stations
+WHERE n % 10000 = 0;
+CREATE INDEX ON __S__.obs (station_id, obstime DESC);
+ANALYZE __S__.stations;
+ANALYZE __S__.obs;
+";
+
+/// Every station of [`STATION_CAP`]: rows 0 to 100 of the grid.
+const STATION_CAP_EVERY: &str =
+    "POLYGON((-0.0005 -0.0005,1 -0.0005,1 0.1005,-0.0005 0.1005,-0.0005 -0.0005))";
+/// Rows 0 to 99, without the ten of row 100: exactly the cap.
+const STATION_CAP_AT_CAP: &str =
+    "POLYGON((-0.0005 -0.0005,1 -0.0005,1 0.0995,-0.0005 0.0995,-0.0005 -0.0005))";
+
+/// An EDR query of `engine` on a blocking thread, as the EDR executor runs
+/// it.
+async fn edr_query<F>(
+    engine: &Arc<PostgisEngine>,
+    query: F,
+) -> Result<Vec<QueryResult>, DataServerError>
+where
+    F: FnOnce(&PostgisEngine) -> Result<CoverageResponse, DataServerError> + Send + 'static,
+{
+    let engine = Arc::clone(engine);
+    tokio::task::spawn_blocking(move || match query(engine.as_ref())? {
+        CoverageResponse::Collection(coverages) => Ok(coverages),
+        CoverageResponse::Single(coverage) => Ok(vec![coverage]),
+    })
+    .await
+    .expect("EDR query task")
+}
+
+/// #1501: a station area answers a `PointSeries` coverage per station, so
+/// it is bounded by `MAX_AREA_POINT_COVERAGES` stations, counted where the
+/// polygon matches them, data or not, before any observation is read. Ten
+/// stations past the cap are the 400 naming it through
+/// `EdrEngine::query_area` and `query_radius`, in stations-only mode and
+/// both observation-derived modes, even at an instant only ten of them
+/// report at; the stations-only statement reads one row past the cap.
+/// Exactly the cap is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn station_areas_are_bounded_by_coverages() {
+    let Some(dsn) = dsn() else {
+        return;
+    };
+    let schema = "mc1501_station_cap";
+    let held = MAX_AREA_POINT_COVERAGES + 10;
+    let client = connect(&dsn).await;
+    {
+        let _setup = SETUP.lock().await;
+        exec(&client, schema, "CREATE EXTENSION IF NOT EXISTS postgis;").await;
+        exec(&client, schema, STATION_CAP).await;
+        let insert = STATION_CAP_ROWS.replace("__S__", &quote_ident(schema).unwrap());
+        let inserted = client
+            .execute(insert.as_str(), &[&(held as i32)])
+            .await
+            .expect("insert the stations");
+        assert_eq!(inserted, held as u64);
+        exec(&client, schema, STATION_CAP_OBS).await;
+    }
+    let long = |geom_col: Option<&str>| PostgisObservationsConfig {
+        table: Some(format!("{schema}.obs")),
+        station_fk_col: Some("station_id".into()),
+        time_col: Some("obstime".into()),
+        param_col: Some("param".into()),
+        value_col: Some("value".into()),
+        geom_col: geom_col.map(String::from),
+        locations_window: geom_col.map(|_| "all".into()),
+        ..observations("long")
+    };
+    let modes = [
+        ("stations-only", config(Some(stations(schema)), long(None))),
+        (
+            "stations with observation geometry",
+            config(Some(stations(schema)), long(Some("geom"))),
+        ),
+        (
+            "observation geometry only",
+            config(None, long(Some("geom"))),
+        ),
+    ];
+    let instant = Some((t0(), t0()));
+    let refused = |mode: &str, answer: Result<Vec<QueryResult>, DataServerError>| match answer {
+        Err(DataServerError::QueryTooLarge(m))
+            if m.contains(&format!("{MAX_AREA_POINT_COVERAGES} stations"))
+                && m.contains("narrow the polygon") => {}
+        Err(other) => panic!("{mode}: expected the coverage cap's 400, got {other:?}"),
+        Ok(coverages) => panic!(
+            "{mode}: expected the coverage cap's 400, got {} coverages",
+            coverages.len()
+        ),
+    };
+    for (mode, cfg) in modes {
+        let engine = engine(schema, &cfg).await;
+        let t2m = || Some(vec!["t2m".to_string()]);
+
+        // Ten past the cap: refused, though only ten stations report at
+        // `t0()`.
+        let parameters = t2m();
+        refused(
+            mode,
+            edr_query(&engine, move |e| {
+                e.query_area(
+                    STATION_CAP_EVERY,
+                    instant,
+                    parameters.as_deref(),
+                    None,
+                    None,
+                )
+            })
+            .await,
+        );
+        // A circle around every station.
+        let parameters = t2m();
+        refused(
+            mode,
+            edr_query(&engine, move |e| {
+                e.query_radius(
+                    "POINT(0.5 0.05)",
+                    60_000.0,
+                    instant,
+                    parameters.as_deref(),
+                    None,
+                    None,
+                )
+            })
+            .await,
+        );
+
+        // Exactly the cap: answered, a coverage for each station reporting
+        // at `t0()`, every 10 000th.
+        let parameters = t2m();
+        let coverages = edr_query(&engine, move |e| {
+            e.query_area(
+                STATION_CAP_AT_CAP,
+                instant,
+                parameters.as_deref(),
+                None,
+                None,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{mode}: an answer at the cap, got {e:?}"));
+        let mut values: Vec<f64> = coverages
+            .iter()
+            .map(|c| c.ranges["t2m"].values[0].expect("a value at t0"))
+            .collect();
+        values.sort_by(f64::total_cmp);
+        let expected: Vec<f64> = (1..=10).map(|k| f64::from(k * 10_000)).collect();
+        assert_eq!(values, expected, "{mode}");
+    }
+
+    // The stations-only prefilter reads one row past the cap.
+    let validated = PostgisEngineConfig::resolve(&config(Some(stations(schema)), long(None)))
+        .expect("resolve the stations-only config");
+    let statement =
+        build_stations_in_polygon(&validated, STATION_CAP_EVERY).expect("the prefilter");
+    let rows = client
+        .query(statement.sql.as_str(), &params_as_refs(&statement.params))
+        .await
+        .expect("run the prefilter");
+    assert_eq!(rows.len(), MAX_STATIONS_IN_POLYGON);
+    assert_eq!(MAX_STATIONS_IN_POLYGON, MAX_AREA_POINT_COVERAGES + 1);
     exec(&client, schema, "DROP SCHEMA __S__ CASCADE;").await;
 }
 

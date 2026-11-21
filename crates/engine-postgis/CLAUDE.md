@@ -262,14 +262,25 @@ in step when changing this lifecycle.
   `DataServerError::QueryTooLarge` → HTTP 400, never `Engine` (the API
   layer hides that behind an opaque 500 — that misread a too-large polygon
   as a server fault in production).
-- Supporting caps: stations-in-polygon `MAX_STATIONS_IN_POLYGON` =
-  200 001, one past a 200 000-station ceiling (#1062 raised it from 10 001,
-  which made "every station at 06 UTC" a 400 on a 20 000-station network).
-  It is a memory guard, well above any network: the value budget does not
-  bound per-station memory, because one value a station is still a
-  coverage a station. A request holds about 300 bytes a station before any
-  row (≈ 60 MB at the ceiling) and then a coverage per station with data,
-  of the order of a kilobyte each before serialisation. Fan-out
+- **A station area is bounded by coverages, not only values (#1501).**
+  An area answers a `PointSeries` coverage per station, and an instant
+  leaves each one value, so the value budget does not bound it:
+  stations-in-polygon `MAX_STATIONS_IN_POLYGON` is
+  `ds_core::feature::MAX_AREA_POINT_COVERAGES + 1` (100 001), the rows both
+  prefilters fetch (the SQL `LIMIT` of `build_stations_in_polygon`, an
+  integer literal from the constant, never a bind; the in-memory `.take`
+  of `stations_in_polygon`), and `check_station_count` refuses a full batch
+  through `ds_core::feature::check_area_station_count`, a `QueryTooLarge`
+  naming the cap, before any observation statement runs. It counts matched stations, data or not:
+  that refuses some answers that would have fit, as the events statement
+  does, but reads nothing first. Still well above any network (#1062
+  raised it from 10 001, which made "every station at 06 UTC" a 400 on a
+  20 000-station network, to a 200 000 memory guard). A request holds
+  about 300 bytes a station before any row (≈ 30 MB at the cap) and then a
+  coverage per station with data, of the order of a kilobyte each before
+  serialisation. `/locations` is not bounded by it: `max_locations`
+  (above) is its own cap.
+- Supporting caps: fan-out
   `MAX_AREA_QUERIES` 20k statements (stations × params for `per_parameter`),
   **fan-out path only**; locations `LIMIT max_locations + 1` (above);
   nearest-station `LIMIT 1`.
@@ -520,6 +531,14 @@ in step when changing this lifecycle.
   the cap, and a window holding exactly the cap is answered whole, newest
   first. A request's statement reads one row past
   `MAX_AREA_POINT_COVERAGES`, and the same window is answered whole.
+- `station_areas_are_bounded_by_coverages` (#1501, `mc1501_station_cap`):
+  `MAX_AREA_POINT_COVERAGES + 10` stations from one `INSERT … SELECT
+  generate_series`, a `long` table reporting them all an hour before `t0`
+  and every 10 000th at `t0`. In stations-only mode and both
+  observation-derived modes, `EdrEngine::query_area` and `query_radius`
+  over every station at `t0` are the 400 naming the cap, though ten
+  stations report; a polygon of exactly the cap answers those ten; the
+  stations-only prefilter statement returns `MAX_STATIONS_IN_POLYGON` rows.
 - `events_area_polygons_are_parsed_first` (#1494, `mc1494_events`): the
   keyword in any case, standard spacing, an open ring, the bbox form and a
   radius answer as the canonical polygon; a three-pair ring is an answer;
