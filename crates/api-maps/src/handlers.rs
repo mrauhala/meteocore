@@ -58,7 +58,7 @@ pub(crate) fn request_base_url(state: &MapsState, headers: &HeaderMap) -> String
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn lookup_engine<'a>(
+pub(crate) fn lookup_engine<'a>(
     state: &'a MapsState,
     id: &str,
 ) -> Result<(&'a Arc<dyn MapEngine>, &'a CollectionConfig), MapsError> {
@@ -1166,12 +1166,25 @@ pub async fn style_legend(
     params::reject_unknown_parameters(query.as_deref(), params::LEGEND_PARAMETERS)?;
     let state = state.load_full();
     let (engine, _config) = lookup_engine(&state, &id)?;
+    legend(engine, &state.styles, &id, &style_id, &params).await
+}
+
+/// The legend of style `style_id` of collection `id`, drawn by `engine`
+/// with the style layers `styles`: the body of every Maps legend route,
+/// the shared root's for a collection only Tiles draws included (#792).
+pub(crate) async fn legend(
+    engine: &Arc<dyn MapEngine>,
+    styles: &HashMap<String, HashMap<String, StyleInfo>>,
+    id: &str,
+    style_id: &str,
+    params: &LegendQueryParams,
+) -> Result<Response, MapsError> {
     let format = params.validate()?;
 
     // An RGB composite's legend is its channel list (#819).
     if let Some(spec) = composite_parameter(engine.as_ref(), params.parameter_name.as_deref()) {
         if style_id != ds_render::COMPOSITE_STYLE {
-            return Err(composite_style_not_found(&id, &spec.name, &style_id));
+            return Err(composite_style_not_found(id, &spec.name, style_id));
         }
         return composite_legend(engine.as_ref(), spec, format).await;
     }
@@ -1182,23 +1195,18 @@ pub async fn style_legend(
     // routes render for that same request.
     let info = engine.raster_info_shared();
     let resolved = layer_style(
-        &state.styles,
-        &id,
+        styles,
+        id,
         params.parameter_name.as_deref(),
         &info,
-        &style_id,
+        style_id,
     )?;
     let style_info = resolved.style;
 
     // Mirror the render path's validation: an unknown `parameter-name` must
     // 400 with the available list, not fall back to the collection style and
     // emit a legend labelled with a parameter that doesn't exist.
-    check_parameter_name(
-        engine.as_ref(),
-        &info,
-        &id,
-        params.parameter_name.as_deref(),
-    )?;
+    check_parameter_name(engine.as_ref(), &info, id, params.parameter_name.as_deref())?;
     let (parameter, unit) = ds_render::legend_parameter_unit(style_info, &info, resolved.parameter);
 
     match format {

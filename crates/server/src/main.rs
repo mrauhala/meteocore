@@ -903,7 +903,10 @@ async fn serve(cli: CliArgs) {
     let shared_api = api_common::shared::SharedApi::new(
         "",
         vec![
-            Arc::new(api_maps::MapsBlock::new(maps_swap.clone())),
+            Arc::new(admin::shared_maps_block(
+                maps_swap.clone(),
+                tiles_swap.clone(),
+            )),
             Arc::new(api_tiles::TilesBlock::new(tiles_swap.clone())),
             Arc::new(api_features::FeaturesBlock::new(features_swap.clone())),
         ],

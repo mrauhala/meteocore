@@ -2023,6 +2023,43 @@ mod mvt {
         }))
     }
 
+    /// A vector collection has no legend at the shared root (#792): the
+    /// root's legend route answers a collection Tiles draws as a raster, so
+    /// a vector one's style, were one registered, links only its tilesets,
+    /// and the shared definition describes no legend for it.
+    #[tokio::test]
+    async fn a_vector_collection_links_no_legend_at_the_shared_root() {
+        use api_common::shared::BuildingBlock;
+        let state = build_mvt_state();
+        let mut styled = (**state.load()).clone();
+        styled.styles.insert(
+            "places".into(),
+            HashMap::from([(
+                "default".to_string(),
+                super::palette_style("default", "viridis", None),
+            )]),
+        );
+        let block = api_tiles::TilesBlock::new(Arc::new(ArcSwap::from_pointee(styled)));
+        let places = block.collection("places", "https://x").unwrap();
+        let styles = places.fields["styles"].as_array().unwrap();
+        assert_eq!(styles.len(), 1);
+        for style in styles {
+            assert!(
+                style["links"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|l| l["rel"] != api_common::rel::LEGEND),
+                "{style}"
+            );
+        }
+        assert!(!block
+            .openapi("")
+            .paths
+            .keys()
+            .any(|path| path.ends_with("/legend")));
+    }
+
     /// Mock engine that always returns at least one more feature than the
     /// density cap permits, regardless of the requested bbox or limit.
     /// Used to exercise the `tile-too-dense` 400 branch.

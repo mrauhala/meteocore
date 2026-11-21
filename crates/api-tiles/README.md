@@ -78,6 +78,12 @@ plus:
   `parameter-name` besides `f`: a style only that parameter's layer offers
   (its built-in `contours`) is resolved there, and the list's links and
   tile templates carry it.
+- At the shared root each style of a raster collection links its styled map
+  tilesets and its legend, `/collections/{id}/styles/{styleId}/legend`
+  (#792). That route is the Maps block's: for a collection only Tiles draws,
+  it answers from this crate's registry with the legend `/tiles` gives, and
+  the shared OpenAPI document describes it. A vector collection has no
+  legend.
 - Style links, styled tileset lists and their tile templates percent-encode
   the style name and the collection id as path segments, as Maps does
   (#1517): the style `a/b` is `…/styles/a%2Fb/map/tiles`.

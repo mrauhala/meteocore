@@ -145,6 +145,16 @@ not a non-negative integer is a JSON 400 naming it. The landing page,
 conformance and collection operations document the 400 of an unsupported or
 repeated `f`. No Common classes change.
 
+Shared-root legends (2026-11-21, [#792](https://github.com/mrauhala/meteocore/issues/792)):
+a raster collection with `tiles` and not `maps` in its `apis` has its legends
+at the shared root. Each style in its description links
+`…/styles/{styleId}/legend` (`…/rel/ogc/1.0/legend`), and the shared
+definition describes that path. The route is the Maps block's; for such a
+collection it answers from the Tiles registry with the legend the per-API
+Tiles service gives. Its `…/styles` list and styled maps stay Maps' own and
+404. A collection both Maps and Tiles serve is unchanged. No Common classes
+change.
+
 Paths below are relative to `/edr`, `/maps`, `/tiles` or `/features` respectively;
 the shared root's are relative to `/`.
 Part 4 rows concern **collection discovery**, not querying the contents of a
