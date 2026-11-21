@@ -86,7 +86,7 @@ tiles, with the Scaling and Background parameters.
 |---|---|
 | `bbox`, `bbox-crs` | Area: four values in the CRS's axis order. West greater than east crosses the antimeridian. |
 | `subset`, `subset-crs` | Area by axis, e.g. `Lon(19:32),Lat(59:70)`, or `E`/`N` in a projected CRS. `*` or a left-out axis keeps the extent. Also `time(…)`, and `reference_time(…)` on a collection with model runs. |
-| `center`, `center-crs` | Area around a point, at the native resolution or `scale-denominator`. |
+| `center`, `center-crs` | Area around a point, at the native resolution there (see below) or `scale-denominator`. |
 | `width`, `height` | Output size in pixels (see below). |
 | `scale-denominator` | One pixel spans scale × 0.28 mm on the ground at the map centre. |
 | `crs` | Output CRS: `CRS:84`, `EPSG:4326`, `EPSG:3857`, `EPSG:3067`, `EPSG:3035`, as code, URI or safe CURIE. Default: the `storageCrs` if it is one of these, else CRS84. |
@@ -108,6 +108,17 @@ tiles, with the Scaling and Background parameters.
   `center`, or `scale-denominator` and no area, the size sets the extent; an
   omitted side takes the other's value, else 1024. Every size, given or
   derived, is capped at 8000 a side and 64 000 000 pixels.
+- **Native resolution.** A `center` map without `scale-denominator` spans
+  one native cell a pixel. In the storage CRS (or CRS84 and EPSG:4326, one
+  plane) that is the extent over the grid. In another CRS it is the cell of
+  the native grid at `center`, its corners projected once (#962): a pixel
+  is the distance along its axis that crosses one cell, so x and y can
+  differ, and a 0.01° lat/lon cell at 60°N is 1113 m wide and 2226 m tall
+  in EPSG:3857. A centre outside the grid takes the grid's cell size there.
+  Where the cell has no drawing in the output CRS (past a pole, past Web
+  Mercator's ±85.05° square world, outside EPSG:3067's or EPSG:3035's area)
+  or the collection reports no native grid, the extent over the grid is
+  used, an average right at no single point.
 - **Time.** `datetime` or `subset=time(…)`, not both. The engine snaps an
   instant to one of its time steps (a parameter's own axis when it has one).
   An interval renders the latest step inside it, with a model run named or
