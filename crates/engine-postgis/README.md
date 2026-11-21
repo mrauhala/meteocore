@@ -60,9 +60,17 @@ time index serves the order too.
 
 A statement the `statement_timeout` cancels is logged at WARN and answered
 503 with `Retry-After: 1` (EDR: 504), as a read past its time budget is in
-every engine. Until a metadata refresh has checked the tables, queries
-answer 503 with `Retry-After: 1` too. Any other database error is a 500
-whose body names nothing internal.
+every engine. A statement still running at the request deadline of an EDR
+query, a Features page of events or a GetFeatureInfo pick gets the same
+answer at that deadline: the engine logs its SQL template at WARN, asks the
+server to cancel it and closes its connection rather than return it to the
+pool. The role's `statement_timeout` stays the backstop, for a cancel that
+cannot reach the server and for the reads no request deadline ends: the
+metadata refresh, a station grid's analysis reads, and the map layers'
+strike-window and station-frame reads, cache fills other requests join.
+Until a metadata refresh has checked the tables, queries answer 503 with
+`Retry-After: 1` too. Any other database error is a 500 whose body names
+nothing internal.
 
 Put the DSN in an environment variable
 (`export OBS_DSN='postgres://meteocore_ro:…@127.0.0.1:5432/weather'`); a
@@ -312,8 +320,9 @@ column's index probe.
   through the `(time, id)` index: no offset scan. `offset` is a 400.
 - No statement counts. `numberMatched` is reported only on a first page
   that holds every match, and left out of every other page.
-- The reads run on the shared query runtime, never a request worker, with
-  the role's `statement_timeout` and the Features 30 s deadline.
+- The reads run on the shared query runtime, never a request worker, and
+  end at the Features 30 s deadline, canceled in the database; the role's
+  `statement_timeout` is the backstop.
 - `numberItems` is left out of the collection: the table is not counted.
   The temporal extent is the snapshot's.
 - `tiles` stays the strike layer's raster tiles; there are no vector tiles

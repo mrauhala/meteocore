@@ -87,7 +87,33 @@ Derivation rules (hard-won from production timeouts):
   set via `ALTER ROLE meteocore_ro SET ...` (crate README). The engine uses
   `RecyclingMethod::Fast` and issues no `SET` on checkout, so **a superuser
   DSN or an unconfigured role bypasses those limits entirely** — the
-  role-setup SQL is operationally mandatory, not optional.
+  role-setup SQL is operationally mandatory, not optional. The request
+  deadline (below) ends request statements earlier; the role's timeout is
+  the backstop for a cancel that cannot reach the server and for the reads
+  no deadline ends.
+- **Request statements end at the request deadline (#1500).** Every
+  `engine.rs` statement path (EDR, Features event pages, GetFeatureInfo
+  picks, all on the query runtime) runs through
+  `statement_deadline::Checkouts`: `Checkouts::current()` reads
+  `ds_core::deadline::current()` on the calling thread, `get` checks a
+  connection out, `block_on` races the call against the deadline. Past it
+  the call is `DeadlineExceeded`, logged once at WARN with the stopped
+  statements' SQL templates (never binds), the server is sent a cancel
+  for each connection the call still holds (spawned on the calling
+  runtime, `CANCEL_TIMEOUT` 2 s each), and those connections are
+  discarded (`Object::take`), never recycled. Two races decide that shape:
+  a token is kept from checkout until the connection is given back and only
+  tokens still out are used (a pooled connection may be running another
+  request's statement), and a canceled connection never returns to the
+  pool (a late cancel would hit its next statement). Run a statement
+  through `Conn::rows`/`row_opt`, or `Conn::run` for a stream or a
+  prepared statement, so the log names it. No deadline: nothing tracked,
+  no token taken, the call runs to its end as before. Never add a
+  request-path statement outside `Checkouts`. The map layers' strike-window
+  and station-frame fills (`maps.rs`, `station_map.rs`) stay outside on
+  purpose: other renders join them, and a fill that outlives its render's
+  deadline still serves the retry. A station grid's analysis reads run on
+  its compute pool, without a deadline.
 - **Per-URL pool** shared across collections on the same
   `(host, port, db, user, sslmode)` tuple; first-caller-wins on size;
   `HARD_POOL_CAP = 32`. Across incremental reloads (#574) a reused engine
@@ -384,7 +410,8 @@ in step when changing this lifecycle.
   request-path statement goes through it. A request before a refresh
   validated the tables (`require_validated`, pending) is
   `ResourceExhausted`, a 503, logged at WARN; a confirmed schema mismatch
-  stays the 500. A pool checkout that fails is still the 500.
+  stays the 500. A pool checkout that fails is still the 500; one still
+  waiting at the request deadline is `DeadlineExceeded` (above).
 - No data in window → `LocationNotFound` → 404 (an empty PointSeries fails
   CoverageJSON validation).
 - Supported `pg_type`s for `property_cols`: `bool`, `int2/4/8`, `float4/8`,
@@ -585,6 +612,14 @@ in step when changing this lifecycle.
   `statement_timeout` and a view whose geometry sleeps, empty while the
   refresh validates it, make the area and Features reads
   `DeadlineExceeded`.
+- `tests/support/request_deadline.rs` (#1500, `mc1500_*`): a view whose
+  function sleeps 20 s on a marked row. The events area (one connection)
+  and the station area fan-out (three, all running) under a 1.5 s
+  deadline answer `DeadlineExceeded` at it; the backends seen running in
+  `pg_stat_activity` are gone within seconds (canceled, and discarded: a
+  recycled connection would stay connected idle); the next query under a
+  deadline answers. The fan-out collection sets its own `pool_label` so its
+  fan-out limiter's width is its own.
 - The timing test prints both paths by stations × steps on a TimescaleDB
   hypertable, each path's time to the value-budget 400 for a week over
   20 000 stations, and that set-based statement's `EXPLAIN ANALYZE`. It

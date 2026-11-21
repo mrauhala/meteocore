@@ -288,10 +288,12 @@ only CSV, BUFR and ODIM PVOL sites can answer; other engines answer a 400.
   inventory included: 400, 404, 503 `ServerBusy`, 503 `SourceUnavailable`,
   or 500; a query past its deadline is EDR's 504, where the render APIs
   answer 503. So is a PostGIS statement the database cancels for its
-  `statement_timeout`; a PostGIS query before a metadata refresh has
-  checked the tables is a 503 `ServerBusy`. An inventory the engine
-  reports not found, as an ODIM PVOL site not in the network catalog yet,
-  is an empty `/locations` list, and each of its location ids a 404.
+  `statement_timeout`, and one still running at the deadline, which the
+  engine then cancels in the database; a PostGIS query before a metadata
+  refresh has checked the tables is a 503 `ServerBusy`. An inventory the
+  engine reports not found, as an ODIM PVOL site not in the network
+  catalog yet, is an empty `/locations` list, and each of its location ids
+  a 404.
 - **A collection without data yet.** A GRIB or NetCDF collection whose
   source holds no file yet (a fresh source, a store unreachable since the
   start, a mistyped prefix), or a Zarr store whose time axis is still
