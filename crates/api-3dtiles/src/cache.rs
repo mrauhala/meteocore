@@ -8,7 +8,7 @@
 //! preloads up to 48 animation frames concurrently, multiplying that cost by
 //! the frame count on every load, reload, and control change.
 //!
-//! The cache stores the final encoded bytes + their strong ETag, keyed by
+//! The cache stores the final encoded bytes + their weak ETag, keyed by
 //! everything that determines them (collection, product, quantity, time,
 //! product parameters, resolution, colour ramp) **plus a data-version** derived from the
 //! collection's `VolumeInfo` time axis — when the engine ingests or drops a
@@ -86,7 +86,7 @@ pub struct ContentKey {
     pub version: u64,
 }
 
-/// A cached response body: cheap-clone bytes + the strong ETag computed over
+/// A cached response body: cheap-clone bytes + the weak ETag computed over
 /// them. Returned by value (both fields are refcounted).
 #[derive(Clone)]
 pub struct CachedContent {

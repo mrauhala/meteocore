@@ -610,6 +610,8 @@ fn forecast_runs_are_instances_and_selectable() {
     assert!(e.has_instances());
     // The run axis without any run's valid times (#1006).
     assert_eq!(e.instance_reference_times(), vec![run0, run1]);
+    // The newest run, O(1) from the same catalog (#1500).
+    assert_eq!(e.latest_reference_time(), Some(run1));
     let inst = e.get_instances();
     assert_eq!(
         inst.iter().map(|r| r.reference_time).collect::<Vec<_>>(),

@@ -210,8 +210,8 @@ impl Document {
             &state.point_engines,
             base_url,
         );
-        let etag = HeaderValue::try_from(format!("W/{}", ds_core::http_cache::etag_of(&xml)))
-            .expect("a quoted hex ETag is a header value");
+        let etag = HeaderValue::try_from(ds_core::http_cache::weak_etag_of(&xml))
+            .expect("a weak quoted-hex ETag is a header value");
         let gzip = match gzip(&xml) {
             Ok(gzip) => Some(Bytes::from(gzip)),
             Err(e) => {
@@ -235,11 +235,10 @@ impl Document {
     /// answer right without the layer too.
     pub(crate) fn response(&self, headers: &HeaderMap) -> Response {
         let vary = HeaderValue::from_static("accept-encoding");
-        let not_modified = headers
-            .get(header::IF_NONE_MATCH)
-            .and_then(|value| value.to_str().ok())
-            .zip(self.etag.to_str().ok())
-            .is_some_and(|(if_none_match, etag)| ds_render::etag_matches(if_none_match, etag));
+        let not_modified = self
+            .etag
+            .to_str()
+            .is_ok_and(|etag| api_common::caching::if_none_match(headers, etag));
         if not_modified {
             return (
                 StatusCode::NOT_MODIFIED,

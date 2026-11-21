@@ -1984,6 +1984,25 @@ pub async fn vector_tile(
 /// MVT MIME type registered with IANA.
 pub(crate) const MVT_CONTENT_TYPE: &str = "application/vnd.mapbox-vector-tile";
 
+/// The 304 of a vector tile: its tag, its `Cache-Control`, and the
+/// `Vary: accept-encoding` the server's compression layer gives the 200
+/// (RFC 9110 §15.4.5), which the layer never adds to an empty 304.
+fn mvt_not_modified(cached: &CachedTile, cache_control: &'static str) -> Response {
+    let mut response = axum::response::Response::builder()
+        .status(StatusCode::NOT_MODIFIED)
+        .header(header::ETAG, cached.etag())
+        .header(header::CACHE_CONTROL, cache_control)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    if api_common::caching::compressed_by_server(
+        Some(MVT_CONTENT_TYPE),
+        Some(cached.bytes.len() as u64),
+    ) {
+        api_common::caching::vary_as_compressed(response.headers_mut());
+    }
+    response
+}
+
 /// Encode an MVT from a `FeatureEngine` and return it as an HTTP response.
 ///
 /// Reached through content negotiation on the standard tile path:
@@ -2087,24 +2106,16 @@ async fn render_vector_tile(
         time: datetime.clone(),
     };
     let cache_control = "public, max-age=300";
-    let if_none_match = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string());
+    // Every line of it (RFC 9110 §5.3), never only the first.
+    let if_none_match = api_common::caching::if_none_match_list(&headers);
 
     // ETag is content-derived, so we must look at the cached bytes (or freshly
     // encoded bytes) before we can answer `If-None-Match`. A key-derived ETag
     // would let stale browser caches survive a server fix indefinitely.
     if let Some(cached) = state.vector_tile_cache.get(&cache_key) {
         if let Some(ref inm) = if_none_match {
-            if ds_render::etag_matches(inm, cached.etag()) {
-                return Ok(axum::response::Response::builder()
-                    .status(StatusCode::NOT_MODIFIED)
-                    .header(header::ETAG, cached.etag())
-                    .header(header::CACHE_CONTROL, cache_control)
-                    .body(axum::body::Body::empty())
-                    .unwrap()
-                    .into_response());
+            if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
+                return Ok(mvt_not_modified(&cached, cache_control));
             }
         }
         return Ok(axum::response::Response::builder()
@@ -2191,14 +2202,8 @@ async fn render_vector_tile(
     fill.finish();
 
     if let Some(ref inm) = if_none_match {
-        if ds_render::etag_matches(inm, cached.etag()) {
-            return Ok(axum::response::Response::builder()
-                .status(StatusCode::NOT_MODIFIED)
-                .header(header::ETAG, cached.etag())
-                .header(header::CACHE_CONTROL, cache_control)
-                .body(axum::body::Body::empty())
-                .unwrap()
-                .into_response());
+        if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
+            return Ok(mvt_not_modified(&cached, cache_control));
         }
     }
 
@@ -2750,10 +2755,8 @@ async fn render_tile(
     // for one timestep share the entry, not the header. On an engine with
     // runs only a named run the engine drew is fixed (#1421).
     let cache_control = cache_control_value(pinned, cache_key.content_version);
-    let if_none_match = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string);
+    // Every line of it (RFC 9110 §5.3), never only the first.
+    let if_none_match = api_common::caching::if_none_match_list(&headers);
 
     // Cache lookup runs BEFORE the If-None-Match check. The ETag is
     // content-derived (see `CachedRendered::new`), so a key-derived 304
@@ -2766,7 +2769,7 @@ async fn render_tile(
     let render_start = std::time::Instant::now();
     if let Some(cached) = state.rendered_cache.get(&cache_key) {
         if let Some(ref inm) = if_none_match {
-            if ds_render::etag_matches(inm, cached.etag()) {
+            if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
                 // 304 from the cache-HIT branch. The `x-cache: HIT` header
                 // lets the regression test (and curious clients) distinguish
                 // this from a post-render MISS→304, which the handler also
@@ -3016,7 +3019,7 @@ async fn render_tile(
     // not a misleading `MISS`. This matters for any tile viewer
     // panning over out-of-coverage areas.
     if let Some(ref inm) = if_none_match {
-        if ds_render::etag_matches(inm, cached.etag()) {
+        if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
             return Ok(with_datetime(axum::response::Response::builder())
                 .status(StatusCode::NOT_MODIFIED)
                 .header(header::ETAG, cached.etag())

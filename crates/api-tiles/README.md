@@ -28,7 +28,10 @@ rendered on demand by the collection's engine, then cached.
   cached under the step actually rendered.
 - Map tiles share the rendered-image cache with WMS and Maps. Vector tiles have
   their own cache, keyed on the engine's data version and the time filter.
-  ETags hash the bytes, and `If-None-Match` gets a 304.
+  ETags hash the bytes, and `If-None-Match` gets a 304, compared weakly
+  (`W/"x"` matches `"x"`). A map tile's ETag is strong (an image is never
+  gzipped); a vector tile's is weak, `W/"…"`, one tag for the plain and the
+  gzipped tile.
 - Rendering and MVT encoding run through `ds-executor`, on render slots and a
   deadline shared with WMS and Maps; map tiles also reserve output memory.
 - `TilesState` (swapped on reload) holds the map and feature engine registries

@@ -371,27 +371,6 @@ impl CacheKey {
     }
 }
 
-/// Check whether an `If-None-Match` header value matches a given ETag.
-///
-/// Handles comma-separated lists, the `*` wildcard, and the `W/` weak prefix
-/// per RFC 7232 §3.2 (weak comparison).
-pub fn etag_matches(if_none_match: &str, etag: &str) -> bool {
-    let etag_bare = etag
-        .trim()
-        .strip_prefix("W/")
-        .unwrap_or(etag.trim())
-        .trim_matches('"');
-
-    if_none_match.split(',').any(|tag| {
-        let tag = tag.trim();
-        if tag == "*" {
-            return true;
-        }
-        let tag_bare = tag.strip_prefix("W/").unwrap_or(tag).trim_matches('"');
-        tag_bare == etag_bare
-    })
-}
-
 /// Quantize a floating-point bbox to integer microdegrees for cache key stability.
 pub fn quantize_bbox(bbox: &[f64; 4]) -> [i64; 4] {
     [
@@ -424,9 +403,12 @@ pub struct CachedRendered {
 
 impl CachedRendered {
     /// Build a cache entry from encoded bytes, deriving the ETag from
-    /// the content via FNV-1a. Format matches `ds_mvt::CachedTile::etag`
-    /// and `CacheKey::etag` so the same `etag_matches` helper works
-    /// across raster and vector responses. FNV-1a (not the stdlib
+    /// the content via FNV-1a. Strong, `"<16 hex>"`: the entry is an
+    /// image, which the server's `CompressionLayer` never encodes
+    /// (tower-http's default predicate skips `image/*`), so the tag names
+    /// exactly the bytes sent. `ds_mvt::CachedTile`'s tag is weak: a
+    /// vector tile is compressed (#1500). Both are compared by
+    /// `ds_core::http_cache::if_none_match_matches`. FNV-1a (not the stdlib
     /// `DefaultHasher`) so the ETag is stable across rustc versions —
     /// a binary rebuild against unchanged content keeps the same ETag
     /// and browser caches survive the redeploy.
@@ -2489,43 +2471,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(two, two_again);
-    }
-
-    #[test]
-    fn test_etag_matches_exact() {
-        assert!(etag_matches("\"abc123\"", "\"abc123\""));
-    }
-
-    #[test]
-    fn test_etag_matches_no_match() {
-        assert!(!etag_matches("\"abc123\"", "\"def456\""));
-    }
-
-    #[test]
-    fn test_etag_matches_multiple() {
-        assert!(etag_matches("\"aaa\", \"bbb\", \"ccc\"", "\"bbb\""));
-    }
-
-    #[test]
-    fn test_etag_matches_multiple_no_match() {
-        assert!(!etag_matches("\"aaa\", \"bbb\"", "\"ccc\""));
-    }
-
-    #[test]
-    fn test_etag_matches_wildcard() {
-        assert!(etag_matches("*", "\"anything\""));
-    }
-
-    #[test]
-    fn test_etag_matches_weak_prefix() {
-        assert!(etag_matches("W/\"abc123\"", "\"abc123\""));
-        assert!(etag_matches("\"abc123\"", "W/\"abc123\""));
-        assert!(etag_matches("W/\"abc123\"", "W/\"abc123\""));
-    }
-
-    #[test]
-    fn test_etag_matches_weak_in_list() {
-        assert!(etag_matches("\"aaa\", W/\"bbb\"", "\"bbb\""));
     }
 
     #[test]

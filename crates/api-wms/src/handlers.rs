@@ -1040,10 +1040,8 @@ pub async fn wms_handler(
 
             // Read If-None-Match into an owned String so it survives the move
             // into spawn_blocking and the cache-hit/miss branches below.
-            let if_none_match = headers
-                .get(header::IF_NONE_MATCH)
-                .and_then(|h| h.to_str().ok())
-                .map(str::to_string);
+            // Every line of it (RFC 9110 §5.3), never only the first.
+            let if_none_match = api_common::caching::if_none_match_list(&headers);
 
             // Cache lookup runs BEFORE the If-None-Match check. The ETag is
             // content-derived (see `CachedRendered::new`), so a key-derived
@@ -1059,7 +1057,7 @@ pub async fn wms_handler(
                 .and_then(|key| state.rendered_cache.get(key))
             {
                 if let Some(ref inm) = if_none_match {
-                    if ds_render::etag_matches(inm, cached.etag()) {
+                    if ds_core::http_cache::if_none_match_matches(inm, cached.etag()) {
                         // 304 from the cache-HIT branch. The `x-cache: HIT`
                         // header lets the regression test (and curious
                         // clients) distinguish this from a post-render
@@ -1285,7 +1283,7 @@ pub async fn wms_handler(
             // miss → encode → revalidate against fresh ETag.
             let not_modified = if_none_match
                 .as_deref()
-                .is_some_and(|inm| ds_render::etag_matches(inm, cached.etag()));
+                .is_some_and(|inm| ds_core::http_cache::if_none_match_matches(inm, cached.etag()));
             let mut response = if not_modified {
                 // 304 from the post-render branch. Forward the same
                 // `x_cache` label the 200 response would carry — `"MISS"`,

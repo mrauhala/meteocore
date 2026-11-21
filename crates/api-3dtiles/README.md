@@ -92,15 +92,16 @@ kept refusing the read. A 500 never carries internal detail.
 
 ## Caching
 
-- A process-wide, byte-bounded LRU holds encoded content and its strong
-  ETag: `[memory.caches] tiles3d_content` (default 512; `0` keeps nothing). The
+- A process-wide, byte-bounded LRU holds encoded content and its ETag,
+  weak (`W/"…"`) since the server gzips JSON and binary content after it
+  was tagged: `[memory.caches] tiles3d_content` (default 512; `0` keeps nothing). The
   key covers collection, product, quantity, time, parameters, grid size,
   colour ramp, and a version hashed from the volume time axis, so a new
   volume moves "latest" while an exactly advertised time keeps its entry.
 - Concurrent requests for one key share one computation, errors included.
   It finishes and fills the cache even if every client disconnects. Errors
-  are not kept. A matching `If-None-Match` gets 304; on a cache hit that
-  costs no recompute.
+  are not kept. A matching `If-None-Match` gets 304, compared weakly
+  (`W/"x"` matches `"x"`); on a cache hit that costs no recompute.
 - `Cache-Control`: a `datetime` equal to an advertised volume time (and the
   voxel subtree) gets `public, max-age=86400, immutable`; latest and other
   times get `public, max-age=60`. The viewer page and script are `no-cache`.

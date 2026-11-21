@@ -1070,7 +1070,7 @@ pub async fn items(
     let (etag, mut resp) = match wanted {
         ds_core::html::Wanted::Json => {
             let blank = serde_json::to_string(&doc).expect("GeoJSON Value serializes");
-            let etag = ds_core::http_cache::etag_of(blank.as_bytes());
+            let etag = api_common::caching::etag(blank.as_bytes());
             doc["timeStamp"] = json!(time_stamp);
             (etag, GeoJsonResponse(doc).into_response())
         }
@@ -1083,15 +1083,12 @@ pub async fn items(
                 root,
                 &html_controls(engine.as_ref()),
             );
-            let etag = ds_core::http_cache::etag_of(page.as_bytes());
+            let etag = api_common::caching::etag(page.as_bytes());
             crate::html::stamp_generation_time(&mut page, &time_stamp);
             (etag, Html(page).into_response())
         }
     };
-    resp.headers_mut().insert(
-        header::ETAG,
-        HeaderValue::from_str(&etag).expect("quoted-hex etag is a valid header value"),
-    );
+    resp.headers_mut().insert(header::ETAG, etag);
     resp.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(cache_control),

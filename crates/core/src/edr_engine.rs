@@ -117,6 +117,24 @@ pub trait EdrEngine: Send + Sync {
             .collect()
     }
 
+    /// The newest run's reference time, the last of
+    /// [`Self::instance_reference_times`]; `None` without runs. **O(1)**
+    /// from a snapshot: every EDR data query reads it for its
+    /// `Cache-Control` (#1500). A run is published before all its steps
+    /// are in, and a later run covers valid times from its reference time
+    /// on, so the newest run's answers, and a latest-run window ending at
+    /// or after its reference time, can still change.
+    ///
+    /// The default derives it from [`Self::instance_reference_times`],
+    /// which costs nothing on the non-forecast engines that take it. An
+    /// engine that overrides that method overrides this one with the last
+    /// key of its run map, and a wrapper forwards it.
+    fn latest_reference_time(&self) -> Option<DateTime<Utc>> {
+        // NOTE: forecast engines MUST override this, as `has_instances`:
+        // the default copies every run's reference time per call.
+        self.instance_reference_times().last().copied()
+    }
+
     /// Execute a query for a named location.
     ///
     /// `z` selects vertical levels: `None` returns every level (a profile),

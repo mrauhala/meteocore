@@ -280,6 +280,196 @@ mod compression {
     }
 }
 
+/// An EDR router with no collections, wrapped in CompressionLayer as
+/// main.rs wraps every router: its metadata is JSON the layer compresses.
+fn build_compressed_edr_router() -> axum::Router {
+    let state = Arc::new(ArcSwap::from_pointee(api_edr::handlers::EdrState {
+        engines: HashMap::new(),
+        feature_engines: HashMap::new(),
+        collections: HashMap::new(),
+        styles: HashMap::new(),
+        base_url: String::new(),
+        trust_proxy_headers: false,
+        discovery: Default::default(),
+    }));
+    api_edr::router(state).layer(CompressionLayer::new())
+}
+
+mod edr_compression {
+    use super::*;
+
+    /// The EDR (and Features) ETag is set inside the router and the body
+    /// gzipped outside it, so the plain and the gzipped responses carry one
+    /// tag: it is weak, `W/"…"`, since a strong tag would name two
+    /// different byte sequences as one (#1500). Either response's tag
+    /// revalidates the other, in either form.
+    #[tokio::test]
+    async fn gzip_and_identity_carry_one_weak_tag() {
+        const URI: &str = "/conformance?f=json";
+        let (status, plain, plain_body) =
+            wms_request(build_compressed_edr_router(), URI, vec![]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(plain.get(header::CONTENT_ENCODING).is_none());
+        let (status, gzipped, gzipped_body) = wms_request(
+            build_compressed_edr_router(),
+            URI,
+            vec![("accept-encoding", "gzip")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(gzipped[header::CONTENT_ENCODING], "gzip");
+        assert_ne!(plain_body, gzipped_body);
+        let etag = plain[header::ETAG].to_str().unwrap().to_string();
+        assert_eq!(gzipped[header::ETAG], etag.as_str());
+        assert_eq!(etag, ds_core::http_cache::weak_etag_of(&plain_body));
+
+        let strong = etag.trim_start_matches("W/").to_string();
+        for accept in ["identity", "gzip"] {
+            for sent in [&etag, &strong] {
+                let (status, headers, body) = wms_request(
+                    build_compressed_edr_router(),
+                    URI,
+                    vec![("accept-encoding", accept), ("if-none-match", sent)],
+                )
+                .await;
+                assert_eq!(status, StatusCode::NOT_MODIFIED, "{accept} {sent}");
+                assert_eq!(headers[header::ETAG], etag.as_str(), "{accept} {sent}");
+                assert!(body.is_empty(), "{accept} {sent}");
+            }
+        }
+    }
+}
+
+/// The wire: `app` served on a local port as main.rs serves its router,
+/// through hyper, which a `oneshot` skips.
+mod wire {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    pub async fn serve(app: axum::Router) -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        addr
+    }
+
+    /// One GET over a fresh connection: the status and every header line,
+    /// names lowercased.
+    pub async fn get(
+        addr: std::net::SocketAddr,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, Vec<(String, String)>) {
+        let exchange = async {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut request =
+                format!("GET {uri} HTTP/1.1\r\nhost: localhost\r\nconnection: close\r\n");
+            for (name, value) in headers {
+                request.push_str(&format!("{name}: {value}\r\n"));
+            }
+            request.push_str("\r\n");
+            stream.write_all(request.as_bytes()).await.unwrap();
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.unwrap();
+            raw
+        };
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(10), exchange)
+            .await
+            .expect("the server answered");
+        let end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        let head = String::from_utf8(raw[..end].to_vec()).unwrap();
+        let mut lines = head.split("\r\n");
+        let status = lines.next().unwrap().split(' ').nth(1).unwrap();
+        let headers = lines
+            .map(|line| {
+                let (name, value) = line.split_once(':').unwrap();
+                (name.trim().to_ascii_lowercase(), value.trim().to_string())
+            })
+            .collect();
+        (status.parse().unwrap(), headers)
+    }
+
+    /// Every value of `name`, each line split at its commas, sorted.
+    pub fn values(headers: &[(String, String)], name: &str) -> Vec<String> {
+        let mut values: Vec<String> = headers
+            .iter()
+            .filter(|(n, _)| n == name)
+            .flat_map(|(_, v)| v.split(',').map(|v| v.trim().to_ascii_lowercase()))
+            .collect();
+        values.sort();
+        values
+    }
+}
+
+mod not_modified_on_the_wire {
+    use super::*;
+
+    /// A 304 carries the `Vary` its 200 does (RFC 9110 §15.4.5): the
+    /// handler's `accept`, and the `accept-encoding` the compression layer
+    /// gives a body it compresses, in neither case for an image. And it
+    /// states no `Content-Length` (§8.6), which a gzipped 200 does not
+    /// state either: axum puts `content-length: 0` in the empty body's
+    /// headers, and hyper sends no length without a body. Nor a
+    /// `Content-Encoding` (#1500).
+    #[tokio::test]
+    async fn a_304_varies_as_its_200_and_states_no_length() {
+        let edr = wire::serve(build_compressed_edr_router()).await;
+        let wms = wire::serve(build_compressed_router()).await;
+        for (addr, uri, compressed) in [
+            (edr, "/conformance?f=json", true),
+            (edr, "/conformance", true),
+            (wms, WMS_GETMAP, false),
+        ] {
+            for accept in ["gzip", "identity"] {
+                let (status, ok) = wire::get(addr, uri, &[("accept-encoding", accept)]).await;
+                assert_eq!(status, 200, "{uri} {accept}");
+                let vary = wire::values(&ok, "vary");
+                assert_eq!(
+                    vary.contains(&"accept-encoding".to_string()),
+                    compressed,
+                    "{uri} {accept}: {vary:?}"
+                );
+                let etag = ok.iter().find(|(n, _)| n == "etag").unwrap().1.clone();
+                let (status, not_modified) = wire::get(
+                    addr,
+                    uri,
+                    &[("accept-encoding", accept), ("if-none-match", &etag)],
+                )
+                .await;
+                assert_eq!(status, 304, "{uri} {accept}");
+                assert_eq!(wire::values(&not_modified, "vary"), vary, "{uri} {accept}");
+                let tags: Vec<_> = not_modified.iter().filter(|(n, _)| n == "etag").collect();
+                assert_eq!(
+                    tags,
+                    [&("etag".to_string(), etag.clone())],
+                    "{uri} {accept}"
+                );
+                for absent in ["content-length", "content-encoding", "content-type"] {
+                    assert!(
+                        wire::values(&not_modified, absent).is_empty(),
+                        "{uri} {accept}: {absent} in {not_modified:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `If-None-Match` on several lines is one list: a tag on its second
+    /// line is a 304 (RFC 9110 §5.3).
+    #[tokio::test]
+    async fn every_if_none_match_line_counts() {
+        let edr = wire::serve(build_compressed_edr_router()).await;
+        let (_, ok) = wire::get(edr, "/conformance", &[]).await;
+        let etag = ok.iter().find(|(n, _)| n == "etag").unwrap().1.clone();
+        let (status, _) = wire::get(
+            edr,
+            "/conformance",
+            &[("if-none-match", "\"other\""), ("if-none-match", &etag)],
+        )
+        .await;
+        assert_eq!(status, 304);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Conditional requests (304 Not Modified)
 // ---------------------------------------------------------------------------

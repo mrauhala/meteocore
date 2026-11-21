@@ -2082,6 +2082,10 @@ impl EdrEngine for GribEngine {
         self.catalog().runs.keys().copied().collect()
     }
 
+    fn latest_reference_time(&self) -> Option<DateTime<Utc>> {
+        self.catalog().runs.keys().next_back().copied()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let catalog = self.catalog();
         catalog.runs.get(&reference_time).map(|run| RunInfo {

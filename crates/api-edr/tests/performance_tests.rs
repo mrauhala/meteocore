@@ -266,7 +266,7 @@ async fn locations_metadata_runs_off_http_worker_and_etag_matches_response() {
     let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
         .await
         .unwrap();
-    assert_eq!(etag, ds_core::http_cache::etag_of(&bytes));
+    assert_eq!(etag, ds_core::http_cache::weak_etag_of(&bytes));
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
         body["features"][0]["properties"]["parameter-name"][0],

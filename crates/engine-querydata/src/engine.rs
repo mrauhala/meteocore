@@ -308,6 +308,10 @@ impl EdrEngine for QueryDataEngine {
         self.runs.load().runs.keys().copied().collect()
     }
 
+    fn latest_reference_time(&self) -> Option<DateTime<Utc>> {
+        self.runs.load().runs.keys().next_back().copied()
+    }
+
     fn find_instance(&self, reference_time: DateTime<Utc>) -> Option<RunInfo> {
         let set = self.runs.load();
         set.runs.get(&reference_time).map(|e| RunInfo {
@@ -2312,6 +2316,8 @@ mod tests {
         assert_eq!(engine.raster_info().reference_times.len(), instances.len());
         let runs: Vec<_> = instances.iter().map(|r| r.reference_time).collect();
         assert_eq!(engine.instance_reference_times(), runs);
+        // The newest run, O(1) from the same set (#1500).
+        assert_eq!(engine.latest_reference_time(), runs.last().copied());
         // An un-pinned position query (reference_time = None) serves the latest
         // run; pinning the latest run's reference time returns the same series.
         let latest_rt = instances.last().unwrap().reference_time;

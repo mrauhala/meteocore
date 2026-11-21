@@ -36,10 +36,13 @@ without reading code.
   here serves them (`FeaturesState::collection_pages`, `edr` in `apis`).
   `html.rs` never interprets weather property names, and an engine never
   builds a URL.
-- **`/items` precomputes its ETag with `timeStamp` blanked**; the
-  `caching.rs` middleware honours a handler-set ETag. It is a near-twin of
-  `api-edr/src/caching.rs` — keep the two in sync (ds-core is
-  framework-free, so the axum glue cannot be shared; #306).
+- **`/items` precomputes its ETag with `timeStamp` blanked**, with
+  `api_common::caching::etag`; the `conditional_get` middleware (both
+  `caching.rs` files re-export `api_common::caching`, one copy for EDR,
+  Features and the shared root) honours a handler-set ETag. Every tag is
+  weak, `W/"…"`: the server's `CompressionLayer` gzips the body after it was
+  tagged, so one tag names both forms. `If-None-Match` compares weakly
+  (#1500).
 - **An engine's error maps to its class's status** (`handlers::engine_failure`,
   both `/items` and `/items/{featureId}`, by `DataServerError::class()`, #17):
   `BadRequest` a 400 with the engine's message, `NotFound` a 404

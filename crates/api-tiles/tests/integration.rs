@@ -2268,7 +2268,9 @@ mod mvt {
             .expect("ETag must be set")
             .to_str()
             .unwrap();
-        assert!(etag.starts_with('"') && etag.ends_with('"'));
+        // Weak (#1500): the server's compression layer gzips the tile after
+        // the handler tagged it, so the tag names both forms.
+        assert!(etag.starts_with("W/\"") && etag.ends_with('"'), "{etag}");
         assert_eq!(headers.get("cache-control").unwrap(), "public, max-age=300");
         assert_eq!(
             headers.get("x-content-type-options").unwrap(),
@@ -2286,10 +2288,25 @@ mod mvt {
         let app = build_mvt_router();
         let req = Request::builder()
             .uri("/collections/places/tiles/WebMercatorQuad/0/0/0?f=mvt")
-            .header("if-none-match", etag)
+            .header("if-none-match", &etag)
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+        // The `Vary` the server's compression layer gives the tile's 200,
+        // which it never adds to the empty 304 (RFC 9110 §15.4.5).
+        assert_eq!(resp.headers()["vary"], "accept-encoding");
+
+        // `If-None-Match` compares weakly (RFC 9110 §13.1.2, #1500): the
+        // strong form of the same tag, which a client held before the tag
+        // turned weak, revalidates too.
+        let strong = etag.to_str().unwrap().trim_start_matches("W/").to_owned();
+        let req = Request::builder()
+            .uri("/collections/places/tiles/WebMercatorQuad/0/0/0?f=mvt")
+            .header("if-none-match", strong)
+            .body(Body::empty())
+            .unwrap();
+        let resp = build_mvt_router().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
     }
 
