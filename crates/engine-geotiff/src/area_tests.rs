@@ -1,7 +1,8 @@
 //! #1435: an EDR area query on a projected GeoTIFF answers a regular CRS84
 //! grid whose every cell holds the value of the native pixel at its own
 //! `(x[i], y[j])`, where a position query there reads. A geographic source
-//! answers its native window, as before.
+//! answers its native window, as before, and across the antimeridian the
+//! columns the bbox holds in the raster's own frame (#1442).
 //!
 //! The fixtures are written here: small tiled float32 GeoTIFFs whose every
 //! pixel holds its own index `row × width + col`, so a value names the
@@ -158,6 +159,20 @@ fn tm_at(lon0: f64) -> Projection {
     }
 }
 
+/// EPSG:4326, a geographic raster.
+fn geographic() -> Projection {
+    Projection {
+        crs: Crs::Wgs84,
+        geokeys: vec![
+            1, 1, 0, 3, //
+            1024, 0, 1, 2, // geographic
+            1025, 0, 1, 1, // pixel is area
+            2048, 0, 1, 4326, // WGS 84
+        ],
+        doubles: Vec::new(),
+    }
+}
+
 /// A Lambert conformal conic (2SP) on WGS84, from its parameter GeoKeys.
 fn lcc(lat1: f64, lat2: f64, lat0: f64, lon0: f64) -> Projection {
     Projection {
@@ -300,6 +315,18 @@ impl Fixture {
             size(max_x + margin - origin.0),
             size(origin.1 - (min_y - margin)),
         );
+        Self::at(name, projection, origin, pixel, dims)
+    }
+
+    /// A one-file collection of `dims` pixels of `pixel` CRS units on
+    /// `projection`, its top-left corner at `origin`.
+    fn at(
+        name: &str,
+        projection: Projection,
+        origin: (f64, f64),
+        pixel: f64,
+        dims: (u32, u32),
+    ) -> Self {
         let dir = TempDir::new(name);
         write_geotiff(
             &dir.0.join("area_20261108T1200Z.tif"),
@@ -351,8 +378,17 @@ impl Fixture {
     }
 }
 
-/// [`Fixture::pixel_values`] on the fixture's grid `gt`.
+/// [`Fixture::pixel_values`] on the fixture's grid `gt`. A Lambert cone
+/// takes the longitude within half a turn of its central meridian, where
+/// its forward is meant to be evaluated (#1114).
 fn pixel_values(gt: &GeoTransform, lon: f64, lat: f64) -> Vec<Option<f64>> {
+    let lon = match gt.crs {
+        Crs::LambertConformalConic { lon0, .. } => {
+            let centre = lon0.to_degrees();
+            centre + (lon - centre + 180.0).rem_euclid(360.0) - 180.0
+        }
+        _ => lon,
+    };
     let (col, row) = gt.world_to_pixel_f64(lon, lat);
     let near = |v: f64| {
         let base = v.floor();
@@ -1068,4 +1104,508 @@ fn two_pieces_join_on_the_envelope_side() {
         }
     }
     eprintln!("25,60,24,61 over 24–26°E: {} × {} cells", x.len(), y.len());
+}
+
+/// The pixel of geographic raster `gt` at `(lon, lat)`, its columns counted
+/// eastward from its western edge round the turn; `None` off it.
+fn geographic_pixel(gt: &GeoTransform, lon: f64, lat: f64) -> Option<f64> {
+    let col = ((lon - gt.origin_x).rem_euclid(360.0) / gt.pixel_width).floor();
+    let row = ((gt.origin_y - lat) / gt.pixel_height).floor();
+    (col < f64::from(gt.width) && row >= 0.0 && row < f64::from(gt.height))
+        .then(|| row * f64::from(gt.width) + col)
+}
+
+/// A longitude east of the antimeridian a turn on: an axis through the
+/// seam unrolled.
+fn unrolled(lon: f64) -> f64 {
+    if lon < 0.0 {
+        lon + 360.0
+    } else {
+        lon
+    }
+}
+
+/// #1442: a global geographic raster, in the CRS84 frame (from 180°W) and
+/// in the 0–360° one, answers the seam bbox 170,10,-170,20 with the columns
+/// either side of the antimeridian whose footprints meet it, 30 of them,
+/// each cell its own pixel where its centre is inside the bbox. Before, the
+/// bbox was swept from 170°E west through 0° to 170°W: 484 columns on the
+/// first raster, all but the two edges masked to nulls, and none of the
+/// western hemisphere on the second.
+#[test]
+fn a_global_geographic_area_answers_the_seam_bbox_on_both_sides() {
+    let seam = ds_core::feature::parse_area_coords("170,10,-170,20")
+        .unwrap()
+        .bbox;
+    for west in [-180.0, 0.0] {
+        let what = format!("global raster from {west}°");
+        let pixel = 360.0 / 512.0;
+        let fixture = Fixture::at(
+            &format!("global{}", west as i32),
+            geographic(),
+            (west, 90.0),
+            pixel,
+            (512, 256),
+        );
+        let gt = fixture.geo_transform();
+        let result = fixture.area("170,10,-170,20").unwrap();
+        let (x, y) = axes(&result);
+        assert_eq!(x.len(), 30, "{what}: columns {x:?}");
+        let through: Vec<f64> = x.iter().copied().map(unrolled).collect();
+        let dx = assert_regular(&through, &what);
+        assert!((dx - pixel).abs() < 1e-9, "{what}: step {dx}");
+        assert!(x.iter().all(|lon| (-180.0..=180.0).contains(lon)), "{what}");
+        // The first and last footprints hold the bbox's edges.
+        assert!((through[0] - 170.0).abs() < pixel / 2.0, "{what}");
+        assert!((through[29] - 190.0).abs() < pixel / 2.0, "{what}");
+        let dy = assert_regular(y, &what);
+        assert!(dy < 0.0 && (y[0] - 20.0).abs() < pixel / 2.0, "{what}");
+        assert!((y[y.len() - 1] - 10.0).abs() < pixel / 2.0, "{what}");
+
+        let values = values(&result);
+        let mut filled = 0;
+        for (j, &lat) in y.iter().enumerate() {
+            for (i, &lon) in x.iter().enumerate() {
+                let value = values[j * x.len() + i];
+                if seam.contains(lon, lat) {
+                    assert_eq!(
+                        value,
+                        geographic_pixel(&gt, lon, lat),
+                        "{what}: ({lon}, {lat})"
+                    );
+                    filled += 1;
+                } else {
+                    assert_eq!(value, None, "{what}: ({lon}, {lat}) lies outside the bbox");
+                }
+            }
+        }
+        // All but the edge columns and rows whose centres lie outside.
+        let rows_in = y.iter().filter(|lat| (10.0..=20.0).contains(*lat)).count();
+        assert!(rows_in + 2 >= y.len(), "{what}: {y:?}");
+        assert_eq!(filled, 28 * rows_in, "{what}");
+
+        // The position query agrees on either side of the seam.
+        let east_of = x.iter().position(|&lon| lon < 0.0).unwrap();
+        let (j, lat) = (y.len() / 2, y[y.len() / 2]);
+        for i in [east_of - 1, east_of] {
+            let lon = x[i];
+            assert_eq!(
+                fixture.position(lon, lat),
+                values[j * x.len() + i],
+                "{what}: ({lon}, {lat})"
+            );
+            assert!(values[j * x.len() + i].is_some(), "{what}");
+        }
+    }
+}
+
+/// #1442: a regional geographic raster answers the side of the seam bbox
+/// it holds: all of it for one stored past 180° (170–202°E), the side east
+/// or west of the antimeridian for one wholly there, and the 400 for one
+/// the bbox misses. Before, the bbox's sweep through 0° made the first a
+/// 400 and gave the others their other side, every cell masked to null.
+#[test]
+fn a_regional_geographic_area_answers_the_side_of_the_seam_it_holds() {
+    let pixel = 0.25;
+    let raster = |name: &str, west: f64, columns: u32| {
+        Fixture::at(name, geographic(), (west, 24.0), pixel, (columns, 64))
+    };
+    for (what, west, columns, cells) in [
+        ("170–202°E", 170.0, 128, (170.0, 190.0)),
+        ("160–176°E", 160.0, 64, (170.0, 176.0)),
+        ("176–160°W", -176.0, 64, (184.0, 190.0)),
+    ] {
+        let fixture = raster(what, west, columns);
+        let gt = fixture.geo_transform();
+        let result = fixture.area("170,10,-170,20").unwrap();
+        let (x, y) = axes(&result);
+        let through: Vec<f64> = x.iter().copied().map(unrolled).collect();
+        assert_regular(&through, what);
+        assert_eq!(
+            x.len(),
+            ((cells.1 - cells.0) / pixel) as usize,
+            "{what}: {through:?}"
+        );
+        assert!((through[0] - pixel / 2.0 - cells.0).abs() < 1e-9, "{what}");
+        assert!(
+            (through[x.len() - 1] + pixel / 2.0 - cells.1).abs() < 1e-9,
+            "{what}"
+        );
+        assert_eq!(y.len(), 40, "{what}: 10–20°N");
+        let values = values(&result);
+        for (j, &lat) in y.iter().enumerate() {
+            for (i, &lon) in x.iter().enumerate() {
+                let value = values[j * x.len() + i];
+                assert!(value.is_some(), "{what}: ({lon}, {lat})");
+                assert_eq!(
+                    value,
+                    geographic_pixel(&gt, lon, lat),
+                    "{what}: ({lon}, {lat})"
+                );
+            }
+        }
+        let (lon, lat) = (x[x.len() / 2], y[y.len() / 2]);
+        assert_eq!(
+            fixture.position(lon, lat),
+            geographic_pixel(&gt, lon, lat),
+            "{what}: position at ({lon}, {lat})"
+        );
+    }
+
+    // A raster the bbox misses, by longitude or by latitude: the 400.
+    let far = raster("0–16°E", 0.0, 64);
+    let off = raster("170–202°E off", 170.0, 128);
+    for (fixture, coords) in [(&far, "170,10,-170,20"), (&off, "170,30,-170,40")] {
+        match fixture.area(coords) {
+            Err(DataServerError::InvalidParameter(msg)) => {
+                assert!(msg.contains("does not intersect the raster"), "{msg}");
+            }
+            Err(e) => panic!("{coords}: expected the 400, got {e:?}"),
+            Ok(result) => panic!("{coords}: expected the 400, got {:?}", axes(&result)),
+        }
+    }
+}
+
+/// #1442: the budgets count the seam bbox's own columns on a global
+/// geographic raster, never the sweep through 0°. On a 1/64° grid the
+/// bbox is 1280 × 640 cells, 819 200, within the 1 M budget; swept, it
+/// was 21 760 columns wide, 13.9 M cells, a 400. Across the seam of the
+/// raster's own frame the window is two, its last columns and its first:
+/// the antimeridian on a raster from 180°W, the prime meridian on one
+/// from 0°.
+#[test]
+fn the_seam_bbox_of_a_global_geographic_raster_counts_its_own_columns() {
+    let pixel = 1.0 / 64.0;
+    let raster = |west: f64| GeoTransform {
+        origin_x: west,
+        origin_y: 90.0,
+        pixel_width: pixel,
+        pixel_height: pixel,
+        width: 360 * 64,
+        height: 180 * 64,
+        crs: Crs::Wgs84,
+    };
+    let bbox = |west, south, east, north| Bbox {
+        west,
+        south,
+        east,
+        north,
+    };
+    let rows = (4480, 5120);
+    for (west, coords, windows) in [
+        (
+            -180.0,
+            bbox(170.0, 10.0, -170.0, 20.0),
+            vec![(22_400, 23_040), (0, 640)],
+        ),
+        (0.0, bbox(170.0, 10.0, -170.0, 20.0), vec![(10_880, 12_160)]),
+        (
+            0.0,
+            bbox(-10.0, 10.0, 10.0, 20.0),
+            vec![(22_400, 23_040), (0, 640)],
+        ),
+        (
+            -180.0,
+            bbox(-10.0, 10.0, 10.0, 20.0),
+            vec![(10_880, 12_160)],
+        ),
+    ] {
+        let gt = raster(west);
+        let what = format!("{coords:?} on a raster from {west}°");
+        let grid = AreaGrid::new(&gt, &coords).unwrap();
+        assert_eq!(grid.dims(), (1280, 640), "{what}");
+        let planned = grid.plan(None, 1, "test").unwrap();
+        let expected: Vec<_> = windows
+            .iter()
+            .map(|&(start, end)| (start, rows.0, end, rows.1))
+            .collect();
+        assert_eq!(planned.windows(), &expected[..], "{what}");
+        assert_eq!(planned.window_dims(), (1280, 640), "{what}");
+        let through: Vec<f64> = planned
+            .x
+            .iter()
+            .map(|&lon| if lon < coords.west { lon + 360.0 } else { lon })
+            .collect();
+        assert_regular(&through, &what);
+        assert_eq!(planned.x[0], coords.west + pixel / 2.0, "{what}");
+        assert_eq!(planned.x[1279], coords.east - pixel / 2.0, "{what}");
+
+        // Two timesteps of it are past the budget, counted on those cells.
+        match AreaGrid::new(&gt, &coords).unwrap().plan(None, 2, "test") {
+            Err(DataServerError::QueryTooLarge(msg)) => {
+                assert!(
+                    msg.contains("2 timesteps × 640 × 1280 cells"),
+                    "{what}: {msg}"
+                );
+            }
+            Err(e) => panic!("{what}: expected QueryTooLarge, got {e:?}"),
+            Ok(_) => panic!("{what}: expected QueryTooLarge, got a plan"),
+        }
+    }
+}
+
+/// #1442: a Lambert conformal conic centred on 180° answers a position near
+/// the antimeridian from the pixel there, on either side, and the area cell
+/// holding the point agrees. The cone's forward is not periodic in
+/// longitude (#1114): -179.9° given as is was a turn from the central
+/// meridian, on the wrong side of the cone.
+#[test]
+fn a_position_near_the_antimeridian_on_a_lambert_cone_reads_its_own_pixel() {
+    let fixture = Fixture::new(
+        "lcc-seam",
+        lcc(40.0, 50.0, 45.0, 180.0),
+        [175.0, 40.0, 185.0, 50.0],
+        10_000.0,
+    );
+    let gt = fixture.geo_transform();
+    // A latitude where both points lie clear of a pixel edge, so each has
+    // one pixel and the answers must equal it.
+    let lat = (0..200)
+        .map(|k| 44.0 + f64::from(k) * 0.01)
+        .find(|&lat| {
+            [179.9, -179.9]
+                .iter()
+                .all(|&lon| pixel_values(&gt, lon, lat).len() == 1)
+        })
+        .expect("a latitude clear of the pixel edges at ±179.9°");
+    for lon in [179.9, -179.9] {
+        let position = fixture.position(lon, lat);
+        let pixels = pixel_values(&gt, lon, lat);
+        assert_eq!(pixels.len(), 1, "({lon}, {lat})");
+        assert!(position.is_some(), "({lon}, {lat}) lies on the raster");
+        assert_eq!(vec![position], pixels, "({lon}, {lat}): position");
+        // The one-cell area round the point: its cell is centred there.
+        let coords = format!(
+            "{},{},{},{}",
+            lon - 0.01,
+            lat - 0.01,
+            lon + 0.01,
+            lat + 0.01
+        );
+        let area = fixture.area(&coords).unwrap();
+        let (x, y) = axes(&area);
+        assert_eq!((x.len(), y.len()), (1, 1), "{coords}");
+        assert!(
+            (x[0] - lon).abs() < 1e-9 && (y[0] - lat).abs() < 1e-9,
+            "{coords}"
+        );
+        assert_eq!(values(&area)[0], position, "{coords}: area and position");
+    }
+
+    // An area through the seam: every cell its own pixel's, the position
+    // query agreeing at its corners and inside, east of 180° too.
+    let result = fixture.area("178,42,-178,48").unwrap();
+    let (x, _) = axes(&result);
+    assert!(x.iter().any(|&lon| lon > 179.0) && x.iter().any(|&lon| lon < -179.0));
+    assert_cells_are_where_the_axes_say(&fixture, &result, "LCC seam");
+}
+
+/// The windows, axis and cell count of an area over `bbox` on geographic
+/// raster `gt`, checked: no column read twice, never more than the raster's
+/// width, `x` stepping a pixel at a time eastward from the bbox's west, and
+/// every pixel whose centre lies on the bbox's edge inside it.
+fn checked_geographic_plan(gt: &GeoTransform, bbox: [f64; 4], what: &str) -> AreaPlan {
+    let planned = plan(gt, bbox);
+    let windows = planned.windows();
+    let columns: Vec<u32> = windows
+        .iter()
+        .flat_map(|&(start, _, end, _)| start..end)
+        .collect();
+    let unique: std::collections::HashSet<u32> = columns.iter().copied().collect();
+    assert_eq!(
+        unique.len(),
+        columns.len(),
+        "{what}: a column read twice, {windows:?}"
+    );
+    assert!(
+        columns.len() <= gt.width as usize,
+        "{what}: {} columns",
+        columns.len()
+    );
+    assert_eq!(planned.x.len(), columns.len(), "{what}");
+    let [west, south, east, north] = bbox;
+    let through: Vec<f64> = planned
+        .x
+        .iter()
+        .map(|&lon| {
+            if lon < west - gt.pixel_width {
+                lon + 360.0
+            } else {
+                lon
+            }
+        })
+        .collect();
+    if through.len() > 2 {
+        let step = assert_regular(&through, what);
+        assert!((step - gt.pixel_width).abs() < 1e-9, "{what}: step {step}");
+    }
+    let area = Bbox {
+        west,
+        south,
+        east,
+        north,
+    };
+    let lat = planned.y[planned.y.len() / 2];
+    for &lon in [planned.x[0], planned.x[planned.x.len() - 1]].iter() {
+        let on_edge = [west, east].iter().any(|&edge| {
+            (unrolled(lon) - unrolled(edge)).abs() < 1e-9 || (lon - edge).abs() < 1e-9
+        });
+        if on_edge {
+            assert!(
+                area.contains(lon, lat),
+                "{what}: the edge pixel at {lon} is masked"
+            );
+        }
+    }
+    planned
+}
+
+/// Review of #1442: a global raster whose seam lies half a pixel off ±180°,
+/// as ERA5 and GFS lay theirs out (edges -180.5..179.5 at 1°) and the
+/// mirror (-179.5..180.5). The pixel centred on ±180° meets both ends of a
+/// whole-world arc: it is read once, and no answer has more columns than
+/// the raster. A bbox with an edge on ±180° takes that pixel as the bbox
+/// names it, 180° from the west, -180° from the east, so the axis steps on
+/// and the mask keeps it, never a column of nulls after 179°.
+#[test]
+fn a_global_raster_half_a_pixel_off_the_antimeridian_reads_each_column_once() {
+    let raster = |west: f64| GeoTransform {
+        origin_x: west,
+        origin_y: 90.0,
+        pixel_width: 1.0,
+        pixel_height: 1.0,
+        width: 360,
+        height: 180,
+        crs: Crs::Wgs84,
+    };
+    // `(raster west edge, bbox, columns, first x, last x)`.
+    for (origin, bbox, columns, first, last) in [
+        (-180.5, [-180.0, -90.0, 180.0, 90.0], 360, -180.0, 179.0),
+        (-180.5, [0.0, -10.0, 180.0, 10.0], 181, 0.0, 180.0),
+        (-180.5, [-180.0, -10.0, 0.0, 10.0], 181, -180.0, 0.0),
+        (-180.5, [170.0, 10.0, 180.0, 20.0], 11, 170.0, 180.0),
+        (-180.5, [170.0, 10.0, -170.0, 20.0], 21, 170.0, -170.0),
+        (-179.5, [-180.0, -90.0, 180.0, 90.0], 360, -180.0, 179.0),
+        (-179.5, [0.0, -10.0, 180.0, 10.0], 181, 0.0, 180.0),
+        (-179.5, [-180.0, -10.0, 0.0, 10.0], 181, -180.0, 0.0),
+        (-179.5, [170.0, 10.0, -170.0, 20.0], 21, 170.0, -170.0),
+    ] {
+        let what = format!("{bbox:?} on a 1° raster from {origin}°");
+        let planned = checked_geographic_plan(&raster(origin), bbox, &what);
+        assert_eq!(planned.x.len(), columns, "{what}: {:?}", planned.x);
+        assert_eq!(planned.x[0], first, "{what}");
+        assert_eq!(planned.x[columns - 1], last, "{what}");
+        // The whole world reads the raster once: as it lies from -180.5°,
+        // and from -179.5° its last pixel, centred on ±180°, then the rest.
+        if bbox[2] - bbox[0] == 360.0 {
+            let windows: Vec<(u32, u32)> = planned
+                .windows()
+                .iter()
+                .map(|&(start, _, end, _)| (start, end))
+                .collect();
+            let expected = if origin == -180.5 {
+                vec![(0, 360)]
+            } else {
+                vec![(359, 360), (0, 359)]
+            };
+            assert_eq!(windows, expected, "{what}");
+        }
+    }
+    // Every longitude at 0.25°, edges -180.125..179.875: 1440 columns once.
+    let quarter = GeoTransform {
+        origin_x: -180.125,
+        pixel_width: 0.25,
+        pixel_height: 0.25,
+        width: 1440,
+        height: 720,
+        ..raster(0.0)
+    };
+    for (bbox, columns) in [
+        ([-180.0, -10.0, 180.0, 10.0], 1440),
+        ([0.0, -10.0, 180.0, 10.0], 721),
+    ] {
+        let what = format!("{bbox:?} at 0.25°");
+        let planned = checked_geographic_plan(&quarter, bbox, &what);
+        assert_eq!(planned.x.len(), columns, "{what}");
+    }
+}
+
+/// Review of #1442: the same through the engine, on a written raster of
+/// 0.703125° pixels from 180.3515625°W, the pixel of column 0 centred on
+/// ±180°. Each answer holds that pixel's value where the bbox names it,
+/// and the whole world reads its 512 columns once.
+#[test]
+fn a_raster_half_a_pixel_off_the_antimeridian_answers_its_seam_pixel_once() {
+    let pixel = 360.0 / 512.0;
+    let fixture = Fixture::at(
+        "half-pixel-seam",
+        geographic(),
+        (-180.0 - pixel / 2.0, 90.0),
+        pixel,
+        (512, 256),
+    );
+    let gt = fixture.geo_transform();
+    for (coords, seam_x) in [
+        ("-180,-90,180,90", Some(-180.0)),
+        ("0,-10,180,10", Some(180.0)),
+        ("-180,-10,0,10", Some(-180.0)),
+        ("170,10,-170,20", Some(180.0)),
+        ("10,10,20,20", None),
+    ] {
+        let result = fixture.area(coords).unwrap();
+        let (x, y) = axes(&result);
+        let values = values(&result);
+        assert!(x.len() <= 512, "{coords}: {} columns", x.len());
+        let seams: Vec<usize> = (0..x.len()).filter(|&i| x[i].abs() == 180.0).collect();
+        match seam_x {
+            Some(seam_x) => {
+                assert_eq!(seams.len(), 1, "{coords}: {x:?}");
+                let i = seams[0];
+                assert_eq!(x[i], seam_x, "{coords}");
+                let j = y.len() / 2;
+                let value = values[j * x.len() + i];
+                assert!(value.is_some(), "{coords}: the seam pixel is masked");
+                assert_eq!(value, geographic_pixel(&gt, x[i], y[j]), "{coords}");
+                assert_eq!(
+                    value,
+                    Some(f64::from(gt.width) * ((gt.origin_y - y[j]) / pixel).floor())
+                );
+            }
+            None => assert!(seams.is_empty(), "{coords}"),
+        }
+        if coords == "-180,-90,180,90" {
+            assert_eq!(x.len(), 512, "{coords}");
+        }
+    }
+}
+
+/// Review of #1442: a raster a fraction of a pixel short of the whole turn
+/// (1439 columns of 0.25° from 180°W, to 179.75°E) is split at its seam
+/// too, so the seam bbox answers both sides: 170–179.75°E from its last
+/// columns and 180–170°W from its first, the missing quarter degree none.
+#[test]
+fn a_near_global_raster_answers_both_sides_of_the_seam_bbox() {
+    let gt = GeoTransform {
+        origin_x: -180.0,
+        origin_y: 90.0,
+        pixel_width: 0.25,
+        pixel_height: 0.25,
+        width: 1439,
+        height: 720,
+        crs: Crs::Wgs84,
+    };
+    let planned = plan(&gt, [170.0, 10.0, -170.0, 20.0]);
+    let rows = (280, 320);
+    assert_eq!(
+        planned.windows(),
+        &[(1400, rows.0, 1439, rows.1), (0, rows.0, 40, rows.1)][..]
+    );
+    assert_eq!(planned.x.len(), 79);
+    assert_eq!(planned.x[0], 170.125);
+    assert_eq!(planned.x[38], 179.625);
+    assert_eq!(planned.x[39], -179.875);
+    assert_eq!(planned.x[78], -170.125);
+    // Every longitude: the raster once, as it is.
+    let whole = plan(&gt, [-180.0, -10.0, 180.0, 10.0]);
+    assert_eq!(whole.windows(), &[(0, 320, 1439, 400)][..]);
 }
