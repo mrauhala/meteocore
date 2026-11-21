@@ -576,6 +576,42 @@ budgets need the window's grid, so on a STAC source they also run before
 those loads, on the window's first entry, which loads alone first when it is
 cold (#1075).
 
+**Frame reads (#1495).** Position and area read their window's frames
+through `frames::read_frames`, jobs of `ds_executor::field_jobs::run_field_jobs`
+on the query runtime, each inside `block_in_place` and under the query's
+deadline, and place each result by its frame's index, so the `t` axis keeps
+the catalog's order.
+
+- **Position:** `frames::position_frame_reads` gives `REMOTE_FRAME_READS`
+  (8) when an object store serves every frame
+  (`DataSource::reads_from_object_store`), else 1. Eight frames reserve
+  eight tiles, about 24 MiB for 512 × 512 Float32.
+- **Frames decoded in process** (a local file, or a remote file the scan
+  downloaded whole) read one at a time. They have no round trip to
+  overlap, and each cold decode reserves its tile plus the decoder's
+  64 MiB cap: eight would hold half the default decode budget per query.
+- **STAC assets** (`HttpDirect`) read one at a time. reqwest reads them
+  outside `ds_storage`'s host limits and 429 back-off.
+- **Area** reads one frame at a time (`AREA_FRAME_READS`). Its tiles are
+  fetched on the process-wide `TILE_FETCH_POOL`, which cold map renders
+  share, and eight area frames at once would starve them, the #240/#243
+  convoy.
+
+A job builds its frame's whole answer (an area's resampled cells), never
+keeping a decoded window past it, and owns what it reads (`frames::Frame`,
+the `Arc<TileCache>`, an `Arc` of the area plan): it is a task of its own. The
+error rules above are applied inside the job, so a fatal error stops new
+reads and the running ones drain; `note_frames_health` runs for the window
+once the reads end, before an error returns. Pinned by `frame_read_tests`
+(eight position reads in flight over a delaying
+`ds_storage::test_util::SlowReads`, one area read, each frame of a
+multi-frame answer equal to that frame alone, no read past the deadline). Tests decode into the process-wide decoded-chunk cache for the
+rest of the suite, and a test reading its own chunks back fails once their
+shards are full of others' (about 200 MB resident did it). So the
+read-back tests run in a process of their own (`alone_in_a_process` in
+`reader.rs`), and a test that decodes many tiles reads small ones and drops
+its engine's chunks when it ends (`decoded_cache::forget_for_test`).
+
 Encoded remote tile ranges are validated before fetching: each is capped at
 64 MiB and included in decode admission alongside raw and boxed output buffers.
 Direct HTTP range bodies are also streamed with the requested length as a cap,

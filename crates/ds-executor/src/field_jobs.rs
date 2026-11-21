@@ -8,7 +8,8 @@
 //! `block_in_place` and under the query's `ds_core::deadline`, and hands
 //! each job's small result (samples, a subset) to the caller in completion
 //! order. Taken from engine-grib, which keeps its own fallback runtime;
-//! engine-netcdf shares it.
+//! engine-netcdf shares it, and engine-geotiff and engine-odim's composites
+//! read a query's frames with it, one job per frame (#1495).
 
 use std::future::Future;
 use std::sync::Arc;

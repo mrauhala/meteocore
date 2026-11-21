@@ -25,7 +25,7 @@
 //! runtime handle for remote reads instead.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use chrono::{DateTime, Utc};
 use ds_core::edr_engine::EdrEngine;
@@ -39,9 +39,196 @@ use ds_core::model::{
 };
 use ds_core::resample::ProjectionGrid;
 
-use crate::catalog::CatalogEntry;
-use crate::engine::{footprint_guard_envelope, OdimEngine};
+use crate::catalog::{CatalogEntry, Location};
+use crate::engine::{footprint_guard_envelope, LoadError, OdimEngine};
+use crate::read_budget::{Budget, Permit};
 use crate::reader::{OdimComposite, VALUE_PRECISION};
+
+/// The most composites one EDR position or area query over a remote
+/// catalog reads at once (#1495). A remote composite is a HEAD and a
+/// whole-object GET, mostly waiting on the store, then an HDF5 decode:
+/// eight overlap eight of them, so a 144-frame window pays 18 round trips,
+/// not 144. Every read past a query's first is admitted by
+/// `read_budget::BUDGET` ([`FrameAdmission`]).
+pub(crate) const MAX_FRAME_READS: usize = 8;
+
+/// How many of `entries`' composites a query reads at once:
+/// [`MAX_FRAME_READS`] when a store serves every one, else one at a time,
+/// as before #1495: a local file has no round trip to overlap.
+pub(crate) fn frame_reads(entries: &[CatalogEntry]) -> usize {
+    if entries
+        .iter()
+        .all(|entry| matches!(entry.location, Location::Remote { .. }))
+    {
+        MAX_FRAME_READS
+    } else {
+        1
+    }
+}
+
+/// How the composite reads one EDR query has in flight are admitted
+/// (#1495), as a PVOL walk's reads ahead are. Until its composite enters
+/// `COMPOSITE_CACHE`, a read holds the file's bytes and the decode, about
+/// 1.25 × the decoded array: OPERA's 4400 × 3800 `f32` grid, 67 MB decoded,
+/// holds about 87 MB.
+///
+/// - One read at a time is unbudgeted, as every read was when a query read
+///   one composite at a time.
+/// - Each read beside it reserves the file's size, from its HEAD, and the
+///   decode ([`OdimEngine::seed_decode_bytes`]) from the budget with
+///   [`Budget::try_reserve_background`], which leaves half the budget to
+///   the PVOL walks that must have theirs, and which counts no rejection.
+/// - A read that gets no reservation waits for the unbudgeted one to end:
+///   never refused, it is then read as one at a time would have read it,
+///   until the request's deadline, which is `DeadlineExceeded`.
+///
+/// Only a read that fetches the file itself is admitted
+/// (`engine::CompositeReader::load`): a resident composite, or another
+/// request's fill the read joins first, holding nothing, takes no HEAD and
+/// no admission. A read that claims the fill takes its HEAD and tries
+/// [`Self::try_admit`], which never waits. Only without room does it give
+/// the claim back and wait in [`Self::admit`], holding nothing. So a map
+/// render or another query that wants the same composite waits for a fill
+/// in progress, never behind a query's admission wait. The wait is on a
+/// condition variable inside the read's `block_in_place`, never on a
+/// runtime worker (#1200).
+pub(crate) struct FrameAdmission {
+    budget: Arc<Budget>,
+    decode_bytes: u64,
+    /// Whether the query's unbudgeted read is taken.
+    unbudgeted: Mutex<bool>,
+    freed: Condvar,
+}
+
+/// What admitted one composite read: held until its composite is decoded,
+/// and given back on drop.
+pub(crate) enum Admitted {
+    /// The query's one unbudgeted read.
+    Unbudgeted { _read: UnbudgetedRead },
+    /// A reservation of the read budget.
+    Reserved { _permit: Permit },
+}
+
+/// The query's unbudgeted read, taken: dropping it lets the next read have
+/// it.
+pub(crate) struct UnbudgetedRead(Arc<FrameAdmission>);
+
+impl Drop for UnbudgetedRead {
+    fn drop(&mut self) {
+        *self.0.unbudgeted.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.0.freed.notify_one();
+    }
+}
+
+impl FrameAdmission {
+    /// The admission of one query's reads, reserving from `budget` each
+    /// read's file and `decode_bytes`.
+    pub(crate) fn new(budget: Arc<Budget>, decode_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            budget,
+            decode_bytes,
+            unbudgeted: Mutex::new(false),
+            freed: Condvar::new(),
+        })
+    }
+
+    /// Admit a read of a file of `file_bytes` without waiting: the
+    /// unbudgeted read if it is free, else a reservation, else `None`.
+    pub(crate) fn try_admit(self: &Arc<Self>, file_bytes: u64) -> Option<Admitted> {
+        if let Some(read) = self.take_unbudgeted() {
+            return Some(Admitted::Unbudgeted { _read: read });
+        }
+        let bytes = file_bytes.saturating_add(self.decode_bytes);
+        let permit = self.budget.try_reserve_background(bytes)?;
+        Some(Admitted::Reserved { _permit: permit })
+    }
+
+    /// Admit a read of a file of `file_bytes`: [`Self::try_admit`], else the
+    /// unbudgeted read once it is given back, waiting no longer than the
+    /// request's deadline. Never called holding a fill claim.
+    pub(crate) fn admit(self: &Arc<Self>, file_bytes: u64) -> Result<Admitted, DataServerError> {
+        if let Some(admitted) = self.try_admit(file_bytes) {
+            return Ok(admitted);
+        }
+        let deadline = ds_core::deadline::current();
+        let mut taken = self.unbudgeted.lock().unwrap_or_else(|e| e.into_inner());
+        while *taken {
+            taken = match deadline {
+                Some(deadline) => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(DataServerError::DeadlineExceeded);
+                    }
+                    self.freed
+                        .wait_timeout(taken, left)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                }
+                None => self.freed.wait(taken).unwrap_or_else(|e| e.into_inner()),
+            };
+        }
+        *taken = true;
+        Ok(Admitted::Unbudgeted {
+            _read: UnbudgetedRead(Arc::clone(self)),
+        })
+    }
+
+    /// The unbudgeted read, if no read has it.
+    fn take_unbudgeted(self: &Arc<Self>) -> Option<UnbudgetedRead> {
+        let mut taken = self.unbudgeted.lock().unwrap_or_else(|e| e.into_inner());
+        (!*taken).then(|| {
+            *taken = true;
+            UnbudgetedRead(Arc::clone(self))
+        })
+    }
+}
+
+/// Read the composites of `entries` with `read`, at most `concurrency` at
+/// once, and hand each entry's index and value to `place` (#1495). Each
+/// read is a job of `ds_executor::field_jobs::run_field_jobs`: a task of
+/// the query runtime, inside `block_in_place`, under the query's deadline,
+/// so a wait on `COMPOSITE_CACHE` for another request's fill of the same
+/// file holds no runtime worker (#1200), and the fill is shared as before.
+/// On the first error or once the deadline passes no read starts, and the
+/// reads already running finish before this returns the error: what they
+/// read stays cached for a retry.
+pub(crate) fn read_frames<T: Send + 'static>(
+    concurrency: usize,
+    entries: Vec<CatalogEntry>,
+    read: impl Fn(&CatalogEntry) -> Result<T, DataServerError> + Send + Sync + 'static,
+    mut place: impl FnMut(usize, T) + Send,
+) -> Result<(), DataServerError> {
+    ds_executor::field_jobs::run_field_jobs(
+        ds_executor::query_runtime(),
+        concurrency,
+        entries.into_iter().enumerate(),
+        move |(index, entry): (usize, CatalogEntry)| read(&entry).map(|value| (index, value)),
+        |(index, value)| {
+            place(index, value);
+            Ok(())
+        },
+    )
+}
+
+/// The value overrides of the collection's config, applied over each
+/// composite's own.
+#[derive(Clone, Copy)]
+struct Calibration {
+    gain: Option<f64>,
+    offset: Option<f64>,
+    nodata: Option<f64>,
+}
+
+impl Calibration {
+    /// `(gain, offset, nodata)` for `composite`.
+    fn of(&self, composite: &OdimComposite) -> (f64, f64, f64) {
+        (
+            self.gain.unwrap_or(composite.gain),
+            self.offset.unwrap_or(composite.offset),
+            self.nodata.unwrap_or(composite.nodata),
+        )
+    }
+}
 
 /// Parse an EDR `coords` value for a position query into
 /// `(lat, lon)`. Accepts WKT `POINT(lon lat)` and the bare
@@ -196,70 +383,122 @@ fn geometry(composite: &OdimComposite) -> Geometry {
     )
 }
 
-impl OdimEngine {
-    /// Each area cell's composite pixel, as [`source_px`] measures it,
-    /// `None` outside the polygon. A lat/lon composite's is affine and
-    /// exact per cell. A projected one's (stereographic, LAEA, TM) is a
-    /// forward transform per cell, exact as a position query's, up to
-    /// [`MAX_EXACT_AREA_CELLS`]; past it the transforms would dominate the
-    /// answer (Critical Rule 5), and a larger grid's come from a coarse
-    /// [`ProjectionGrid`] that evaluates the transform at its nodes only,
-    /// as the map's does, the cells outside the catalog's footprint left
-    /// out, as the map's ghost guard leaves them (#449, #1436).
-    fn area_positions(
-        &self,
-        composite: &OdimComposite,
-        polygon: &QueryPolygon,
-        axes: &AreaGridAxes,
-        mask: &[bool],
-    ) -> Positions {
-        let (nx, ny) = axes.dims();
-        if matches!(composite.crs, Crs::Wgs84) || nx * ny <= MAX_EXACT_AREA_CELLS {
-            return axes
-                .y
-                .iter()
-                .flat_map(|&y| axes.x.iter().map(move |&x| (x, y)))
-                .zip(mask)
-                .map(|((x, y), &inside)| inside.then(|| source_px(composite, x, y)).flatten())
-                .collect();
+/// An area query's grid, shared by its frame reads (#1495), and each
+/// cell's composite pixel, placed once per composite geometry (every scan
+/// of a catalog normally shares it) rather than once per cell and scan.
+struct AreaFrames {
+    polygon: QueryPolygon,
+    axes: AreaGridAxes,
+    mask: Vec<bool>,
+    seed_spatial_extent: [f64; 4],
+    placed: Mutex<Option<(Geometry, Arc<Positions>)>>,
+}
+
+impl AreaFrames {
+    /// Each cell's pixel of `composite`, placed for its geometry by the
+    /// first frame read of it while the others wait. The wait is for that
+    /// computation alone, never for I/O.
+    fn positions(&self, composite: &OdimComposite) -> Arc<Positions> {
+        let key = geometry(composite);
+        let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((geometry, positions)) = placed.as_ref() {
+            if *geometry == key {
+                return Arc::clone(positions);
+            }
         }
-        let b = &polygon.bbox;
-        let east = if b.crosses_antimeridian() {
-            b.east + 360.0
-        } else {
-            b.east
-        };
-        let (rows, cols) = composite.pixels.shape();
-        let window = OutputCrs::Wgs84.footprint_pixel_window(
-            [b.west, b.south, east, b.north],
-            footprint_guard_envelope(self.seed_spatial_extent),
-            nx as u32,
-            ny as u32,
-        );
-        let grid = ProjectionGrid::build_2d_within(
-            nx as u32,
-            ny as u32,
-            window,
-            cols as u32,
-            rows as u32,
-            |fx, fy| {
-                (
-                    b.west + fx * (east - b.west),
-                    b.north - fy * (b.north - b.south),
-                )
-            },
-            |lon, lat| source_px(composite, lon, lat).unwrap_or((f64::NAN, f64::NAN)),
-        );
-        let (x0, x1, y0, y1) = window;
-        (0..ny)
-            .flat_map(|iy| (0..nx).map(move |ix| (ix, iy)))
-            .map(|(ix, iy)| {
-                let (ox, oy) = (ix as u32, iy as u32);
-                let inside =
-                    mask[axes.index(ix, iy)] && (x0..=x1).contains(&ox) && (y0..=y1).contains(&oy);
-                inside.then(|| grid.sample(ox, oy))
-            })
-            .collect()
+        let positions = Arc::new(area_positions(
+            self.seed_spatial_extent,
+            composite,
+            &self.polygon,
+            &self.axes,
+            &self.mask,
+        ));
+        *placed = Some((key, Arc::clone(&positions)));
+        positions
+    }
+}
+
+/// Each area cell's composite pixel, as [`source_px`] measures it,
+/// `None` outside the polygon. A lat/lon composite's is affine and
+/// exact per cell. A projected one's (stereographic, LAEA, TM) is a
+/// forward transform per cell, exact as a position query's, up to
+/// [`MAX_EXACT_AREA_CELLS`]; past it the transforms would dominate the
+/// answer (Critical Rule 5), and a larger grid's come from a coarse
+/// [`ProjectionGrid`] that evaluates the transform at its nodes only,
+/// as the map's does, the cells outside the catalog's footprint left
+/// out, as the map's ghost guard leaves them (#449, #1436).
+fn area_positions(
+    seed_spatial_extent: [f64; 4],
+    composite: &OdimComposite,
+    polygon: &QueryPolygon,
+    axes: &AreaGridAxes,
+    mask: &[bool],
+) -> Positions {
+    let (nx, ny) = axes.dims();
+    if matches!(composite.crs, Crs::Wgs84) || nx * ny <= MAX_EXACT_AREA_CELLS {
+        return axes
+            .y
+            .iter()
+            .flat_map(|&y| axes.x.iter().map(move |&x| (x, y)))
+            .zip(mask)
+            .map(|((x, y), &inside)| inside.then(|| source_px(composite, x, y)).flatten())
+            .collect();
+    }
+    let b = &polygon.bbox;
+    let east = if b.crosses_antimeridian() {
+        b.east + 360.0
+    } else {
+        b.east
+    };
+    let (rows, cols) = composite.pixels.shape();
+    let window = OutputCrs::Wgs84.footprint_pixel_window(
+        [b.west, b.south, east, b.north],
+        footprint_guard_envelope(seed_spatial_extent),
+        nx as u32,
+        ny as u32,
+    );
+    let grid = ProjectionGrid::build_2d_within(
+        nx as u32,
+        ny as u32,
+        window,
+        cols as u32,
+        rows as u32,
+        |fx, fy| {
+            (
+                b.west + fx * (east - b.west),
+                b.north - fy * (b.north - b.south),
+            )
+        },
+        |lon, lat| source_px(composite, lon, lat).unwrap_or((f64::NAN, f64::NAN)),
+    );
+    let (x0, x1, y0, y1) = window;
+    (0..ny)
+        .flat_map(|iy| (0..nx).map(move |ix| (ix, iy)))
+        .map(|(ix, iy)| {
+            let (ox, oy) = (ix as u32, iy as u32);
+            let inside =
+                mask[axes.index(ix, iy)] && (x0..=x1).contains(&ox) && (y0..=y1).contains(&oy);
+            inside.then(|| grid.sample(ox, oy))
+        })
+        .collect()
+}
+
+impl OdimEngine {
+    /// The admission of one EDR query's composite reads (#1495).
+    fn frame_admission(&self) -> Arc<FrameAdmission> {
+        FrameAdmission::new(
+            Arc::clone(&crate::read_budget::BUDGET),
+            self.seed_decode_bytes,
+        )
+    }
+
+    /// The collection's value overrides.
+    fn calibration(&self) -> Calibration {
+        Calibration {
+            gain: self.gain_override,
+            offset: self.offset_override,
+            nodata: self.nodata_override,
+        }
     }
 
     /// Snapshot the catalog entries whose timestamps fall in the
@@ -322,16 +561,23 @@ impl OdimEngine {
             ));
         }
 
-        let mut times = Vec::with_capacity(entries.len());
-        let mut values = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            times.push(entry.time);
-            match self.load_composite(&entry.location) {
+        let times: Vec<DateTime<Utc>> = entries.iter().map(|entry| entry.time).collect();
+        let mut values = vec![None; entries.len()];
+        let collection: Arc<str> = Arc::from(self.collection_id.as_str());
+        let calibration = self.calibration();
+        let admission = self.frame_admission();
+        let reader = self.composite_reader();
+        // A few composites at a time over a remote catalog (#1495).
+        read_frames(
+            frame_reads(&entries),
+            entries,
+            move |entry| match reader
+                .load(&entry.location, &admission)
+                .map_err(LoadError::for_query)
+            {
                 Ok(composite) => {
-                    let gain = self.gain_override.unwrap_or(composite.gain);
-                    let offset = self.offset_override.unwrap_or(composite.offset);
-                    let nodata = self.nodata_override.unwrap_or(composite.nodata);
-                    values.push(sample_bilinear(
+                    let (gain, offset, nodata) = calibration.of(&composite);
+                    Ok(sample_bilinear(
                         &composite,
                         lon,
                         lat,
@@ -339,25 +585,25 @@ impl OdimEngine {
                         offset,
                         nodata,
                         composite.undetect,
-                    ));
+                    ))
                 }
                 // The request's time is up (#1399), or the read failed
                 // (#1496): no gap stands in for it, since a null would be
                 // kept as "no data" by every cache of the answer.
-                Err(e) if e.class().is_transient() => return Err(e),
+                Err(e) if e.class().is_transient() => Err(e),
                 Err(e) => {
                     // A file gone since the scan or whose bytes do not
                     // decode shouldn't fail the whole series: emit a gap
                     // and carry on.
                     tracing::warn!(
-                        "[{}] EDR position query: failed to load `{}`: {e}",
-                        self.collection_id,
+                        "[{collection}] EDR position query: failed to load `{}`: {e}",
                         entry.location.id()
                     );
-                    values.push(None);
+                    Ok(None)
                 }
-            }
-        }
+            },
+            |index, value| values[index] = value,
+        )?;
 
         let mut ranges = HashMap::new();
         ranges.insert(
@@ -422,66 +668,86 @@ impl OdimEngine {
         let (nx, ny) = axes.dims();
         let mask = polygon.cell_mask(&axes);
 
-        let mut times = Vec::with_capacity(entries.len());
-        let mut all_values: Vec<Option<f64>> = Vec::with_capacity(entries.len() * ny * nx);
-        // Each cell's composite pixel, placed once per composite geometry
-        // (every scan of a catalog normally shares it) rather than once per
-        // cell and scan.
-        let mut placed: Option<(Geometry, Positions)> = None;
+        let times: Vec<DateTime<Utc>> = entries.iter().map(|entry| entry.time).collect();
+        // `[t][y][x]`; a file gone or undecodable stays a timestep of nulls.
+        let cells = ny * nx;
+        let mut all_values: Vec<Option<f64>> = vec![None; times.len() * cells];
+        let area = Arc::new(AreaFrames {
+            polygon: polygon.clone(),
+            axes,
+            mask,
+            seed_spatial_extent: self.seed_spatial_extent,
+            placed: Mutex::new(None),
+        });
+        let frame_area = Arc::clone(&area);
+        let collection: Arc<str> = Arc::from(self.collection_id.as_str());
+        let calibration = self.calibration();
+        let admission = self.frame_admission();
+        let reader = self.composite_reader();
 
-        for entry in &entries {
-            times.push(entry.time);
-            let composite = match self.load_composite(&entry.location) {
-                Ok(c) => c,
-                // The deadline or a failed read (#1399, #1496), as in
-                // `query_point`: the query fails, never a timestep of nulls.
-                Err(e) if e.class().is_transient() => return Err(e),
-                // Gone since the scan, or bytes that do not decode.
-                Err(e) => {
-                    tracing::warn!(
-                        "[{}] EDR area query: failed to load `{}`: {e}",
-                        self.collection_id,
-                        entry.location.id()
-                    );
-                    all_values.extend(std::iter::repeat_n(None, ny * nx));
-                    continue;
+        // A few composites at a time over a remote catalog (#1495), as in
+        // `query_point`.
+        read_frames(
+            frame_reads(&entries),
+            entries,
+            move |entry| {
+                let read = reader.load(&entry.location, &admission);
+                let composite = match read.map_err(LoadError::for_query) {
+                    Ok(c) => c,
+                    // The deadline or a failed read (#1399, #1496), as in
+                    // `query_point`: the query fails, never a timestep of
+                    // nulls.
+                    Err(e) if e.class().is_transient() => return Err(e),
+                    // Gone since the scan, or bytes that do not decode.
+                    Err(e) => {
+                        tracing::warn!(
+                            "[{collection}] EDR area query: failed to load `{}`: {e}",
+                            entry.location.id()
+                        );
+                        return Ok(None);
+                    }
+                };
+                ds_core::deadline::check()?;
+                let positions = frame_area.positions(&composite);
+                let (gain, offset, nodata) = calibration.of(&composite);
+                let values: Vec<Option<f64>> = positions
+                    .iter()
+                    .map(|position| {
+                        position.and_then(|(col, row)| {
+                            sample_px(
+                                &composite,
+                                col,
+                                row,
+                                gain,
+                                offset,
+                                nodata,
+                                composite.undetect,
+                            )
+                        })
+                    })
+                    .collect();
+                Ok(Some(values))
+            },
+            |index, values| {
+                if let Some(values) = values {
+                    let step = &mut all_values[index * cells..(index + 1) * cells];
+                    for (cell, value) in step.iter_mut().zip(values) {
+                        *cell = value;
+                    }
                 }
-            };
-            ds_core::deadline::check()?;
-            let key = geometry(&composite);
-            if placed.as_ref().is_none_or(|(placed, _)| *placed != key) {
-                let positions = self.area_positions(&composite, polygon, &axes, &mask);
-                placed = Some((key, positions));
-            }
-            let positions = &placed.as_ref().expect("placed above").1;
-            let gain = self.gain_override.unwrap_or(composite.gain);
-            let offset = self.offset_override.unwrap_or(composite.offset);
-            let nodata = self.nodata_override.unwrap_or(composite.nodata);
-            all_values.extend(positions.iter().map(|position| {
-                position.and_then(|(col, row)| {
-                    sample_px(
-                        &composite,
-                        col,
-                        row,
-                        gain,
-                        offset,
-                        nodata,
-                        composite.undetect,
-                    )
-                })
-            }));
-        }
+            },
+        )?;
 
         // Every catalog entry is a timestamped scan, so the scans served are
         // always on a `t` axis, one scan included (#1412).
+        let shape = vec![times.len(), ny, nx];
         let domain = DomainDescription::Grid {
-            x: axes.x,
-            y: axes.y,
+            x: area.axes.x.clone(),
+            y: area.axes.y.clone(),
             t: Some(times),
             z: None,
-            coarsened: axes.coarsened,
+            coarsened: area.axes.coarsened.clone(),
         };
-        let shape = vec![entries.len(), ny, nx];
         let axis_names = vec!["t".to_string(), "y".to_string(), "x".to_string()];
 
         let mut ranges = HashMap::new();

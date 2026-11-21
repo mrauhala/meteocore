@@ -1719,13 +1719,14 @@ static PVOL_CATALOG_SITES: LazyLock<IntGaugeVec> = LazyLock::new(|| {
 static PVOL_READ_USED: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "pvol_read_reserved_bytes",
-        "Reserved PVOL EDR read memory: volume bytes fetched and moments decoded",
+        "Reserved PVOL EDR read memory: volume bytes fetched and moments decoded, \
+         and ODIM composite EDR reads beside a query's first",
     )
 });
 static PVOL_READ_PEAK: LazyLock<IntGauge> = LazyLock::new(|| {
     int_gauge(
         "pvol_read_reserved_peak_bytes",
-        "Most PVOL EDR read memory reserved at once since the previous scrape",
+        "Most PVOL and ODIM composite EDR read memory reserved at once since the previous scrape",
     )
 });
 static PVOL_READ_LIMIT: LazyLock<IntGauge> =

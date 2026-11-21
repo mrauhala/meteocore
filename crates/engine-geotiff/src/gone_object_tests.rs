@@ -222,7 +222,9 @@ fn two_frame_engine(local: &EmptyDir, store: &Arc<RefusingStore>) -> GeoTiffEngi
         store: DataStore::new(store.clone()),
         prefix: ObjectPath::from("d"),
     };
-    engine.tile_cache = cache::TileCache::new(config.effective_tile_cache_mb() * 1024 * 1024);
+    engine.tile_cache = Arc::new(cache::TileCache::new(
+        config.effective_tile_cache_mb() * 1024 * 1024,
+    ));
     engine.poll_once();
     assert_eq!(times(&engine), [older(), newer()]);
     engine

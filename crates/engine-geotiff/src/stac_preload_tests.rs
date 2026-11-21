@@ -991,7 +991,9 @@ fn failure<T>(result: Result<T, DataServerError>) -> DataServerError {
 
 /// #889: a query over cold STAC items loads their metadata concurrently,
 /// at most `STAC_PRELOAD_CONCURRENCY` in flight, never one item after
-/// another on the request worker.
+/// another on the request worker. The point is off the raster, so the
+/// query reads no tile: the frames it reads by range run eight at a time
+/// (#1495), and the asset host would count their reads with the loads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn query_loads_cold_stac_items_concurrently() {
     let options = MockOptions {
@@ -1002,7 +1004,15 @@ async fn query_loads_cold_stac_items_concurrently() {
     let times = mock.times.clone();
     let engine = Arc::new(stac_engine(mock.items_url.clone(), mock.allowlist.clone()));
 
-    let response = query_position(&engine, (times[0], times[7])).await.unwrap();
+    let window = Some((times[0], times[7]));
+    let query = Arc::clone(&engine);
+    let response =
+        tokio::spawn(
+            async move { query.query_position("POINT(-150 -60)", window, None, None, None) },
+        )
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(series_times(response), times);
     assert_eq!(loaded_times(&engine), times);
     let most = mock.assets.max_in_flight.load(Ordering::SeqCst);

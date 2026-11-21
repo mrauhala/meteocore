@@ -84,7 +84,11 @@ available.
   query reading ahead reserves what each volume's read fetches, its byte
   ranges or the file, and its moments when the read starts, and reads no
   further ahead than the budget allows. A volume that does not fit is a
-  503. Map, 3D Tiles and storm-cell reads are not counted.
+  503. The budget also counts the composite reads an EDR query runs beside
+  its first, each its file and decode until the composite is cached, in
+  the half a PVOL walk does not need; one that finds no room waits for the
+  query's first read instead of failing. Map, 3D Tiles and storm-cell
+  reads are not counted.
 - **Read errors.** A missing or undecodable polar volume reads as no data
   and is remembered as bad. A passed deadline or a storage failure fails
   the request, so no cache keeps an empty frame: a storage failure is a
