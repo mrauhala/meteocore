@@ -122,6 +122,36 @@ fn decoder_reads_every_fixture_with_eccodes_values() {
     assert!((v("011002", None).unwrap() - 2.6).abs() < 1e-6);
 }
 
+/// Station positions are the decimals the reports state, in the decoded
+/// report and in EDR `/locations`: Hong Kong and Indonesia came out as
+/// `22.309440000000002` and `122.85125000000001` (#1500).
+#[test]
+fn positions_are_the_decimals_the_reports_state() {
+    let d = Decoder::new();
+    let locations = engine().get_locations().unwrap();
+    for (file, lon, lat) in [
+        ("synop_hk-hko_20260912T0800Z.bufr", 113.92194, 22.30944),
+        ("synop_id-bmkg_20260912T0800Z.bufr", 122.85125, 0.63907),
+        ("synop_se-smhi_20260912T0800Z.bufr", 18.98391, 57.44075),
+    ] {
+        let report = d
+            .decode(&std::fs::read(fixtures().join(file)).unwrap())
+            .unwrap()
+            .reports
+            .remove(0);
+        assert_eq!((report.lon, report.lat), (lon, lat), "{file}");
+        let location = locations
+            .iter()
+            .find(|l| l.id == report.station_id)
+            .unwrap();
+        assert_eq!(
+            (location.longitude, location.latitude),
+            (lon, lat),
+            "{file}"
+        );
+    }
+}
+
 #[test]
 fn edr_locations_parameters_and_extents() {
     let e = engine();

@@ -3293,15 +3293,8 @@ impl DataRequest {
 /// together included, and the 400 refusing more.
 const POSITION_BUDGET: crate::datetime_list::ValueBudget = crate::datetime_list::ValueBudget {
     max: crate::params::MAX_POSITION_VALUES,
-    refuse: position_too_large,
+    refuse: ds_core::feature::position_too_large,
 };
-
-fn position_too_large() -> DataServerError {
-    DataServerError::QueryTooLarge(format!(
-        "Position response exceeds {} values",
-        crate::params::MAX_POSITION_VALUES
-    ))
-}
 
 async fn run_position_query(
     id: String,

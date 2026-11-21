@@ -350,8 +350,10 @@ errors clearly if the table is set without the feature.
   decode's serial read, as before. Dropping a planned range's
   `metered::Ahead` counts it exactly once (used, unused, skipped, serial,
   failed, expired) and gives back the room it did not stage into: keep
-  that in `Drop`, so a panic out of the fetches cannot leak room. A MULTIPOINT past `ds_core::feature::MAX_POSITION_VALUES`
-  plans nothing. Reads inside `metered::PREFETCH` go to
+  that in `Drop`, so a panic out of the fetches cannot leak room. A position query past `ds_core::feature::MAX_POSITION_VALUES`
+  is refused before it plans or reads anything
+  (`ds_core::feature::check_position_budget`, which counts a derived
+  parameter as the one range the `Derived` wrapper answers, #1500). Reads inside `metered::PREFETCH` go to
   `metered::staging`, never the payload cache: the decode's read misses
   the cache, takes the staged range, and inserts it exactly as a storage
   read would, so payload hits, admissions and churn match serial reads

@@ -50,12 +50,16 @@ type TimeAndRun = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 ///   ([`super::Formula::reads_level_pressure`]) takes the isobaric level
 ///   the engine draws its first input at ([`MapEngine::resolve_elevation`]).
 /// - **EDR**: every derived parameter in `parameter_names` and every
-///   query. The inputs are queried in place of the derived names and
+///   query; the wrapped engine's 400 for an unknown `parameter-name` lists
+///   them too (`relist`, #1500). The inputs are queried in place of the
+///   derived names and
 ///   combined per value; inputs the client did not ask for are dropped
 ///   again. The response, derived values included, must fit the shared
 ///   value budget ([`MAX_AREA_VALUES`]); it is counted before anything is
 ///   derived. An engine that fits an area grid to that budget leaves room
-///   for the derived ranges ([`AreaShare::extra_parameters`], #1436). A
+///   for the derived ranges, and one refusing a position response before it
+///   reads counts the response's ranges, not the inputs only the derivation
+///   asked for ([`AreaShare::derived`], #1436, #1500). A
 ///   formula that reads the level's pressure takes each value's level from
 ///   the coverage's `z`.
 ///
@@ -423,6 +427,43 @@ impl Derived {
         common
     }
 
+    /// The EDR parameters: the wrapped engine's, then each derived one
+    /// whose inputs it serves under EDR.
+    fn edr_parameters(&self, plan: &Plan) -> Vec<String> {
+        let mut names = self.edr.get_parameters();
+        for d in &plan.derived {
+            if d.edr_inputs.iter().all(|input| names.contains(input)) && !names.contains(&d.name) {
+                names.push(d.name.clone());
+            }
+        }
+        names
+    }
+
+    /// The wrapped engine's refusal of a `parameter-name`, listing the
+    /// derived parameters too (#1500). The engine applies the shared rule
+    /// over its stored parameters, so its 400 lists those alone: a client
+    /// never learns of the derived ones, and the EDR HTML error page, which
+    /// checks the message against `get_parameters`, offered no choices.
+    /// Only that refusal is rewritten, after the engine made it: an engine
+    /// may take names it does not list (QueryData's short names, #1215),
+    /// which a check here against the listed names would refuse.
+    fn relist(&self, plan: &Plan, error: DataServerError) -> DataServerError {
+        let DataServerError::InvalidParameter(message) = &error else {
+            return error;
+        };
+        if plan.derived.is_empty() {
+            return error;
+        }
+        let stored = self.edr.get_parameters();
+        let all = self.edr_parameters(plan);
+        let stored: Vec<&str> = stored.iter().map(String::as_str).collect();
+        let all: Vec<&str> = all.iter().map(String::as_str).collect();
+        match crate::edr_engine::relist_parameters(message, &stored, &all) {
+            Some(message) => DataServerError::InvalidParameter(message),
+            None => error,
+        }
+    }
+
     /// Run an EDR query, deriving the requested derived parameters from the
     /// inputs the wrapped engine returns.
     fn derive_query(
@@ -432,13 +473,15 @@ impl Derived {
     ) -> Result<CoverageResponse, DataServerError> {
         let plan = self.plan();
         match EdrSelection::new(&plan, parameters) {
-            None => query(parameters),
+            None => query(parameters).map_err(|e| self.relist(&plan, e)),
             Some(selection) => {
                 // An area grid fitted to the budget leaves room for the
                 // ranges added here, or the response check below would
                 // refuse what a coarser grid serves (#1436).
-                let _share = AreaShare::extra_parameters(selection.added_ranges());
-                selection.finish(query(selection.inner.as_deref())?)
+                let _share = selection.share();
+                let response =
+                    query(selection.inner.as_deref()).map_err(|e| self.relist(&plan, e))?;
+                selection.finish(response)
             }
         }
     }
@@ -530,11 +573,12 @@ impl EdrSelection {
         })
     }
 
-    /// How many more ranges the response has than the wrapped engine
-    /// answers at most: a range per derived parameter, less the inputs only
-    /// the derivation asked for.
-    fn added_ranges(&self) -> usize {
-        self.derive.len().saturating_sub(self.drop.len())
+    /// The response's ranges against the wrapped engine's, for the engines
+    /// that fit an area grid or refuse a position response to the value
+    /// budget: a range per derived parameter more, the inputs only the
+    /// derivation asked for fewer.
+    fn share(&self) -> AreaShare {
+        AreaShare::derived(self.derive.len(), self.drop.len())
     }
 
     fn finish(&self, response: CoverageResponse) -> Result<CoverageResponse, DataServerError> {
@@ -1267,14 +1311,7 @@ impl EdrEngine for Derived {
     }
 
     fn get_parameters(&self) -> Vec<String> {
-        let mut names = self.edr.get_parameters();
-        let plan = self.plan();
-        for d in &plan.derived {
-            if d.edr_inputs.iter().all(|input| names.contains(input)) && !names.contains(&d.name) {
-                names.push(d.name.clone());
-            }
-        }
-        names
+        self.edr_parameters(&self.plan())
     }
 
     fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
@@ -1397,16 +1434,22 @@ impl EdrEngine for Derived {
         let Some(selection) = EdrSelection::new(&plan, parameters) else {
             return self
                 .edr
-                .query_positions(points, datetime, parameters, z, reference_time, emit);
+                .query_positions(points, datetime, parameters, z, reference_time, emit)
+                .map_err(|e| self.relist(&plan, e));
         };
-        self.edr.query_positions(
-            points,
-            datetime,
-            selection.inner.as_deref(),
-            z,
-            reference_time,
-            &mut |response| emit(selection.finish(response)?),
-        )
+        // An engine refusing an oversize response before it reads counts
+        // the response's ranges, not its inputs (#1500).
+        let _share = selection.share();
+        self.edr
+            .query_positions(
+                points,
+                datetime,
+                selection.inner.as_deref(),
+                z,
+                reference_time,
+                &mut |response| emit(selection.finish(response)?),
+            )
+            .map_err(|e| self.relist(&plan, e))
     }
 
     fn query_cube(

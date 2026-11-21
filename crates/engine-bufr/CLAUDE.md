@@ -90,6 +90,10 @@ live decode failure fixed in #1008; its README names the cause of each).
   precipitation / extremes each have their own preceding period. If a
   producer needs a different rule, add a `[[bufr.parameters]]` override,
   don't change the walker.
+- Every scaled value (`Value::Decimal(m, s)`) goes through
+  `decode::scaled`: a negative scale divides by the exact power of ten, so
+  a position is the decimal the report states (`122.85125`, never the
+  `122.85125000000001` that multiplying by `10^s` gave, #1500).
 - ecCodes key names are not Table B names: its `pressure` is the `007004`
   standard-level coordinate; station pressure `010004` is
   `nonCoordinatePressure`. Trust the descriptor, not the label.

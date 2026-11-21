@@ -82,9 +82,9 @@ or map window. Nothing is converted or copied first.
   is dropped after 30 s, at the next staging call or scrape. While it is
   fetched, a range takes memory from the read budget only while half the
   budget stays free for requests, without waiting. A range refused either
-  room, a fetch that fails, a query with one cold chunk, a `MULTIPOINT`
-  response past the API's million-value cap and a plain store all read as
-  before. Shards of runs other than the default are fetched ahead only
+  room, a fetch that fails, a query with one cold chunk and a plain store
+  all read as before. A position or `MULTIPOINT` response past the API's
+  million-value cap is refused before anything is read. Shards of runs other than the default are fetched ahead only
   once a first read has loaded their index.
 - **Memory admission.** A read first reserves its estimated source buffers
   from one process-wide budget, `[memory.caches] zarr_read` (default 1024 MiB,

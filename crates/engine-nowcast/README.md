@@ -100,7 +100,9 @@ northward precipitation motion, m/s; echo motion, not wind) and
 side, `y` ascending south to north; blocks outside the area are `null`.
 `radius` runs as a circle polygon. Instances are the retained generations,
 each valid only at its anchor. Without an instance, `datetime` picks the
-newest generation anchored inside it. Each cell in EDR `items` names a
+newest generation anchored inside it. A `datetime` holding no anchor, with
+an instance or without, and a polygon off the motion grid are a 404, so a
+`datetime` list answers the instants that hold one. Each cell in EDR `items` names a
 radius query centred on it. Other query types answer 404. See the
 [EDR matrix](../api-edr/README.md#per-engine-query-type-matrix).
 

@@ -542,8 +542,22 @@ fn num(v: &Value) -> Option<f64> {
     match v {
         Value::Missing => None,
         Value::Integer(i) => Some(*i as f64),
-        Value::Decimal(m, s) => Some(*m as f64 * 10f64.powi(*s as i32)),
+        Value::Decimal(m, s) => Some(scaled(*m, *s)),
         Value::String(_) => None,
+    }
+}
+
+/// A scaled BUFR value `m × 10^s` as the decimal the report states. A
+/// negative scale divides by the exact power of ten: multiplying by the
+/// inexact `10^s` puts noise in the last digit (122.85125 read as
+/// 122.85125000000001, #1500), and every decoded position, elevation and
+/// element value comes through here.
+fn scaled(m: i128, s: i16) -> f64 {
+    let m = m as f64;
+    if s < 0 {
+        m / 10f64.powi(-i32::from(s))
+    } else {
+        m * 10f64.powi(i32::from(s))
     }
 }
 
@@ -688,6 +702,54 @@ mod tests {
         assert!(xy_from_code("12101").is_none());
         assert!(xy_from_code("112101").is_none());
         assert!(xy_from_code("01210a").is_none());
+    }
+
+    /// `m` over `10^s` written out as a decimal, trailing zeros dropped.
+    fn decimal(m: i64, s: u32) -> String {
+        let (whole, frac) = (
+            m.unsigned_abs() / 10u64.pow(s),
+            m.unsigned_abs() % 10u64.pow(s),
+        );
+        let mut text = whole.to_string();
+        if frac != 0 {
+            let digits = format!("{frac:0width$}", width = s as usize);
+            text = format!("{text}.{}", digits.trim_end_matches('0'));
+        }
+        if m < 0 {
+            text.insert(0, '-');
+        }
+        text
+    }
+
+    /// A scaled value is the decimal the report states, digit for digit:
+    /// the coordinates that came out of `m × 10^s` with noise in the last
+    /// place (#1500), and every mantissa of up to eight digits at the
+    /// scales BUFR uses.
+    #[test]
+    fn scaled_values_are_the_decimals_reports_state() {
+        for (m, s, want) in [
+            (12_285_125, -5, 122.85125),
+            (2_230_944, -5, 22.30944),
+            (11_392_194, -5, 113.92194),
+            (63_907, -5, 0.63907),
+            (81, -1, 8.1),
+            (29_012, -2, 290.12),
+        ] {
+            assert_eq!(scaled(m, s), want, "{m}e{s}");
+            assert_eq!(num(&Value::Decimal(m, s)), Some(want));
+        }
+        assert_eq!(scaled(12_285_125, -5).to_string(), "122.85125");
+        assert_eq!(scaled(3, 2), 300.0);
+        assert_eq!(scaled(-25, 0), -25.0);
+        for s in 1..=7u32 {
+            for m in (-20_000_000i64..=20_000_000).step_by(997) {
+                assert_eq!(
+                    scaled(i128::from(m), -(s as i16)).to_string(),
+                    decimal(m, s),
+                    "{m}e-{s}"
+                );
+            }
+        }
     }
 
     #[test]

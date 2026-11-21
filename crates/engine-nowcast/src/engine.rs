@@ -2398,13 +2398,16 @@ fn describe_motion_param(p: &motion_grid::ParamSpec) -> ParameterDescription {
 
 impl NowcastEngine {
     /// Generation selection for the EDR motion product. `reference_time`
-    /// (an instance pin) wins: it must name a retained generation (404
-    /// otherwise), and because the product has exactly ONE valid time — the
-    /// anchor — a `datetime` that excludes the anchor is a 400. Without a
-    /// pin, `datetime` picks the NEWEST generation anchored INSIDE the
-    /// interval — the same rule `get_features` applies to cell snapshots
-    /// (#548), so a client animating source frames gets cells and motion
-    /// from the same anchor. Neither ⇒ latest.
+    /// (an instance pin) wins: it must name a retained generation
+    /// (`ReferenceTimeNotFound` otherwise), and because the product has
+    /// exactly ONE valid time — the anchor — a `datetime` that excludes the
+    /// anchor has no data. Without a pin, `datetime` picks the NEWEST
+    /// generation anchored INSIDE the interval — the same rule
+    /// `get_features` applies to cell snapshots (#548), so a client
+    /// animating source frames gets cells and motion from the same anchor.
+    /// Neither ⇒ latest. A window holding no anchor is `LocationNotFound`
+    /// (404), the "no step in the window" a `datetime` list skips: any
+    /// other error fails the whole list (#968, #1500).
     fn select_motion_generation(
         state: &NowcastState,
         datetime: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -2420,7 +2423,7 @@ impl NowcastEngine {
             if let Some((start, end)) = datetime {
                 let anchor = generation.reference_time;
                 if anchor < start || anchor > end {
-                    return Err(DataServerError::InvalidDatetime(format!(
+                    return Err(DataServerError::LocationNotFound(format!(
                         "instance {} is valid only at that instant, outside the requested {} / {}",
                         format_instance_id(anchor),
                         start.to_rfc3339(),
@@ -2445,16 +2448,18 @@ impl NowcastEngine {
             None => state.generations.iter().next_back(),
             Some((start, end)) => state.generations.range(start..=end).next_back(),
         };
-        picked.map(|(_, g)| g.clone()).ok_or_else(|| {
-            DataServerError::ReferenceTimeNotFound(match datetime {
-                None => "no nowcast generation available yet".to_string(),
-                Some((start, end)) => format!(
+        picked
+            .map(|(_, g)| g.clone())
+            .ok_or_else(|| match datetime {
+                None => DataServerError::ReferenceTimeNotFound(
+                    "no nowcast generation available yet".to_string(),
+                ),
+                Some((start, end)) => DataServerError::LocationNotFound(format!(
                     "no nowcast generation anchored inside {} / {}",
                     start.to_rfc3339(),
                     end.to_rfc3339()
-                ),
+                )),
             })
-        })
     }
 
     /// Instance lookup: exact, then to the minute. The EDR instance id
@@ -2617,8 +2622,10 @@ impl EdrEngine for NowcastEngine {
             [bbox.west, bbox.south, bbox.east, bbox.north],
         )
         .ok_or_else(|| {
-            DataServerError::InvalidParameter(
-                "Bbox does not intersect the motion field grid".to_string(),
+            // Off the grid is no data there, a 404 as on the other gridded
+            // engines, never a 400 that would fail a `datetime` list.
+            DataServerError::LocationNotFound(
+                "The polygon lies outside the motion field grid".to_string(),
             )
         })?;
 

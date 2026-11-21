@@ -808,23 +808,18 @@ impl EdrEngine for ZarrEngine {
 
         let selected = select_vars(&cat, parameters)?;
 
-        // A response the API will refuse for its size reads nothing ahead:
-        // its points are read in turn until the refusal, as before.
-        let values = points
-            .len()
-            .saturating_mul(selected.len())
-            .saturating_mul(time_idx.len());
-        if values <= ds_core::feature::MAX_POSITION_VALUES {
-            let mut reads = Vec::new();
-            for &(lon, lat) in &points {
-                for &v in &selected {
-                    if let Some(read) = cat.position_read(v, run, lon, lat, &time_idx)? {
-                        reads.push((v, read.subset));
-                    }
+        // A response the API will refuse for its size reads nothing: every
+        // point carries a value per variable and step (#1500).
+        ds_core::feature::check_position_budget(points.len(), selected.len(), time_idx.len())?;
+        let mut reads = Vec::new();
+        for &(lon, lat) in &points {
+            for &v in &selected {
+                if let Some(read) = cat.position_read(v, run, lon, lat, &time_idx)? {
+                    reads.push((v, read.subset));
                 }
             }
-            cat.prefetch(&reads);
         }
+        cat.prefetch(&reads);
 
         for (lon, lat) in points {
             ds_core::deadline::check()?;

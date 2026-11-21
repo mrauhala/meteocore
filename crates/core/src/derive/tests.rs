@@ -66,6 +66,9 @@ struct Mock {
     tiles: Mutex<Vec<Call>>,
     queries: Mutex<Vec<Option<Vec<String>>>>,
     samples: usize,
+    /// Refuses a position response past the budget before it "reads", as
+    /// an engine that knows its answer's size does (Zarr, #1500).
+    budgeted: bool,
 }
 
 impl Mock {
@@ -113,6 +116,7 @@ impl Mock {
             tiles: Mutex::new(Vec::new()),
             queries: Mutex::new(Vec::new()),
             samples: 4,
+            budgeted: false,
         })
     }
 }
@@ -313,7 +317,18 @@ impl EdrEngine for Mock {
             .lock()
             .unwrap()
             .push(parameters.map(<[String]>::to_vec));
-        let selected = select_parameters(parameters, &PARAMETERS)?;
+        // An alias the engine takes but does not list, as QueryData takes
+        // a parameter's short name (#1215).
+        let parameters: Option<Vec<String>> = parameters.map(|names| {
+            names
+                .iter()
+                .map(|n| if n == "t" { "2t".into() } else { n.clone() })
+                .collect()
+        });
+        let selected = select_parameters(parameters.as_deref(), &PARAMETERS)?;
+        if self.budgeted {
+            crate::feature::check_position_budget(1, selected.len(), self.samples)?;
+        }
         let descriptions = self.get_parameter_descriptions();
         Ok(CoverageResponse::Single(QueryResult {
             domain: DomainDescription::PointSeries {
@@ -607,6 +622,67 @@ fn feature_picks_are_the_wrapped_engines() {
     ));
 }
 
+/// An unknown `parameter-name` is the shared rule's 400 over every EDR
+/// parameter, the derived ones included, the message the EDR HTML error
+/// page builds from `get_parameters`, where the wrapped engine's refusal
+/// listed its stored parameters alone; on both position routes (#1500). A
+/// name the engine takes without listing it still reaches it.
+#[test]
+fn an_unknown_parameter_lists_the_derived_ones_too() {
+    let mock = Mock::new();
+    let (derived, _) = wrap(&mock, Derivations::ALL);
+    let available = derived.get_parameters();
+    let names: Vec<&str> = available.iter().map(String::as_str).collect();
+    let expected = |requested: &[String]| match select_parameters(Some(requested), &names) {
+        Err(DataServerError::InvalidParameter(message)) => message,
+        other => panic!("{requested:?}: {other:?}"),
+    };
+    let message = |requested: &[&str], positions: bool| {
+        let requested: Vec<String> = requested.iter().map(|s| s.to_string()).collect();
+        let result = if positions {
+            derived.query_positions(
+                &["POINT(0.5 0.5)".to_string()],
+                None,
+                Some(&requested),
+                None,
+                None,
+                &mut |_| Ok(()),
+            )
+        } else {
+            derived
+                .query_position("POINT(0.5 0.5)", None, Some(&requested), None, None)
+                .map(drop)
+        };
+        match result {
+            Err(DataServerError::InvalidParameter(message)) => {
+                assert_eq!(message, expected(&requested), "{requested:?}");
+                message
+            }
+            Err(other) => panic!("{requested:?}: {other}"),
+            Ok(()) => panic!("{requested:?}: answered"),
+        }
+    };
+    for positions in [false, true] {
+        assert_eq!(
+            message(&["nope"], positions),
+            "Unknown parameter 'nope'; available: 10u, 10v, z, 2t, 10si, 10wdir, gh"
+        );
+        message(&["gh", "nope"], positions);
+        message(&["2t", "nope"], positions);
+        assert!(message(&[], positions).starts_with("No parameter requested; available: "));
+    }
+    // A known name, stored or derived, any case, and an alias the engine
+    // takes without listing it, are answered.
+    position(&derived, Some(&["2T", "10SI"]));
+    assert_eq!(
+        mock.queries.lock().unwrap().pop().unwrap(),
+        Some(vec!["2T".to_string(), "10u".to_string(), "10v".to_string()])
+    );
+    assert!(position(&derived, Some(&["t", "gh"]))
+        .ranges
+        .contains_key("2t"));
+}
+
 /// EDR: the height is computed from the geopotential the engine returns,
 /// value by value, with its own unit and CF standard name; a geopotential
 /// the client did not ask for is dropped again.
@@ -692,4 +768,64 @@ fn derived_heights_count_against_the_response_budget() {
     assert!(derived
         .query_position("POINT(0.5 0.5)", None, Some(&names), None, None)
         .is_ok());
+}
+
+/// An engine refusing a position response past the budget before it
+/// reads counts the response the wrapper makes of its answer: a wind speed
+/// queried as its two components is one range, so components that alone
+/// pass the budget never refuse it, on either position route (#1500).
+#[test]
+fn an_engine_position_budget_counts_derived_ranges_not_inputs() {
+    use crate::feature::MAX_POSITION_VALUES;
+    let mut mock = Mock::new();
+    {
+        let mock = Arc::get_mut(&mut mock).unwrap();
+        mock.samples = MAX_POSITION_VALUES / 2 + 1;
+        mock.budgeted = true;
+    }
+    let (derived, _) = wrap(&mock, Derivations::ALL);
+    let names = |names: &[&str]| -> Vec<String> { names.iter().map(|s| s.to_string()).collect() };
+    let point = |requested: &[&str]| {
+        derived.query_position("POINT(0.5 0.5)", None, Some(&names(requested)), None, None)
+    };
+    let points = |requested: &[&str]| {
+        let mut ranges = Vec::new();
+        derived
+            .query_positions(
+                &["POINT(0.5 0.5)".to_string()],
+                None,
+                Some(&names(requested)),
+                None,
+                None,
+                &mut |response| {
+                    let CoverageResponse::Single(result) = response else {
+                        panic!("one series")
+                    };
+                    ranges.extend(result.ranges.into_keys());
+                    Ok(())
+                },
+            )
+            .map(|()| ranges)
+    };
+    let CoverageResponse::Single(speed) = point(&["10si"]).unwrap() else {
+        panic!("one series")
+    };
+    assert_eq!(speed.ranges.keys().collect::<Vec<_>>(), ["10si"]);
+    assert_eq!(points(&["10si"]).unwrap(), ["10si"]);
+    let too_large = |result: Result<(), DataServerError>| match result {
+        Err(DataServerError::QueryTooLarge(message)) => {
+            assert!(
+                message.starts_with("Position response exceeds"),
+                "{message}"
+            )
+        }
+        Err(other) => panic!("{other}"),
+        Ok(()) => panic!("answered past the budget"),
+    };
+    // The components themselves, or the speed beside another range, are
+    // two ranges: past the budget.
+    for requested in [&["10u", "10v"][..], &["10si", "2t"], &["10si", "10u"]] {
+        too_large(point(requested).map(drop));
+        too_large(points(requested).map(drop));
+    }
 }
