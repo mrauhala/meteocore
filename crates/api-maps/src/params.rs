@@ -2057,7 +2057,10 @@ mod tests {
 
     /// No centre, grid or output CRS panics or frames a map with a
     /// coordinate that is not finite: a map is a frame of finite, positive
-    /// spans at the requested size, or a 400 or 404. The size is the
+    /// spans at the requested size, or a 400 or 404. Its read window is
+    /// finite too, except for a projected frame wholly outside its CRS's
+    /// valid area, the empty map, whose window is `NO_READ_WINDOW` and is
+    /// never read (#1101): a centre on the far side of EPSG:3067. The size is the
     /// request's, whatever the resolution, so the output caps hold as
     /// before: 8000 × 8000 at most.
     #[test]
@@ -2084,11 +2087,17 @@ mod tests {
                     match center_view(&info, center, crs.code(), size) {
                         Ok(view) => {
                             let [x0, y0, x1, y1] = view.frame.plane();
+                            let read_window = view.bbox.iter().all(|v| v.is_finite())
+                                || (view.bbox.iter().all(|v| v.is_nan())
+                                    && view
+                                        .output_crs
+                                        .domain_rows(view.bbox, view.height)
+                                        .is_none());
                             assert!(
                                 [x0, y0, x1, y1].iter().all(|v| v.is_finite())
                                     && x1 > x0
                                     && y1 > y0
-                                    && view.bbox.iter().all(|v| v.is_finite()),
+                                    && read_window,
                                 "{center} in {}: {:?}",
                                 crs.code(),
                                 view.frame
