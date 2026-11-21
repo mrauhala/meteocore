@@ -10373,6 +10373,45 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
     reading
 }
 
+/// The layers every request passes through, innermost first: a caught
+/// handler panic, metrics, the request log, the correlation id, CORS and
+/// compression.
+///
+/// The panic layer sits inside the metrics and logging middleware, so a
+/// panicking handler is a 500 that `http_requests_total` counts and the
+/// request log records, rather than a dropped connection neither sees and
+/// a proxy turns into a 502 (#1500 M5).
+pub fn with_request_layers(router: axum::Router) -> axum::Router {
+    router
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            panic_response,
+        ))
+        .layer(axum::middleware::from_fn(metrics_middleware))
+        .layer(axum::middleware::from_fn(request_logging_middleware))
+        .layer(axum::middleware::from_fn(correlation_id_middleware))
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(tower_http::compression::CompressionLayer::new())
+}
+
+/// The answer to a request whose handler panicked: the generic 500 every
+/// API gives an internal error, in the shared JSON form, which also
+/// attaches the `ErrorReason` the request log records. The panic message
+/// is logged here at ERROR and never reaches the client. This runs inside
+/// the request's `http_request` span, so the event carries its request id.
+fn panic_response(payload: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a panic payload that is not a string".to_string());
+    tracing::error!(panic = %message, "request handler panicked");
+    api_common::JsonError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"code": "ServerError", "description": "Internal server error"})),
+    )
+    .into_response()
+}
+
 /// Middleware that records HTTP request metrics.
 pub async fn metrics_middleware(
     matched_path: Option<MatchedPath>,
@@ -13886,6 +13925,46 @@ prewarm_sweeps = 0
             assert_eq!(response.status(), axum::http::StatusCode::OK);
             assert_eq!(counter.get(), before + 1, "{uri}");
         }
+    }
+
+    /// A panicking handler answers the generic 500 and is counted, instead
+    /// of dropping the connection unseen (#1500 M5); the panic message
+    /// stays out of the body, and the response still carries its request id.
+    #[tokio::test]
+    async fn a_handler_panic_is_a_counted_generic_500() {
+        use tower::ServiceExt;
+        let template = "/edr/collections/{id}/position";
+        let app = super::with_request_layers(axum::Router::new().route(
+            template,
+            axum::routing::get(|| async {
+                if true {
+                    panic!("internal detail /data/secret.grib2");
+                }
+                "unreachable"
+            }),
+        ));
+        let counter =
+            super::HTTP_REQUESTS_TOTAL.with_label_values(&["GET", template, "500", "edr"]);
+        let before = counter.get();
+        let request = axum::http::Request::builder()
+            .uri("/edr/collections/boom/position")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(response.headers().contains_key("x-request-id"));
+        assert_eq!(counter.get(), before + 1);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"code": "ServerError", "description": "Internal server error"})
+        );
     }
 
     /// `(api, outcome, sample count)` of each `render_duration_seconds`

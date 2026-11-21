@@ -326,8 +326,8 @@ pub(crate) fn collection_parts(
     const CRS84_URI: &str = "http://www.opengis.net/def/crs/OGC/1.3/CRS84";
     let mut crs_uris: Vec<&'static str> = Vec::new();
     for tms_id in SUPPORTED_TILE_MATRIX_SETS {
-        // `if let` (not `expect`): this runs in the request-serving path and
-        // there is no CatchPanicLayer, so a panic would drop the connection.
+        // `if let` (not `expect`): this runs in the request-serving path,
+        // where a panic would turn the whole collection document into a 500.
         // Divergence between SUPPORTED_TILE_MATRIX_SETS and `get_tile_matrix_set`
         // is instead caught in CI by `tilematrixset::tests::
         // every_supported_tms_resolves`, so `crs[]` is never silently shortened
