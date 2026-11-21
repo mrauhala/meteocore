@@ -78,6 +78,9 @@ plus:
   `parameter-name` besides `f`: a style only that parameter's layer offers
   (its built-in `contours`) is resolved there, and the list's links and
   tile templates carry it.
+- Style links, styled tileset lists and their tile templates percent-encode
+  the style name and the collection id as path segments, as Maps does
+  (#1517): the style `a/b` is `…/styles/a%2Fb/map/tiles`.
 
 Collection metadata adds `dataType`, `crs`, `storageCrs`, `styles` (the
 collection's own, then those only some parameter layers offer, such as the

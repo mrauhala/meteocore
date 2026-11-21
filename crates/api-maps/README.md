@@ -177,6 +177,11 @@ legend is a line swatch and `every 4 hPa`, and the JSON carries a `contour`
 member (`interval`, `base`, `color`, `width`, `fill`, `description`) and,
 for lines alone, no stops.
 
+Nothing restricts a style name, so a style link percent-encodes the style
+name and the collection id as path segments (#1517): the style `a/b` is
+`…/styles/a%2Fb/map`, and its route reads the segment back as `a/b`. A name
+of letters, digits, `-`, `.`, `_` and `~` is its own segment.
+
 The legend takes `f` (`json`, the default, or `png`; media types work too) and
 `parameter-name`. JSON gives the palette stops, value range and interpolation
 for a client to draw its own legend; PNG is a 180 × 300 image. A composite's

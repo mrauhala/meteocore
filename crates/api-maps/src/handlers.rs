@@ -218,17 +218,27 @@ fn with_vary(mut resp: Response) -> Response {
 /// no client depended on them (a bare unregistered relation type is not an
 /// RFC 8288 extension relation). A style only `parameter`'s layer offers
 /// names it as `parameter-name`, without which it is not drawn.
+///
+/// The collection id and style name are percent-encoded path segments
+/// (#1517): nothing restricts either, and a style named `a/b` or `a#b`
+/// would otherwise name another resource.
 fn style_links_for(
     collection_id: &str,
     style_name: &str,
     parameter: Option<&str>,
     root: &str,
 ) -> serde_json::Value {
+    use api_common::workbench::path_segment;
     let query = parameter
-        .map(|p| format!("?parameter-name={}", api_common::workbench::path_segment(p)))
+        .map(|p| format!("?parameter-name={}", path_segment(p)))
         .unwrap_or_default();
-    let map = format!("{root}/collections/{collection_id}/styles/{style_name}/map{query}");
-    let legend = format!("{root}/collections/{collection_id}/styles/{style_name}/legend{query}");
+    let style = format!(
+        "{root}/collections/{}/styles/{}",
+        path_segment(collection_id),
+        path_segment(style_name)
+    );
+    let map = format!("{style}/map{query}");
+    let legend = format!("{style}/legend{query}");
     json!([
         {"href": map, "rel": rel::MAP, "type": "image/png"},
         {"href": legend, "rel": rel::LEGEND, "type": "application/json"}

@@ -90,10 +90,18 @@ fn vector_tilesets_link(links: &[Value]) -> Option<&str> {
         .and_then(|l| l["href"].as_str())
 }
 
+/// `value` percent-encoded as one URL path segment, also fit for a query
+/// or fragment value. The RFC 3986 unreserved characters (letters, digits,
+/// `-`, `.`, `_`, `~`) and `*` pass, so a name made of them is its own
+/// segment; a space is `%20`, since a path keeps `+` as a plus. A `/`, `?`
+/// or `#` in a style name or collection id is `%2F`, `%3F` or `%23`, which
+/// a route's `Path` extractor decodes back into one segment (#1517).
 pub fn path_segment(value: &str) -> String {
     form_urlencoded::byte_serialize(value.as_bytes())
         .collect::<String>()
         .replace('+', "%20")
+        // `%` itself is `%25`, so this `%7E` can only be a `~`.
+        .replace("%7E", "~")
 }
 
 /// Replace only f, retaining duplicate property predicates and encoded operators.
@@ -3439,6 +3447,28 @@ pub fn instances_html(surface: Surface<'_>, title: &str, doc: &Value, nav: &[Lin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A name of unreserved characters is its own segment, byte for byte;
+    /// everything else a path segment cannot carry is percent-encoded, a
+    /// space as `%20` and `%` itself as `%25` (#1517).
+    #[test]
+    fn path_segments_keep_unreserved_characters() {
+        let unreserved = "AZaz09-._~";
+        assert_eq!(path_segment(unreserved), unreserved);
+        for (name, segment) in [
+            ("a b", "a%20b"),
+            ("a#b", "a%23b"),
+            ("a/b", "a%2Fb"),
+            ("a?b", "a%3Fb"),
+            ("a%b", "a%25b"),
+            ("a%7Eb", "a%257Eb"),
+            ("a+b", "a%2Bb"),
+            ("{z}", "%7Bz%7D"),
+            ("sää", "s%C3%A4%C3%A4"),
+        ] {
+            assert_eq!(path_segment(name), segment, "{name}");
+        }
+    }
 
     const MAPS_PROXY: Surface<'static> = Surface {
         base: "https://example.test/proxy",
