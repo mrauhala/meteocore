@@ -23,9 +23,9 @@
 //!
 //! A background `poll_loop` re-scans the source every
 //! `poll_interval_secs` and atomically swaps the catalog
-//! (`ArcSwap<Vec<CatalogEntry>>`) when the file set changes, so
-//! new ODIM files appear in the temporal extent without needing
-//! an admin reload.
+//! (`ArcSwap<CompositeCatalog>`: the entries and the `RasterInfo` built
+//! from them) when the file set changes, so new ODIM files appear in the
+//! temporal extent without needing an admin reload.
 //!
 //! See [[project_odim_engine_plan]] for the full multi-phase plan.
 
@@ -411,6 +411,66 @@ fn fetch_bytes(location: &Location) -> Result<Bytes, FetchError> {
     }
 }
 
+/// The catalog entries a scan found, time-ascending, with the map metadata
+/// built from them when the catalog is published (#1485), so `raster_info`
+/// is a snapshot read, never a build per request (Critical Rule 10). Both
+/// are swapped in one `ArcSwap` store, so a reader never sees new entries
+/// with old metadata. Derefs to the entries.
+pub(crate) struct CompositeCatalog {
+    entries: Vec<CatalogEntry>,
+    raster_info: Arc<RasterInfo>,
+}
+
+impl CompositeCatalog {
+    /// `entries` with `info` advertising their times. Every other field of a
+    /// composite's metadata is fixed for the engine's lifetime: the seed
+    /// composite's grid and the configured parameter and unit. So the poll
+    /// passes the snapshot it replaces, and nothing in it depends on the
+    /// clock: a `time_window` is applied by the scan that found `entries`.
+    fn new(entries: Vec<CatalogEntry>, info: &RasterInfo) -> Self {
+        // Every field named, so the old `times` are never cloned only to be
+        // dropped, and a new field is carried over here too.
+        let RasterInfo {
+            native_crs,
+            spatial_extent,
+            times: _,
+            parameter,
+            unit,
+            parameters,
+            vertical,
+            grid_size,
+            native_grid,
+            layer_subtitle,
+            reference_times,
+        } = info;
+        let raster_info = Arc::new(RasterInfo {
+            native_crs: native_crs.clone(),
+            spatial_extent: *spatial_extent,
+            times: entries.iter().map(|e| e.time).collect(),
+            parameter: parameter.clone(),
+            unit: unit.clone(),
+            parameters: parameters.clone(),
+            vertical: vertical.clone(),
+            grid_size: *grid_size,
+            native_grid: native_grid.clone(),
+            layer_subtitle: layer_subtitle.clone(),
+            reference_times: reference_times.clone(),
+        });
+        Self {
+            entries,
+            raster_info,
+        }
+    }
+}
+
+impl std::ops::Deref for CompositeCatalog {
+    type Target = [CatalogEntry];
+
+    fn deref(&self) -> &[CatalogEntry] {
+        &self.entries
+    }
+}
+
 /// `MapEngine` implementation backed by an ODIM_H5 composite catalog.
 ///
 /// Holds an [`ArcSwap`]-protected catalog so the async poll loop can
@@ -419,29 +479,26 @@ fn fetch_bytes(location: &Location) -> Result<Bytes, FetchError> {
 pub struct OdimEngine {
     // Fields used by both the `MapEngine` impl (this file) and the
     // `EdrEngine` impl (`edr.rs`) are `pub(crate)`.
-    pub(crate) catalog: Arc<ArcSwap<Vec<CatalogEntry>>>,
+    pub(crate) catalog: Arc<ArcSwap<CompositeCatalog>>,
     pub(crate) collection_id: String,
     pub(crate) parameter: String,
     pub(crate) unit: String,
     pub(crate) gain_override: Option<f64>,
     pub(crate) offset_override: Option<f64>,
     pub(crate) nodata_override: Option<f64>,
-    /// Native-CRS label, WGS84 corner envelope, and grid dimensions
-    /// captured from the seed composite at construction. Every
-    /// timestep of a given ODIM collection shares the same grid, so
-    /// these are stable for the engine's lifetime. Holding them as
-    /// plain fields lets `raster_info()` (MapEngine) and the EDR
+    /// WGS84 corner envelope and grid dimensions captured from the seed
+    /// composite at construction. Every timestep of a given ODIM
+    /// collection shares the same grid, so these are stable for the
+    /// engine's lifetime. Holding them as plain fields lets the EDR
     /// metadata / area-grid-sizing paths answer without touching the
     /// process-global composite cache — and, crucially, without
     /// depending on whether a `get_raster_tile` call has warmed that
     /// cache yet (an `apis = ["edr"]`-only collection never issues one).
-    pub(crate) seed_native_crs: String,
+    /// The catalog's `RasterInfo` carries them, with the native CRS
+    /// label and grid, from the same seed.
     pub(crate) seed_spatial_extent: [f64; 4],
     pub(crate) seed_xsize: u32,
     pub(crate) seed_ysize: u32,
-    /// The seed composite's grid in its own CRS (#1237): its outer pixel
-    /// edges, and the EPSG code its projdef states.
-    seed_native_grid: Option<NativeGrid>,
     /// Local directory or S3/HTTP object store the poll loop re-scans.
     source: Source,
     matcher: FilenameMatcher,
@@ -663,16 +720,33 @@ impl OdimEngine {
                 })?,
             );
 
-        let seed_native_crs = crs_label(&composite.crs);
         let seed_spatial_extent = composite.wgs84_bbox;
         let seed_xsize = composite.xsize;
         let seed_ysize = composite.ysize;
-        let seed_native_grid = NativeGrid::from_edges(
-            composite.crs.clone(),
-            composite.crs_epsg,
-            [seed_xsize, seed_ysize],
-            composite.bbox,
-        );
+        // `native_crs` / `spatial_extent` / `native_grid` come from the seed
+        // composite: every timestep shares the same grid, so the metadata
+        // needs neither the render cache nor a warmed one.
+        let info = RasterInfo {
+            native_crs: crs_label(&composite.crs),
+            spatial_extent: Some(seed_spatial_extent),
+            times: Vec::new(),
+            parameter: parameter.clone(),
+            unit: unit.clone(),
+            parameters: vec![],
+            vertical: None, // 2-D composite, no vertical dimension
+            grid_size: Some([seed_xsize, seed_ysize]),
+            layer_subtitle: None,
+            reference_times: Vec::new(),
+            // The seed composite's grid in its own CRS (#1237): its outer
+            // pixel edges, and the EPSG code its projdef states.
+            native_grid: NativeGrid::from_edges(
+                composite.crs.clone(),
+                composite.crs_epsg,
+                [seed_xsize, seed_ysize],
+                composite.bbox,
+            ),
+        };
+        let catalog = CompositeCatalog::new(catalog, &info);
 
         // Seed the process-global composite cache so the first render of the
         // most recent file is a hit (we just decoded it for the metadata
@@ -688,11 +762,9 @@ impl OdimEngine {
             gain_override: overrides.gain,
             offset_override: overrides.offset,
             nodata_override: overrides.nodata,
-            seed_native_crs,
             seed_spatial_extent,
             seed_xsize,
             seed_ysize,
-            seed_native_grid,
             source,
             matcher,
             max_files,
@@ -852,7 +924,8 @@ impl OdimEngine {
                     .map(|t| t.to_rfc3339())
                     .unwrap_or_else(|| "<none>".into()),
             );
-            self.catalog.store(Arc::new(scan));
+            let catalog = CompositeCatalog::new(scan, &prev.raster_info);
+            self.catalog.store(Arc::new(catalog));
         }
     }
 
@@ -1328,26 +1401,13 @@ impl MapEngine for OdimEngine {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        // `native_crs` / `spatial_extent` come from the seed fields
-        // captured at construction — every timestep shares the same
-        // grid, so this needs neither the render-cache `Mutex` nor a
-        // warmed cache. Times come from the lock-free `ArcSwap`
-        // catalog snapshot.
-        let times: Vec<DateTime<Utc>> = self.catalog.load().iter().map(|e| e.time).collect();
+        (*self.raster_info_shared()).clone()
+    }
 
-        RasterInfo {
-            native_crs: self.seed_native_crs.clone(),
-            spatial_extent: Some(self.seed_spatial_extent),
-            times,
-            parameter: self.parameter.clone(),
-            unit: self.unit.clone(),
-            parameters: vec![],
-            vertical: None, // 2-D composite, no vertical dimension
-            grid_size: Some([self.seed_xsize, self.seed_ysize]),
-            layer_subtitle: None,
-            reference_times: Vec::new(),
-            native_grid: self.seed_native_grid.clone(),
-        }
+    /// The metadata built when the catalog was published (#1485): one
+    /// `Arc` per catalog, from the lock-free `ArcSwap` snapshot.
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
+        self.catalog.load().raster_info.clone()
     }
 
     fn resolve_time(
@@ -1364,7 +1424,7 @@ impl MapEngine for OdimEngine {
     }
 }
 
-/// Human-readable identifier for a `Crs`. Used by `raster_info()` —
+/// Human-readable identifier for a `Crs`. Used by the catalog's `RasterInfo` —
 /// approximate, not an authoritative EPSG mapping. ODIM composites in the wild
 /// use spheres, so EPSG codes don't strictly apply; this engine deliberately
 /// never claims one (unlike engine-geotiff, which upgrades TM35FIN/ETRS89-LAEA
@@ -1927,6 +1987,67 @@ mod tests {
 
         let local = OdimEngine::new("comp-local", prefix.to_str(), &config).unwrap();
         assert_eq!(local.storage_bytes_read(), 0);
+    }
+
+    /// #1485: `raster_info_shared` is the catalog's snapshot: one `Arc`
+    /// until a poll publishes a changed catalog, then a new one advertising
+    /// its times, every other field the seed composite's and the config's.
+    #[test]
+    fn raster_info_is_the_catalogs_snapshot() {
+        let fixture = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/odim-dmi-fixture.h5"),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str| std::fs::write(dir.path().join(name), &fixture).unwrap();
+        write("20260120T1125_radar.h5");
+        write("20260120T1130_radar.h5");
+        let at = |hhmm: &str| -> DateTime<Utc> {
+            format!("2026-01-20T{}:{}:00Z", &hhmm[..2], &hhmm[2..])
+                .parse()
+                .unwrap()
+        };
+        let config = config_with(None, None, None, None);
+        let engine = OdimEngine::new("comp-snapshot-1485", dir.path().to_str(), &config).unwrap();
+
+        let first = engine.raster_info_shared();
+        assert!(Arc::ptr_eq(&first, &engine.raster_info_shared()));
+        assert_eq!(first.times, [at("1125"), at("1130")]);
+        assert_eq!(first.parameter, "reflectivity");
+        assert_eq!(first.unit, "dBZ");
+        assert_eq!(first.spatial_extent, Some(engine.seed_spatial_extent));
+        assert_eq!(
+            first.grid_size,
+            Some([engine.seed_xsize, engine.seed_ysize])
+        );
+        assert!(first.parameters.is_empty() && first.vertical.is_none());
+        assert!(first.layer_subtitle.is_none() && first.reference_times.is_empty());
+        assert!(first.native_grid.is_some(), "the seed's grid (#1237)");
+        assert_eq!(engine.raster_info().times, first.times, "a clone of it");
+
+        engine.poll_once();
+        assert!(
+            Arc::ptr_eq(&first, &engine.raster_info_shared()),
+            "a poll that finds the same files publishes nothing"
+        );
+
+        write("20260120T1135_radar.h5");
+        engine.poll_once();
+        let next = engine.raster_info_shared();
+        assert!(!Arc::ptr_eq(&first, &next));
+        assert!(Arc::ptr_eq(&next, &engine.catalog.load().raster_info));
+        assert_eq!(next.times, [at("1125"), at("1130"), at("1135")]);
+        assert_eq!(first.times.len(), 2, "a snapshot never changes");
+        let without_times = |info: &RasterInfo| {
+            format!(
+                "{:?}",
+                RasterInfo {
+                    times: Vec::new(),
+                    ..info.clone()
+                }
+            )
+        };
+        assert_eq!(without_times(&next), without_times(&first));
     }
 
     /// `shutdown()` called before `poll_loop()` ever starts must still

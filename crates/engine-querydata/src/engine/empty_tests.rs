@@ -107,10 +107,8 @@ fn a_run_without_timesteps_draws_no_data_yet() {
     .expect("ecmwf-kenya fixture");
     let mut data = QueryData::open(&path).unwrap();
     data.times.clear();
-    let mut set = RunSet::default();
-    set.runs
-        .insert(data.origin_time, RunEntry::new(Arc::new(data), path));
-    let engine = engine_over(set);
+    let runs = BTreeMap::from([(data.origin_time, RunEntry::new(Arc::new(data), path))]);
+    let engine = engine_over(RunSet::new(runs, None));
     for time in [None, Some(at("2026-04-04T06:00:00Z"))] {
         assert_no_data_yet(&format!("map at {time:?}"), map(&engine, time));
     }

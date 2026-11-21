@@ -176,6 +176,9 @@ fn fmi_components_on_lat_lon_give_speed_and_direction() {
     let info = wind.raster_info_shared();
     let speed = info.parameters.iter().find(|p| p.name == "WindSpeedMS");
     assert_eq!(speed.map(|p| p.unit.as_str()), Some("m s-1"));
+    // The wrapper keeps its metadata while the engine's snapshot stands
+    // (#1485): no rebuild per request.
+    assert!(Arc::ptr_eq(&info, &wind.raster_info_shared()));
     assert_speed_tile(&engine, &wind, [35.0, -4.0, 40.0, 3.0], "WindSpeedMS");
 }
 

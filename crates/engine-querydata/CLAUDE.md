@@ -14,6 +14,9 @@ runtime).
   re-parsed). Each run is an EDR instance / `RasterInfo.reference_times`
   entry; the latest run is the default for un-pinned queries. Implements the
   shared `ds_core::instances` contract (root CLAUDE.md).
+  `RunSet::new` builds the set's wind facts and its `RasterInfo` (#1485),
+  so `raster_info_shared` is an `Arc` clone and swaps with the runs; a new
+  `RunSet` goes through it, never a struct literal.
   `list_sqd_files` skips temporary names (`ds_core::temp_files::is_temporary`):
   a publisher writes `.name.sqd` and renames it, and parsing it mid-write
   logged a spurious ERROR and read up to 1 GB (#1009).

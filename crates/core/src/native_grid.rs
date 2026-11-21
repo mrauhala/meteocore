@@ -172,6 +172,17 @@ impl NativeGrid {
     }
 }
 
+impl crate::heap::HeapSize for NativeGrid {
+    /// The CRS reference, an `Arc<str>` (the authority URI, or a WKT2 text
+    /// of some 800 bytes) that every clone of the grid shares. Each holder
+    /// counts it in full, as [`crate::heap::HeapSize`] counts any `Arc`: a
+    /// store that keeps several clones of one grid counts it once itself.
+    /// The [`Crs`] owns no heap.
+    fn heap_size(&self) -> usize {
+        crate::heap::HeapSize::heap_size(&self.crs_ref)
+    }
+}
+
 /// A registered CRS that MeteoCore advertises as a `storageCrs`, with the
 /// facts a description needs: the EPSG name (PROJ 9.8's database), its
 /// axis unit (`deg` or `m`) and whether its first axis is northing (or

@@ -2270,10 +2270,13 @@ pub(crate) struct SiteMeta {
     wmo: Option<String>,
     /// Antenna height above mean sea level (metres).
     height_m: f64,
-    /// Map/WMS layer descriptors with units from this site's
-    /// lowest sweep. **No `<nod>:` prefix**: the site *is*
-    /// the collection, so the parameter is the bare quantity.
-    parameters: Vec<ds_core::map_engine::ParameterInfo>,
+    /// The site view's map metadata (#1485), built with this snapshot so
+    /// `MapEngine::raster_info_shared` is an `Arc` clone: its layer
+    /// descriptors (`parameters`, units from the dictionary, **no `<nod>:`
+    /// prefix**: the site *is* the collection, so the parameter is the bare
+    /// quantity), times, extent, elevation angles and subtitle. Rebuilt on
+    /// each catalog swap; one per site, whatever views read it.
+    raster_info: Arc<RasterInfo>,
     /// Bare EDR quantities (lowest sweep), sorted distinct.
     pub(crate) quantities: Vec<String>,
     /// This site's distinct volume times, ascending.
@@ -2340,21 +2343,19 @@ pub(crate) struct Catalog {
     /// The estimated heap this catalog and the engine's parse cache hold
     /// (#1307), computed in [`derive_catalog`]: `pvol_catalog_bytes`.
     pub(crate) heap_bytes: u64,
+    /// The part of `heap_bytes` that is the sites' map metadata snapshots
+    /// (#1485), each site's counted once however many views read it.
+    snapshot_bytes: u64,
     /// The volumes `by_site` holds, counted in [`derive_catalog`]:
     /// `pvol_catalog_volumes` (#193).
     volumes: usize,
 }
 
-/// The estimated heap of one site's derived metadata (#1307).
+/// The estimated heap of one site's derived metadata (#1307), without its
+/// map metadata snapshot, which [`derive_catalog`] counts on its own.
 fn site_meta_bytes(meta: &SiteMeta) -> usize {
     use ds_core::heap::{HeapSize, ARC_COUNTS};
     use std::mem::size_of;
-    let parameters = meta.parameters.capacity() * size_of::<ds_core::map_engine::ParameterInfo>()
-        + meta
-            .parameters
-            .iter()
-            .map(|p| p.name.heap_size() + p.title.heap_size() + p.unit.heap_size())
-            .sum::<usize>();
     let vertical = meta.vertical.as_ref().map_or(0, |v| v.levels.heap_size());
     let info = &meta.volume_info;
     let volume_info = ARC_COUNTS
@@ -2365,7 +2366,6 @@ fn site_meta_bytes(meta: &SiteMeta) -> usize {
         + info.default_unit.heap_size();
     meta.plc.heap_size()
         + meta.wmo.heap_size()
-        + parameters
         + meta.quantities.heap_size()
         + meta.times.heap_size()
         + vertical
@@ -3503,9 +3503,15 @@ fn derive_catalog(
     let features_time = features_time_of(&by_site_meta);
     let feature_version = feature_version_of(&sorted_nods, &by_site_meta);
 
+    // Each site's snapshot `Arc`, once: every view of the site shares it.
+    let snapshot_bytes = by_site_meta
+        .values()
+        .map(|meta| ds_core::heap::HeapSize::heap_size(&meta.raster_info))
+        .sum::<usize>();
     let heap_bytes = cache_bytes
         + left_out_bytes
         + catalog_bytes(&by_site, &by_site_meta)
+        + snapshot_bytes
         + ds_core::heap::HeapSize::heap_size(&sorted_nods);
     let volumes = by_site.values().map(Vec::len).sum();
     Catalog {
@@ -3516,6 +3522,7 @@ fn derive_catalog(
         features_time,
         feature_version,
         heap_bytes: heap_bytes as u64,
+        snapshot_bytes: snapshot_bytes as u64,
         volumes,
     }
 }
@@ -3717,13 +3724,31 @@ fn derive_site_meta(nod: &str, list: &[VolumeEntry]) -> Option<SiteMeta> {
         latitude: site.lat,
         longitude: site.lon,
     }]));
+    // The site view's map metadata, from this snapshot only (no clock: a
+    // `time_window` was applied by the scan that found the volumes).
+    let raster_info = Arc::new(RasterInfo {
+        native_crs: "CRS:84".to_string(),
+        spatial_extent,
+        times: times.clone(),
+        parameter: volume_info.default_quantity.clone(),
+        unit: volume_info.default_unit.clone(),
+        parameters,
+        vertical: vertical.clone(),
+        grid_size: None,
+        // Site place name (ODIM `/what` PLC, falling back to NOD) — same
+        // value `get_locations` uses — so WMS can prefix each child
+        // layer's title and flat clients can tell the sites apart.
+        layer_subtitle: Some(site.plc.clone().unwrap_or_else(|| nod.to_owned())),
+        reference_times: Vec::new(),
+        native_grid: None,
+    });
     Some(SiteMeta {
         lon: site.lon,
         lat: site.lat,
         plc: site.plc.clone(),
         wmo: site.wmo.clone(),
         height_m: site.height,
-        parameters,
+        raster_info,
         quantities,
         times,
         spatial_extent,
@@ -3969,6 +3994,14 @@ impl PolarVolumeEngine {
     /// Computed when the catalog is derived, so a read is O(1).
     pub fn catalog_bytes(&self) -> u64 {
         self.catalog.load().heap_bytes
+    }
+
+    /// The part of [`Self::catalog_bytes`] that is the sites' map metadata
+    /// snapshots (#1485), for the heap test to measure against what one
+    /// snapshot holds.
+    #[doc(hidden)]
+    pub fn site_snapshot_bytes(&self) -> u64 {
+        self.catalog.load().snapshot_bytes
     }
 
     /// What this engine's scans have done and the catalog they hold (#193):
@@ -6280,6 +6313,25 @@ pub struct PolarVolumeSiteView {
     pub(crate) resampling: ResamplingMethod,
 }
 
+/// The metadata of a site view whose site has no metadata in the catalog
+/// (its volumes left it, or none has moments): no layers, no times, no
+/// extent. One process-wide snapshot, never rebuilt per call.
+static NO_SITE_INFO: std::sync::LazyLock<Arc<RasterInfo>> = std::sync::LazyLock::new(|| {
+    Arc::new(RasterInfo {
+        native_crs: "CRS:84".to_string(),
+        spatial_extent: None,
+        times: Vec::new(),
+        parameter: String::new(),
+        unit: String::new(),
+        parameters: Vec::new(),
+        vertical: None,
+        grid_size: None,
+        layer_subtitle: None,
+        reference_times: Vec::new(),
+        native_grid: None,
+    })
+});
+
 /// The volume `get_raster_tile` renders for a requested time: nearest by
 /// absolute time difference, latest when `None`. The ONLY implementation of
 /// this selection — the render path and `MapEngine::resolve_time` (the
@@ -6383,31 +6435,18 @@ impl MapEngine for PolarVolumeSiteView {
     }
 
     fn raster_info(&self) -> RasterInfo {
-        let catalog = self.catalog.load();
-        let meta = catalog.by_site_meta.get(&self.nod);
-        let parameters = meta.map(|m| m.parameters.clone()).unwrap_or_default();
-        let parameter = meta
-            .map(|m| m.volume_info.default_quantity.clone())
-            .unwrap_or_default();
+        (*self.raster_info_shared()).clone()
+    }
 
-        RasterInfo {
-            native_crs: "CRS:84".to_string(),
-            spatial_extent: meta.and_then(|m| m.spatial_extent),
-            times: meta.map(|m| m.times.clone()).unwrap_or_default(),
-            parameter,
-            unit: meta
-                .map(|m| m.volume_info.default_unit.clone())
-                .unwrap_or_default(),
-            parameters,
-            vertical: meta.and_then(|m| m.vertical.clone()),
-            grid_size: None,
-            // Site place name (ODIM `/what` PLC, falling back to NOD) — same
-            // value `get_locations` uses — so WMS can prefix each child
-            // layer's title and flat clients can tell the sites apart.
-            layer_subtitle: meta.map(|m| m.plc.clone().unwrap_or_else(|| self.nod.clone())),
-            reference_times: Vec::new(),
-            native_grid: None,
-        }
+    /// The site's metadata built with the catalog (#1485): an `Arc` clone
+    /// from one `ArcSwap` load. A site whose volumes left the catalog
+    /// answers with no layers until a reload drops its collection.
+    fn raster_info_shared(&self) -> Arc<RasterInfo> {
+        self.catalog
+            .load()
+            .by_site_meta
+            .get(&self.nod)
+            .map_or_else(|| NO_SITE_INFO.clone(), |m| m.raster_info.clone())
     }
 
     fn resolve_time(
@@ -12434,6 +12473,121 @@ mod tests {
         });
     }
 
+    /// #1485: a site view's metadata is its site's snapshot, built with the
+    /// catalog: one `Arc` across calls and across the views of one site,
+    /// each site its own, and a new one in a catalog that replaces it, with
+    /// what the site's volumes say. A site the catalog lacks answers with
+    /// the one empty snapshot.
+    #[test]
+    fn site_views_share_their_sites_metadata_snapshot() {
+        let at = |minute: u32| -> DateTime<Utc> {
+            format!("2026-06-17T12:{minute:02}:00Z").parse().unwrap()
+        };
+        let volume = |lon: f64, lat: f64, minute: u32, id: &str| {
+            let mut volume = synthetic_volume(lon, lat);
+            volume.time = at(minute);
+            entry(volume, id)
+        };
+        let mut by_site: HashMap<String, Vec<VolumeEntry>> = HashMap::new();
+        by_site.insert("fivih".into(), vec![volume(25.0, 60.0, 0, "snap-v0")]);
+        by_site.insert("fianj".into(), vec![volume(27.0, 60.9, 0, "snap-a0")]);
+        let view = site_view_for(by_site.clone(), "fivih");
+        let view_of = |nod: &str| PolarVolumeSiteView {
+            catalog: view.catalog.clone(),
+            source: view.source.clone(),
+            nod: nod.to_string(),
+            collection_id: format!("test-{nod}"),
+            resampling: view.resampling,
+        };
+
+        let first = view.raster_info_shared();
+        assert!(Arc::ptr_eq(&first, &view.raster_info_shared()));
+        assert!(
+            Arc::ptr_eq(&first, &view_of("fivih").raster_info_shared()),
+            "the views of one site share its snapshot"
+        );
+        assert!(!Arc::ptr_eq(&first, &view_of("fianj").raster_info_shared()));
+        let meta = view.catalog.load().by_site_meta["fivih"].clone();
+        assert_eq!(first.native_crs, "CRS:84");
+        assert_eq!(first.times, meta.times);
+        assert_eq!(first.times, [at(0)]);
+        assert_eq!(first.spatial_extent, meta.spatial_extent);
+        assert_eq!(first.vertical, meta.vertical);
+        assert_eq!(first.parameter, meta.volume_info.default_quantity);
+        assert_eq!(first.unit, meta.volume_info.default_unit);
+        assert_eq!(first.layer_subtitle.as_deref(), Some("Test Site"));
+        assert_eq!(first.grid_size, None);
+        assert!(first.reference_times.is_empty() && first.native_grid.is_none());
+        assert_eq!(
+            MapEngine::raster_info(&view).times,
+            first.times,
+            "raster_info clones the snapshot"
+        );
+
+        by_site
+            .get_mut("fivih")
+            .unwrap()
+            .push(volume(25.0, 60.0, 5, "snap-v1"));
+        view.catalog.store(Arc::new(derive_catalog(
+            by_site.clone(),
+            &ParseCache::default(),
+            None,
+        )));
+        let next = view.raster_info_shared();
+        assert!(!Arc::ptr_eq(&first, &next), "a new catalog, a new snapshot");
+        assert!(Arc::ptr_eq(&next, &view.raster_info_shared()));
+        assert_eq!(next.times, [at(0), at(5)]);
+        assert_eq!(first.times, [at(0)], "a snapshot never changes");
+
+        by_site.remove("fivih");
+        view.catalog.store(Arc::new(derive_catalog(
+            by_site,
+            &ParseCache::default(),
+            None,
+        )));
+        let gone = view.raster_info_shared();
+        assert!(Arc::ptr_eq(&gone, &view.raster_info_shared()));
+        assert!(Arc::ptr_eq(&gone, &NO_SITE_INFO));
+        assert_eq!(gone.native_crs, "CRS:84");
+        assert!(gone.parameters.is_empty() && gone.times.is_empty());
+        assert_eq!((gone.parameter.as_str(), gone.unit.as_str()), ("", ""));
+        assert!(gone.spatial_extent.is_none() && gone.vertical.is_none());
+        assert!(gone.layer_subtitle.is_none());
+    }
+
+    /// #1485: a poll publishes each site's snapshot in the catalog it
+    /// stores, every poll (its change check would miss a moment added at
+    /// a volume time already held); a view built by the engine reads it,
+    /// and a poll that finds the same file builds the same metadata again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_poll_publishes_the_site_snapshot_with_its_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.h5"), COLD_BATCH).unwrap();
+        let config = ds_core::config::OdimConfig {
+            prewarm_sweeps: 0,
+            ..empty_config()
+        };
+        let engine =
+            PolarVolumeEngine::new("pvol-snapshot-1485", dir.path().to_str(), &config).unwrap();
+        let (nod, _) = engine.sites().into_iter().next().expect("one site");
+        let view = engine.site_view(&nod, "pvol-snapshot-1485-site");
+        let first = view.raster_info_shared();
+        assert!(Arc::ptr_eq(&first, &view.raster_info_shared()));
+        assert!(!first.parameters.is_empty() && !first.times.is_empty());
+
+        engine.poll_once().await;
+        let next = view.raster_info_shared();
+        assert!(Arc::ptr_eq(
+            &next,
+            &engine.catalog.load().by_site_meta[&nod].raster_info
+        ));
+        assert_eq!(format!("{first:?}"), format!("{next:?}"), "the same file");
+
+        std::fs::remove_file(dir.path().join("a.h5")).unwrap();
+        engine.poll_once().await;
+        assert!(Arc::ptr_eq(&view.raster_info_shared(), &NO_SITE_INFO));
+    }
+
     /// A per-site view advertises **bare** quantities (no
     /// `<nod>:` prefix), a single EDR location (the antenna), and the
     /// site's own coverage extent — even when the catalog holds other
@@ -13792,7 +13946,7 @@ mod tests {
                 plc: plc.map(String::from),
                 wmo: None,
                 height_m,
-                parameters: vec![],
+                raster_info: NO_SITE_INFO.clone(),
                 quantities: vec!["DBZH".to_string()],
                 times: vec![],
                 spatial_extent: None,

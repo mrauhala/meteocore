@@ -664,12 +664,12 @@ fn collection_parameters(
         .get(id)
         .or_else(|| tiles.map_engines.get(id))
         .or_else(|| wms.engines.get(id))?;
-    let info = engine.raster_info();
+    // The engine's snapshot (#1485): borrowed, never a deep copy per request.
+    let info = engine.raster_info_shared();
     let default_parameter = default_parameter_name(&info);
-    let raster_params = info.parameters;
 
     // Single-band engine → no meaningful per-request selection.
-    if raster_params.is_empty() {
+    if info.parameters.is_empty() {
         return None;
     }
 
@@ -679,20 +679,20 @@ fn collection_parameters(
         .map(|engine| engine.get_parameter_descriptions())
         .unwrap_or_default();
 
-    let mut out: Vec<Value> = raster_params
-        .into_iter()
+    let mut out: Vec<Value> = info
+        .parameters
+        .iter()
         .map(|parameter| {
-            let name = parameter.name;
-            let title = parameter.title;
+            let name = parameter.name.as_str();
             let (label, unit) = edr_descs
-                .get(&name)
-                .map(|d| (d.label.clone(), d.unit.clone()))
-                .unwrap_or((title, parameter.unit));
+                .get(name)
+                .map(|d| (d.label.as_str(), d.unit.as_str()))
+                .unwrap_or((parameter.title.as_str(), parameter.unit.as_str()));
             let mut entry = json!({ "name": name, "title": label, "unit": unit });
-            if default_parameter.as_deref() == Some(name.as_str()) {
+            if default_parameter.as_deref() == Some(name) {
                 entry["default"] = json!(true);
             }
-            if let Some(times) = engine.parameter_times(&name) {
+            if let Some(times) = engine.parameter_times(name) {
                 entry["temporal_extent"] =
                     parameter_temporal_extent(id, config, engine.default_time(), &times);
             }
@@ -766,13 +766,9 @@ fn first_config<'a>(
         .or_else(|| wms.collections.get(id))
 }
 
-// TODO: `resolve_spatial_extent` and `resolve_temporal_extent` both call
-// `raster_info()` on every maps / tiles / wms engine, which clones the
-// engine's `times: Vec<DateTime<Utc>>`. At default `limit=100` with
-// archive-sized collections (hundreds of timesteps) this is ~2× the
-// necessary clone work. Out of scope for the initial Phase 1 PR; the fix
-// is to call `raster_info()` once per entry in `build_entry` and pass
-// references down to both resolvers.
+// `resolve_spatial_extent` and `resolve_temporal_extent` read each map
+// engine's metadata through `raster_info_shared()`, the engine's snapshot
+// (#1485): an `Arc` clone, never a copy of its times per call.
 #[allow(clippy::too_many_arguments)]
 fn resolve_spatial_extent(
     id: &str,
@@ -788,12 +784,12 @@ fn resolve_spatial_extent(
         }
     }
     if let Some(engine) = maps.engines.get(id) {
-        if let Some(bbox) = engine.raster_info().spatial_extent {
+        if let Some(bbox) = engine.raster_info_shared().spatial_extent {
             return Some(bbox);
         }
     }
     if let Some(engine) = tiles.map_engines.get(id) {
-        if let Some(bbox) = engine.raster_info().spatial_extent {
+        if let Some(bbox) = engine.raster_info_shared().spatial_extent {
             return Some(bbox);
         }
     }
@@ -809,7 +805,7 @@ fn resolve_spatial_extent(
     }
     // WMS-only collection — same `MapEngine` interface as Maps/Tiles.
     if let Some(engine) = wms.engines.get(id) {
-        if let Some(bbox) = engine.raster_info().spatial_extent {
+        if let Some(bbox) = engine.raster_info_shared().spatial_extent {
             return Some(bbox);
         }
     }
@@ -840,8 +836,9 @@ fn resolve_temporal_extent(
         .or_else(|| wms.engines.get(id));
     let default_time = raster_engine.and_then(|e| e.default_time());
     let raster_times = raster_engine
-        .map(|e| e.raster_info().times)
-        .filter(|t| !t.is_empty());
+        .map(|e| e.raster_info_shared())
+        .filter(|info| !info.times.is_empty())
+        .map(|info| info.times.clone());
 
     // Pick the source that backs `values`, then derive `interval` from the
     // same source so the preview card's "Time" row matches the slider's

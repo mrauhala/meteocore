@@ -7,11 +7,19 @@
 //! 400 copies of it under different names: one site, 400 parsed volumes,
 //! each with its two sweeps of two moments and their byte spans. Capped, it
 //! is 40 of them, and what the scan remembers of the other 360.
+//!
+//! The site's map metadata snapshot (#1485) is under 1 KB of that, too
+//! little for the 25 % band to tell whether it is counted at all. So it is
+//! measured on its own: its views share it, reading it allocates nothing,
+//! and the part of the estimate that counts it is exactly what freeing the
+//! one snapshot gives back.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ds_core::config::OdimConfig;
 use ds_core::heap::Counting;
+use ds_core::map_engine::MapEngine;
 use engine_odim::PolarVolumeEngine;
 
 #[global_allocator]
@@ -72,6 +80,48 @@ fn catalog_estimate_matches_the_heap_held() {
             error.abs() <= 0.25,
             "max_files {max_files:?}: the estimate {estimate} is {:.1} % off the {held} bytes held",
             100.0 * error
+        );
+
+        // Two views of the site read the one snapshot the estimate counts:
+        // a hundred reads hold no more heap than the `Vec` holding them.
+        let (nod, _) = engine.sites().into_iter().next().expect("one site");
+        let views = [
+            engine.site_view(&nod, "pvol-heap-site"),
+            engine.site_view(&nod, "pvol-heap-site-again"),
+        ];
+        let mut infos = Vec::with_capacity(100);
+        let before_reads = Counting::live();
+        for i in 0..100 {
+            infos.push(views[i % 2].raster_info_shared());
+        }
+        assert_eq!(
+            Counting::live() - before_reads,
+            0,
+            "max_files {max_files:?}: a read allocates"
+        );
+        assert!(infos.iter().all(|info| Arc::ptr_eq(info, &infos[0])));
+        assert!(!infos[0].parameters.is_empty());
+        assert_eq!(engine.catalog_bytes() as f64, estimate, "built once");
+
+        // Keep one handle on the snapshot and drop everything else: freeing
+        // it then gives back exactly the bytes the estimate counted for it,
+        // once for the one site.
+        let counted = engine.site_snapshot_bytes();
+        let snapshot = infos[0].clone();
+        drop(infos);
+        drop(views);
+        drop(engine);
+        let before_free = Counting::live();
+        drop(snapshot);
+        let freed = before_free - Counting::live();
+        println!("site snapshot, max_files {max_files:?}: freed {freed} bytes, counted {counted}");
+        assert!(
+            freed > 0,
+            "max_files {max_files:?}: the snapshot outlived the catalog"
+        );
+        assert_eq!(
+            freed as u64, counted,
+            "max_files {max_files:?}: the estimate counts the site's snapshot once"
         );
     }
 }
