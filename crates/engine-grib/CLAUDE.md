@@ -217,7 +217,16 @@ A listed size and last-modified time only tell a rewritten file from its
 earlier listing. Of the first run prefix with files, newest first (a
 fixed-prefix source's one prefix), a file counts unless it was read into
 an older run, and one not read yet (failed or deferred) counts when first
-seen. A failed listing neither restarts nor ends the grace. Once judged
+seen. Every listed file's version is remembered, read or not, for two
+days after it was last listed (`UNREAD_MEMORY`, the prefixes a scan
+lists), so an index that is never readable (not UTF-8, rejected by the
+parser, a GET that keeps failing) is new once, not after every listing
+that misses it. A failed or empty listing neither restarts nor ends the
+grace. A sync that rewrites every file on each pass (`rsync -r` without
+`-t`, a `cp` cron job) never lets the newest run finish: the collection
+keeps one extra run for good, always the one just below the newest. Keep
+modification times (`rsync -t` or `-a`) or move finished files into
+place by rename. Once judged
 finished a run stays finished until a newer run is catalogued: a rewrite
 or a stalled run's late step neither keeps an extra run again nor has the
 hourly re-list read back an evicted one. While it publishes, or on a

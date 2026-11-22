@@ -302,6 +302,37 @@ fn a_run_that_stops_publishing_keeps_the_extra_run_only_for_the_grace() {
     assert_eq!(times.len(), 2, "the stalled run serves what it has");
 }
 
+/// An index that cannot be read is new once: listings that miss it in
+/// between, its folder gone or the scan listing nothing, do not make it
+/// new again and restart the grace.
+#[test]
+fn an_unreadable_index_does_not_restart_the_grace() {
+    let runs = Runs::new(2);
+    runs.finished_runs();
+    runs.scan(t("2026-04-06T07:30:00Z"));
+    runs.publish(R00, 0, t("2026-04-06T07:41:00Z"));
+    std::fs::write(runs.source.dir.join("20260406/00/bad.idx"), "invalid index").unwrap();
+    let seen = t("2026-04-06T07:42:00Z");
+    runs.scan(seen);
+    assert_eq!(runs.runs().len(), 3);
+
+    let folder = runs.source.dir.join("20260406");
+    let away = runs.source.dir.join("20260406-away");
+    for (i, at) in [10, 20, 29].into_iter().enumerate() {
+        let hidden = i % 2 == 0;
+        if hidden {
+            std::fs::rename(&folder, &away).unwrap();
+        }
+        runs.scan(seen + minutes(at));
+        if hidden {
+            std::fs::rename(&away, &folder).unwrap();
+        }
+        assert_eq!(runs.runs().len(), 3, "{at} min");
+    }
+    runs.scan(seen + PUBLISHING_GRACE);
+    assert_eq!(runs.runs(), [reference(R18), reference(R00)]);
+}
+
 /// Once the newest run has finished, an index of it rewritten, or a stalled
 /// run's late step, does not make it publish again: the hourly re-list
 /// does not read back the run already evicted.

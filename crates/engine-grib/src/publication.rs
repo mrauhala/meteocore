@@ -25,6 +25,12 @@ pub(crate) const PUBLISHING_GRACE: chrono::Duration = ds_storage::discovery::DEF
 /// with its own earlier listing.
 pub(crate) type Version = (u64, DateTime<Utc>);
 
+/// How long a file not read is remembered after it was last listed: the
+/// two days of run prefixes a scan lists. A file that cannot be read (not
+/// UTF-8, an index the parser rejects, a GET that keeps failing) is then
+/// new once, not again after every listing that misses it.
+const UNREAD_MEMORY: chrono::Duration = chrono::Duration::days(2);
+
 /// What the scans have seen of the newest run's publication.
 #[derive(Debug, Default)]
 pub(crate) struct Publication {
@@ -35,10 +41,12 @@ pub(crate) struct Publication {
     seen: Option<DateTime<Utc>>,
     /// Judged finished; only a newer run publishes again.
     finished: bool,
-    /// The newest run prefix's index files as listed, by path, and the
-    /// files read before: a path seen again with the same version is not
-    /// new. Pruned to the files read and those the last listing had.
-    versions: HashMap<String, Version>,
+    /// The newest run prefix's index files as listed, by path, with when a
+    /// scan last listed each: a path seen again with the same version is
+    /// not new, read or not. Pruned to the files read and those listed
+    /// within [`UNREAD_MEMORY`], so a scan that lists nothing, or another
+    /// prefix, forgets none it will list again.
+    versions: HashMap<String, (Version, DateTime<Utc>)>,
 }
 
 impl Publication {
@@ -75,7 +83,8 @@ impl Publication {
         self.run = newest;
         if let Some(listed) = listed {
             let changed = listed.iter().any(|(path, version)| {
-                self.versions.get(path) != Some(version) && (in_newest(path) || !read(path))
+                self.versions.get(path).map(|(seen, _)| seen) != Some(version)
+                    && (in_newest(path) || !read(path))
             });
             if changed && !self.finished && self.run.is_some() {
                 self.seen = Some(now);
@@ -83,11 +92,11 @@ impl Publication {
             self.versions.extend(
                 listed
                     .iter()
-                    .map(|(path, version)| (path.clone(), *version)),
+                    .map(|(path, version)| (path.clone(), (*version, now))),
             );
         }
         self.versions
-            .retain(|path, _| listed.is_some_and(|listed| listed.contains_key(path)) || read(path));
+            .retain(|path, (_, listed)| now - *listed < UNREAD_MEMORY || read(path));
         let publishing = self.publishing(now);
         if !publishing && self.run.is_some() {
             self.finished = true;
@@ -153,6 +162,14 @@ mod tests {
         let mut publication = Publication::default();
         assert!(publication.observe(t(0), run, None, |_| true, |_| true));
         let unread = listing(&[("unread", 1, 10)]);
+        // A scan that lists nothing between does not make it new again.
+        assert!(publication.observe(t(10), run, Some(&unread), |_| false, |_| false));
+        assert!(publication.observe(t(15), run, None, |_| false, |_| false));
+        assert!(publication.observe(t(20), run, Some(&unread), |_| false, |_| false));
+        assert!(!publication.observe(t(40), run, Some(&unread), |_| false, |_| false));
+
+        let mut publication = Publication::default();
+        assert!(publication.observe(t(0), run, None, |_| true, |_| true));
         assert!(publication.observe(t(10), run, Some(&unread), |_| false, |_| false));
         assert!(publication.observe(t(39), run, Some(&unread), |_| false, |_| false));
         assert!(!publication.observe(t(40), run, Some(&unread), |_| false, |_| false));

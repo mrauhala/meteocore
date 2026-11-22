@@ -247,7 +247,11 @@ fixtures ([`split-levels`](../../testdata/grib-local/split-levels.toml),
   dropped from later runs stays listed until its last run is evicted.
   A run once judged finished stays so until a newer run appears: steps
   that arrive after a pause of 30 minutes or more no longer keep the run
-  they replace.
+  they replace. A sync that rewrites every file on each pass, such as
+  `rsync -r` without `-t` or a `cp` cron job, never lets the newest run
+  finish, so the collection keeps one extra run for good, always the one
+  just below the newest. Copy with `rsync -t` or `-a`, which keep
+  modification times, or move finished files into place by rename.
 - Soil, isentropic and fractional levels belong to no level view; model
   levels are not converted to height or pressure.
 - wgrib2 hour-window accumulations and averages are keyed by duration
