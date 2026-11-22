@@ -668,8 +668,8 @@ access = "opendap"` reads a remote family through DAP2.
   reserves the budget, decodes and inserts. It reads through the host's
   request store, not its background share: requests wait on it, so it is
   no background work whatever its budget (#1530); the share
-  (`Host::background`, `for_background()`) is ingest's and prewarm's. The request waits for the value
-  until its own deadline only. A fetch slower than the deadline fails that
+  (`Host::background`, `for_background()`) is ingest's and prewarm's.
+  The request waits for the value until its own deadline only. A fetch slower than the deadline fails that
   request (503) and still fills the cache. A failed detached fill drops
   the guard: a waiting reader then fills inline and gets the error itself.
   At most `MAX_DETACHED_FILLS` (16) run at once, over every collection;
@@ -690,7 +690,15 @@ access = "opendap"` reads a remote family through DAP2.
   `CHUNKS`, the field cache keeps the frames being drawn. Each (ingest,
   variable, step) once (`PollState::prewarmed`); the first failure
   (budget, network) stops it until the next poll. ~100 MB per MEPS
-  variable and run. A collection with `prewarm_variables` marks the
+  variable and run. Known limit (#1530): its chunk fills are single-flight
+  `CHUNKS` fills, and a render or query wanting the same chunk joins one
+  in flight, so it waits on background work, until its own deadline: the
+  fill keeps its background class (at most half a limited host's permits,
+  first come, first served within it) rather than becoming a request's
+  when a request joins. A class does not move with a fill another reader
+  joins; that would need the single-flight cache to tell the store, for a
+  rare overlap (prewarm runs right after a poll publishes, ahead of the
+  frames clients draw). A collection with `prewarm_variables` marks the
   process-wide chunk cache filled ahead of its reads
   (`remote::mark_chunks_prewarmed`, sticky): elastic memory neither lends
   nor decays it (#1314).

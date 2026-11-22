@@ -306,15 +306,22 @@ retries included, and on a 429:
 - **Background work holds a share.** The reads of a store
   `DataStore::for_background()` made, polls, scans, ingest and pre-warms
   that no request waits on, hold or queue for at most half the limit now,
-  rounded down and at least one (`AdaptiveLimit::share`); within it they
-  queue first come, first served with every other read. So requests always
-  have room, and background work is never starved: a satellite scan's
-  sixteen tile reads take eight of a bucket's sixteen starting permits.
+  rounded down (`AdaptiveLimit::share`): none at a limit of 1, so a request
+  never waits behind a poll's read for the only permit. Their places in
+  the share go first come, first served, and a read that has waited 30 s
+  (`BACKGROUND_PATIENCE`, a quarter of its budget) may hold one permit past
+  it, so background work is never starved. Within the share they queue
+  for permits first come, first served with every other read: a satellite
+  scan's sixteen tile reads take eight of a bucket's sixteen starting
+  permits. After a cut, background reads keep the permits they hold until
+  their reads end, as every read does; new ones wait for the smaller
+  share.
   The class is the caller's, never its `FetchBudget`: engine-netcdf's
   detached field fills read under the background budget, and requests
-  wait on them. Background work: the GRIB pre-warm, the GeoTIFF scan's
-  header reads and downloads, the PVOL catalog scan and cell warm-up, the
-  satellite ingest, NetCDF's ingest and prewarm share.
+  wait on them. Background work: the GRIB scan's LISTs, index reads and
+  header probes and its pre-warm, the GeoTIFF scan's header reads and
+  downloads, the PVOL catalog scan and cell warm-up, the satellite ingest,
+  NetCDF's ingest and prewarm share.
 - **The retry delay.** A request refused without `Retry-After` is retried 2 s
   (`RETRY_DELAY`) after the refusal, not 0.1 s, so its retry goes out
   under the cut limit and the raised pace. The retry waits for it, holding

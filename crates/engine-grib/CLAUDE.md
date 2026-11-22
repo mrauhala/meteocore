@@ -59,10 +59,16 @@ unlike GeoTIFF's one band per collection.
   Run with `--ignored --nocapture`; timings are measurements, not CI gates.
 - A bucket refusing GETs (`503 SlowDown`, #1530) is backed off in
   ds-storage: its request limit, starting at 16 and cut by the `SlowDown`s,
-  bounds the reads in flight below the chunk. The pre-warm reads through
-  `store.for_background()` (`prewarm::Reader::Prewarm`), at most half the
-  limit; the read-ahead does not, since the next frame's request may join
-  its GET. Once a read of a chunk
+  bounds the reads in flight below the chunk. A scan's LISTs, index reads
+  and metadata probes, and the pre-warm (`prewarm::Reader::Prewarm`), read
+  through `store.for_background()`, at most half the limit; the read-ahead
+  does not, since the next frame's request may join its GET
+  (`scan_tests::a_scans_index_reads_are_background_work`). The indexes a
+  stopped scan left unread (`GribSource::deferred_indexes`) keep the
+  newest run publishing (`publication::Reads::deferred`) while scans list
+  them, however long the throttle outlasts `PUBLISHING_GRACE`; an index
+  that cannot be read still counts once
+  (`run_eviction_tests::indexes_a_throttle_left_unread_keep_the_newest_run_publishing`). Once a read of a chunk
   failed, a timeout included, while the source backs off
   (`source_backing_off`), the scan reads no more indexes: the collection
   keeps what it read; that chunk's failed indexes and the later chunks are

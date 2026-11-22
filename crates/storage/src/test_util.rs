@@ -716,6 +716,98 @@ fn quicken(host: &crate::throttle::HostThrottle) {
     });
 }
 
+/// A store recording, for each GET or HEAD of `inner`, whether it ran as
+/// background work (`DataStore::for_background`, #1530): a test pins which
+/// of a caller's reads are background work and which a request waits on.
+/// Put a remote store over it ([`ThrottledBucket::store`]): a read's class
+/// is set by the remote store's layers.
+#[derive(Debug)]
+pub struct ReadClasses {
+    inner: Arc<dyn ObjectStore>,
+    reads: Mutex<Vec<(String, bool)>>,
+}
+
+impl ReadClasses {
+    pub fn new(inner: Arc<dyn ObjectStore>) -> Self {
+        Self {
+            inner,
+            reads: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The reads since the last call: each path and whether it was
+    /// background work.
+    pub fn take(&self) -> Vec<(String, bool)> {
+        std::mem::take(&mut *self.reads.lock().unwrap())
+    }
+}
+
+impl std::fmt::Display for ReadClasses {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ReadClasses({})", self.inner)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for ReadClasses {
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: PutPayload,
+        options: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(path, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        options: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        path: &Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let background = crate::throttle::background();
+        self.reads
+            .lock()
+            .unwrap()
+            .push((path.to_string(), background));
+        self.inner.get_opts(path, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        paths: BoxStream<'static, object_store::Result<Path>>,
+    ) -> BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 /// An S3 bucket's back-off that a test drives (#1530): stores on it
 /// ([`Self::store`]) report it through [`crate::DataStore::back_off`],
 /// [`Self::slow_down`] backs it off as a `503 SlowDown` the bucket

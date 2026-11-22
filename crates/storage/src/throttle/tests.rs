@@ -1145,6 +1145,55 @@ async fn a_request_read_has_a_permit_while_background_holds_its_share() {
     assert_eq!(host.take_peak(), INITIAL / 2 + 1);
 }
 
+/// At a limit of 1 background work has no share: a poll's 4 s read waits,
+/// and a request's read arriving after it has the only permit at once
+/// (#1530). The poll's read is not starved: once it has waited
+/// `BACKGROUND_PATIENCE` it takes a permit past the share.
+#[tokio::test(start_paused = true)]
+async fn at_a_limit_of_one_background_work_waits_its_patience() {
+    use super::limit::BACKGROUND_PATIENCE;
+    let slow = Duration::from_secs(4);
+    let host = Scripted::new(slow);
+    let (store, path) = limited("http://one.backoff.test/x", 1, &host);
+    let poll = store.clone().for_background();
+    let ((poll_asked, poll_served), (asked, served)) = tokio::join!(
+        timed_read(&poll, &path, FetchBudget::Background, Duration::ZERO),
+        timed_read(
+            &store,
+            &path,
+            FetchBudget::Request,
+            Duration::from_millis(100)
+        ),
+    );
+    assert_eq!(served - asked, slow, "the request has the permit at once");
+    assert_eq!(poll_served - poll_asked, BACKGROUND_PATIENCE + slow);
+}
+
+/// Places in the background share go first come, first served: one
+/// collection's reads, each asking again as it ends, do not keep another's
+/// read out of the share until they stop (#1530).
+#[tokio::test(start_paused = true)]
+async fn background_places_go_first_come_first_served() {
+    let host = Scripted::new(Duration::from_millis(100));
+    let store = s3("places.s3.test", "goes", &host);
+    let path = Path::from("scan.nc");
+    let pipeline = store.clone().for_background();
+    let other = store.clone().for_background();
+    let end = Instant::now() + Duration::from_secs(5);
+    let share = INITIAL / 2;
+    let (_, (asked, served)) = tokio::join!(
+        read_until(&pipeline, &path, share, end),
+        timed_read(
+            &other,
+            &path,
+            FetchBudget::Background,
+            Duration::from_millis(1050)
+        ),
+    );
+    let waited = served - asked;
+    assert!(waited <= Duration::from_millis(250), "{waited:?}");
+}
+
 /// Only a request naming the bucket, by path after its endpoint's own path
 /// or by host, goes through its throttle: a credential endpoint's, which
 /// object_store sends through the same connector, passes by. A bucket

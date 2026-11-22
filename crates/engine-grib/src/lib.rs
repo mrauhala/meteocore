@@ -273,6 +273,9 @@ struct GribSource {
     /// Whether the catalog's newest run is still publishing, by the
     /// engine's own clock (#1562): it is kept on top of `max_runs` then.
     publication: Mutex<publication::Publication>,
+    /// The index files the last scan left unread because its source backed
+    /// off (#1530): a run listing one is still publishing until it is read.
+    deferred_indexes: Mutex<HashSet<String>>,
     /// Which index file format this collection uses.
     index_format: index::IndexFormat,
     /// Parameter metadata keyed by short name AND level identity. Populated
@@ -694,6 +697,7 @@ impl GribEngine {
                 settled_prefixes: Mutex::new(HashSet::new()),
                 last_full_scan: Mutex::new(None),
                 publication: Mutex::default(),
+                deferred_indexes: Mutex::default(),
                 index_format,
                 param_meta: RwLock::new(ParamMetadataCache::default()),
                 probe_cursor: Mutex::new(None),
@@ -751,6 +755,10 @@ impl GribEngine {
     }
 
     fn scan_at(&self, now: DateTime<Utc>) -> Result<(), DataServerError> {
+        // A scan's LISTs and index reads are background work (#1530): no
+        // request waits on them, so they hold at most half a bucket's
+        // permits and leave requests room.
+        let scan_store = self.source.store.clone().for_background();
         let index_suffix = self
             .source
             .config
@@ -843,7 +851,7 @@ impl GribEngine {
             let obj_prefix = ds_storage::object_store::path::Path::from(prefix.as_str());
             let mut hits_in_this_prefix = 0usize;
             let mut versions = HashMap::new();
-            match self.source.store.list(&obj_prefix) {
+            match scan_store.list(&obj_prefix) {
                 Ok(objects) => {
                     for obj in objects {
                         let loc = obj.location.as_ref();
@@ -1019,11 +1027,7 @@ impl GribEngine {
             let mut failed: Vec<ds_storage::object_store::path::Path> = Vec::new();
             // No HEAD per sidecar: the indexes are already listed and only
             // their contents are needed. Each GET keeps its own timeout.
-            let results = match self
-                .source
-                .store
-                .get_many(chunk, INDEX_FETCH_CONCURRENCY, None)
-            {
+            let results = match scan_store.get_many(chunk, INDEX_FETCH_CONCURRENCY, None) {
                 Ok(results) => results,
                 Err(e) => {
                     tracing::warn!(
@@ -1135,6 +1139,8 @@ impl GribEngine {
             );
         }
         settle(&unread);
+        *self.source.deferred_indexes.lock().unwrap() =
+            unread.iter().map(|path| path.as_ref().to_owned()).collect();
 
         ambiguities.emit(&self.collection_id);
 
@@ -1243,12 +1249,16 @@ impl GribEngine {
             .contains(path.replace(index_suffix, data_suffix).as_str())
         };
         let known = self.source.known_indexes.lock().unwrap();
+        let deferred = self.source.deferred_indexes.lock().unwrap();
         self.source.publication.lock().unwrap().observe(
             now,
             newest.map(|run| run.reference_time),
             listed,
-            |path| known.contains(path),
-            in_newest,
+            publication::Reads {
+                read: |path: &str| known.contains(path),
+                deferred: |path: &str| deferred.contains(path),
+                in_newest,
+            },
         )
     }
 
@@ -1356,7 +1366,9 @@ impl GribEngine {
             .iter()
             .map(|(_, (file, entry))| (file.message_url(entry), *entry))
             .collect();
-        let results = metadata::read_batch(&self.source.store, &entries);
+        // Background work, as the scan's index reads are (#1530).
+        let store = self.source.store.clone().for_background();
+        let results = metadata::read_batch(&store, &entries);
         // Apply in cursor order, preserving deterministic metadata fallback
         // representatives even when the reads complete out of order.
         let mut changed = false;

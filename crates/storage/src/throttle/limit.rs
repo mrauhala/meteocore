@@ -17,18 +17,24 @@
 //! limit at its ceiling ([`AdaptiveLimit::warning_when_full`]).
 //!
 //! Background work (`throttle::BACKGROUND`, a store's reads
-//! `DataStore::for_background` marked) holds at most half the limit now,
-//! at least one permit ([`AdaptiveLimit::share`]), so requests always have
-//! room; within it, its reads queue for permits first come, first served,
-//! with every other read (#1530).
+//! `DataStore::for_background` marked) holds or queues for at most half
+//! the limit now, rounded down ([`AdaptiveLimit::share`]): none at a limit
+//! of 1, so a request never waits behind a poll's read for the only
+//! permit. Its reads take their places in the share first come, first
+//! served, and one that has waited [`BACKGROUND_PATIENCE`] may hold one
+//! permit past it, so background work is never starved. Within the share
+//! its reads queue for permits first come, first served with every other
+//! read (#1530). After a cut, background reads keep the permits they hold
+//! until their reads end, as every read does; new ones wait for the
+//! smaller share.
 //!
 //! [`Limited`] is the store under the limit, as object_store's
 //! `LimitStore` is under a fixed one: every operation holds a permit while
 //! it runs, a GET until its body has been read or dropped.
 
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
@@ -47,6 +53,12 @@ use super::{CUT_WINDOW, QUIET_INTERVAL};
 /// Each quiet interval adds this share of the configured limit back:
 /// an eighth, so a host configured at 8 grows by 1.
 const GROWTH_PARTS: usize = 8;
+
+/// How long a background read waits for its place in the share before it
+/// may hold a permit past it: a quarter of its 120 s background budget, so
+/// it still has the time to be read when requests keep the share full or a
+/// limit of 1 leaves none.
+pub(crate) const BACKGROUND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// At most one WARN per limit per this long that requests wait for a
 /// limit at its ceiling.
@@ -67,9 +79,8 @@ pub(crate) struct AdaptiveLimit {
     warn_when_full: bool,
     semaphore: Arc<Semaphore>,
     state: Mutex<LimitState>,
-    /// Background reads holding a permit or queued for one: at most
-    /// [`Self::share`] of them.
-    background: AtomicUsize,
+    /// Background reads' places in the share, and those waiting for one.
+    places: Mutex<Places>,
     /// Told when a background read may take its place in the share: one
     /// left it, or the limit grew.
     freed: Notify,
@@ -107,7 +118,7 @@ impl AdaptiveLimit {
             configured,
             warn_when_full: false,
             semaphore: Arc::new(Semaphore::new(configured)),
-            background: AtomicUsize::new(0),
+            places: Mutex::new(Places::default()),
             freed: Notify::new(),
             state: Mutex::new(LimitState {
                 current: configured,
@@ -170,32 +181,55 @@ impl AdaptiveLimit {
     }
 
     /// The permits background work may hold or queue for now: half the
-    /// limit, rounded down, and at least one.
+    /// limit, rounded down, none at a limit of 1.
     pub(crate) fn share(&self) -> usize {
-        (self.state().current / 2).max(1)
+        self.state().current / 2
     }
 
-    /// A background read's place in the share: taken while fewer than the
-    /// share hold or wait for a permit, else waited for until one leaves
-    /// or the limit grows.
+    fn places(&self) -> MutexGuard<'_, Places> {
+        self.places.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A background read's place in the share, in the order the reads
+    /// asked: the first waiting takes one while fewer than the share hold
+    /// one, or, once it has waited [`BACKGROUND_PATIENCE`], while no more
+    /// than the share do.
     async fn background_place(self: &Arc<Self>) -> Share {
+        let asked = Instant::now();
+        let ticket = {
+            let mut places = self.places();
+            let id = places.next;
+            places.next += 1;
+            places.waiting.insert(id);
+            PlaceTicket(self, id)
+        };
+        let patient = asked + BACKGROUND_PATIENCE;
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
             let share = self.share();
-            let held = self.background.load(Ordering::SeqCst);
-            if held < share {
-                if self
-                    .background
-                    .compare_exchange(held, held + 1, Ordering::SeqCst, Ordering::SeqCst)
-                    .is_ok()
-                {
-                    return Share(self.clone());
+            let now = Instant::now();
+            let taken = {
+                let mut places = self.places();
+                let first = places.waiting.first() == Some(&ticket.1);
+                let room = if now >= patient { share + 1 } else { share };
+                let take = first && places.held < room;
+                if take {
+                    places.held += 1;
                 }
-                continue;
+                take
+            };
+            if taken {
+                drop(ticket);
+                return Share(self.clone());
             }
-            freed.await;
+            if now < patient {
+                // Told, or patient by then.
+                let _ = tokio::time::timeout_at(patient, freed).await;
+            } else {
+                freed.await;
+            }
         }
     }
 
@@ -308,13 +342,38 @@ impl AdaptiveLimit {
     }
 }
 
+/// The background reads' places in the share ([`AdaptiveLimit::share`]).
+#[derive(Debug, Default)]
+struct Places {
+    /// Places held, by reads holding a permit or queued for one.
+    held: usize,
+    /// The tickets of the reads waiting for a place, in the order they
+    /// asked.
+    waiting: BTreeSet<u64>,
+    /// The next ticket.
+    next: u64,
+}
+
+/// A background read's place in the queue for the share, given up when it
+/// has a place or is dropped, which tells the next.
+struct PlaceTicket<'a>(&'a AdaptiveLimit, u64);
+
+impl Drop for PlaceTicket<'_> {
+    fn drop(&mut self) {
+        self.0.places().waiting.remove(&self.1);
+        self.0.freed.notify_waiters();
+    }
+}
+
 /// A background read's place in [`AdaptiveLimit::share`], left when
 /// dropped: with its permit, or when it gives up waiting for one.
 struct Share(Arc<AdaptiveLimit>);
 
 impl Drop for Share {
     fn drop(&mut self) {
-        self.0.background.fetch_sub(1, Ordering::SeqCst);
+        let mut places = self.0.places();
+        places.held = places.held.saturating_sub(1);
+        drop(places);
         self.0.freed.notify_waiters();
     }
 }

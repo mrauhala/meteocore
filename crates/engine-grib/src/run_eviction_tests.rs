@@ -480,3 +480,84 @@ fn a_restart_lists_one_more_run_and_keeps_it_for_the_grace() {
     runs.scan(restart + PUBLISHING_GRACE);
     assert_eq!(runs.runs(), [reference(R18), reference(R00)]);
 }
+
+/// A run whose indexes a throttling bucket leaves unread stays publishing
+/// while they wait, however long past the grace the throttle lasts (#1530:
+/// on 2026-11-22 it lasted 40 minutes): the extra run stays until they are
+/// read, and goes the grace after the last scan that listed one unread.
+#[test]
+fn indexes_a_throttle_left_unread_keep_the_newest_run_publishing() {
+    use crate::test_support::store::TestStore;
+    use ds_storage::object_store::{path::Path, ObjectStoreExt};
+    let mut runs = Runs::new(2);
+    runs.finished_runs();
+    runs.scan(t("2026-04-06T07:30:00Z"));
+    runs.publish_run(R00, 0, 48, t("2026-04-06T07:41:00Z"));
+
+    // The same files, now in a bucket that refuses one of 00Z's indexes.
+    let bucket = ds_storage::test_util::ThrottledBucket::new("s3.test/forecasts");
+    let store = Arc::new(TestStore {
+        bucket: Some(bucket.clone()),
+        ..Default::default()
+    });
+    let mut pending = vec![runs.source.dir.clone()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let key = path.strip_prefix(&runs.source.dir).unwrap();
+            let bytes = std::fs::read(&path).unwrap();
+            crate::runtime::run_fetches(
+                store
+                    .inner
+                    .put(&Path::from(key.to_str().unwrap()), bytes.into()),
+            )
+            .unwrap();
+        }
+    }
+    let refused = "20260406/00/f006.idx";
+    store.reads.lock().unwrap().throttled.insert(refused.into());
+    let reads: Arc<dyn ds_storage::object_store::ObjectStore> = store.clone();
+    Arc::get_mut(&mut runs.engine.source).unwrap().store = bucket.store(reads);
+
+    let three = [reference(R12), reference(R18), reference(R00)];
+    let seen = t("2026-04-06T07:42:00Z");
+    runs.scan(seen);
+    assert_eq!(runs.runs(), three);
+    for at in [
+        PUBLISHING_GRACE + minutes(1),
+        PUBLISHING_GRACE + minutes(15),
+    ] {
+        runs.scan(seen + at);
+        assert_eq!(runs.runs(), three, "{at}: the index is still to come");
+    }
+    assert!(!runs
+        .engine
+        .source
+        .known_indexes
+        .lock()
+        .unwrap()
+        .contains(refused));
+
+    bucket.quiet();
+    store.reads.lock().unwrap().throttled.clear();
+    let last_unread = seen + PUBLISHING_GRACE + minutes(15);
+    runs.scan(last_unread + minutes(5));
+    assert!(runs
+        .engine
+        .source
+        .known_indexes
+        .lock()
+        .unwrap()
+        .contains(refused));
+    assert_eq!(
+        runs.runs(),
+        three,
+        "the grace runs from its last unread listing"
+    );
+    runs.scan(last_unread + PUBLISHING_GRACE);
+    assert_eq!(runs.runs(), [reference(R18), reference(R00)]);
+}

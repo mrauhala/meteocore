@@ -497,3 +497,31 @@ fn natural_order_compares_steps_as_numbers() {
         ]
     );
 }
+
+/// A scan's LISTs and index reads are background work (#1530): they hold
+/// at most half a bucket's permits, so a request has room behind a poll's
+/// burst. A read through the source's store is a request's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scans_index_reads_are_background_work() {
+    let count = INDEX_FETCH_CONCURRENCY + 3;
+    let (_source, mut engine, store) =
+        engine_with_indexes(count, "ecmwf-json", Duration::ZERO).await;
+    let classes = Arc::new(ds_storage::test_util::ReadClasses::new(store.clone()));
+    let bucket = ds_storage::test_util::ThrottledBucket::new("s3.test/forecasts");
+    let reads: Arc<dyn ds_storage::object_store::ObjectStore> = classes.clone();
+    Arc::get_mut(&mut engine.source).unwrap().store = bucket.store(reads);
+    engine.scan_once().unwrap();
+    let read = classes.take();
+    let indexes: Vec<_> = read
+        .iter()
+        .filter(|(path, _)| path.ends_with(".idx"))
+        .collect();
+    assert_eq!(indexes.len(), count);
+    assert!(
+        indexes.iter().all(|(_, background)| *background),
+        "{read:?}"
+    );
+
+    engine.source.store.get(&Path::from("f000.idx")).unwrap();
+    assert_eq!(classes.take(), [("f000.idx".to_string(), false)]);
+}
