@@ -60,7 +60,8 @@
 //! the plan itself, keeping the valve's ceilings (`capped`) but those it
 //! supersedes ([`reconcile`]), restarts the tick's 5 minutes and forgets
 //! the resizes that stopped short ([`fitted`]); a recovery pass does
-//! neither. The pressure timers and ceilings carry over, since the
+//! neither. While the startup load runs (#317) the valve runs and the
+//! re-plan tick waits for the load to settle. The pressure timers and ceilings carry over, since the
 //! process's memory does not change with its config. Where the gates
 //! close (report mode, no total, a total from the host), the valve's state
 //! is dropped: report mode gives every size the plan set back, and with
@@ -521,7 +522,12 @@ pub(crate) fn step(state: &AdminState, now: Instant) -> Step {
         }
         _ => without_valve(&mut governor()),
     }
-    let due = {
+    // No re-plan while the startup load runs (#317): fitted over the caches
+    // of the collections built so far, it would give them the shares of
+    // those still loading, which the planner then keeps once requests warm
+    // them. The plan is fitted at boot, lowering sizes only, and once the
+    // load settles; the valve above runs throughout.
+    let due = !state.startup.is_loading() && {
         let governor = governor();
         let since = |at: Option<Instant>| {
             at.is_none_or(|at| now.saturating_duration_since(at) >= decide::REPLAN_EVERY)

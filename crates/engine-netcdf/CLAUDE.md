@@ -274,11 +274,11 @@ Every catalog is built by a scan and swapped through `ArcSwap`.
   other leads, which settle at once when older than `min_age`), then at
   most one run's leads (the newest run's files) under a deadline of
   `INITIAL_SCAN_BUDGET` (15 s) from the start, entered on every open
-  thread. Why the bound: `load_collections` builds collections one after
-  another and the server answers nothing until all are built (main.rs
-  "Socket bound — loading collections, not yet serving", and the same on
-  reload, on the poll runtime), so a remote `new()` delays every collection
-  after it and the whole boot. 67 MEPS opens are ~67 MB at the background
+  thread. Why the bound: a reload's `load_collections` builds collections
+  one after another, so a remote `new()` delays every collection after it
+  and the reload; at boot each collection loads on its own (#317), but a
+  slow `new()` still holds this collection and one of the few startup load
+  slots. 67 MEPS opens are ~67 MB at the background
   share of 2: seconds from a server's network, tens of seconds over a slow
   link. The worst case is the budget plus one wave of HEADs (30 s each).
   The rest is the poll loop's: its first tick fires at once

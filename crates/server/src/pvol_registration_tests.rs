@@ -109,9 +109,12 @@ fn served(state: &AdminState, id: &str) -> bool {
 /// The status and the error `/health` gives `id`, if it lists it.
 async fn health_of(state: &AdminState, id: &str) -> Option<(String, Option<String>)> {
     use axum::response::IntoResponse;
-    let response = super::health_handler(axum::extract::State(state.clone()))
-        .await
-        .into_response();
+    let response = super::health_handler(
+        axum::extract::State(state.clone()),
+        api_common::JsonQuery(Default::default()),
+    )
+    .await
+    .into_response();
     let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
         .await
         .unwrap();

@@ -57,6 +57,31 @@ tests:
               summary: "2 collection(s) failed on a:8000"
               description: "Collections failed to load or lost their source. /health names them and their errors."
 
+  # Loading for 15 minutes: a boot that settles in 10 stays quiet.
+  - name: CollectionsLoading
+    interval: 1m
+    input_series:
+      - series: 'collections_loading{job="meteocore", instance="a:8000"}'
+        values: '1x20'
+      - series: 'collections_loading{job="meteocore", instance="b:8000"}'
+        values: '3x10 0x10'
+      - series: 'collections_loading{job="node", instance="c:9100"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CollectionsLoading
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: CollectionsLoading
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: meteocore
+              instance: a:8000
+            exp_annotations:
+              summary: "1 collection(s) still loading on a:8000"
+              description: "Collections have not finished loading 15 minutes after start: their source is slow or unreachable. /health lists them as loading."
+
   # Stale = data age at least the delay + 3 intervals and at least the
   # delay + an interval + 15 min; no delay series counts as no delay.
   #   radar: 5-minute interval, 20 minutes old: stale (threshold 20 min).

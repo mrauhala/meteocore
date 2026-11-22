@@ -191,6 +191,48 @@ pub(crate) fn replan(state: &ServerState, rows: &[Row], memory: &MemoryReading) 
     keep(report, rows)
 }
 
+/// The plan at boot, before the startup load builds any collection
+/// (#317): fitted over what is registered then, and applied in `auto` only
+/// to the process-wide entries (the render caches and budget, which
+/// requests fill during the load) and only where it lowers a size. Every
+/// cache is empty then, so a shrink keeps nothing a later plan must hold: a
+/// grant this partial plan gives above the full one is never applied, one
+/// below it the plan fitted once the load settles grows back. An engine's
+/// caches and budgets wait for that plan: some engines check them while
+/// built (a station grid its grid cache and computation budget). Kept as
+/// the last report, so `/admin/cache-plan` and the governor's valve read it
+/// during the load.
+pub(crate) fn lower_at_boot(state: &crate::admin::AdminState) -> Arc<Report> {
+    let memory = crate::admin::refresh_metrics(state);
+    let rows = crate::cache_plan::snapshot(state);
+    let mut report = fit(state, &rows, &memory);
+    report.changes = match (report.mode, &report.plan) {
+        (MemoryMode::Auto, Some(_)) => {
+            let process: Vec<Row> = rows
+                .iter()
+                .filter(|row| row.entry.scope == Scope::Process)
+                .cloned()
+                .collect();
+            apply_with(&report, &process, &|row, grant| {
+                Some(grant.bytes.min(row.usage.capacity_bytes))
+            })
+        }
+        _ => Vec::new(),
+    };
+    keep(report, &rows)
+}
+
+/// The plan fitted again as the startup load publishes a collection
+/// (#317), applying nothing: kept as the last report, so the governor's
+/// pressure valve finds a grant and a floor for every cache registered so
+/// far, a later collection's included, rather than only those the boot
+/// report saw. Sizes move once the load settles.
+pub(crate) fn refit_during_load(state: &crate::admin::AdminState) -> Arc<Report> {
+    let memory = crate::admin::refresh_metrics(state);
+    let rows = crate::cache_plan::snapshot(state);
+    keep(fit(state, &rows, &memory), &rows)
+}
+
 /// [`replan`]'s second half for the memory governor's re-plan tick
 /// (#1315): `report`, fitted by [`fit`], applied only where `wanted` gives
 /// a row a size ([`apply_with`]), counted and kept as the last report.

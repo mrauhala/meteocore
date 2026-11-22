@@ -294,6 +294,18 @@ pub struct ServerSettings {
     /// survive reloads, so a change needs a restart.
     #[serde(default)]
     pub render_concurrency: Option<usize>,
+    /// How many collections the startup load builds at once (#317): the
+    /// server serves from boot and publishes each collection once built.
+    /// Default 4; must be 1..=[`MAX_STARTUP_CONCURRENCY`]. Read at boot.
+    #[serde(default = "default_startup_concurrency")]
+    pub startup_concurrency: usize,
+    /// How long `GET /health?loaded`, the readiness check, waits for the
+    /// startup load (#317), in seconds: 503 while collections load, 200
+    /// once every one is built or this long after the load started, so a
+    /// single slow source cannot keep a server out of service for good. 0
+    /// waits for every collection. Default 300. Read at boot.
+    #[serde(default = "default_startup_readiness_grace_secs")]
+    pub startup_readiness_grace_secs: u64,
     /// Directory for engine state snapshots (#1000): the file backend of
     /// `ds_core::state::StateStore`. A WIS2-fed CAP collection writes its
     /// alert accumulator under the key `<collection id>.cap`, the file
@@ -307,6 +319,11 @@ pub struct ServerSettings {
     #[serde(default, deserialize_with = "de_trimmed_opt_string")]
     pub state_dir: Option<String>,
 }
+
+/// Upper bound for `[server] startup_concurrency`: more loads at once than
+/// this multiply the boot's requests to one store and its memory peak
+/// without loading a config any sooner.
+pub const MAX_STARTUP_CONCURRENCY: usize = 64;
 
 /// Upper bound for `[server] render_concurrency`. Each slot runs its render
 /// on Tokio's blocking pool (512 threads by default); more slots than that
@@ -361,6 +378,8 @@ impl ServerConfig {
                 watch_debounce_ms: default_watch_debounce_ms(),
                 trust_proxy_headers: false,
                 render_concurrency: None,
+                startup_concurrency: default_startup_concurrency(),
+                startup_readiness_grace_secs: default_startup_readiness_grace_secs(),
                 state_dir: None,
             },
             collections: Vec::new(),
@@ -1442,6 +1461,14 @@ pub const DEFAULT_METATILE_CACHE_MB: u64 = 1024;
 
 fn default_watch_debounce_ms() -> u64 {
     500
+}
+
+fn default_startup_concurrency() -> usize {
+    4
+}
+
+fn default_startup_readiness_grace_secs() -> u64 {
+    300
 }
 
 /// Shared WMS style set: one default + zero or more named extras.
@@ -5076,6 +5103,14 @@ impl ServerConfig {
                 "[server] state_dir must not be empty; omit it to disable state snapshots".into(),
             ));
         }
+        // Zero would load nothing.
+        let n = self.server.startup_concurrency;
+        if !(1..=MAX_STARTUP_CONCURRENCY).contains(&n) {
+            return Err(crate::error::DataServerError::Config(format!(
+                "[server] startup_concurrency must be between 1 and \
+                 {MAX_STARTUP_CONCURRENCY} (got {n}); omit it for the default of 4"
+            )));
+        }
         // Zero slots would stall every uncached render until its deadline.
         if let Some(n) = self.server.render_concurrency {
             if !(1..=MAX_RENDER_CONCURRENCY).contains(&n) {
@@ -7414,6 +7449,44 @@ description = "A test"
             settings.state_dir_path(std::path::Path::new("config.toml")),
             Some(std::path::PathBuf::from("state"))
         );
+    }
+
+    /// `[server] startup_concurrency` and `startup_readiness_grace_secs`
+    /// (#317): defaults, explicit values, and the concurrency's range.
+    #[test]
+    fn startup_load_settings_default_parse_and_bound() {
+        let tmp = TempDir::new().unwrap();
+        let load = |line: &str| {
+            let toml = format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{line}\n");
+            let path = write_config(tmp.path(), "config.toml", &toml);
+            ServerConfig::from_file(path.to_str().unwrap())
+                .map(|(config, _)| {
+                    (
+                        config.server.startup_concurrency,
+                        config.server.startup_readiness_grace_secs,
+                    )
+                })
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(load(""), Ok((4, 300)));
+        let auto = ServerConfig::default_for_auto().server;
+        assert_eq!(
+            (auto.startup_concurrency, auto.startup_readiness_grace_secs),
+            (4, 300)
+        );
+        assert_eq!(
+            load("startup_concurrency = 1\nstartup_readiness_grace_secs = 0"),
+            Ok((1, 0))
+        );
+        assert_eq!(load("startup_concurrency = 64"), Ok((64, 300)));
+        for value in [0, MAX_STARTUP_CONCURRENCY + 1] {
+            let err = load(&format!("startup_concurrency = {value}")).unwrap_err();
+            assert!(
+                err.contains("startup_concurrency must be between 1 and 64")
+                    && err.contains(&format!("got {value}")),
+                "{err}"
+            );
+        }
     }
 
     #[test]

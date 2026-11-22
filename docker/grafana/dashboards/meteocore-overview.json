@@ -2854,7 +2854,7 @@
         "spec": {
           "id": 2,
           "title": "Collections",
-          "description": "Collections by /health state now. Ready serve normally. Degraded serve with reduced capability: database unreachable, empty catalog, a truncated station list, a broker session down. Failed could not be built; a reload or the background retry may bring them back. Degraded and failed should be 0: /health names the reason and the Warnings & errors log says why.",
+          "description": "Collections by /health state now. Ready serve normally. Degraded serve with reduced capability: database unreachable, empty catalog, a truncated station list, a broker session down. Failed could not be built; a reload or the background retry may bring them back. Loading are configured collections the startup load has not built yet, served once built: 0 a few minutes after a restart. Degraded and failed should be 0: /health names the reason and the Warnings & errors log says why.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -2919,6 +2919,28 @@
                       "spec": {
                         "expr": "sum(collections_failed{job=~\"$job\"})",
                         "legendFormat": "failed",
+                        "range": true,
+                        "instant": false,
+                        "editorMode": "code"
+                      }
+                    }
+                  }
+                },
+                {
+                  "kind": "PanelQuery",
+                  "spec": {
+                    "refId": "D",
+                    "hidden": false,
+                    "query": {
+                      "kind": "DataQuery",
+                      "group": "prometheus",
+                      "version": "v0",
+                      "datasource": {
+                        "name": "${DS_PROMETHEUS}"
+                      },
+                      "spec": {
+                        "expr": "sum(collections_loading{job=~\"$job\"})",
+                        "legendFormat": "loading",
                         "range": true,
                         "instant": false,
                         "editorMode": "code"
@@ -3042,6 +3064,30 @@
                             },
                             {
                               "color": "red",
+                              "value": 1
+                            }
+                          ]
+                        }
+                      }
+                    ]
+                  },
+                  {
+                    "matcher": {
+                      "id": "byName",
+                      "options": "loading"
+                    },
+                    "properties": [
+                      {
+                        "id": "thresholds",
+                        "value": {
+                          "mode": "absolute",
+                          "steps": [
+                            {
+                              "color": "green",
+                              "value": null
+                            },
+                            {
+                              "color": "yellow",
                               "value": 1
                             }
                           ]

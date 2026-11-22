@@ -11,6 +11,7 @@ mod memory_plan;
 mod preview;
 mod robots;
 mod sld;
+mod startup;
 mod watcher;
 
 use std::sync::{Arc, OnceLock, RwLock};
@@ -482,11 +483,7 @@ async fn serve(cli: CliArgs) {
 
     let base_url = config.server.base_url();
     info!("Base URL: {base_url}");
-    // The socket is bound + listening from here, but HTTP is not served
-    // until `axum::serve` below — keep the message explicit so a
-    // log-watching operator isn't misled. (A TCP-only readiness probe
-    // will see the port open early; probe `/health` over HTTP instead.)
-    info!("Socket bound to {addr} — loading collections, not yet serving");
+    info!("Socket bound to {addr}");
 
     // Must precede the first load_collections, which sizes the render slots.
     if let Err(e) = admin::init_render_concurrency(config.server.render_concurrency) {
@@ -533,156 +530,21 @@ async fn serve(cli: CliArgs) {
     // The WCMP2 records WIS2-fed collections learn (#1356): one registry
     // for the process, which every load and engine shares.
     let learned_records = Arc::new(ds_core::discovery::LearnedRecords::default());
+    let style_fingerprint = colormaps::style_config_fingerprint(&config, config_dir.as_deref());
+    // The registries start empty, over the render caches every collection's
+    // load then registers with (#317): the server serves at once, and each
+    // collection joins them when built (`startup`).
     let result = admin::load_collections(
         &style_ctx,
-        &config.collections,
+        &[],
         &config.style_bundles,
         &base_url,
         config.server.trust_proxy_headers,
         &config.discovery(learned_records.clone()),
         render_cache_sizes.clone(),
-        // Startup builds the render caches fresh; reloads reuse them.
         admin::ReusableCaches::default(),
-        // Startup has no live engines to reuse; incremental reloads do (#574).
         admin::EngineReuse::default(),
     );
-
-    let loaded = result
-        .health
-        .iter()
-        .filter(|h| h.status != admin::CollectionStatus::Failed)
-        .count();
-
-    if loaded == 0 {
-        if config.collections.is_empty() {
-            // Nothing was configured to fail — a legitimately empty server
-            // (e.g. the no-config-file boot). Start it: it answers /health and
-            // an empty /collections, and can be populated via reload.
-            tracing::warn!(
-                "Starting with no collections. The server responds to /health and an empty \
-                 /collections; add collections via config + POST /admin/collections/reload."
-            );
-        } else if admin::can_start_failed_radar(&config.collections) {
-            tracing::warn!("Remote radar startup failed; starting with failed health and background retry (30–300 s). Check endpoint/bucket/credentials if failures persist.");
-        } else {
-            tracing::error!(
-                "No collections loaded successfully ({} configured). Refusing to start an empty server.",
-                config.collections.len()
-            );
-            std::process::exit(1);
-        }
-    } else {
-        info!(
-            "Loaded {}/{} collections successfully",
-            loaded,
-            config.collections.len()
-        );
-    }
-
-    // Spawn poll loops on the dedicated background runtime so their blocking
-    // I/O never parks a request-serving worker (#221).
-    for engine in &result.geotiff_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.querydata_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.grib_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.zarr_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.satellite_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.netcdf_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.odim_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    for engine in &result.odim_volume_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    // CAP alert refresh loop — re-reads the feed / directory so new, updated
-    // and expired alerts are picked up without a reload (#442: this block was
-    // missing, so CAP collections served a frozen alert set after a cold boot).
-    for engine in &result.cap_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    // BUFR observation loop — scans the source, prunes expired reports and
-    // rebuilds the station snapshot (blocking ds-storage I/O; background
-    // runtime only).
-    for engine in &result.bufr_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    // PostGIS metadata refresh loop — keeps the location list / extents / the
-    // `locations_window` "currently reporting" set current without a reload.
-    for engine in &result.postgis_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    // Nowcast generation loop — watches the source engine and regenerates
-    // extrapolated frames (blocking source I/O; background runtime only).
-    for engine in &result.nowcast_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    // Station-grid loop — re-reads the latest analysis times for late
-    // observations and computes them ahead (source I/O; background runtime
-    // only).
-    for engine in &result.station_grid_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-    // Period-product loop — reads the source's new and leaving frames into
-    // the rolling windows (blocking source I/O; background runtime only).
-    for engine in &result.period_engines {
-        let poller = engine.clone();
-        poll_runtime().spawn(async move {
-            poller.poll_loop().await;
-        });
-    }
-
-    // Set initial health gauges
-    admin::update_health_gauges(&result.health);
 
     // Build swappable state
     let edr_swap = Arc::new(ArcSwap::from_pointee(result.edr_state));
@@ -792,12 +654,13 @@ async fn serve(cli: CliArgs) {
         accepted_load: RwLock::new(Some(Arc::new(admin::AcceptedLoad::new(
             &config,
             style_ctx,
-            colormaps::style_config_fingerprint(&config, config_dir.as_deref()),
+            style_fingerprint,
             learned_records.clone(),
         )))),
         recovery_shutdown: ds_poll::Shutdown::new(),
         config_path,
-        health: RwLock::new(result.health),
+        // Every configured collection, `loading` until it is built (#317).
+        health: RwLock::new(startup::loading_health(&config.collections)),
         geotiff_engines: RwLock::new(result.geotiff_engines),
         querydata_engines: RwLock::new(result.querydata_engines),
         grib_engines: RwLock::new(result.grib_engines),
@@ -817,10 +680,7 @@ async fn serve(cli: CliArgs) {
         reload_lock: Default::default(),
         learned_records,
         admin_token,
-        style_fingerprint: std::sync::atomic::AtomicU64::new(colormaps::style_config_fingerprint(
-            &config,
-            config_dir.as_deref(),
-        )),
+        style_fingerprint: std::sync::atomic::AtomicU64::new(style_fingerprint),
         // Diff basis + reuse pool for the first incremental reload (#574):
         // the EFFECTIVE startup config (post --collections filter and
         // --auto-collections merge) and the engines built from it.
@@ -834,12 +694,22 @@ async fn serve(cli: CliArgs) {
         engine_handles: RwLock::new(result.engines_by_id),
         wind_handles: RwLock::new(result.wind_by_id),
         delivery_delays: Default::default(),
+        startup: startup::StartupLoad::loading(config.server.startup_readiness_grace_secs),
     });
-
-    // The memory plan (#1306): what every cache and budget holds and why.
+    admin::update_health_gauges(
+        &server_state
+            .health
+            .read()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
+    // The memory plan (#1306) at boot, before any collection is built:
+    // lowering sizes only (#317). Its block is logged once the load settles.
     cache_plan::register_render_caches(&server_state);
-    cache_plan::log(&server_state, cache_plan::Occasion::Boot);
+    memory_plan::lower_at_boot(&server_state);
 
+    // The server's own loops run from boot (#317). The recovery loop and
+    // the governor's re-plan wait for the startup load to settle; the
+    // governor's pressure valve does not.
     let recovery_state = server_state.clone();
     poll_runtime().spawn(async move {
         admin::radar_recovery_loop(recovery_state).await;
@@ -850,8 +720,8 @@ async fn serve(cli: CliArgs) {
     poll_runtime().spawn(async move {
         governor::run(governor_state).await;
     });
-    // Each collection's delivery delay (#1389): its first observation, now
-    // that every engine is loaded, is the baseline.
+    // Each collection's delivery delay (#1389): the first observation of an
+    // engine, at boot or once its collection is published, is its baseline.
     let delay_state = server_state.clone();
     poll_runtime().spawn(async move {
         admin::delivery_delay_loop(delay_state).await;
@@ -859,7 +729,8 @@ async fn serve(cli: CliArgs) {
 
     // Start the config-directory watcher (issues #318, #571) if enabled.
     // Best-effort: a watcher init failure logs and the server runs without
-    // auto-reload.
+    // auto-reload. A change it sees while the startup load runs is applied
+    // once the load settles (#317).
     if watch_collections.is_some() || watch_colormaps.is_some() {
         // Trust-model note: watch-triggered reloads are gated by write access
         // to the watched directories (a local-filesystem control plane), NOT
@@ -892,6 +763,63 @@ async fn serve(cli: CliArgs) {
             tracing::warn!("Failed to start config-directory watcher: {e}");
         }
     }
+
+    // The startup load (#317), behind the HTTP service: each collection is
+    // built on the poll runtime and published once built, under the reload
+    // lock for each publish only. Reloads wait for it to settle
+    // (`StartupLoad::is_loading`); what ran after the load at boot runs then.
+    let configured = config.collections.len();
+    let concurrency = config.server.startup_concurrency;
+    let load_state = server_state.clone();
+    poll_runtime().spawn(async move {
+        let state = load_state;
+        let _settled = state.startup.settles_on_drop();
+        let startup::Settled::Loaded { elapsed } =
+            startup::load(state.clone(), startup::loader(), concurrency).await
+        else {
+            return;
+        };
+        let health = state
+            .health
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let accepted = state
+            .accepted_load
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("boot sets the accepted load");
+        match startup::verdict(accepted.collections(), &health) {
+            startup::Verdict::Serve { loaded } => info!(
+                "All collections loaded in {:.1} s: {loaded}/{configured} successfully",
+                elapsed.as_secs_f64()
+            ),
+            startup::Verdict::Empty => tracing::warn!(
+                "Serving no collections. The server responds to /health and an empty \
+                 /collections; add collections via config + POST /admin/collections/reload."
+            ),
+            startup::Verdict::RetryRadar => tracing::warn!(
+                "Remote radar startup failed; serving with failed health and background retry \
+                 (30–300 s). Check endpoint/bucket/credentials if failures persist."
+            ),
+            startup::Verdict::Exit => {
+                tracing::error!(
+                    "No collections loaded successfully ({configured} configured). Refusing to \
+                     serve an empty server."
+                );
+                std::process::exit(1);
+            }
+        }
+        // The memory plan (#1306) over every collection, applied as its
+        // mode says, under the reload lock as a reload's is.
+        let _plan = state.reload_lock.lock().await;
+        if state.recovery_shutdown.is_shutdown() {
+            return;
+        }
+        cache_plan::register_render_caches(&state);
+        cache_plan::log(&state, cache_plan::Occasion::Boot);
+    });
 
     // The shared OGC API root (#789): Maps, Tiles and Features as building
     // blocks over the per-API services' own state, so reloads reach both
@@ -1006,12 +934,17 @@ async fn serve(cli: CliArgs) {
         let edr = edr_state.load();
         api_common::request_base_url(&edr.base_url, edr.trust_proxy_headers, headers)
     });
+    // A partial catalog is not cached while collections load (#317).
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        server_state.clone(),
+        admin::loading_cache_control,
+    ));
     let app = admin::with_request_layers(app);
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
     let app = NormalizePathLayer::trim_trailing_slash().layer(app);
 
-    info!("Server ready, accepting requests");
+    info!("Serving HTTP on {addr}; {configured} collection(s) load behind it");
 
     axum::serve(
         listener,
@@ -1022,6 +955,8 @@ async fn serve(cli: CliArgs) {
     .expect("Server error");
 
     server_state.recovery_shutdown.shutdown();
+    // Each startup publish holds the lock: a collection still loading
+    // publishes nothing after this.
     let _reload_guard = server_state.reload_lock.lock().await;
     // The engines holding push-fed state (WIS2 CAP and BUFR) flush a state
     // snapshot in `shutdown()`: a blocking encode and save each, under

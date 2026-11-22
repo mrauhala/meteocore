@@ -66,10 +66,106 @@ disk, no TOML needed.
   and each folder; the root itself is never judged. A hidden `.name.geojson`
   would otherwise clash with `name.geojson`'s id and fail the config.
 
+## Startup load (#317, `src/startup.rs`)
+
+The server serves HTTP once its socket binds and its config validates. The
+collections load behind it, each published to the live registries the
+moment it is built, so a slow source holds only its own collection.
+
+- `main` builds the registries empty (`load_collections(&[], ..)`, which
+  builds the render caches), lists every configured collection `loading` in
+  `ServerState::health` (`startup::loading_health`), starts the server's
+  own loops and the watcher, and spawns `startup::load` on `poll_runtime`.
+- Each configured collection is one task on `poll_runtime` that runs
+  `admin::load_for_startup`, a `load_collections` of that collection alone
+  over the live render caches, inside `block_in_place`: off the request
+  runtime (Critical Rules 6 and 7), as a reload, without holding a poll
+  worker while it blocks. At most `[server] startup_concurrency` (default
+  4, 1..=64) build at once; the module doc says why.
+- A derived collection waits for the collections of lower load passes its
+  sources name (`startup::dependencies`, over `admin::load_pass`: base,
+  nowcast, station grid, period), by id or, for a GRIB level view or a
+  radar site, by the `{id}-` prefix of the config that registers it. Its
+  load reads their engines from `admin::BuiltSources` through
+  `LoadScope::built`, the map and Features engines of non-derived
+  collections only, as the passes of one load see them, and checks names
+  against the whole config (`LoadScope::all`). A failed source fails it with
+  the error one load gives. PostGIS collections share one `PoolRegistry`
+  across the loads (`LoadScope::pools`), as within one load.
+- A polar-volume source and a collection named like one of its radar sites
+  (`{base}-{nod}`) load in the order one load registers them, a higher pass
+  after a lower, else the later declared after the earlier, so the same one
+  keeps the id whichever load ends first. The other's id is dropped and its
+  entry fails: a site "derived id collides …", a collection "id collides
+  with radar site '{nod}' of network '{base}', registered first"
+  (`admin::id_taken_error`). One load decides it the same way
+  (`id_taken!` at the top of each pass's collection), so a reload of the
+  boot config, a watched change or a recovery pass among them, keeps what
+  the boot decided. A load whose every id collided publishes no engine or
+  poll loop, and nothing to `BuiltSources`. Any `{network}-{alphanumeric}`
+  id counts as a possible site, so a collection named so after a
+  polar-volume network (`radar-composite` after `radar`) waits for the
+  network's bootstrap: name site-like collections only `<network>-<site>`,
+  and others so that no network's id and a dash begin them.
+- `admin::publish_load` adds a load's engines to the engine lists and spawns
+  their poll loops, then swaps each registry once with `rcu` (the MCP state
+  follows Features), then replaces the collection's `loading` entry with its
+  health entries, in place. A collection is never listed ready before every
+  API serves it; `effective_health`'s live overrides leave `loading`
+  entries alone. Each publish holds `reload_lock`, briefly; between them
+  the load holds nothing.
+- A load that panics fails its collection; a load that ends without a
+  result leaves none `loading`.
+- Reloads wait for the load (`StartupLoad::is_loading`, true until `main`
+  has run the steps after it): the admin endpoint answers 409 at once, the
+  `collections_dir` watcher, running from boot, waits for it to settle and
+  then applies every change it saw once (`do_reload` diffs against the boot
+  config, reusing what the load built), and the recovery loop skips its
+  passes (each registers the whole accepted config again).
+- The memory plan: each publish fits it again without applying it
+  (`memory_plan::refit_during_load`), so the pressure valve finds a grant
+  and floor for every cache registered so far. At boot, before any
+  collection is built,
+  `memory_plan::lower_at_boot` fits it over what is registered then and,
+  in `auto`, applies only the sizes it lowers (every cache is empty, so a
+  shrink keeps nothing; a partial set's larger grant is never applied). The
+  governor runs from boot; its pressure valve steps throughout, its
+  re-plan tick skips until the load settles: a plan fitted over the
+  collections built so far would give their caches the shares of those
+  still loading, which the planner keeps once requests warm them. Once the
+  load settles, `main` runs the empty-start guard (`startup::verdict`, exit
+  1 when every configured collection failed, except an all-remote-radar
+  config), then the boot plan over every collection under `reload_lock`
+  (`cache_plan::log(Boot)`, its INFO block). The delivery-delay loop starts
+  at boot: an engine first seen later is a baseline.
+- `/health?loaded`, the chart's readiness probe, is 503 while collections
+  load until `[server] startup_readiness_grace_secs` (default 300, 0: none)
+  after the load started (`StartupLoad::grace_elapsed`) with some
+  collection ready or degraded: a pod whose first loads are all slow, or
+  failed, serves only 404s and takes no traffic. Its `loaded` member says
+  which: `settled`, `N still loading`, `N loading, none ready`, `grace
+  elapsed, N still loading`.
+- A load that never ends has no remedy short of a restart: reloads keep
+  answering 409, and a watched change, the recovery loop and the full plan
+  wait. The server serves what it built meanwhile, and `CollectionsLoading`
+  fires after 15 minutes.
+- While collections load, `admin::loading_cache_control` turns a 200 or
+  304 with the short metadata policy or none into `no-cache`: catalogs
+  grow during the load. Data policies are kept.
+- Shutdown during the load: `startup::load` returns at the signal. A load
+  still running cannot be stopped; once `main` holds `reload_lock` for good
+  it publishes nothing.
+- A collection still loading is unknown to every API (404, absent from
+  `/collections`, no WMS layer).
+- `startup_tests.rs` gates chosen loads with a test hook (`Loader`) over
+  real fixture loads and compares the outcomes with one load of the same
+  config.
+
 ## Reload & the collections_dir watcher
 
 - `POST /admin/collections/reload` re-reads config and atomically swaps
-  engines. Shared core: `admin::do_reload`.
+  engines. Shared core: `admin::do_reload`. It answers 409 while the startup
+  load runs.
 - **Reloads never overlap (#1402).** Whoever runs one holds
   `ServerState::reload_lock` until it ends: the handler (409 when busy), the
   watcher (waits), the recovery loop (skips a cycle); shutdown takes it for
@@ -347,7 +443,9 @@ see every answer goes outside the panic layer.
   call `admin::refresh_metrics` first: a process-wide cache exists only
   once read. The snapshot drops collection- and source-scoped entries whose
   id is not in `last_collections` (a replaced engine a request still holds).
-- `register_render_caches` runs after every accepted load (`main`,
+- `register_render_caches` runs after every accepted load (`main`, at boot
+  before `memory_plan::lower_at_boot` and once the startup load settles,
+  when it logs the boot block,
   `apply_load`, the test `build_state`). Per-collection caches register in
   `load_collections` right after their engine is pushed, reused engines
   too, except a reused GRIB or GeoTIFF engine, which registers in its
@@ -633,8 +731,19 @@ see every answer goes outside the panic layer.
   ring has no `*_ghost_hits_total` series. A new churn family goes in
   `CHURN_PARTS`/`CHURN_FAMILIES` in `scripts/check_grafana_dashboard.py`.
 
-## Health: data age and poll age (#1007)
+## Health: status, data age and poll age (#1007)
 
+- `/health` lists every configured collection from the first request:
+  `loading` until the startup load builds it (#317), then `ready`,
+  `degraded` or `failed`, and the overall `status` is `loading` while any
+  is. It answers 200 while collections load, so a container health check
+  (`curl -f /health`) passes during a long boot, and 503 only once none is
+  loading and every collection failed. `/health?loaded` (or `loaded=true`)
+  also answers 503 while collections load, within the readiness grace
+  (`[server] startup_readiness_grace_secs`, above): the readiness check.
+  Other parameters are ignored, as they always were. `collections_loading`
+  counts the `loading` entries; `CollectionsLoading` alerts when it stays
+  above 0 for 15 minutes, and `collections_failed` never counts them.
 - `/health` `data_age_secs` and the `/metrics` gauge
   `collection_data_age_seconds{collection}` are one number from one source,
   `admin::collection_data_ages`: now minus the newest data the collection
@@ -739,13 +848,13 @@ see every answer goes outside the panic layer.
 
 ## Operational notes
 
-- A brief "no images" period right after a deploy is the expected readiness
-  blip: the port binds before collections finish loading (#247). Not a code
-  bug.
+- Right after a deploy a collection still loading answers 404, and
+  `/health` lists it `loading` (#317): each is served once built. Not a code
+  bug (#247).
 - Engine poll loops are spawned on `poll_runtime()` at boot (`main.rs`) and
   on reload (`admin.rs`), with `shutdown()` called on the old engines at
   reload. When adding an engine with a poll loop, wire ALL THREE places:
-  the boot spawn block in `main.rs`, `rotate_poll_loops!` in `admin.rs`,
+  `publish_engines!` in `admin::publish_load` (boot), `rotate_poll_loops!` in `admin.rs`,
   and the graceful-shutdown lists at the end of `main` (`signal_shutdown!`, or `flush_state!` for an engine whose `shutdown()` flushes state) (bug #442 was a
   missing boot-path spawn for `cap_engines`; the shutdown block had also
   silently skipped cap, postgis and nowcast). An engine whose push-fed
@@ -906,7 +1015,8 @@ Wiring:
 
 Remote COMP/PVOL sources whose startup scan fails keep `failed` health (503
 when every collection failed) but no longer require a manual reload to recover.
-A serialized background task retries after 30 seconds, backing off to five
+A serialized background task, whose passes wait for the startup load to
+settle, retries after 30 seconds, backing off to five
 minutes while failures persist. PVOL sites a poll adds are registered by the
 same loop, local or remote (PVOL site registration below). Rebuilding
 registration also retries failed dependent nowcasts. Healthy engines, static
@@ -1047,10 +1157,15 @@ PR:
 - **Required keys:** `[server] host` and `port`, and a collection's `title`
   and `description`. The chart's default config and sample collection
   carry them.
-- **Health:** the startup and readiness probes read `/health` (503 only
-  when every collection failed; 200 with no collections), and the startup
-  probe allows 10 minutes for the load between binding the port and
-  serving. Liveness is a TCP check.
+- **Health:** the startup probe reads `/health`, which answers from boot
+  (#317): 200 while collections load, 503 only once loading settled and
+  every collection failed, 200 with no collections. It passes within
+  seconds of the bind, so a load longer than its 10 minutes never restarts
+  the pod. The readiness probe reads `/health?loaded`: 503 while
+  collections load, until `[server] startup_readiness_grace_secs` (300 s)
+  after the load started with some collection served, so a rolling update
+  keeps the old pod serving.
+  Liveness is a TCP check.
 - **Metrics:** `/metrics` on the main port, for the ServiceMonitor.
 - **Shutdown:** the SIGTERM flush of `state_dir` snapshots must finish
   within `terminationGracePeriodSeconds`, 60 s.
