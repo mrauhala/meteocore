@@ -11197,7 +11197,7 @@
         "spec": {
           "id": 47,
           "title": "Remote requests per host",
-          "description": "Requests to each rate-limited remote host (today the remote NetCDF sources) and to each S3 bucket (host/bucket, limit 64 until it throttles): in flight, waiting for a permit, and the limit (dashed). NetCDF polls take at most 2 permits. A queue that stays up means requests wait on the host or bucket, and that wait counts against their deadline.",
+          "description": "Requests to each rate-limited remote host (today the remote NetCDF sources) and to each S3 bucket (host/bucket; its limit starts at 16, grows to 64 in three minutes, and is cut while the bucket throttles): in flight, waiting for a permit, and the limit (dashed). NetCDF polls take at most 2 permits. A queue that stays up means requests wait on the host or bucket, and that wait counts against their deadline.",
           "links": [],
           "data": {
             "kind": "QueryGroup",
@@ -18307,7 +18307,7 @@
         "spec": {
           "id": 119,
           "title": "Throttling answers per host",
-          "description": "Throttling answers per second from each rate-limited remote host (today the remote NetCDF sources: 429 Too Many Requests) and each S3 bucket (host/bucket: 503 SlowDown), to every store and collection on it. Each one spaces the host's or bucket's requests apart and can halve its request limit (the panel above), and the request it refused is retried after 2 s. Zero is normal. A rate that stays up means the source is refusing work: NetCDF polls open a few files each and catch up over several, GRIB scans stop reading indexes and pre-warms wait until it is quiet, and requests wait their turn against their deadline.",
+          "description": "Throttling answers per second from each rate-limited remote host (today the remote NetCDF sources: 429 Too Many Requests) and each S3 bucket (host/bucket: 503 SlowDown), to every store and collection on it. Each one spaces the host's requests apart and can halve its request limit (the panel above), and the request it refused is retried 2 s later; a bucket backs off from its third SlowDown in 10 s, a stray one is only counted. Zero is normal. A rate that stays up means the source is refusing work: NetCDF polls open a few files each and catch up over several, GRIB scans stop reading indexes and pre-warms wait until it is quiet, and requests wait their turn against their deadline.",
           "links": [],
           "data": {
             "kind": "QueryGroup",

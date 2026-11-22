@@ -695,12 +695,13 @@ pub fn quick_backoff(url: &str) -> QuickBackoff {
 
 /// [`quick_backoff`] of the S3 bucket `bucket` at `endpoint` (#1530), as
 /// its `503 SlowDown`s back it off: its pace from 2.5 ms up to 20 ms, a
-/// refused request retried after 20 ms. Unlike an HTTP host's, a bucket's
-/// back-off lives for the process, so the stores may be built before or
-/// after.
+/// refused request retried after 20 ms. The bucket lives while the guard
+/// or a store on it does: build the stores while the guard lives, or call
+/// it after building one.
 pub fn quick_bucket_backoff(endpoint: &str, bucket: &str) -> QuickBackoff {
     let label = crate::traced::s3_label(Some(endpoint), None, bucket);
-    let host = crate::bucket::bucket(&label, bucket).throttle;
+    let path = crate::bucket::endpoint_path(Some(endpoint));
+    let host = crate::bucket::bucket(&label, bucket, &path).throttle;
     quicken(&host);
     QuickBackoff(host)
 }
@@ -729,10 +730,10 @@ impl ThrottledBucket {
     /// A bucket's back-off, labelled `source` (`host[:port]/bucket`), its
     /// own whatever other test made one of that name.
     pub fn new(source: &str) -> Self {
-        let bucket = source.rsplit('/').next().unwrap_or(source).to_string();
+        let bucket = source.rsplit('/').next().unwrap_or(source);
         Self(Arc::new(crate::throttle::HostThrottle::new(
             source.to_string(),
-            crate::throttle::Kind::Bucket(bucket),
+            crate::throttle::Kind::bucket(bucket, ""),
         )))
     }
 
@@ -741,6 +742,7 @@ impl ThrottledBucket {
         let source = crate::traced::Labels {
             store: self.0.host().into(),
             collection: None,
+            background: false,
         };
         crate::DataStore::layered(
             inner,
@@ -750,11 +752,14 @@ impl ThrottledBucket {
         )
     }
 
-    /// The bucket answered `503 SlowDown`: it backs off, as through a
-    /// store's transport.
+    /// The bucket throttles: it answers `503 SlowDown` as often as it
+    /// takes a bucket to back off (three times), as through a store's
+    /// transport, and backs off.
     pub fn slow_down(&self) {
-        self.0
-            .throttled(reqwest::StatusCode::SERVICE_UNAVAILABLE, None);
+        for request in 0..crate::throttle::BUCKET_TRIGGER as u64 {
+            self.0
+                .throttled(reqwest::StatusCode::SERVICE_UNAVAILABLE, None, request);
+        }
     }
 
     /// Its back-off is over.

@@ -289,3 +289,211 @@ async fn a_bucket_refusing_index_reads_stops_the_scan_until_the_next_poll() {
         );
     }
 }
+
+/// An ECMWF JSON index of the run at `hour` on 2026-04-05, step `step`.
+fn run_index(hour: u32, step: u32) -> String {
+    serde_json::json!({
+        "date": "20260405", "time": format!("{hour:02}00"), "step": step.to_string(),
+        "param": "TMP", "levtype": "sfc", "_offset": 0, "_length": 183
+    })
+    .to_string()
+}
+
+/// A remote source of runs `%Y%m%d/{run}z/` at 00 and 06 UTC, in a bucket
+/// whose back-off a test drives: the 06z run's `newest` indexes and the
+/// 00z run's `older`, `f000.idx` on. Its scans run at 07 UTC.
+async fn remote_runs(
+    newest: u32,
+    older: u32,
+) -> (
+    test_support::TestSource,
+    GribEngine,
+    Arc<ScanStore>,
+    ds_storage::test_util::ThrottledBucket,
+) {
+    let source = test_support::TestSource::new();
+    let mut config = source.config();
+    config.index_format = Some("ecmwf-json".into());
+    let mut engine = GribEngine::new("remote-scan", &config).unwrap();
+    let bucket = ds_storage::test_util::ThrottledBucket::new("s3.test/forecasts");
+    let store = Arc::new(ScanStore {
+        bucket: Some(bucket.clone()),
+        ..Default::default()
+    });
+    for (hour, count) in [(6, newest), (0, older)] {
+        for step in 0..count {
+            store
+                .inner
+                .put(
+                    &Path::from(format!("20260405/{hour:02}z/f{step:03}.idx")),
+                    run_index(hour, step).into(),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let inner = Arc::get_mut(&mut engine.source).unwrap();
+    inner.scan_mode = ScanMode::Remote {
+        prefix_pattern: "%Y%m%d/{run}z/".into(),
+    };
+    inner.config.run_hours = Some(vec![0, 6]);
+    let reads: Arc<dyn ds_storage::object_store::ObjectStore> = store.clone();
+    inner.store = bucket.store(reads);
+    (source, engine, store, bucket)
+}
+
+fn scan_at_seven(engine: &GribEngine) {
+    engine
+        .scan_at("2026-04-05T07:00:00Z".parse().unwrap())
+        .unwrap();
+}
+
+/// The indexes `store` has been asked for, sorted.
+fn attempted(store: &ScanStore) -> Vec<String> {
+    store
+        .reads
+        .lock()
+        .unwrap()
+        .attempts
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// A scan reads the newest run first, each run in step order (#1530): a
+/// bucket refusing its first chunk leaves the older run unread, not the
+/// newest. The run with indexes left unread is not settled, so the next
+/// poll lists it and reads them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scan_reads_the_newest_run_first_and_a_refused_one_leaves_the_older() {
+    let (_source, engine, store, bucket) = remote_runs(3, 13).await;
+    store
+        .reads
+        .lock()
+        .unwrap()
+        .throttled
+        .insert("20260405/06z/f001.idx".into());
+    scan_at_seven(&engine);
+    let mut first_chunk: Vec<String> = (0..3)
+        .map(|step| format!("20260405/06z/f{step:03}.idx"))
+        .chain((0..5).map(|step| format!("20260405/00z/f{step:03}.idx")))
+        .collect();
+    first_chunk.sort();
+    assert_eq!(
+        attempted(&store),
+        first_chunk,
+        "the newest run's chunk only"
+    );
+    let known = engine.source.known_indexes.lock().unwrap().clone();
+    assert!(known.contains("20260405/06z/f000.idx"));
+    assert!(known.contains("20260405/06z/f002.idx"));
+    assert_eq!(known.len(), 7);
+    let settled = engine.source.settled_prefixes.lock().unwrap().clone();
+    assert!(!settled.contains("20260405/00z"), "{settled:?}");
+
+    bucket.quiet();
+    store.reads.lock().unwrap().throttled.clear();
+    scan_at_seven(&engine);
+    assert_eq!(engine.source.known_indexes.lock().unwrap().len(), 16);
+    let settled = engine.source.settled_prefixes.lock().unwrap().clone();
+    assert!(settled.contains("20260405/00z"), "{settled:?}");
+    let attempts = store.reads.lock().unwrap().attempts.clone();
+    assert_eq!(attempts["20260405/06z/f001.idx"], 2);
+    assert_eq!(attempts["20260405/00z/f012.idx"], 1);
+}
+
+/// The failed reads of the chunk a refusing bucket stopped the scan at are
+/// unread too (#1530): with that chunk the last, their run is not settled
+/// and the next poll reads them, not the hourly re-list.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_refused_chunks_failed_reads_leave_their_run_unsettled() {
+    let (_source, engine, store, bucket) = remote_runs(3, 13).await;
+    store
+        .reads
+        .lock()
+        .unwrap()
+        .throttled
+        .insert("20260405/00z/f009.idx".into());
+    scan_at_seven(&engine);
+    assert_eq!(
+        attempted(&store).len(),
+        16,
+        "the refused chunk was the last"
+    );
+    assert_eq!(engine.source.known_indexes.lock().unwrap().len(), 15);
+    let settled = engine.source.settled_prefixes.lock().unwrap().clone();
+    assert!(!settled.contains("20260405/00z"), "{settled:?}");
+
+    bucket.quiet();
+    store.reads.lock().unwrap().throttled.clear();
+    scan_at_seven(&engine);
+    assert_eq!(
+        store.reads.lock().unwrap().attempts["20260405/00z/f009.idx"],
+        2
+    );
+    assert_eq!(engine.source.known_indexes.lock().unwrap().len(), 16);
+    let settled = engine.source.settled_prefixes.lock().unwrap().clone();
+    assert!(settled.contains("20260405/00z"), "{settled:?}");
+}
+
+/// A failed read while the bucket does not back off, another collection's
+/// stray `SlowDown` counted meanwhile included, stops nothing; a read that
+/// fails while it backs off stops the scan whatever made it back off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn only_a_read_failing_while_the_bucket_backs_off_stops_the_scan() {
+    let (_source, engine, store, bucket) = remote_runs(3, 13).await;
+    store
+        .reads
+        .lock()
+        .unwrap()
+        .fail_once
+        .insert("20260405/06z/f001.idx".into());
+    scan_at_seven(&engine);
+    assert_eq!(
+        attempted(&store).len(),
+        16,
+        "a transient failure stops nothing"
+    );
+    assert_eq!(engine.source.known_indexes.lock().unwrap().len(), 15);
+
+    let (_source, engine, store, bucket_b) = remote_runs(3, 13).await;
+    drop(bucket);
+    bucket_b.slow_down();
+    store
+        .reads
+        .lock()
+        .unwrap()
+        .fail_once
+        .insert("20260405/06z/f001.idx".into());
+    scan_at_seven(&engine);
+    assert_eq!(
+        attempted(&store).len(),
+        8,
+        "a failure while it backs off stops it"
+    );
+}
+
+/// Within a run, indexes are read in step order, numbers as numbers.
+#[test]
+fn natural_order_compares_steps_as_numbers() {
+    let mut names = vec![
+        "20261122000000-102h-oper-fc.index",
+        "20261122000000-12h-oper-fc.index",
+        "20261122000000-6h-oper-fc.index",
+        "20261122000000-0h-oper-fc.index",
+        "20261122000000-06h-oper-fc.index",
+        "20261122000000-9h-enfo-ef.index",
+    ];
+    names.sort_by(|a, b| natural_order(a, b));
+    assert_eq!(
+        names,
+        [
+            "20261122000000-0h-oper-fc.index",
+            "20261122000000-06h-oper-fc.index",
+            "20261122000000-6h-oper-fc.index",
+            "20261122000000-9h-enfo-ef.index",
+            "20261122000000-12h-oper-fc.index",
+            "20261122000000-102h-oper-fc.index",
+        ]
+    );
+}

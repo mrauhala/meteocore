@@ -139,11 +139,12 @@ mod tests {
             object.path = "/bucket/object".into();
             object.status = status;
         }
+        let store = crate::s3_store_from_parts(&server.url, "bucket", QUICK_S3_RETRY).unwrap();
+        // The store holds the bucket, and so its timing.
         drop(crate::test_util::quick_bucket_backoff(
             &server.url,
             "bucket",
         ));
-        let store = crate::s3_store_from_parts(&server.url, "bucket", QUICK_S3_RETRY).unwrap();
         (server, store)
     }
 

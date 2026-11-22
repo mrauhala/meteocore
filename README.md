@@ -1547,7 +1547,7 @@ GRIB2 files from NWP models. The engine discovers data via index sidecar files, 
 - **Data source:** S3/HTTP remote (default) or a local directory (`data_path`).
 
 **Data access pattern:**
-1. Poll S3 prefix (or local directory) for index files (lightweight, ~35 KB each); download new sidecars in batches of up to eight concurrent reads, within the bucket's request limit, which its `503 SlowDown`s cut. Once a batch's read fails while the bucket throttles, the poll reads no more indexes: the collection keeps what it has and the next poll reads the rest (#1530)
+1. Poll S3 prefix (or local directory) for index files (lightweight, ~35 KB each); download new sidecars in batches of up to eight concurrent reads, the newest run's first and each run's in step order, within the bucket's request limit, which starts at 16 and is cut by its `503 SlowDown`s. Once a read of a batch fails while the bucket backs off, the poll reads no more indexes: the collection keeps what it has and the next poll reads the rest (#1530)
 2. Parse index → build catalog: `(reference_time, step) → (file_url, message_offsets)`
 3. On query: byte-range read for the specific GRIB message (~500 KB per surface field)
 4. Decode message → regular lat/lon grid → serve via EdrEngine/MapEngine

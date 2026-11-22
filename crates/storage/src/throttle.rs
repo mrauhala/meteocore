@@ -19,14 +19,17 @@
 //!   [`PACE_FLOOR`] and doubles, at most once per [`CUT_WINDOW`], up to
 //!   [`PACE_CAP`]; each [`QUIET_INTERVAL`] without a 429 halves it, and
 //!   below the floor it is off. A host that never answered 429 has none,
-//!   and its requests wait for nothing.
+//!   and its requests wait for nothing. Turns go in the order the requests
+//!   asked for them, and a turn is taken when it comes, never booked
+//!   ahead, so a request dropped at its deadline holds none (#1530).
 //! - **The retry**: a request refused without `Retry-After` is retried
-//!   after [`RETRY_DELAY`], not object_store's 0.1 s; its request permit
-//!   is held meanwhile.
+//!   [`RETRY_DELAY`] after the refusal, not object_store's 0.1 s: its retry
+//!   waits for it, holding the request permit, and a last attempt fails at
+//!   once.
 //! - **The adaptive limit** of a store [`crate::build_http_store_limited`]
 //!   built ([`AdaptiveLimit`]): it halves, never below 1, at most once per
-//!   [`CUT_WINDOW`], and grows by 1 for each [`QUIET_INTERVAL`] without a
-//!   429, back to the configured limit.
+//!   [`CUT_WINDOW`], and grows by an eighth of the configured limit, at
+//!   least 1, for each [`QUIET_INTERVAL`] without a 429, back to it.
 //!
 //! [`throttled_answers`] counts each host's 429s, for its callers and
 //! `/metrics`.
@@ -36,9 +39,11 @@
 //! every prefix, was refused for 40 minutes while HEADs and LISTs were
 //! answered (#1530). So every S3 store this crate builds has a throttle
 //! per bucket (`bucket.rs`), [`Kind::Bucket`], shared by every store on
-//! it: the requests that name the bucket go through it, and a 503 or a
-//! 429 backs it off exactly as a 429 backs off an HTTP host. Requests to
-//! another host, a credential endpoint, pass by.
+//! it: the requests that name the bucket go through it, and once the
+//! bucket throttles, [`BUCKET_TRIGGER`] 503s or 429s within
+//! [`BUCKET_TRIGGER_WINDOW`], it is backed off exactly as a 429 backs off
+//! an HTTP host; a stray `SlowDown` is only counted. Requests to another
+//! host, a credential endpoint, pass by.
 
 mod limit;
 #[cfg(test)]
@@ -46,7 +51,7 @@ mod tests;
 
 pub(crate) use limit::{AdaptiveLimit, Limited};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime};
@@ -54,6 +59,7 @@ use std::time::{Duration, SystemTime};
 use object_store::client::{HttpError, HttpRequest, HttpResponse, HttpService};
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::StatusCode;
+use tokio::sync::Notify;
 use tokio::time::Instant;
 
 /// The longest a `Retry-After` stops new requests to a host. A server may
@@ -84,12 +90,44 @@ pub(crate) const PACE_FLOOR: Duration = Duration::from_millis(250);
 /// two, seconds, inside a request's deadline.
 pub(crate) const PACE_CAP: Duration = Duration::from_secs(2);
 
-/// How long a request refused with a 429 without `Retry-After` waits
-/// before object_store or the document layer retries it, in place of
-/// their 0.1 s. Past [`CUT_WINDOW`], so the retry goes out under the cut
-/// limit and the raised pace, not in the burst that was refused; three
-/// attempts then span at least 4 s, past a per-second limiter's window.
+/// How long after a request was refused with a 429 without `Retry-After`
+/// its retry, from object_store or the document layer, is sent, where
+/// their own back-off is 0.1 s. Past [`CUT_WINDOW`], so the retry goes out
+/// under the cut limit and the raised pace, not in the burst that was
+/// refused; three attempts then span at least 4 s, past a per-second
+/// limiter's window. The retry waits for it, not the refused answer, so
+/// the last attempt fails at once.
 pub(crate) const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// An S3 bucket backs off at its `BUCKET_TRIGGER`th throttling answer
+/// within [`BUCKET_TRIGGER_WINDOW`] (#1530). S3 answers a stray `SlowDown`
+/// under ordinary load, about one in ten minutes in production, which
+/// object_store's own 0.5 s retry rides out: backing off for it would hold
+/// the bucket's every read, a radar animation's included, for 30 s. Three
+/// within 10 s is a bucket that throttles: one GET refused at its first
+/// three attempts, or several refused together. An HTTP host's 429 says so
+/// at once.
+pub(crate) const BUCKET_TRIGGER: usize = 3;
+
+/// See [`BUCKET_TRIGGER`].
+pub(crate) const BUCKET_TRIGGER_WINDOW: Duration = Duration::from_secs(10);
+
+tokio::task_local! {
+    /// Whether the operation in progress is background work, which no
+    /// request waits on: a read of a store
+    /// [`crate::DataStore::for_background`] made, set around each of its
+    /// operations by its `storage` span's layer (`traced.rs`). Such reads
+    /// hold at most a share of a host's limit ([`AdaptiveLimit`]); unset,
+    /// a read is one a request may wait on.
+    pub(crate) static BACKGROUND: bool;
+}
+
+/// Whether the operation in progress is background work ([`BACKGROUND`]).
+pub(crate) fn background() -> bool {
+    BACKGROUND
+        .try_with(|background| *background)
+        .unwrap_or(false)
+}
 
 /// At most one WARN per host per this long, however often it throttles.
 const WARN_INTERVAL: Duration = Duration::from_secs(60);
@@ -114,28 +152,38 @@ impl Timing {
 /// What a throttle governs, and which answers back it off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Kind {
-    /// An HTTP host: every request to it, backed off by a 429.
+    /// An HTTP host: every request to it, backed off by its first 429.
     Http,
-    /// The S3 bucket of this name (#1530): the requests naming it, by
-    /// path (`/bucket/key`) or host (`bucket.s3.…`), backed off by a 503,
-    /// S3's `SlowDown`, or a 429.
-    Bucket(String),
+    /// The S3 bucket `name` (#1530): the requests naming it, by path
+    /// (`path`, the endpoint's own path and `/name`, as `/forecasts` or
+    /// `/s3/forecasts`) or by host (`name.s3.…`), backed off by its
+    /// [`BUCKET_TRIGGER`]th 503, S3's `SlowDown`, or 429 in
+    /// [`BUCKET_TRIGGER_WINDOW`].
+    Bucket { name: String, path: String },
 }
 
 impl Kind {
+    /// The bucket `name` at an endpoint whose URL path is `endpoint_path`
+    /// (empty, or `/s3` for `https://minio.example/s3`).
+    pub(crate) fn bucket(name: &str, endpoint_path: &str) -> Self {
+        Kind::Bucket {
+            name: name.to_string(),
+            path: format!("{}/{name}", endpoint_path.trim_end_matches('/')),
+        }
+    }
+
     /// Whether a request to `uri` goes through the throttle.
     fn governs(&self, uri: &http::Uri) -> bool {
-        let Kind::Bucket(bucket) = self else {
+        let Kind::Bucket { name, path } = self else {
             return true;
         };
         let by_path = uri
             .path()
-            .strip_prefix('/')
-            .and_then(|path| path.strip_prefix(bucket.as_str()))
+            .strip_prefix(path.as_str())
             .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
         let by_host = uri
             .host()
-            .and_then(|host| host.strip_prefix(bucket.as_str()))
+            .and_then(|host| host.strip_prefix(name.as_str()))
             .is_some_and(|rest| rest.starts_with('.'));
         by_path || by_host
     }
@@ -143,16 +191,32 @@ impl Kind {
     /// Whether an answer with `status` asks for fewer requests.
     pub(crate) fn refuses(&self, status: StatusCode) -> bool {
         status == StatusCode::TOO_MANY_REQUESTS
-            || (matches!(self, Kind::Bucket(_)) && status == StatusCode::SERVICE_UNAVAILABLE)
+            || (matches!(self, Kind::Bucket { .. }) && status == StatusCode::SERVICE_UNAVAILABLE)
     }
 
     /// The throttling answer, as the quiet-time log lines name it.
     pub(crate) fn quiet_name(&self) -> &'static str {
         match self {
             Kind::Http => "429",
-            Kind::Bucket(_) => "SlowDown",
+            Kind::Bucket { .. } => "SlowDown",
         }
     }
+}
+
+/// The identity of a request across its attempts: its method, URI and
+/// range. object_store and the document layer resend a refused request
+/// unchanged, so its retry has the refused attempt's.
+fn request_key(request: &HttpRequest) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    request.method().hash(&mut hasher);
+    request.uri().hash(&mut hasher);
+    request
+        .headers()
+        .get(http::header::RANGE)
+        .map(|range| range.as_bytes())
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 /// The answer `status` as the WARN names it: S3's 503 is its `SlowDown`.
@@ -177,6 +241,9 @@ pub(crate) struct HostThrottle {
     /// The throttling answers the host has given: 429s, and an S3
     /// bucket's 503s.
     answers: AtomicU64,
+    /// Told when the first waiter for a turn under the pace may have
+    /// changed: one took its turn or gave up.
+    turns: Notify,
 }
 
 #[derive(Debug)]
@@ -200,6 +267,17 @@ struct HostState {
     limits: Vec<Arc<AdaptiveLimit>>,
     /// When the last WARN was logged.
     warned_at: Option<Instant>,
+    /// A bucket's throttling answers within [`BUCKET_TRIGGER_WINDOW`], at
+    /// most [`BUCKET_TRIGGER`] of them.
+    recent: VecDeque<Instant>,
+    /// The requests refused without `Retry-After` whose retry is still to
+    /// wait its retry delay, by [`request_key`], and when.
+    refused: HashMap<u64, Instant>,
+    /// The tickets of the requests waiting for a turn under the pace, in
+    /// the order they asked: the first takes the next turn.
+    waiting: BTreeSet<u64>,
+    /// The next ticket.
+    next_ticket: u64,
 }
 
 impl HostThrottle {
@@ -217,8 +295,13 @@ impl HostThrottle {
                 timing: Timing::DEFAULT,
                 limits: Vec::new(),
                 warned_at: None,
+                recent: VecDeque::new(),
+                refused: HashMap::new(),
+                waiting: BTreeSet::new(),
+                next_ticket: 0,
             }),
             answers: AtomicU64::new(0),
+            turns: Notify::new(),
         }
     }
 
@@ -253,6 +336,8 @@ impl HostThrottle {
         state.next_at = None;
         state.paced_at = None;
         state.paused_until = None;
+        state.recent.clear();
+        state.refused.clear();
     }
 
     /// The pace now: zero while the host is not throttling.
@@ -278,34 +363,73 @@ impl HostThrottle {
         self.state().limits.push(limit);
     }
 
-    /// Wait for the request's turn under the pace, if the host has one,
-    /// and until the host's `Retry-After` has passed: at once when it has
-    /// neither. A later 429 can push the `Retry-After` out while this waits.
-    pub(crate) async fn wait(&self) {
-        let turn = {
+    /// Wait to send `request` ([`request_key`]): until its retry delay
+    /// has passed if it is the retry of a refused one, until the host's
+    /// `Retry-After` has passed, and then for its turn under the pace, if
+    /// the host has one: at once when there is none of them. A later 429
+    /// can push the `Retry-After` out while this waits.
+    ///
+    /// Turns go first come, first served: a waiter takes a ticket and the
+    /// first ticket takes the next turn when it comes, never booked ahead,
+    /// so a waiter dropped at its deadline holds none and the next takes
+    /// it. Only a request holding one of a limited host's permits waits
+    /// here, so the queue is no longer than the limit.
+    pub(crate) async fn wait(&self, request: u64) {
+        /// What the waiter does next.
+        enum Step {
+            Send,
+            Sleep(Instant),
+            Wait,
+        }
+        let retry_at = {
             let mut state = self.state();
-            let now = Instant::now();
-            self.decay(&mut state, now);
-            if state.pace.is_zero() {
-                None
-            } else {
-                let turn = [Some(now), state.next_at, state.paused_until]
+            let delay = state.timing.retry_delay;
+            state.refused.remove(&request).map(|at| at + delay)
+        };
+        let mut ticket: Option<Ticket<'_>> = None;
+        loop {
+            let first = self.turns.notified();
+            tokio::pin!(first);
+            first.as_mut().enable();
+            let step = {
+                let mut state = self.state();
+                let now = Instant::now();
+                self.decay(&mut state, now);
+                let blocked = [retry_at, state.paused_until]
                     .into_iter()
                     .flatten()
-                    .max()
-                    .unwrap_or(now);
-                state.next_at = Some(turn + state.pace);
-                Some(turn)
-            }
-        };
-        if let Some(turn) = turn {
-            tokio::time::sleep_until(turn).await;
-        }
-        loop {
-            let until = self.state().paused_until;
-            match until {
-                Some(until) if until > Instant::now() => tokio::time::sleep_until(until).await,
-                _ => return,
+                    .filter(|until| *until > now)
+                    .max();
+                if let Some(until) = blocked {
+                    Step::Sleep(until)
+                } else if state.pace.is_zero() {
+                    Step::Send
+                } else {
+                    let mine = match &ticket {
+                        Some(ticket) => ticket.1,
+                        None => {
+                            let id = state.next_ticket;
+                            state.next_ticket += 1;
+                            state.waiting.insert(id);
+                            ticket = Some(Ticket(self, id));
+                            id
+                        }
+                    };
+                    let turn = state.next_at.unwrap_or(now).max(now);
+                    if state.waiting.first() != Some(&mine) {
+                        Step::Wait
+                    } else if turn > now {
+                        Step::Sleep(turn)
+                    } else {
+                        state.next_at = Some(now + state.pace);
+                        Step::Send
+                    }
+                }
+            };
+            match step {
+                Step::Send => return,
+                Step::Sleep(until) => tokio::time::sleep_until(until).await,
+                Step::Wait => first.await,
             }
         }
     }
@@ -337,29 +461,53 @@ impl HostThrottle {
         state.pace_quiet_since = Some(since);
     }
 
-    /// The host answered `status`, a 429 or an S3 bucket's 503, with
-    /// `retry_after` when it said how long to wait: pause new requests that
-    /// long, at most [`MAX_RETRY_AFTER`], raise the pace and cut the host's
-    /// limits. Returns how long the refused request waits before it is
-    /// retried: nothing more when the host said (the pause holds the retry
-    /// too), else the retry delay.
+    /// The host answered `request` ([`request_key`]) with `status`, a 429
+    /// or an S3 bucket's 503, with `retry_after` when it said how long to
+    /// wait: pause new requests that long, at most [`MAX_RETRY_AFTER`],
+    /// raise the pace, cut the host's limits, and, when it did not say,
+    /// hold the request's retry for the retry delay. A bucket does so from
+    /// its [`BUCKET_TRIGGER`]th answer in [`BUCKET_TRIGGER_WINDOW`], or
+    /// its first with `Retry-After`, and then while it backs off; before,
+    /// the answer is only counted.
     pub(crate) fn throttled(
         &self,
         status: StatusCode,
         retry_after: Option<Duration>,
-    ) -> Option<Duration> {
+        request: u64,
+    ) {
         let now = Instant::now();
         self.answers.fetch_add(1, Ordering::Relaxed);
         let wait = retry_after
             .map(|wait| wait.min(MAX_RETRY_AFTER))
             .filter(|wait| !wait.is_zero());
-        let (limits, paced, retry_delay) = {
+        let (limits, paced) = {
             let mut state = self.state();
+            self.decay(&mut state, now);
+            if matches!(self.kind, Kind::Bucket { .. }) {
+                state.recent.push_back(now);
+                while state.recent.len() > BUCKET_TRIGGER
+                    || state.recent.front().is_some_and(|at| {
+                        now.saturating_duration_since(*at) > BUCKET_TRIGGER_WINDOW
+                    })
+                {
+                    state.recent.pop_front();
+                }
+                let throttling = !state.pace.is_zero()
+                    || state.paused_until.is_some_and(|until| until > now)
+                    || state.recent.len() >= BUCKET_TRIGGER;
+                if !throttling && wait.is_none() {
+                    return;
+                }
+            }
             if let Some(wait) = wait {
                 let until = now + wait;
                 state.paused_until = Some(state.paused_until.map_or(until, |at| at.max(until)));
             }
-            self.decay(&mut state, now);
+            if retry_after.is_none() {
+                let delay = state.timing.retry_delay;
+                state.refused.retain(|_, at| now < *at + delay);
+                state.refused.insert(request, now);
+            }
             state.answered_at = Some(now);
             state.pace_quiet_since = Some(now);
             let timing = state.timing;
@@ -373,7 +521,7 @@ impl HostThrottle {
             let next = now + state.pace;
             state.next_at = Some(state.next_at.map_or(next, |at| at.max(next)));
             let paced = raised.then_some(state.pace);
-            (state.limits.clone(), paced, timing.retry_delay)
+            (state.limits.clone(), paced)
         };
         let mut cut = false;
         let mut sum = None;
@@ -383,14 +531,13 @@ impl HostThrottle {
             let (all_current, all_configured) = sum.unwrap_or((0, 0));
             sum = Some((all_current + current, all_configured + configured));
         }
-        let delay = retry_after.is_none().then_some(retry_delay);
         if !cut && wait.is_none() && paced.is_none() {
-            return delay;
+            return;
         }
         {
             let mut state = self.state();
             if state.warned_at.is_some_and(|at| now < at + WARN_INTERVAL) {
-                return delay;
+                return;
             }
             state.warned_at = Some(now);
         }
@@ -417,7 +564,17 @@ impl HostThrottle {
             answer_name(status),
             detail.join("; ")
         );
-        delay
+    }
+}
+
+/// A waiter's place in [`HostState::waiting`], given up when it has its
+/// turn or is dropped, which tells the next.
+struct Ticket<'a>(&'a HostThrottle, u64);
+
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        self.0.state().waiting.remove(&self.1);
+        self.0.turns.notify_waiters();
     }
 }
 
@@ -472,11 +629,12 @@ pub fn throttled_answers(url: &str) -> u64 {
 }
 
 /// An HTTP transport whose every request the throttle governs waits for
-/// its turn under its host's pace and `Retry-After` before it is sent, and
-/// whose every throttling answer (a 429, an S3 bucket's 503) is reported to
-/// the host ([`HostThrottle::throttled`]) and handed back after the retry
-/// delay, if any. object_store calls it once per attempt, so it sees the
-/// attempts object_store retries as well.
+/// its turn under its host's pace, its `Retry-After` and, a retry, its
+/// retry delay before it is sent ([`HostThrottle::wait`]), and whose every
+/// throttling answer (a 429, an S3 bucket's 503) is reported to the host
+/// ([`HostThrottle::throttled`]) and handed back at once. object_store
+/// calls it once per attempt, so it sees the attempts object_store retries
+/// as well.
 #[derive(Debug, Clone)]
 pub(crate) struct Throttled<S> {
     pub inner: S,
@@ -489,14 +647,13 @@ impl<S: HttpService> HttpService for Throttled<S> {
         if !self.host.kind.governs(request.uri()) {
             return self.inner.call(request).await;
         }
-        self.host.wait().await;
+        let key = request_key(&request);
+        self.host.wait(key).await;
         let response = self.inner.call(request).await?;
         let status = response.status();
         if self.host.kind.refuses(status) {
             let wait = retry_after(response.headers(), SystemTime::now());
-            if let Some(delay) = self.host.throttled(status, wait) {
-                tokio::time::sleep(delay).await;
-            }
+            self.host.throttled(status, wait, key);
         }
         Ok(response)
     }

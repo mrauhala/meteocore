@@ -521,7 +521,12 @@ impl GribEngine {
         })?;
         let path = Path::from(fetch.url.as_str());
         let get = move || {
-            let bytes = self.background_fetch(&path, range, (&ahead.gets, &ahead.bytes));
+            let bytes = self.background_fetch(
+                &path,
+                range,
+                (&ahead.gets, &ahead.bytes),
+                crate::prewarm::Reader::ReadAhead,
+            );
             drop(permit);
             bytes
         };

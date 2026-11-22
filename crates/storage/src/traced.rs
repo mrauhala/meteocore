@@ -34,6 +34,7 @@ use object_store::{
 use tracing::Instrument;
 
 use crate::retryable::COLLECTION;
+use crate::throttle::BACKGROUND;
 
 /// What the `storage` span names.
 #[derive(Debug, Clone)]
@@ -43,6 +44,9 @@ pub(crate) struct Labels {
     pub store: Arc<str>,
     /// The collection the store reads for, once an engine has named it.
     pub collection: Option<Arc<str>>,
+    /// Whether the store's reads are background work, which no request
+    /// waits on ([`crate::DataStore::for_background`], #1530).
+    pub background: bool,
 }
 
 /// `base`, inside the span `labels` name.
@@ -83,13 +87,42 @@ pub(crate) fn authority(endpoint: &str) -> String {
 /// The `store` label of an S3 bucket: its endpoint's `host[:port]` and the
 /// bucket, as `s3.us-east-1.amazonaws.com/noaa-goes19`. Without an
 /// endpoint, AWS's regional one, in `us-east-1` without a region, as
-/// object_store builds it.
+/// object_store builds it. An AWS endpoint is named by its region however
+/// it is spelt (`s3-eu-west-1`, `s3.dualstack.eu-west-1`, the bucket's own
+/// virtual host, the global `s3.amazonaws.com`), so the stores of one
+/// bucket share one label, and so one back-off (`bucket.rs`, #1530).
 pub(crate) fn s3_label(endpoint: Option<&str>, region: Option<&str>, bucket: &str) -> String {
     let host = match endpoint {
-        Some(endpoint) => authority(endpoint),
+        Some(endpoint) => {
+            let host = authority(endpoint).to_ascii_lowercase();
+            aws_regional(&host, bucket).unwrap_or(host)
+        }
         None => format!("s3.{}.amazonaws.com", region.unwrap_or("us-east-1")),
     };
     format!("{host}/{bucket}")
+}
+
+/// `s3.{region}.amazonaws.com` for an AWS S3 endpoint `host`, without a
+/// port: path-style or the bucket's virtual host, dotted, dashed or
+/// dual-stack, the global endpoint as `us-east-1`. `None` for any other.
+fn aws_regional(host: &str, bucket: &str) -> Option<String> {
+    let host = host
+        .strip_prefix(bucket)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or(host);
+    let name = host.strip_suffix(".amazonaws.com")?;
+    let region = match name {
+        "s3" => "us-east-1",
+        _ => name
+            .strip_prefix("s3.dualstack.")
+            .or_else(|| name.strip_prefix("s3-"))
+            .or_else(|| name.strip_prefix("s3."))?,
+    };
+    let valid = !region.is_empty()
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    valid.then(|| format!("s3.{region}.amazonaws.com"))
 }
 
 /// An object store whose every operation runs inside a `storage` span.
@@ -110,28 +143,32 @@ impl Traced {
         )
     }
 
-    /// `operation` inside `span`, with the collection set for the
-    /// transport ([`COLLECTION`]).
+    /// `operation` inside `span`, with the collection and the read's class
+    /// set for the transport and the host's limit ([`COLLECTION`],
+    /// [`BACKGROUND`]).
     fn run<F: Future>(&self, span: tracing::Span, operation: F) -> impl Future<Output = F::Output> {
-        COLLECTION.scope(self.labels.collection.clone(), operation.instrument(span))
+        let operation = BACKGROUND.scope(self.labels.background, operation.instrument(span));
+        COLLECTION.scope(self.labels.collection.clone(), operation)
     }
 
-    /// `inner`, polled inside `span` with the collection set.
+    /// `inner`, polled inside `span` with the collection and class set.
     fn in_span<T>(&self, span: tracing::Span, inner: BoxStream<'static, Result<T>>) -> InSpan<T> {
         InSpan {
             inner,
             span,
             collection: self.labels.collection.clone(),
+            background: self.labels.background,
         }
     }
 }
 
-/// A stream polled inside `span` with `collection` set: a GET body or a
-/// LIST, whose retries run while it is polled.
+/// A stream polled inside `span` with `collection` and `background` set: a
+/// GET body or a LIST, whose retries run while it is polled.
 struct InSpan<T> {
     inner: BoxStream<'static, Result<T>>,
     span: tracing::Span,
     collection: Option<Arc<str>>,
+    background: bool,
 }
 
 impl<T> Stream for InSpan<T> {
@@ -140,7 +177,11 @@ impl<T> Stream for InSpan<T> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         let _entered = this.span.enter();
-        COLLECTION.sync_scope(this.collection.clone(), || this.inner.poll_next_unpin(cx))
+        let (collection, background) = (this.collection.clone(), this.background);
+        let inner = &mut this.inner;
+        COLLECTION.sync_scope(collection, || {
+            BACKGROUND.sync_scope(background, || inner.poll_next_unpin(cx))
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {

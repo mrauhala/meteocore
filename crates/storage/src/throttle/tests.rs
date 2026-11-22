@@ -189,9 +189,6 @@ fn spacing(host: &Scripted, from: usize) -> Vec<Duration> {
     sent[from..].iter().map(|(at, _)| *at - first).collect()
 }
 
-/// object_store's wait before its first retry: its `init_backoff`.
-const FIRST_BACKOFF: Duration = Duration::from_millis(100);
-
 /// `n` HEADs of `path` at once through `store`, all successful.
 async fn heads(store: &DataStore, path: &Path, n: usize) {
     let all = futures::future::join_all((0..n).map(|_| store.inner().head(path))).await;
@@ -290,9 +287,9 @@ async fn a_429_paces_every_store_on_the_host_until_it_is_quiet() {
 }
 
 /// A request refused with a 429 without `Retry-After`, as thredds.met.no
-/// refuses, is retried after [`RETRY_DELAY`] and object_store's own
-/// backoff, not after the backoff alone (#1290); one carrying
-/// `Retry-After` when it says.
+/// refuses, is retried [`RETRY_DELAY`] after the refusal, not after
+/// object_store's 0.1 s backoff (#1290); one carrying `Retry-After` when
+/// it says.
 #[tokio::test(start_paused = true)]
 async fn a_bare_429_is_retried_after_the_retry_delay() {
     let host = Scripted::new(Duration::ZERO);
@@ -303,7 +300,7 @@ async fn a_bare_429_is_retried_after_the_retry_delay() {
     let [(refused, 429), (retried, 200)] = sent.as_slice() else {
         panic!("a 429 and its retry: {sent:?}");
     };
-    assert_eq!(*retried - *refused, RETRY_DELAY + FIRST_BACKOFF);
+    assert_eq!(*retried - *refused, RETRY_DELAY);
 
     tokio::time::sleep(QUIET_INTERVAL * 4).await;
     host.throttle(Some("1"));
@@ -612,10 +609,7 @@ async fn a_bare_429_on_an_unlimited_host_paces_it() {
     let (first, second) = tokio::join!(store.inner().head(&path), store.inner().head(&path));
     first.unwrap();
     second.unwrap();
-    assert_eq!(
-        spacing(&host, 0),
-        [Duration::ZERO, PACE_FLOOR, RETRY_DELAY + FIRST_BACKOFF]
-    );
+    assert_eq!(spacing(&host, 0), [Duration::ZERO, PACE_FLOOR, RETRY_DELAY]);
     assert_eq!(pace("bare.backoff.test"), PACE_FLOOR);
     let warns = at_level(&log, "WARN");
     assert_eq!(warns.len(), 1, "{warns:#?}");
@@ -776,7 +770,7 @@ fn a_429_on_a_catalog_poll_backs_off_the_host() {
 fn s3(endpoint: &str, bucket: &str, host: &Scripted) -> DataStore {
     let url = format!("http://{endpoint}");
     let label = crate::traced::s3_label(Some(&url), None, bucket);
-    crate::bucket::s3_store(&label, bucket, |throttle| {
+    crate::bucket::s3_store(&label, bucket, "", |throttle: &Arc<super::HostThrottle>| {
         let transport = super::Throttled {
             inner: crate::retryable::Counted(host.clone()),
             host: throttle.clone(),
@@ -798,21 +792,53 @@ fn s3(endpoint: &str, bucket: &str, host: &Scripted) -> DataStore {
 
 /// The pace of the S3 bucket `name` labelled `label` now.
 fn bucket_pace(label: &str, name: &str) -> Duration {
-    crate::bucket::bucket(label, name).throttle.pace()
+    crate::bucket::bucket(label, name, "").throttle.pace()
 }
 
 /// S3's first back-off, [`crate::S3_RETRY`]'s `init_backoff`.
 const S3_FIRST_BACKOFF: Duration = Duration::from_millis(500);
 
-/// A `503 SlowDown` backs the bucket off as a 429 backs off an HTTP host
-/// (#1530): the refused GET is retried after the retry delay and S3's own
-/// first back-off, the bucket's limit halves from [`crate::bucket::S3_REQUEST_LIMIT`]
-/// and every store on the bucket, another collection's too, starts its
-/// requests the pace apart. `back_off` reports it on each, and
-/// `host_requests` under the bucket's label. Another bucket on the same
-/// endpoint is not backed off: S3 throttles a bucket.
+/// The limit a bucket starts at.
+const INITIAL: usize = crate::bucket::S3_INITIAL_LIMIT;
+
+/// A stray `SlowDown`, which S3 answers under ordinary load, is counted and
+/// retried on S3's own back-off, as before #1530: no pace, no cut, no
+/// retry delay, and the bucket does not report itself backing off.
 #[tokio::test(start_paused = true)]
-async fn a_slowdown_backs_off_every_store_on_the_bucket_and_no_other() {
+async fn a_stray_slowdown_is_only_counted() {
+    const LABEL: &str = "stray.s3.test/radar";
+    let host = Scripted::new(Duration::ZERO);
+    let store = s3("stray.s3.test", "radar", &host);
+    let path = Path::from("composite.tif");
+    host.answer(503, None, Duration::ZERO);
+    store.inner().head(&path).await.unwrap();
+    let sent = host.sent();
+    let [(refused, 503), (retried, 200)] = sent.as_slice() else {
+        panic!("a SlowDown and its retry: {sent:?}");
+    };
+    assert_eq!(*retried - *refused, S3_FIRST_BACKOFF);
+    let from = host.sent().len();
+    heads(&store, &path, 3).await;
+    assert_eq!(spacing(&host, from), [Duration::ZERO; 3], "not paced");
+    assert_eq!(requests(LABEL), (INITIAL, 0, 0), "nor cut");
+    assert_eq!(
+        store.back_off(),
+        Some(crate::HostBackOff {
+            throttled: 1,
+            backing_off: false,
+        })
+    );
+}
+
+/// A bucket that throttles, three `SlowDown`s within 10 s, backs off as a
+/// 429 backs off an HTTP host (#1530): the refused GET is retried 2 s after
+/// the refusal that made it throttle, the bucket's limit halves and every
+/// store on it, another collection's too, starts its requests the pace
+/// apart. `back_off` reports it on each, and `host_requests` under the
+/// bucket's label. Another bucket on the same endpoint is not backed off:
+/// S3 throttles a bucket.
+#[tokio::test(start_paused = true)]
+async fn a_throttling_bucket_backs_off_every_store_on_it_and_no_other() {
     const ENDPOINT: &str = "slowdown.s3.test";
     const LABEL: &str = "slowdown.s3.test/forecasts";
     let host = Scripted::new(Duration::ZERO);
@@ -826,60 +852,68 @@ async fn a_slowdown_backs_off_every_store_on_the_bucket_and_no_other() {
     });
     assert_eq!(ifs.back_off(), calm);
 
-    host.answer(503, None, Duration::ZERO);
+    for _ in 0..super::BUCKET_TRIGGER {
+        host.answer(503, None, Duration::ZERO);
+    }
     let got = ifs.inner().get(&path).await.unwrap();
     assert_eq!(got.bytes().await.unwrap(), BODY);
     let sent = host.sent();
-    let [(refused, 503), (retried, 200)] = sent.as_slice() else {
-        panic!("a SlowDown and its retry: {sent:?}");
+    let [(first, 503), (second, 503), (third, 503), (retried, 200)] = sent.as_slice() else {
+        panic!("three SlowDowns and the retry: {sent:?}");
     };
-    assert_eq!(*retried - *refused, RETRY_DELAY + S3_FIRST_BACKOFF);
+    assert_eq!(*second - *first, S3_FIRST_BACKOFF, "stray: S3's back-off");
+    assert!(*third - *second < Duration::from_secs(1), "{sent:?}");
+    assert_eq!(
+        *retried - *third,
+        RETRY_DELAY,
+        "throttling: the retry delay"
+    );
     let throttled = Some(crate::HostBackOff {
-        throttled: 1,
+        throttled: 3,
         backing_off: true,
     });
     assert_eq!(ifs.back_off(), throttled);
     assert_eq!(aifs.back_off(), throttled, "one back-off for the bucket");
     assert_eq!(bucket_pace(LABEL, "forecasts"), PACE_FLOOR);
     assert_eq!(other.back_off(), calm, "and none for another bucket");
-    let limit = crate::bucket::S3_REQUEST_LIMIT;
-    assert_eq!(requests(LABEL), (limit / 2, 0, 0));
+    assert_eq!(requests(LABEL), (INITIAL / 2, 0, 0));
     let all = crate::requests_to(|label| label == LABEL);
-    assert_eq!(all[0].throttled, 1);
+    assert_eq!(all[0].throttled, 3);
 
     let from = host.sent().len();
     heads(&aifs, &path, 3).await;
+    let spaced = spacing(&host, from);
     assert_eq!(
-        spacing(&host, from),
-        [Duration::ZERO, PACE_FLOOR, PACE_FLOOR * 2],
-        "the other collection's requests are paced"
+        spaced[1] - spaced[0],
+        PACE_FLOOR,
+        "the other collection is paced"
     );
+    assert_eq!(spaced[2] - spaced[1], PACE_FLOOR);
     let from = host.sent().len();
     heads(&other, &path, 3).await;
     assert_eq!(
         spacing(&host, from),
         [Duration::ZERO; 3],
-        "another bucket's are not"
+        "another bucket is not"
     );
 
     tokio::time::sleep(QUIET_INTERVAL).await;
     assert_eq!(
         ifs.back_off(),
         Some(crate::HostBackOff {
-            throttled: 1,
+            throttled: 3,
             backing_off: false,
         })
     );
-    assert_eq!(requests(LABEL).0, limit / 2 + 1, "and the limit grows back");
 }
 
-/// A bucket that keeps answering `SlowDown` gets 5 attempts of a GET, each
-/// retry after the retry delay, S3's back-off and the bucket's pace, and
-/// the read is `Unavailable` within the request budget, so each API
-/// answers its 503 (#1355) rather than timing out. Its pace and limit are
-/// cut as the answers come.
+/// A bucket that keeps answering `SlowDown` gets 7 attempts of a GET,
+/// those after it throttles the retry delay apart, and the read is
+/// `Unavailable` within the request budget, at its last refusal, so each
+/// API answers its 503 (#1355) rather than timing out. Its pace and limit
+/// are cut as the answers come.
 #[tokio::test(start_paused = true)]
-async fn a_bucket_that_keeps_refusing_gets_five_attempts_the_back_off_apart() {
+async fn a_bucket_that_keeps_refusing_gets_seven_attempts_and_fails_at_the_last() {
     const LABEL: &str = "refusing.s3.test/forecasts";
     let host = Scripted::new(Duration::ZERO);
     let store = s3("refusing.s3.test", "forecasts", &host);
@@ -899,16 +933,18 @@ async fn a_bucket_that_keeps_refusing_gets_five_attempts_the_back_off_apart() {
     );
     let sent = host.sent();
     assert_eq!(sent.len(), 1 + crate::S3_RETRY.max_retries, "{sent:?}");
-    for pair in sent.windows(2) {
-        assert!(
-            pair[1].0 - pair[0].0 >= RETRY_DELAY + S3_FIRST_BACKOFF,
-            "{sent:?}"
-        );
+    for pair in sent[super::BUCKET_TRIGGER - 1..].windows(2) {
+        assert!(pair[1].0 - pair[0].0 >= RETRY_DELAY, "{sent:?}");
     }
-    let spent = start.elapsed();
-    assert!(spent < FetchBudget::Request.timeout(), "{spent:?}");
+    let last = sent.last().unwrap().0;
+    assert_eq!(
+        Instant::now(),
+        last,
+        "no retry delay after the last attempt"
+    );
+    assert!(last - start < FetchBudget::Request.timeout(), "{sent:?}");
     assert_eq!(bucket_pace(LABEL, "forecasts"), PACE_CAP);
-    assert_eq!(requests(LABEL).0, crate::bucket::S3_REQUEST_LIMIT / 32);
+    assert_eq!(requests(LABEL).0, 1);
 }
 
 /// A 500 from a bucket is not a throttle: it is retried on S3's back-off
@@ -918,16 +954,15 @@ async fn a_bucket_error_that_is_not_a_slowdown_backs_nothing_off() {
     const LABEL: &str = "error.s3.test/forecasts";
     let host = Scripted::new(Duration::ZERO);
     let store = s3("error.s3.test", "forecasts", &host);
-    host.answer(500, None, Duration::ZERO);
+    for _ in 0..4 {
+        host.answer(500, None, Duration::ZERO);
+    }
     store.inner().head(&Path::from("index")).await.unwrap();
     let sent = host.sent();
-    let [(refused, 500), (retried, 200)] = sent.as_slice() else {
-        panic!("a 500 and its retry: {sent:?}");
-    };
-    assert_eq!(*retried - *refused, S3_FIRST_BACKOFF);
+    assert_eq!(sent.len(), 5, "{sent:?}");
+    assert_eq!(sent[1].0 - sent[0].0, S3_FIRST_BACKOFF);
     assert_eq!(bucket_pace(LABEL, "forecasts"), Duration::ZERO);
-    let limit = crate::bucket::S3_REQUEST_LIMIT;
-    assert_eq!(requests(LABEL), (limit, 0, 0));
+    assert_eq!(requests(LABEL), (INITIAL, 0, 0));
     assert_eq!(
         store.back_off(),
         Some(crate::HostBackOff {
@@ -938,7 +973,7 @@ async fn a_bucket_error_that_is_not_a_slowdown_backs_nothing_off() {
 }
 
 /// A bucket's `SlowDown` carrying `Retry-After` pauses its new requests
-/// that long, as a host's 429 does.
+/// that long, as a host's 429 does, the first one already.
 #[tokio::test(start_paused = true)]
 async fn a_slowdown_with_retry_after_pauses_the_bucket() {
     let host = Scripted::new(Duration::ZERO);
@@ -952,13 +987,171 @@ async fn a_slowdown_with_retry_after_pauses_the_bucket() {
     assert_eq!(*retried - *refused, Duration::from_secs(3));
 }
 
-/// Only a request naming the bucket, by path or by host, goes through its
-/// throttle: a credential endpoint's, which object_store sends through the
-/// same connector, passes by. A bucket counts a 503 and a 429; an HTTP host
-/// only a 429.
+/// Make the bucket of `store` on `host` throttle: three `SlowDown`s to one
+/// HEAD, served at its retry. Returns when the retry was sent.
+async fn throttle_bucket(host: &Scripted, store: &DataStore, path: &Path) -> Instant {
+    for _ in 0..super::BUCKET_TRIGGER {
+        host.answer(503, None, Duration::ZERO);
+    }
+    store.inner().head(path).await.unwrap();
+    host.sent().last().unwrap().0
+}
+
+/// A read that gives up its wait for a turn under the pace, at its
+/// deadline, holds no turn (#1530): with a render's reads dropped at their
+/// deadline, the next read waits one pace, not one for each of them. Only
+/// the reads that had their turn were sent.
+#[tokio::test(start_paused = true)]
+async fn a_read_dropped_at_its_deadline_holds_no_turn() {
+    let host = Scripted::new(Duration::ZERO);
+    let store = s3("dropped.s3.test", "radar", &host);
+    let path = Path::from("composite.tif");
+    let at = throttle_bucket(&host, &store, &path).await;
+    assert_eq!(Instant::now(), at);
+    let sent_before = host.sent().len();
+    let deadline = (at + Duration::from_millis(900)).into_std();
+    let render = futures::future::join_all((0..20).map(|_| {
+        let (store, path) = (&store, &path);
+        crate::within(FetchBudget::Request, Some(deadline), None, async move {
+            store
+                .inner()
+                .head(path)
+                .await
+                .map_err(|e| DataServerError::from(StorageError::from(e)))
+        })
+    }))
+    .await;
+    let served = render.iter().filter(|read| read.is_ok()).count();
+    let late = render
+        .iter()
+        .filter(|read| matches!(read, Err(DataServerError::DeadlineExceeded)))
+        .count();
+    assert_eq!((served, late), (3, 17), "turns at 0.25, 0.5 and 0.75 s");
+    assert_eq!(host.sent().len(), sent_before + 3);
+    store.inner().head(&path).await.unwrap();
+    let next = host.sent().last().unwrap().0;
+    assert_eq!(next - at, PACE_FLOOR * 4, "one pace after the last sent");
+}
+
+/// `n` reads of `path` through `store` in a loop each, one after another,
+/// until `end`.
+async fn read_until(store: &DataStore, path: &Path, n: usize, end: Instant) {
+    futures::future::join_all((0..n).map(|_| async move {
+        while Instant::now() < end {
+            store.inner().head(path).await.unwrap();
+        }
+    }))
+    .await;
+}
+
+/// One read of `path` through `store` under `budget`, `after` from now:
+/// when it was asked for and when it was served.
+async fn timed_read(
+    store: &DataStore,
+    path: &Path,
+    budget: FetchBudget,
+    after: Duration,
+) -> (Instant, Instant) {
+    tokio::time::sleep(after).await;
+    let asked = Instant::now();
+    crate::within(budget, None, None, async {
+        store
+            .inner()
+            .head(path)
+            .await
+            .map_err(|e| DataServerError::from(StorageError::from(e)))
+    })
+    .await
+    .unwrap();
+    (asked, Instant::now())
+}
+
+/// A read under the background budget that a request waits on, as
+/// engine-netcdf's detached field fill, is no background work: under six
+/// request loops on a host limited to 2, with no 429 at all, it queues
+/// first come, first served and is served within a few reads (#1530).
+#[tokio::test(start_paused = true)]
+async fn a_background_budget_read_a_request_waits_on_queues_in_turn() {
+    let host = Scripted::new(Duration::from_millis(100));
+    let (store, path) = limited("http://detached.backoff.test/meps.nc", 2, &host);
+    let end = Instant::now() + Duration::from_secs(4);
+    let (_, (asked, served)) = tokio::join!(
+        read_until(&store, &path, 6, end),
+        timed_read(
+            &store,
+            &path,
+            FetchBudget::Background,
+            Duration::from_millis(550)
+        ),
+    );
+    let waited = served - asked;
+    assert!(waited <= Duration::from_millis(500), "{waited:?}");
+}
+
+/// Background work is served under sustained request load: a bucket
+/// backing off, its limit cut, four request loops for 20 s, and a scan's
+/// read still has its turn within a few paces (#1530).
+#[tokio::test(start_paused = true)]
+async fn background_work_is_served_under_sustained_request_load() {
+    let host = Scripted::new(Duration::from_millis(20));
+    let store = s3("busy.s3.test", "goes", &host);
+    let path = Path::from("scan.nc");
+    throttle_bucket(&host, &store, &path).await;
+    let scan = store.clone().for_background();
+    let end = Instant::now() + Duration::from_secs(20);
+    let (_, (asked, served)) = tokio::join!(
+        read_until(&store, &path, 4, end),
+        timed_read(
+            &scan,
+            &path,
+            FetchBudget::Background,
+            Duration::from_secs(1)
+        ),
+    );
+    let waited = served - asked;
+    assert!(waited <= PACE_FLOOR * 6, "{waited:?}");
+}
+
+/// Background work holds at most half the limit: a satellite scan's
+/// sixteen reads of a bucket starting at 16 hold eight permits, and a
+/// request read arriving after them has one at once (#1530). The scan's
+/// other reads go after.
+#[tokio::test(start_paused = true)]
+async fn a_request_read_has_a_permit_while_background_holds_its_share() {
+    const LABEL: &str = "share.s3.test/goes";
+    let slow = Duration::from_secs(5);
+    let host = Scripted::new(slow);
+    let store = s3("share.s3.test", "goes", &host);
+    let path = Path::from("tile.nc");
+    let scan = store.clone().for_background();
+    let tiles = futures::future::join_all(
+        (0..16).map(|_| timed_read(&scan, &path, FetchBudget::Background, Duration::ZERO)),
+    );
+    let request = async {
+        let read = timed_read(
+            &store,
+            &path,
+            FetchBudget::Request,
+            Duration::from_millis(10),
+        );
+        let (asked, served) = read.await;
+        (asked, served, requests(LABEL))
+    };
+    let (tiles, (asked, served, during)) = tokio::join!(tiles, request);
+    assert_eq!(served - asked, slow, "a permit at once");
+    assert_eq!(during.0, INITIAL);
+    let last = tiles.iter().map(|(_, served)| *served).max().unwrap();
+    assert_eq!(last - tiles[0].0, slow * 2, "eight, then the other eight");
+    assert_eq!(host.take_peak(), INITIAL / 2 + 1);
+}
+
+/// Only a request naming the bucket, by path after its endpoint's own path
+/// or by host, goes through its throttle: a credential endpoint's, which
+/// object_store sends through the same connector, passes by. A bucket
+/// counts a 503 and a 429; an HTTP host only a 429.
 #[test]
 fn a_bucket_governs_the_requests_that_name_it() {
-    let bucket = super::Kind::Bucket("forecasts".into());
+    let bucket = super::Kind::bucket("forecasts", "");
     let governs = |uri: &str| bucket.governs(&uri.parse().unwrap());
     assert!(governs(
         "https://s3.eu-central-1.amazonaws.com/forecasts/20261122/a.index"
@@ -976,37 +1169,63 @@ fn a_bucket_governs_the_requests_that_name_it() {
     assert!(!governs("https://sts.eu-central-1.amazonaws.com/"));
     assert!(super::Kind::Http.governs(&"http://any.test/x".parse().unwrap()));
 
+    let prefixed = super::Kind::bucket("forecasts", "/s3/");
+    let governs = |uri: &str| prefixed.governs(&uri.parse().unwrap());
+    assert!(governs("http://minio.example/s3/forecasts/a.index"));
+    assert!(governs("http://minio.example/s3/forecasts?list-type=2"));
+    assert!(!governs("http://minio.example/forecasts/a.index"));
+    assert_eq!(
+        crate::bucket::endpoint_path(Some("http://minio.example:9000/s3/")),
+        "/s3"
+    );
+    assert_eq!(
+        crate::bucket::endpoint_path(Some("https://s3.amazonaws.com")),
+        ""
+    );
+
     assert!(bucket.refuses(StatusCode::SERVICE_UNAVAILABLE));
     assert!(bucket.refuses(StatusCode::TOO_MANY_REQUESTS));
     assert!(!bucket.refuses(StatusCode::INTERNAL_SERVER_ERROR));
     assert!(!super::Kind::Http.refuses(StatusCode::SERVICE_UNAVAILABLE));
 }
 
-/// A `SlowDown` logs the bucket's WARN, naming the bucket and the answer,
-/// and its return logs the INFO lines naming `SlowDown`.
+/// A throttling bucket logs the WARN naming the bucket and the answer, and
+/// its return the INFO lines naming `SlowDown`; the limit, cut to 1 by six
+/// seconds of them, is back in four minutes, an eighth of its ceiling a
+/// quiet interval.
 #[tokio::test(start_paused = true)]
-async fn a_slowdown_warns_naming_the_bucket() {
+async fn a_throttling_bucket_warns_and_its_limit_is_back_in_minutes() {
     const LABEL: &str = "log.s3.test/forecasts";
     let log = JsonLog::default();
     let _logging = tracing::subscriber::set_default(log.subscriber());
     let host = Scripted::new(Duration::ZERO);
     let store = s3("log.s3.test", "forecasts", &host).for_collection("ifs");
-    host.answer(503, None, Duration::ZERO);
-    store.inner().head(&Path::from("index")).await.unwrap();
+    let path = Path::from("index");
+    throttle_bucket(&host, &store, &path).await;
     let warns = at_level(&log, "WARN");
     assert_eq!(warns.len(), 1, "{warns:#?}");
     assert_eq!(warns[0]["host"], LABEL);
     assert_eq!(
         warns[0]["message"],
         format!(
-            "{LABEL} answered 503 SlowDown: request limit cut to 32 of 64; \
+            "{LABEL} answered 503 SlowDown: request limit cut to 8 of 64; \
              requests start 250 ms apart"
         )
     );
     assert_eq!(warns[0]["span"]["collection"], "ifs");
-    tokio::time::sleep(QUIET_INTERVAL * 40).await;
+    for _ in 0..6 {
+        tokio::time::sleep(CUT_WINDOW).await;
+        host.answer(503, None, Duration::ZERO);
+        store.inner().head(&path).await.unwrap();
+    }
+    assert_eq!(requests(LABEL).0, 1);
+    let mut limits = Vec::new();
+    for _ in 0..8 {
+        tokio::time::sleep(QUIET_INTERVAL).await;
+        limits.push(requests(LABEL).0);
+    }
+    assert_eq!(limits, [9, 17, 25, 33, 41, 49, 57, 64]);
     assert_eq!(store.back_off().map(|b| b.backing_off), Some(false));
-    assert_eq!(requests(LABEL).0, 64);
     let infos: Vec<_> = at_level(&log, "INFO")
         .into_iter()
         .map(|line| line["message"].as_str().unwrap_or_default().to_string())
@@ -1014,10 +1233,87 @@ async fn a_slowdown_warns_naming_the_bucket() {
     assert_eq!(
         infos,
         [
-            format!("{LABEL} has answered no SlowDown for 30 s: its requests are no longer paced"),
             format!("{LABEL} has answered no SlowDown for 30 s: its request limit is back at 64"),
+            format!("{LABEL} has answered no SlowDown for 120 s: its requests are no longer paced"),
         ]
     );
+}
+
+/// A bucket starts at 16 requests in flight and grows to its ceiling of
+/// 64 by 8 each quiet interval, logging nothing; requests waiting for its
+/// permits at the ceiling are logged once.
+#[tokio::test(start_paused = true)]
+async fn a_bucket_starts_at_sixteen_and_warns_when_its_ceiling_binds() {
+    const LABEL: &str = "start.s3.test/goes";
+    let log = JsonLog::default();
+    let _logging = tracing::subscriber::set_default(log.subscriber());
+    let host = Scripted::new(Duration::from_secs(1));
+    let store = s3("start.s3.test", "goes", &host);
+    let path = Path::from("scan.nc");
+    assert_eq!(peak(&host, &store, &path, 24).await, INITIAL);
+    assert!(at_level(&log, "WARN").is_empty(), "below its ceiling");
+    tokio::time::sleep(QUIET_INTERVAL * 6).await;
+    assert_eq!(requests(LABEL).0, crate::bucket::S3_REQUEST_LIMIT);
+    assert!(at_level(&log, "INFO").is_empty(), "never cut");
+    assert_eq!(peak(&host, &store, &path, 80).await, 64);
+    let warns = at_level(&log, "WARN");
+    assert_eq!(warns.len(), 1, "{warns:#?}");
+    assert_eq!(warns[0]["host"], LABEL);
+    assert!(
+        warns[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("MC_COG_TILE_CONCURRENCY above 64"),
+        "{warns:#?}"
+    );
+}
+
+/// One bucket has one label, and so one back-off, however its endpoint is
+/// spelt; a bucket whose stores are all dropped leaves `host_requests`.
+#[test]
+fn a_bucket_has_one_label_and_goes_with_its_stores() {
+    use crate::traced::s3_label;
+    for endpoint in [
+        "https://s3.eu-west-1.amazonaws.com",
+        "https://s3-eu-west-1.amazonaws.com",
+        "https://S3.EU-WEST-1.amazonaws.com/",
+        "https://s3.dualstack.eu-west-1.amazonaws.com",
+        "https://radar.s3.eu-west-1.amazonaws.com",
+    ] {
+        assert_eq!(
+            s3_label(Some(endpoint), None, "radar"),
+            "s3.eu-west-1.amazonaws.com/radar",
+            "{endpoint}"
+        );
+    }
+    assert_eq!(
+        s3_label(Some("https://s3.amazonaws.com"), None, "radar"),
+        "s3.us-east-1.amazonaws.com/radar"
+    );
+    assert_eq!(
+        s3_label(Some("https://minio.example:9000/s3"), None, "radar"),
+        "minio.example:9000/radar"
+    );
+
+    let (dashed, _) = crate::build_store("https://s3-eu-west-1.amazonaws.com/onelabel/x/").unwrap();
+    let (hosted, _) = crate::build_store("https://onelabel.s3.eu-west-1.amazonaws.com/x/").unwrap();
+    let parts =
+        crate::build_s3_store_from_parts("https://s3.eu-west-1.amazonaws.com", "onelabel").unwrap();
+    let label = "s3.eu-west-1.amazonaws.com/onelabel";
+    let reported = || crate::requests_to(|host| host == label).len();
+    assert_eq!(reported(), 1);
+    assert!(Arc::ptr_eq(
+        dashed.throttle().unwrap(),
+        hosted.throttle().unwrap()
+    ));
+    assert!(Arc::ptr_eq(
+        dashed.throttle().unwrap(),
+        parts.throttle().unwrap()
+    ));
+    drop((dashed, hosted));
+    assert_eq!(reported(), 1, "a store is still built on it");
+    drop(parts);
+    assert_eq!(reported(), 0, "gone with its stores");
 }
 
 /// An HTTP store reports its host's back-off through `back_off`, and so do
@@ -1044,8 +1340,8 @@ async fn an_http_store_reports_its_hosts_back_off() {
     assert_eq!(named.back_off().map(|b| b.backing_off), Some(false));
 }
 
-/// Over a real server: a bucket's `503 Slow Down` and then a 200 serve the
-/// read, cut the bucket's limit and count once for it.
+/// Over a real server: a bucket's three `503 Slow Down`s and then a 200
+/// serve the read, cut the bucket's limit and count for it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slowdown_over_http_backs_off_the_bucket() {
     let modified = "2026-11-22T06:00:00Z".parse().unwrap();
@@ -1053,7 +1349,9 @@ async fn a_slowdown_over_http_backs_off_the_bucket() {
     {
         let mut object = server.object.lock().unwrap();
         object.path = "/forecasts/object".into();
-        object.fail_next.push_back("503 Slow Down");
+        object
+            .fail_next
+            .extend(["503 Slow Down", "503 Slow Down", "503 Slow Down"]);
     }
     let _quick = crate::test_util::quick_bucket_backoff(&server.url, "forecasts");
     let store =
@@ -1068,7 +1366,6 @@ async fn a_slowdown_over_http_backs_off_the_bucket() {
     let [bucket] = all.as_slice() else {
         panic!("one entry for {label}: {all:?}");
     };
-    let limit = crate::bucket::S3_REQUEST_LIMIT;
-    assert_eq!((bucket.limit, bucket.throttled), (limit / 2, 1));
-    assert_eq!(store.back_off().map(|b| b.throttled), Some(1));
+    assert_eq!((bucket.limit, bucket.throttled), (INITIAL / 2, 3));
+    assert_eq!(store.back_off().map(|b| b.backing_off), Some(true));
 }

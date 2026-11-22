@@ -46,21 +46,33 @@ unlike GeoTIFF's one band per collection.
   and remains retryable; scanning does not issue a HEAD per index.
 - Fetch new indexes through `DataStore::get_many` in chunks of at most eight.
   Bound the chunk as well as concurrency so raw sidecar bodies do not collect
-  for the entire scan. Merge in sorted path order, regardless of completion
-  order; mark only successfully parsed indexes as known. Failed reads/parses
+  for the entire scan. Read and merge the newest run's first (its prefix's
+  rank in the listing), each run's in natural path order (`natural_order`:
+  digits as numbers, so `-6h-` before `-12h-`; ties by bytes), regardless
+  of completion order; mark only successfully parsed indexes as known. A
+  fixed-prefix source (a local directory, a remote `data_path`) is one
+  prefix, so its indexes go in natural path order only: static data. Failed reads/parses
   remain eligible when their prefix is next listed. Do not add per-index HEADs.
   The ignored `scan_tests::index_scan_latency_replay` test compares one versus
   eight concurrent reads over 120 indexes with 150 ms simulated GET latency.
   Run with `--ignored --nocapture`; timings are measurements, not CI gates.
 - A bucket refusing GETs (`503 SlowDown`, #1530) is backed off in
-  ds-storage: its request limit, cut by the `SlowDown`s, bounds the reads in
-  flight below the chunk. Once a chunk's read failed while the source
-  throttled (`DataStore::back_off`'s count rose), the scan reads no more
-  indexes: the collection keeps what it read, and the run prefixes holding
-  the unread ones are not settled, so the next poll lists them and reads
-  the rest (`a_bucket_refusing_index_reads_stops_the_scan_until_the_next_poll`).
-  Never retry a refused chunk in the same scan. The metadata probes wait
-  for a poll after the back-off too.
+  ds-storage: its request limit, starting at 16 and cut by the `SlowDown`s,
+  bounds the reads in flight below the chunk. The pre-warm reads through
+  `store.for_background()` (`prewarm::Reader::Prewarm`), at most half the
+  limit; the read-ahead does not, since the next frame's request may join
+  its GET. Once a read of a chunk
+  failed, a timeout included, while the source backs off
+  (`source_backing_off`), the scan reads no more indexes: the collection
+  keeps what it read; that chunk's failed indexes and the later chunks are
+  unread, and the run prefixes holding them are not settled, so the next
+  poll lists them and reads the rest. Another collection's failures do not
+  stop this scan, nor does a failure while the bucket is calm
+  (`scan_tests::a_bucket_refusing_index_reads_stops_the_scan_until_the_next_poll`,
+  `a_scan_reads_the_newest_run_first_and_a_refused_one_leaves_the_older`,
+  `the_refused_chunks_failed_reads_leave_their_run_unsettled`). Never
+  retry a refused chunk in the same scan. The metadata probes wait for a
+  poll after the back-off too.
 - Parameter metadata populates lazily: `scan_once` probes ≤32 messages per
   scan, at most eight concurrently, each advertised parameter in the step
   files of the newest run that has it (#1026).

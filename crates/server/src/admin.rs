@@ -2297,9 +2297,11 @@ struct CacheCounterState {
     /// PVOL scan `[ok, failed, cached, parsed, read failures, parse
     /// failures]` per source (#193).
     pvol_scans: HashMap<String, [u64; 6]>,
-    /// The 429s each rate-limited remote host has answered (#1290). They
-    /// count from process start and never reset; the same delta scheme
-    /// as the others all the same.
+    /// The 429s each rate-limited remote host has answered (#1290), and
+    /// each S3 bucket's throttling answers (#1530). A host counts from
+    /// process start and never resets, a bucket from when a store was
+    /// first built on it; the same delta scheme as the others all the
+    /// same. Its keys are the hosts whose series are on `/metrics`.
     storage_host_throttled: HashMap<String, [u64; 1]>,
 }
 
@@ -10422,9 +10424,26 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
         }
     }
     // Hosts behind `ds_storage::build_http_store_limited`, today the remote
-    // NetCDF sources, and every S3 bucket a store was built for (#1530),
-    // labelled `host[:port]/bucket`.
-    for host in ds_storage::host_requests() {
+    // NetCDF sources, and every S3 bucket a store is built on (#1530),
+    // labelled `host[:port]/bucket`. A bucket a reload left without a store
+    // is no longer reported: its series go.
+    let hosts = ds_storage::host_requests();
+    let reported: HashSet<&str> = hosts.iter().map(|host| host.host.as_str()).collect();
+    counter_state.storage_host_throttled.retain(|host, _| {
+        let kept = reported.contains(host.as_str());
+        if !kept {
+            for gauge in [
+                &*STORAGE_HOST_REQUESTS_IN_FLIGHT,
+                &*STORAGE_HOST_REQUESTS_QUEUED,
+                &*STORAGE_HOST_REQUEST_LIMIT,
+            ] {
+                let _ = gauge.remove_label_values(&[host]);
+            }
+            let _ = STORAGE_HOST_THROTTLED_TOTAL.remove_label_values(&[host]);
+        }
+        kept
+    });
+    for host in &hosts {
         let label = [host.host.as_str()];
         STORAGE_HOST_REQUESTS_IN_FLIGHT
             .with_label_values(&label)
@@ -15391,6 +15410,40 @@ prewarm_sweeps = 0
         let text = scrape(&state).await;
         assert!(!text.contains(&format!("collection=\"{gone}\"")), "{text}");
         assert_eq!(series_of(&text, kept).get(&line(kept, 503)), Some(&2.0));
+    }
+
+    /// An S3 bucket a store is built on reports its request limit and
+    /// gauges under `host[:port]/bucket` (#1530), and its series go once no
+    /// store is built on it, as after a reload removed its collections.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bucket_without_a_store_leaves_the_host_series() {
+        let radar = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/radar-tm35fin");
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[server]\nhost = \"127.0.0.1\"\nport = 8000\n[[collections]]\n\
+                 id = \"bucket-series\"\ntitle = \"t\"\ndescription = \"d\"\n\
+                 data_path = \"{radar}\"\nengine_type = \"geotiff\"\napis = [\"wms\"]\n\
+                 [collections.geotiff]\nfilename_template = \"radar_tm35_%Y%m%dT%H%MZ.tif\"\n\
+                 parameter = \"reflectivity\"\nunit = \"dBZ\"\n"
+            ),
+        )
+        .unwrap();
+        let state = crate::watcher::tests::build_state(&config_path);
+        let store =
+            ds_storage::build_s3_store_from_parts("http://bucket-series.test:9000", "radar")
+                .unwrap();
+        let line = "storage_host_request_limit{host=\"bucket-series.test:9000/radar\"}";
+        let text = scrape(&state).await;
+        assert!(text.contains(&format!("{line} 16")), "{text}");
+        assert!(
+            text.contains("storage_host_throttled_total{host=\"bucket-series.test:9000/radar\"} 0")
+        );
+        drop(store);
+        let text = scrape(&state).await;
+        assert!(!text.contains("bucket-series.test"), "{text}");
     }
 
     #[test]

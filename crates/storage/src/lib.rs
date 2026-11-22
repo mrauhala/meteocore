@@ -279,6 +279,7 @@ impl DataStore {
         let labels = traced::Labels {
             store: source.into(),
             collection: None,
+            background: false,
         };
         Self::layered(store, Some(labels), throttle, Arc::new(AtomicU64::new(0)))
     }
@@ -351,6 +352,33 @@ impl DataStore {
         let labels = traced::Labels {
             store: remote.labels.store.clone(),
             collection: Some(id.into()),
+            background: remote.labels.background,
+        };
+        Self::layered(
+            remote.base.clone(),
+            Some(labels),
+            remote.throttle.clone(),
+            self.bytes_read.clone(),
+        )
+    }
+
+    /// This store, its reads background work (#1530): polls, scans, ingest
+    /// and pre-warms, which no request waits on. They may hold at most half
+    /// of a throttling host's or bucket's request limit, so requests always
+    /// have room; otherwise they wait their turn for permits and paced
+    /// sends as any read does. A read a request may wait on, such as a
+    /// fill a request started and left to finish, is no background work,
+    /// whatever its [`FetchBudget`]. The store, its limits, its collection
+    /// and its byte counter are kept; a local or in-memory store, which no
+    /// host limits, is returned as it is.
+    #[must_use]
+    pub fn for_background(self) -> DataStore {
+        let Some(remote) = &self.remote else {
+            return self;
+        };
+        let labels = traced::Labels {
+            background: true,
+            ..remote.labels.clone()
         };
         Self::layered(
             remote.base.clone(),
@@ -1670,18 +1698,16 @@ pub fn build_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServe
 /// A public bucket answers `503 SlowDown` to a large share of GETs while a
 /// few are in flight (#1336), and refuses every GET for minutes after a
 /// model run is published (#1530). object_store retries each request on
-/// its own: the back-off starts at 0.5 s, doubling with jitter up to 4 s.
-/// A `SlowDown` also backs off the bucket (`bucket.rs`): the refused
-/// request waits the 2 s retry delay before object_store's back-off, and
-/// every retry waits its turn under the bucket's pace, 0.25–2 s apart. So
-/// the bucket's back-off does the waiting, and 4 retries span about 15 s
-/// against a bucket that keeps refusing, about what 10 retries of the
-/// back-off alone took (13 s at the median), with 5 attempts instead of 11
-/// (AWS's SDKs make 3 by default). A read that outlasts them is
-/// [`StorageError::Unavailable`], each API's 503 with `Retry-After`, inside
-/// a request's 30 s budget, which 11 attempts so paced would overrun. A
-/// 500, 502 or 504 is not a throttle and is retried on the back-off alone,
-/// within about 5 s.
+/// its own: the back-off starts at 0.5 s, doubling with jitter up to 4 s,
+/// the same for every retryable answer (its retry policy has no per-status
+/// setting). 6 retries, 7 attempts, span 6 s at the median and 11 s at the
+/// 95th percentile, room for a 500, a 502 or 504 or a dropped connection
+/// to pass, where the 10 of 0.5–4 s took 13 s and 24 s. Against a bucket
+/// that throttles (`bucket.rs`) a retry also waits 2 s from the refusal
+/// and its turn under the bucket's pace: 9 s and 12 s, which leaves a
+/// request's 30 s budget room for the pace's turns, so a read that outlasts
+/// the retries is [`StorageError::Unavailable`], each API's 503 with
+/// `Retry-After`, rather than a timeout.
 ///
 /// `retry_timeout` is the background fetch budget: no fetch waits longer,
 /// and a first attempt that stalls until its 30 s timeout still leaves room
@@ -1693,7 +1719,7 @@ pub(crate) const S3_RETRY: object_store::RetryConfig = object_store::RetryConfig
         max_backoff: std::time::Duration::from_secs(4),
         base: 2.0,
     },
-    max_retries: 4,
+    max_retries: 6,
     retry_timeout: FetchBudget::Background.timeout(),
 };
 
@@ -1733,7 +1759,8 @@ fn s3_store_from_parts(
         .with_skip_signature(true)
         .with_retry(retry);
     let source = traced::s3_label(Some(endpoint), None, bucket);
-    let store = bucket::s3_store(&source, bucket, |throttle| {
+    let path = bucket::endpoint_path(Some(endpoint));
+    let store = bucket::s3_store(&source, bucket, &path, |throttle| {
         let store = builder
             .with_http_connector(bucket::Connector(throttle.clone()))
             .build()
@@ -1792,14 +1819,15 @@ fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServer
     // The endpoint and region object_store will use (`AWS_ENDPOINT_URL_S3`
     // over `AWS_ENDPOINT`), for the span's label and the bucket's back-off.
     let config = |key| builder.get_config_value(&key);
+    let endpoint =
+        config(AmazonS3ConfigKey::S3Endpoint).or_else(|| config(AmazonS3ConfigKey::Endpoint));
     let source = traced::s3_label(
-        config(AmazonS3ConfigKey::S3Endpoint)
-            .or_else(|| config(AmazonS3ConfigKey::Endpoint))
-            .as_deref(),
+        endpoint.as_deref(),
         config(AmazonS3ConfigKey::Region).as_deref(),
         bucket,
     );
-    let store = bucket::s3_store(&source, bucket, |throttle| {
+    let path = bucket::endpoint_path(endpoint.as_deref());
+    let store = bucket::s3_store(&source, bucket, &path, |throttle| {
         let store = builder
             .with_http_connector(bucket::Connector(throttle.clone()))
             .build()
@@ -1881,7 +1909,7 @@ fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), Da
         .with_skip_signature(true)
         .with_retry(S3_RETRY);
     let source = traced::s3_label(Some(&endpoint), None, &bucket);
-    let store = bucket::s3_store(&source, &bucket, |throttle| {
+    let store = bucket::s3_store(&source, &bucket, "", |throttle| {
         let store = builder
             .with_http_connector(bucket::Connector(throttle.clone()))
             .build()
@@ -2805,8 +2833,8 @@ mod budget_tests {
         );
         assert_eq!(FetchBudget::Request.timeout(), Duration::from_secs(30));
         // S3's longer back-off (#1355) keeps that room: object_store retries
-        // for as long as the background budget runs. Four retries: the
-        // bucket's back-off does the waiting between them (#1530).
+        // for as long as the background budget runs. Six retries: a
+        // throttling bucket's back-off waits between them too (#1530).
         let s3 = &S3_RETRY.backoff;
         assert_eq!(
             (
@@ -2815,7 +2843,7 @@ mod budget_tests {
                 s3.base,
                 S3_RETRY.max_retries
             ),
-            (Duration::from_millis(500), Duration::from_secs(4), 2.0, 4)
+            (Duration::from_millis(500), Duration::from_secs(4), 2.0, 6)
         );
         assert_eq!(S3_RETRY.retry_timeout, FetchBudget::Background.timeout());
         assert!(S3_RETRY.retry_timeout >= 2 * DataStore::ATTEMPT_TIMEOUT + s3.init_backoff);

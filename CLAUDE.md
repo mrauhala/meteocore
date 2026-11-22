@@ -186,7 +186,11 @@ Violating these has caused production incidents. Never break them.
      120 s), so object_store's own retry of a stalled 30 s attempt can run.
      Anything a request can wait on, a single-flight cache fill included,
      keeps `FetchBudget::Request` (30 s or the render deadline). See
-     `crates/storage/README.md` (#1011). A new budgeted call gets a test over
+     `crates/storage/README.md` (#1011). The budget is not who waits: work
+     no request waits on (polls, scans, ingest, pre-warms) reads through
+     `DataStore::for_background()`, which holds at most half a limited
+     host's or a bucket's permits; a read a request waits on never does,
+     whatever its budget (engine-netcdf's detached fills, #1530). A new budgeted call gets a test over
      `ds_storage::test_util::{StalledBody, run_stalled}` (feature `test-util`,
      dev-dependencies only) that fails when its budget is swapped (#1055).
    - Never wait on a runtime worker for work that needs that runtime: a

@@ -1240,7 +1240,8 @@ pub(crate) fn read_volume_files(
                 .iter()
                 .map(|id| ds_storage::object_store::path::Path::from(*id))
                 .collect();
-            match store.get_many_with_budget(
+            // Background work no request waits on (#1530).
+            match store.clone().for_background().get_many_with_budget(
                 &paths,
                 paths.len().max(1),
                 Some(MAX_REMOTE_FILE_SIZE),
@@ -3094,6 +3095,8 @@ fn build_catalog(
     // construction, never for a request, so each file gets the background
     // budget: a stalled attempt is retried instead of dropping the volume
     // until the next poll (#1011).
+    // Background work no request waits on (#1530).
+    let store = store.clone().for_background();
     for chunk in remote_fetch.chunks(FETCH_CONCURRENCY) {
         let paths: Vec<ObjectPath> = chunk.iter().map(|(_, p, _)| p.clone()).collect();
         let results = match store.get_many_with_budget(

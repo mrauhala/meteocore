@@ -37,6 +37,15 @@ pub(crate) struct Found {
     pub paths: Arc<[ObjectPath]>,
 }
 
+/// Who waits on a fetch of a scan's files ([`Source::fetch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    /// The poll's ingest of a scan no request has seen yet.
+    Ingest,
+    /// A request, or a refetch a request waits on.
+    Request,
+}
+
 impl Source {
     /// The scans of one product with a scan start in `window` (every scan
     /// when `None`), oldest first. `known` names scans already ingested: a
@@ -126,11 +135,12 @@ impl Source {
 
     /// The whole files at `paths`, in order: a tiled scan's tiles are
     /// fetched [`TILE_FETCH_CONCURRENCY`] at a time, and any failure fails
-    /// the scan (the next poll retries it). `budget` limits each file:
-    /// [`FetchBudget::Background`] for the poll's ingest, which nobody waits
-    /// on, so a stalled attempt is retried instead of skipping the scan
-    /// until the next poll (#1011); [`FetchBudget::Request`] wherever a
-    /// request may wait.
+    /// the scan (the next poll retries it). `reader` says who waits: the
+    /// poll's ingest, which nobody waits on, reads each file under
+    /// [`FetchBudget::Background`], so a stalled attempt is retried instead
+    /// of skipping the scan until the next poll (#1011), as background work
+    /// (`DataStore::for_background`, #1530); a request's read under
+    /// [`FetchBudget::Request`].
     ///
     /// Called from the poll loop (background runtime), from render jobs
     /// (blocking workers) and from EDR queries (async request workers) when
@@ -142,10 +152,14 @@ impl Source {
     pub fn fetch(
         &self,
         paths: &[ObjectPath],
-        budget: FetchBudget,
+        reader: Reader,
     ) -> Result<Vec<Vec<u8>>, DataServerError> {
         let store = match self {
             Source::Bucket { store } | Source::Directory { store, .. } => store,
+        };
+        let (store, budget) = match reader {
+            Reader::Ingest => (store.clone().for_background(), FetchBudget::Background),
+            Reader::Request => (store.clone(), FetchBudget::Request),
         };
         if let [path] = paths {
             return Ok(vec![store.get_with_budget(path, budget)?.to_vec()]);

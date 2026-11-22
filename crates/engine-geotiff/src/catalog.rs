@@ -712,8 +712,8 @@ fn read_new_files(
     }
     // Only the poll scan (and engine construction) reads headers before
     // cataloguing, so a stalled attempt may retry under the background
-    // budget (#1011).
-    let headers = match store.get_range_many(
+    // budget (#1011), as background work no request waits on (#1530).
+    let headers = match store.clone().for_background().get_range_many(
         &reads,
         SCAN_READ_CONCURRENCY,
         ds_storage::FetchBudget::Background,
@@ -824,7 +824,8 @@ fn download_whole(
             return files.len() - started * SCAN_READ_CONCURRENCY;
         }
         let paths: Vec<ObjectPath> = group.iter().map(|f| f.object.location.clone()).collect();
-        let downloads = match store.get_many_with_budget(
+        // Background work, as the header reads are (#1530).
+        let downloads = match store.clone().for_background().get_many_with_budget(
             &paths,
             SCAN_READ_CONCURRENCY,
             None,

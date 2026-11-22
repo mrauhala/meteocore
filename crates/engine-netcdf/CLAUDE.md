@@ -665,7 +665,10 @@ access = "opendap"` reads a remote family through DAP2.
   cold field's fill is claimed with `get_value_or_guard_untracked(ZERO)`
   and the guard moved into a task on the I/O runtime's blocking pool
   (`Mode::Detached`: no deadline, `FetchBudget::Background`), which
-  reserves the budget, decodes and inserts. The request waits for the value
+  reserves the budget, decodes and inserts. It reads through the host's
+  request store, not its background share: requests wait on it, so it is
+  no background work whatever its budget (#1530); the share
+  (`Host::background`, `for_background()`) is ingest's and prewarm's. The request waits for the value
   until its own deadline only. A fetch slower than the deadline fails that
   request (503) and still fills the cache. A failed detached fill drops
   the guard: a waiting reader then fills inline and gets the error itself.

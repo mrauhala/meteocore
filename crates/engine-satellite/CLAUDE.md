@@ -77,8 +77,10 @@ Read the root CLAUDE.md. Epic #819 holds the plan, the provider survey
     30 s fetch. Then `DeadlineExceeded` (503/504), and the download lands
     for later requests. No download starts past the deadline
     (`a_render_waits_for_another_download_no_longer_than_its_deadline`).
-  - **Fetch budgets (#1011).** Only the poll's ingest of a new scan uses
-    `FetchBudget::Background` (120 s per file): no request can wait on a
+  - **Fetch budgets (#1011).** Only the poll's ingest of a new scan
+    (`source::Reader::Ingest`) uses `FetchBudget::Background` (120 s per
+    file) and reads as background work (`for_background()`, at most half
+    a bucket's permits, #1530): no request can wait on a
     scan the catalog does not hold yet, and 30 s left object_store's retry
     of a stalled 24–30 MB body no time to run, skipping the scan until the
     next poll. The poll's re-download keeps `FetchBudget::Request`: it holds

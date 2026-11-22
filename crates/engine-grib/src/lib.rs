@@ -787,7 +787,8 @@ impl GribEngine {
         // Collect all index files across all prefixes, iterating newest-first
         // and stopping once we have collected enough runs to satisfy
         // `max_runs`.
-        let mut all_index_paths: Vec<ds_storage::object_store::path::Path> = Vec::new();
+        // Each with the rank of its run prefix, newest first.
+        let mut all_index_paths: Vec<(usize, ds_storage::object_store::path::Path)> = Vec::new();
         let mut runs_with_hits = 0usize;
         let mut listed_prefixes = 0usize;
         let mut skipped_settled = 0usize;
@@ -812,7 +813,7 @@ impl GribEngine {
             .is_none_or(|t| t.elapsed() >= SETTLED_REVALIDATE_INTERVAL);
         let settled_snapshot = self.source.settled_prefixes.lock().unwrap().clone();
         let mut listed_with_hits: Vec<String> = Vec::new();
-        for RunPrefix { prefix, .. } in &prefixes {
+        for (rank, RunPrefix { prefix, .. }) in prefixes.iter().enumerate() {
             if let Some(budget) = scan_budget {
                 if runs_with_hits >= budget {
                     break;
@@ -845,7 +846,7 @@ impl GribEngine {
                                 continue;
                             }
                         }
-                        all_index_paths.push(obj.location);
+                        all_index_paths.push((rank, obj.location));
                         hits_in_this_prefix += 1;
                     }
                 }
@@ -907,16 +908,27 @@ impl GribEngine {
             );
         }
 
-        // Filter to only new index files (not seen before)
+        // Filter to only new index files (not seen before), the newest
+        // run's first and each run's in step order (#1530): a scan the
+        // source stops leaves the oldest unread, not the newest. Runs are
+        // known by their prefix here; a fixed-prefix source, local or a
+        // remote `data_path`, has one, so its indexes go in path order
+        // only: it is static data, whose runs are all there at once.
         let mut new_paths: Vec<_> = {
             let known = self.source.known_indexes.lock().unwrap();
             all_index_paths
                 .iter()
-                .filter(|p| !known.contains(p.as_ref()))
+                .filter(|(_, p)| !known.contains(p.as_ref()))
                 .cloned()
                 .collect()
         };
-        new_paths.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        new_paths.sort_by(|(a_run, a), (b_run, b)| {
+            a_run
+                .cmp(b_run)
+                .then_with(|| natural_order(a.as_ref(), b.as_ref()))
+        });
+        let new_paths: Vec<ds_storage::object_store::path::Path> =
+            new_paths.into_iter().map(|(_, path)| path).collect();
 
         if new_paths.is_empty() {
             tracing::debug!(
@@ -955,10 +967,12 @@ impl GribEngine {
         // sorted merge order even when downloads finish out of order. The
         // reads in flight are the source's: an S3 bucket's request limit,
         // which its `SlowDown`s cut, bounds them below the chunk (#1530).
-        // Once a chunk's read failed while the source throttled, the scan
-        // reads no more: a bucket refusing GETs refuses the next chunk too,
-        // and each read would spend its retries on it. The collection keeps
-        // what it has; the next poll reads the rest.
+        // Once a chunk's own read failed, a timeout included, while the
+        // source backs off, the scan reads no more: a bucket refusing GETs
+        // refuses the next chunk too, and each read would spend its retries
+        // on it. The collection keeps what it has; the chunk's failed
+        // indexes and the rest are unread, so their runs stay unsettled and
+        // the next poll reads them.
         let mut refused = false;
         let mut unread: Vec<ds_storage::object_store::path::Path> = Vec::new();
         for chunk in new_paths.chunks(INDEX_FETCH_CONCURRENCY) {
@@ -966,8 +980,7 @@ impl GribEngine {
                 unread.extend_from_slice(chunk);
                 continue;
             }
-            let before = self.source.store.back_off();
-            let mut failed = false;
+            let mut failed: Vec<ds_storage::object_store::path::Path> = Vec::new();
             // No HEAD per sidecar: the indexes are already listed and only
             // their contents are needed. Each GET keeps its own timeout.
             let results = match self
@@ -982,7 +995,7 @@ impl GribEngine {
                         self.collection_id,
                         e
                     );
-                    failed = true;
+                    failed.extend_from_slice(chunk);
                     Vec::new()
                 }
             };
@@ -990,7 +1003,7 @@ impl GribEngine {
                 let bytes = match result {
                     Ok(b) => b,
                     Err(e) => {
-                        failed = true;
+                        failed.push(path.clone());
                         tracing::warn!(
                             "Collection '{}': failed to read index file {}: {}",
                             self.collection_id,
@@ -1071,7 +1084,10 @@ impl GribEngine {
                     .unwrap()
                     .insert(path.as_ref().to_string());
             }
-            refused = failed && throttled_since(before, self.source.store.back_off());
+            refused = !failed.is_empty() && self.source_backing_off();
+            if refused {
+                unread.extend(failed);
+            }
         }
         if !unread.is_empty() {
             tracing::warn!(
@@ -2598,14 +2614,36 @@ fn settle_completed_runs(
     settled.retain(|p| window.contains(p.as_str()));
 }
 
-/// Whether the source throttled between two readings of its back-off
-/// (#1530): its count of throttling answers rose. `false` for a store
-/// without one, a local directory.
-fn throttled_since(
-    before: Option<ds_storage::HostBackOff>,
-    after: Option<ds_storage::HostBackOff>,
-) -> bool {
-    matches!((before, after), (Some(before), Some(after)) if after.throttled > before.throttled)
+/// `a` against `b` with each run of digits compared as the number it is,
+/// so ECMWF's `-6h-` comes before `-12h-` and `-102h-` (#1530); equal
+/// numbers spelt apart (`06`, `6`) by their bytes.
+fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let (mut x, mut y) = (a, b);
+    loop {
+        match (x.chars().next(), y.chars().next()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(cx), Some(cy)) if cx.is_ascii_digit() && cy.is_ascii_digit() => {
+                let (nx, rx) = x.split_at(digits(x));
+                let (ny, ry) = y.split_at(digits(y));
+                let (nx, ny) = (nx.trim_start_matches('0'), ny.trim_start_matches('0'));
+                let order = nx.len().cmp(&ny.len()).then_with(|| nx.cmp(ny));
+                if order != Ordering::Equal {
+                    return order;
+                }
+                (x, y) = (rx, ry);
+            }
+            (Some(cx), Some(cy)) => {
+                if cx != cy {
+                    return cx.cmp(&cy);
+                }
+                (x, y) = (&x[cx.len_utf8()..], &y[cy.len_utf8()..]);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

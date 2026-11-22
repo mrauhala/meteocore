@@ -121,7 +121,12 @@ pub(crate) fn host(
         Some(index) => index,
         None => {
             hosts.push(Host {
-                background: requests.with_request_limit(BACKGROUND_SHARE),
+                // Ingest and prewarm: no request waits on them (#1530).
+                // A detached fill, which requests wait on, reads through
+                // `requests`.
+                background: requests
+                    .with_request_limit(BACKGROUND_SHARE)
+                    .for_background(),
                 requests,
                 gets: Arc::default(),
             });

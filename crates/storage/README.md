@@ -33,6 +33,10 @@ decides whether that retry gets to run, so a whole-object fetch names its
   scan, GeoTIFF full downloads). Room for the stalled attempt, its retry and
   one more. A request deadline in scope still applies.
 
+The budget says how long a fetch may take, not who waits on it: a read no
+request waits on is marked with `DataStore::for_background()` (Host
+back-off, below).
+
 `get_with_budget`, `get_range_with_budget`, `get_range_on_with_budget`,
 `get_range_if_unmodified` and `get_many_with_budget` take the budget; `get`,
 `get_range`, `get_range_on`, `get_range_or_refusal`, `get_or_refusal`,
@@ -293,19 +297,36 @@ retries included, and on a 429:
   below the floor. A request takes its turn before it is sent, after any
   `Retry-After`; the turn counts against its budget and deadline as the
   pause does. A host that has never answered 429 has no pace, and its
-  requests wait for nothing.
-- **The retry delay.** A request refused without `Retry-After` is handed
-  back to object_store, or to the document layer, after 2 s
-  (`RETRY_DELAY`), so its retry goes out under the cut limit and the
-  raised pace instead of 0.1 s later. It holds its request permit
-  meanwhile.
+  requests wait for nothing. Turns go first come, first served, and a
+  turn is taken when it comes, never booked ahead, so a request dropped
+  at its deadline holds none: a render's tile reads that missed their
+  deadline cost the next read nothing (#1530). Only a request holding one
+  of a limited host's permits waits for a turn, so no more wait than the
+  limit allows.
+- **Background work holds a share.** The reads of a store
+  `DataStore::for_background()` made, polls, scans, ingest and pre-warms
+  that no request waits on, hold or queue for at most half the limit now,
+  rounded down and at least one (`AdaptiveLimit::share`); within it they
+  queue first come, first served with every other read. So requests always
+  have room, and background work is never starved: a satellite scan's
+  sixteen tile reads take eight of a bucket's sixteen starting permits.
+  The class is the caller's, never its `FetchBudget`: engine-netcdf's
+  detached field fills read under the background budget, and requests
+  wait on them. Background work: the GRIB pre-warm, the GeoTIFF scan's
+  header reads and downloads, the PVOL catalog scan and cell warm-up, the
+  satellite ingest, NetCDF's ingest and prewarm share.
+- **The retry delay.** A request refused without `Retry-After` is retried 2 s
+  (`RETRY_DELAY`) after the refusal, not 0.1 s, so its retry goes out
+  under the cut limit and the raised pace. The retry waits for it, holding
+  the request permit, and a last attempt fails at once.
 - **The adaptive limit** of a `build_http_store_limited` host halves, never
   below 1 and at most once per second (`CUT_WINDOW`), so the 429s of one
-  burst cut it once. Each 30 s without a 429 (`QUIET_INTERVAL`) adds one
-  back, up to the configured limit. A cut takes the free permits at once
-  and the held ones as they are released: requests in flight finish, new
-  ones see the lower limit. A share stacked with `with_request_limit` stays
-  within it.
+  burst cut it once. Each 30 s without a 429 (`QUIET_INTERVAL`) adds an
+  eighth of the configured limit back, at least one, up to it: a host
+  configured at 8 grows by 1, a bucket's 64 by 8, both back from 1 within
+  four minutes. A cut takes the free permits at once and the held ones as
+  they are released: requests in flight finish, new ones see the lower
+  limit. A share stacked with `with_request_limit` stays within it.
 
 `storage_host_request_limit{host}` shows the limit as it is now, so a cut
 shows on the dashboard's host panel, and `storage_host_throttled_total{host}`
@@ -334,37 +355,55 @@ coming. So every S3 store this crate builds (`build_store` of an `s3://`
 or S3 URL, `build_s3_store_from_parts`) is one of its bucket's
 (`bucket.rs`): the stores of one bucket, from every collection and
 engine, share one throttle, one adaptive limit and one pair of request
-gauges, labelled as the `storage` span labels the bucket,
-`host[:port]/bucket` (`s3.eu-central-1.amazonaws.com/ecmwf-forecasts`).
-Two buckets on one regional endpoint back off apart.
+gauges.
 
-- A **503** from the bucket, or a 429, backs it off exactly as a 429 backs
-  off an HTTP host: its `Retry-After` if it sends one, the pace, the 2 s
-  retry delay and the adaptive limit. A 500, 502 or 504 is retried on
-  object_store's back-off alone. object_store hands the transport the
-  status, not S3's error code, and a HEAD's 503 has no body to read one
-  from, so every 503 of a bucket counts; S3 answers 503 only to say
-  `SlowDown` or, the same request, `ServiceUnavailable`: reduce your
-  request rate.
-- The **limit** is `S3_REQUEST_LIMIT`, 64, above what any reader asks of a
-  bucket today (GeoTIFF's COG tiles 16, satellite tiles 16, a GRIB
-  collection's indexes 8), so it binds only once `SlowDown`s have cut it:
-  four seconds of them take it to 4.
-- **Fewer retries** (`S3_RETRY`): 4, from 0.5 s doubling to 4 s. The
-  back-off does the waiting between them, so a GET a bucket keeps refusing
-  gets 5 attempts over about 15 s instead of 11, and is `Unavailable`, each
-  API's 503 with `Retry-After`, inside a request's 30 s budget.
-- Only the requests that **name the bucket**, by path (`/bucket/key`) or
-  host (`bucket.s3.…`), go through its throttle: a credential provider's,
-  which object_store sends through the same connector, passes by.
+- **One label per bucket**, `host[:port]/bucket`, as the `storage` span
+  names it. An AWS endpoint is named by its region however it is spelt
+  (`s3-eu-west-1`, `s3.dualstack.eu-west-1`, the bucket's virtual host,
+  the global `s3.amazonaws.com` as `us-east-1`), so its stores share one
+  back-off: `s3.eu-central-1.amazonaws.com/ecmwf-forecasts`. Two buckets
+  on one endpoint back off apart.
+- **A bucket that throttles** backs off: three 503s or 429s within 10 s
+  (`BUCKET_TRIGGER`), or one with `Retry-After`. Then each answer backs it
+  off exactly as a 429 backs off an HTTP host: `Retry-After`, the pace,
+  the 2 s retry delay and the adaptive limit. A stray `SlowDown`, which S3
+  answers under ordinary load (about one in ten minutes in production), is
+  only counted and retried on object_store's back-off: backing off for it
+  would hold a radar bucket's every read for 30 s. A 500, 502 or 504 is
+  never a throttle. object_store hands the transport the status, not S3's
+  error code, and a HEAD's 503 has no body to read one from, so every 503
+  of a bucket counts; S3 answers 503 only to say `SlowDown` or, the same
+  request, `ServiceUnavailable`: reduce your request rate.
+- **The limit** starts at 16 (`S3_INITIAL_LIMIT`), what one reader asks at
+  most, and grows by 8 each quiet 30 s to 64 (`S3_REQUEST_LIMIT`), above
+  what any reader asks of a bucket today (GeoTIFF's COG tiles 16, satellite
+  tiles 16, a GRIB collection's indexes 8). So collections starting on one
+  bucket together queue: three GRIB collections' 24 index reads go out 16
+  at a time. Requests waiting for a permit at the ceiling log a WARN at
+  most every 10 minutes: readers together ask for more, a
+  `MC_COG_TILE_CONCURRENCY` above 64 say.
+- **Retries** (`S3_RETRY`): 6, from 0.5 s doubling to 4 s, 7 attempts over
+  6 s at the median and 11 s at the 95th percentile against a 500 or a
+  dropped connection. Against a throttling bucket each retry also waits
+  2 s from its refusal: 9 s and 12 s, inside a request's 30 s budget with
+  room for the pace's turns, so a GET it keeps refusing is `Unavailable`,
+  each API's 503 with `Retry-After`, not a timeout.
+- Only the requests that **name the bucket**, by path after the endpoint's
+  own (`/bucket/key`, `/s3/bucket/key` for `https://minio.example/s3`) or
+  by host (`bucket.s3.…`), go through its throttle: a credential
+  provider's, which object_store sends through the same connector, passes
+  by.
 - `DataStore::back_off()` reads a store's host or bucket back-off: the
   throttling answers it has given (to compare two readings) and whether
   its requests are paced or paused now. GRIB stops a scan's index reads
-  once one fails while its bucket throttles, and pauses its pre-warm and
-  map read-ahead while the bucket backs off.
-- `host_requests()` reports each bucket as it reports an HTTP host, so
-  `storage_host_request_limit`, `storage_host_throttled_total` and the
-  request gauges have one series per configured bucket, never per prefix.
+  once one of its own fails while its bucket backs off, and pauses its
+  pre-warm, map read-ahead and metadata probes while it does.
+- `host_requests()` reports each bucket a store is built on as it reports
+  an HTTP host, so `storage_host_request_limit`,
+  `storage_host_throttled_total` and the request gauges have one series
+  per bucket, never per prefix. A bucket lives as long as a store on it:
+  once a reload has dropped them all it leaves `host_requests()`, and the
+  server drops its series.
 
 `test_util::quick_bucket_backoff(endpoint, bucket)` is `quick_backoff` for a
 bucket, and `test_util::ThrottledBucket` a bucket's back-off a test drives,

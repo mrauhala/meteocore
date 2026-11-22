@@ -120,6 +120,15 @@ impl BackgroundGets {
     }
 }
 
+/// Whose GET a background fill is ([`GribEngine::background_fetch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reader {
+    /// The pre-warm's: no request waits on it.
+    Prewarm,
+    /// The map read-ahead's: the next frame's request may join it.
+    ReadAhead,
+}
+
 /// One GET of [`BackgroundGets`], freed when dropped.
 pub(crate) struct GetPermit<'a>(&'a BackgroundGets);
 
@@ -415,7 +424,8 @@ impl GribEngine {
         let Some(_permit) = self.source.background_gets.acquire(wait) else {
             return Ok(None);
         };
-        self.background_fetch(path, range, counters).map(Some)
+        self.background_fetch(path, range, counters, Reader::Prewarm)
+            .map(Some)
     }
 
     /// One GET of a background fill, the pre-warm's or the map
@@ -423,16 +433,28 @@ impl GribEngine {
     /// `range` of `path` under [`FetchBudget::Background`]. The caller runs
     /// inside `block_in_place` on a runtime worker, whose handle drives the
     /// GET (root Critical Rule 7). `counters` count the GET and the bytes
-    /// it read; a short read is an error.
+    /// it read; a short read is an error. A pre-warm's is background work,
+    /// which holds at most a share of a throttling bucket's limit; a
+    /// read-ahead's is not, as the next frame's request may join it
+    /// (#1530).
     pub(crate) fn background_fetch(
         &self,
         path: &Path,
         range: Range<usize>,
         (gets, bytes_read): (&AtomicU64, &AtomicU64),
+        reader: Reader,
     ) -> Result<Bytes, DataServerError> {
         gets.fetch_add(1, Ordering::Relaxed);
         let handle = tokio::runtime::Handle::current();
-        let bytes = self.source.store.get_range_on_with_budget(
+        let background;
+        let store = match reader {
+            Reader::Prewarm => {
+                background = self.source.store.clone().for_background();
+                &background
+            }
+            Reader::ReadAhead => &self.source.store,
+        };
+        let bytes = store.get_range_on_with_budget(
             path,
             range.clone(),
             &handle,
