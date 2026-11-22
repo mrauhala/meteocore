@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 ds-core = { path = "../core" }
-mvt = "0.13"
+mvt = "0.15"
 ds-cache = { path = "../ds-cache" }
 bytes = "1"
 thiserror = "2"
