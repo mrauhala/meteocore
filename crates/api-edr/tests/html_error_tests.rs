@@ -22,6 +22,7 @@ use api_edr::handlers::EdrState;
 use ds_core::config::CollectionConfig;
 use ds_core::edr_engine::{select_parameters, EdrEngine};
 use ds_core::error::DataServerError;
+use ds_core::instances::RunInfo;
 use ds_core::model::{CoverageResponse, LocationSnapshot};
 
 const BROWSER: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
@@ -95,16 +96,79 @@ impl EdrEngine for Empty {
     }
 }
 
+/// One run, valid at its reference time alone, as a nowcast generation
+/// is; otherwise [`Empty`].
+struct OneInstant;
+
+impl EdrEngine for OneInstant {
+    fn get_locations(&self) -> Result<Arc<LocationSnapshot>, DataServerError> {
+        Ok(LocationSnapshot::empty())
+    }
+    fn query_location(
+        &self,
+        id: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        _: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Err(DataServerError::LocationNotFound(id.into()))
+    }
+    fn query_position(
+        &self,
+        _: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Empty.answer(parameters)
+    }
+    fn query_area(
+        &self,
+        _: &str,
+        _: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        parameters: Option<&[String]>,
+        _: Option<&[f64]>,
+        _: Option<DateTime<Utc>>,
+    ) -> Result<CoverageResponse, DataServerError> {
+        Empty.answer(parameters)
+    }
+    fn get_instances(&self) -> Vec<RunInfo> {
+        vec![RunInfo {
+            reference_time: t0(),
+            valid_times: vec![t0()],
+        }]
+    }
+    fn get_parameters(&self) -> Vec<String> {
+        PARAMETERS.map(String::from).to_vec()
+    }
+    fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        Some((t0() - Duration::hours(1), t0()))
+    }
+    fn get_spatial_extent(&self) -> Option<[f64; 4]> {
+        Some([20.0, 58.0, 30.0, 62.0])
+    }
+    fn supported_query_types(&self) -> Vec<String> {
+        vec!["position".to_string(), "area".to_string()]
+    }
+}
+
 /// The EDR router mounted at `/edr`, as the server mounts it.
 fn router() -> axum::Router {
     let mut engines: HashMap<String, Arc<dyn EdrEngine>> = HashMap::new();
     engines.insert("g".into(), Arc::new(Empty));
-    let config: CollectionConfig =
-        serde_json::from_value(json!({"id": "g", "title": "Gridded", "description": "No data"}))
-            .unwrap();
+    engines.insert("n".into(), Arc::new(OneInstant));
+    let config = |id: &str| -> CollectionConfig {
+        serde_json::from_value(json!({"id": id, "title": "Gridded", "description": "No data"}))
+            .unwrap()
+    };
     let state = EdrState {
         engines,
-        collections: HashMap::from([("g".to_string(), config)]),
+        collections: HashMap::from([
+            ("g".to_string(), config("g")),
+            ("n".to_string(), config("n")),
+        ]),
         discovery: Default::default(),
         styles: HashMap::new(),
         feature_engines: HashMap::new(),
@@ -224,6 +288,36 @@ async fn no_data_is_worded_for_the_query_type_with_the_time_range() {
         let error = json_error(&uri, StatusCode::NOT_FOUND).await;
         assert_eq!(error["description"], "Location not found: no data");
     }
+}
+
+/// On an instance route the hint names that run's valid times, not the
+/// collection's range: a run valid at one instant (a nowcast generation)
+/// says so (#1500). The latest-run route keeps the collection's range.
+#[tokio::test]
+async fn no_data_on_an_instance_route_names_its_valid_times() {
+    let html = pages(
+        &format!(
+            "/edr/collections/n/instances/2026-06-07T00:00:00Z/area?coords={POLYGON}\
+             &datetime=2026-06-07T00:01:00Z"
+        ),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert!(html.contains("<h1>No data in this area</h1>"), "{html}");
+    assert!(
+        html.contains("Instance 2026-06-07T00:00:00Z holds data at 2026-06-07T00:00:00Z only."),
+        "{html}"
+    );
+    assert!(!html.contains("advertises data from"), "{html}");
+    let html = pages(
+        &format!("/edr/collections/n/area?coords={POLYGON}&datetime=2026-06-07T00:01:00Z"),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert!(
+        html.contains("data from 2026-06-06T23:00:00Z to 2026-06-07T00:00:00Z"),
+        "{html}"
+    );
 }
 
 /// An unknown collection, a query string that does not parse and an

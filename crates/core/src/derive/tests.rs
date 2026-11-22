@@ -25,6 +25,11 @@ fn hour(h: u32) -> DateTime<Utc> {
 
 const PARAMETERS: [&str; 4] = ["10u", "10v", "z", "2t"];
 
+/// A run older than the latest, whose parameters differ from it.
+fn older_run() -> DateTime<Utc> {
+    "2026-09-30T18:00:00Z".parse().unwrap()
+}
+
 /// Four pixels / samples per field: 500 hPa-like geopotential, one sample
 /// missing.
 fn field(parameter: &str) -> [Option<f64>; 4] {
@@ -311,12 +316,17 @@ impl EdrEngine for Mock {
         _: Option<(DateTime<Utc>, DateTime<Utc>)>,
         parameters: Option<&[String]>,
         _: Option<&[f64]>,
-        _: Option<DateTime<Utc>>,
+        reference_time: Option<DateTime<Utc>>,
     ) -> Result<CoverageResponse, DataServerError> {
         self.queries
             .lock()
             .unwrap()
             .push(parameters.map(<[String]>::to_vec));
+        // An older run with a parameter more than the latest lists, as a
+        // QueryData run selects its own (#1500).
+        if reference_time == Some(older_run()) {
+            select_parameters(parameters, &[PARAMETERS.as_slice(), &["tp"]].concat())?;
+        }
         // An alias the engine takes but does not list, as QueryData takes
         // a parameter's short name (#1215).
         let parameters: Option<Vec<String>> = parameters.map(|names| {
@@ -681,6 +691,25 @@ fn an_unknown_parameter_lists_the_derived_ones_too() {
     assert!(position(&derived, Some(&["t", "gh"]))
         .ranges
         .contains_key("2t"));
+    // An older run refuses over its own names, which differ from the
+    // latest's: they stay, and the derived ones follow.
+    for requested in [&["nope"][..], &["10si", "nope"]] {
+        let requested: Vec<String> = requested.iter().map(|s| s.to_string()).collect();
+        match derived.query_position(
+            "POINT(0.5 0.5)",
+            None,
+            Some(&requested),
+            None,
+            Some(older_run()),
+        ) {
+            Err(DataServerError::InvalidParameter(message)) => assert_eq!(
+                message,
+                "Unknown parameter 'nope'; available: 10u, 10v, z, 2t, tp, 10si, 10wdir, gh"
+            ),
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("answered"),
+        }
+    }
 }
 
 /// EDR: the height is computed from the geopotential the engine returns,

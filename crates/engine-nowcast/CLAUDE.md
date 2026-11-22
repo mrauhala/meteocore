@@ -241,7 +241,9 @@ coasting, joins, or raw-byte forecast encoding. See
   rule, start bound included); neither ⇒ latest. A window without an
   anchor, pinned or not, and a polygon off the motion grid are
   `LocationNotFound` (404): a `datetime` list skips that instant, where a
-  400 failed the whole list (#968, #1500). `Generation.interval_secs` is what turns
+  400 failed the whole list (#968, #1500). A generation whose field has no
+  blocks or no positive interval (`NoMotionGrid::Degenerate`) is an
+  internal error, never that 404. `Generation.interval_secs` is what turns
   the vectors into m/s — it is the SOURCE interval the field was measured
   over, not the nowcast `step`. The #524 EMA now rescales the previous
   field by the interval ratio before blending, so a skipped composite no

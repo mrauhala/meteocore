@@ -111,6 +111,17 @@ pub struct MotionGrid {
     pub quality: Vec<f64>,
 }
 
+/// Why [`motion_grid`] has no grid to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoMotionGrid {
+    /// The bbox misses every block: no data there, which a `datetime` list
+    /// skips.
+    OffGrid,
+    /// The field has no blocks, or no positive interval to turn pixels
+    /// into m/s: a fault of the generation, never "no data".
+    Degenerate,
+}
+
 /// Block centres of `field` for every block whose footprint overlaps
 /// `bbox` (`[west, south, east, north]`, WGS84), plus one block of padding
 /// on each side, converted to east/north m/s over `interval_secs`.
@@ -119,7 +130,9 @@ pub struct MotionGrid {
 /// selection GRIB's `extract_bbox` does. The EDR area query then nulls the
 /// blocks outside its polygon: for a rectangle, those whose footprint misses
 /// it, so the overlapping blocks keep their values and the padding blocks
-/// are on the axes without them (#966). `None` when the bbox misses the grid.
+/// are on the axes without them (#966). [`NoMotionGrid::OffGrid`] when the
+/// bbox misses the grid, [`NoMotionGrid::Degenerate`] for a field that can
+/// serve no motion anywhere.
 ///
 /// A block's centre is at working-grid pixel `((b + 0.5) * block)` on each
 /// axis — the same convention [`MotionField::sample`] interpolates
@@ -132,9 +145,9 @@ pub fn motion_grid(
     spec: &GridSpec,
     interval_secs: f64,
     bbox: [f64; 4],
-) -> Option<MotionGrid> {
+) -> Result<MotionGrid, NoMotionGrid> {
     if field.bw == 0 || field.bh == 0 || interval_secs <= 0.0 || interval_secs.is_nan() {
-        return None;
+        return Err(NoMotionGrid::Degenerate);
     }
     let block = field.block as f64;
     let (w, h) = (spec.width as f64, spec.height as f64);
@@ -159,7 +172,7 @@ pub fn motion_grid(
         })
         .collect();
     if cols.is_empty() || rows.is_empty() {
-        return None;
+        return Err(NoMotionGrid::OffGrid);
     }
     // Overlap selection is contiguous; pad by one block each side.
     let pad = |sel: &[usize], n: usize| -> Vec<usize> {
@@ -192,7 +205,7 @@ pub fn motion_grid(
             quality.push(if field.measured[j] { 1.0 } else { 0.0 });
         }
     }
-    Some(MotionGrid {
+    Ok(MotionGrid {
         x: cols.into_iter().map(centre_lon).collect(),
         y: rows.into_iter().map(centre_lat).collect(),
         u,
@@ -252,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn bbox_selects_centres_and_empty_is_none() {
+    fn bbox_selects_centres_and_off_grid_is_no_data() {
         let (field, spec) = field();
         // Exactly the middle column and the top row overlap; one block of
         // padding each side pulls in the neighbours (clamped at the grid).
@@ -263,8 +276,28 @@ mod tests {
         // A bbox touching only the west column pads east only.
         let g = motion_grid(&field, &spec, 300.0, [19.0, 60.0, 20.05, 62.0]).unwrap();
         assert_eq!(g.x, vec![20.05, 20.15]);
-        assert!(motion_grid(&field, &spec, 300.0, [0.0, 0.0, 1.0, 1.0]).is_none());
-        assert!(motion_grid(&field, &spec, 0.0, [-180.0, -90.0, 180.0, 90.0]).is_none());
+        // A bbox off the grid is no data there; a field without blocks or
+        // without a positive interval is a fault, whatever the bbox.
+        let world = [-180.0, -90.0, 180.0, 90.0];
+        let off = [0.0, 0.0, 1.0, 1.0];
+        assert_eq!(
+            motion_grid(&field, &spec, 300.0, off).err(),
+            Some(NoMotionGrid::OffGrid)
+        );
+        for interval in [0.0, -300.0, f64::NAN] {
+            for bbox in [world, off] {
+                assert_eq!(
+                    motion_grid(&field, &spec, interval, bbox).err(),
+                    Some(NoMotionGrid::Degenerate),
+                    "{interval}"
+                );
+            }
+        }
+        let empty = MotionField { bw: 0, ..field };
+        assert_eq!(
+            motion_grid(&empty, &spec, 300.0, world).err(),
+            Some(NoMotionGrid::Degenerate)
+        );
     }
 
     #[test]

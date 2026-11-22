@@ -431,11 +431,8 @@ impl Derived {
     /// whose inputs it serves under EDR.
     fn edr_parameters(&self, plan: &Plan) -> Vec<String> {
         let mut names = self.edr.get_parameters();
-        for d in &plan.derived {
-            if d.edr_inputs.iter().all(|input| names.contains(input)) && !names.contains(&d.name) {
-                names.push(d.name.clone());
-            }
-        }
+        let derived = derived_edr_names(plan, &names);
+        names.extend(derived);
         names
     }
 
@@ -446,7 +443,10 @@ impl Derived {
     /// checks the message against `get_parameters`, offered no choices.
     /// Only that refusal is rewritten, after the engine made it: an engine
     /// may take names it does not list (QueryData's short names, #1215),
-    /// which a check here against the listed names would refuse.
+    /// which a check here against the listed names would refuse. Its own
+    /// list is kept as it gave it: a run older than the latest, or a
+    /// catalog replaced mid-request, may list other names than
+    /// `get_parameters` does now.
     fn relist(&self, plan: &Plan, error: DataServerError) -> DataServerError {
         let DataServerError::InvalidParameter(message) = &error else {
             return error;
@@ -454,11 +454,9 @@ impl Derived {
         if plan.derived.is_empty() {
             return error;
         }
-        let stored = self.edr.get_parameters();
-        let all = self.edr_parameters(plan);
-        let stored: Vec<&str> = stored.iter().map(String::as_str).collect();
-        let all: Vec<&str> = all.iter().map(String::as_str).collect();
-        match crate::edr_engine::relist_parameters(message, &stored, &all) {
+        let derived = derived_edr_names(plan, &self.edr.get_parameters());
+        let derived: Vec<&str> = derived.iter().map(String::as_str).collect();
+        match crate::edr_engine::relist_parameters(message, &derived) {
             Some(message) => DataServerError::InvalidParameter(message),
             None => error,
         }
@@ -485,6 +483,21 @@ impl Derived {
             }
         }
     }
+}
+
+/// The derived parameters EDR serves over the stored `names`, in plan
+/// order: each whose inputs they all hold, unless they hold it already.
+fn derived_edr_names(plan: &Plan, names: &[String]) -> Vec<String> {
+    let mut derived: Vec<String> = Vec::new();
+    for d in &plan.derived {
+        if d.edr_inputs.iter().all(|input| names.contains(input))
+            && !names.contains(&d.name)
+            && !derived.contains(&d.name)
+        {
+            derived.push(d.name.clone());
+        }
+    }
+    derived
 }
 
 /// `parameters` with each derived one replaced by its inputs, each name

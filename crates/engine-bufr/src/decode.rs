@@ -547,17 +547,32 @@ fn num(v: &Value) -> Option<f64> {
     }
 }
 
-/// A scaled BUFR value `m × 10^s` as the decimal the report states. A
-/// negative scale divides by the exact power of ten: multiplying by the
-/// inexact `10^s` puts noise in the last digit (122.85125 read as
-/// 122.85125000000001, #1500), and every decoded position, elevation and
-/// element value comes through here.
+/// The powers of ten an `f64` holds exactly, `10^0` to `10^22` (`5^22` is
+/// the largest power of five under `2^53`), as literals: `f64::powi`
+/// promises no particular precision.
+const EXACT_POWERS_OF_TEN: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// A scaled BUFR value `m × 10^s` as the decimal the report states, the
+/// `f64` nearest it. Every decoded position, elevation and element value
+/// comes through here. A mantissa an `f64` holds exactly, times or over
+/// an exact power of ten, is one correctly rounded operation; dividing,
+/// never multiplying by the inexact `10^s`, which put noise in the last
+/// digit (122.85125 read as 122.85125000000001, #1500). Past those bounds
+/// the decimal is parsed, which rounds it correctly too.
 fn scaled(m: i128, s: i16) -> f64 {
-    let m = m as f64;
-    if s < 0 {
-        m / 10f64.powi(-i32::from(s))
-    } else {
-        m * 10f64.powi(i32::from(s))
+    let power = EXACT_POWERS_OF_TEN.get(usize::from(s.unsigned_abs()));
+    match power {
+        Some(&power) if m.unsigned_abs() <= 1 << f64::MANTISSA_DIGITS => {
+            if s < 0 {
+                m as f64 / power
+            } else {
+                m as f64 * power
+            }
+        }
+        _ => format!("{m}e{s}").parse().unwrap_or(f64::NAN),
     }
 }
 
@@ -721,6 +736,21 @@ mod tests {
         text
     }
 
+    /// The table holds each power of ten exactly: its entry is the literal,
+    /// and the entry before times ten.
+    #[test]
+    fn the_powers_of_ten_are_exact() {
+        let literals = [
+            "1e0", "1e1", "1e2", "1e3", "1e4", "1e5", "1e6", "1e7", "1e8", "1e9", "1e10", "1e11",
+            "1e12", "1e13", "1e14", "1e15", "1e16", "1e17", "1e18", "1e19", "1e20", "1e21", "1e22",
+        ];
+        for (k, (&power, literal)) in EXACT_POWERS_OF_TEN.iter().zip(literals).enumerate() {
+            assert_eq!(power, literal.parse::<f64>().unwrap(), "10^{k}");
+            // Exact: the integer 10^k converts back to itself.
+            assert_eq!(power as u128, 10u128.pow(k as u32), "10^{k}");
+        }
+    }
+
     /// A scaled value is the decimal the report states, digit for digit:
     /// the coordinates that came out of `m × 10^s` with noise in the last
     /// place (#1500), and every mantissa of up to eight digits at the
@@ -741,6 +771,11 @@ mod tests {
         assert_eq!(scaled(12_285_125, -5).to_string(), "122.85125");
         assert_eq!(scaled(3, 2), 300.0);
         assert_eq!(scaled(-25, 0), -25.0);
+        // Past the exact powers, or a mantissa past 2^53: the parsed decimal.
+        assert_eq!(scaled(12_285_125, -30), 12_285_125e-30);
+        assert_eq!(scaled(7, 25), 7e25);
+        assert_eq!(scaled(-(1 << 60) - 1, -3), -1_152_921_504_606_846.977);
+        assert_eq!(scaled(i128::MAX, 0), i128::MAX as f64);
         for s in 1..=7u32 {
             for m in (-20_000_000i64..=20_000_000).step_by(997) {
                 assert_eq!(

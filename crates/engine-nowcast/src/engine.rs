@@ -2621,11 +2621,12 @@ impl EdrEngine for NowcastEngine {
             generation.interval_secs,
             [bbox.west, bbox.south, bbox.east, bbox.north],
         )
-        .ok_or_else(|| {
-            // Off the grid is no data there, a 404 as on the other gridded
-            // engines, never a 400 that would fail a `datetime` list.
-            DataServerError::LocationNotFound(
-                "The polygon lies outside the motion field grid".to_string(),
+        .map_err(|why| {
+            no_motion_grid(
+                why,
+                generation.reference_time,
+                &generation.field,
+                generation.interval_secs,
             )
         })?;
 
@@ -2681,6 +2682,30 @@ impl EdrEngine for NowcastEngine {
             parameters: param_descs,
             ranges,
         }))
+    }
+}
+
+/// The error for an area the motion field cannot answer. Off the grid is no
+/// data there, a 404 as on the other gridded engines, never a 400 that
+/// would fail a `datetime` list. A degenerate field is the engine's fault:
+/// an internal error (a logged, generic 500), never a "no data" a list
+/// skips without a word.
+fn no_motion_grid(
+    why: motion_grid::NoMotionGrid,
+    anchor: DateTime<Utc>,
+    field: &MotionField,
+    interval_secs: f64,
+) -> DataServerError {
+    match why {
+        motion_grid::NoMotionGrid::OffGrid => DataServerError::LocationNotFound(
+            "The polygon lies outside the motion field grid".to_string(),
+        ),
+        motion_grid::NoMotionGrid::Degenerate => DataServerError::Engine(format!(
+            "nowcast generation {} has no usable motion field ({}×{} blocks over {interval_secs} s)",
+            format_instance_id(anchor),
+            field.bw,
+            field.bh,
+        )),
     }
 }
 
@@ -2947,6 +2972,47 @@ mod tests {
         };
         let (_, _, feature) = cell_feature(&cell, wired.0, wired.1, wired.2);
         feature.properties.as_ref().clone()
+    }
+
+    /// A polygon off the motion grid is no data there (a 404 a `datetime`
+    /// list skips); a degenerate generation's field is an internal error,
+    /// a generic 500, never "no data" (#1500).
+    #[test]
+    fn a_degenerate_motion_field_is_an_internal_error() {
+        use ds_core::error::ErrorClass;
+        let anchor: DateTime<Utc> = "2026-09-28T12:00:00Z".parse().unwrap();
+        let field = MotionField {
+            block: 8,
+            bw: 0,
+            bh: 2,
+            u: Vec::new(),
+            v: Vec::new(),
+            measured: Vec::new(),
+        };
+        let off = no_motion_grid(motion_grid::NoMotionGrid::OffGrid, anchor, &field, 300.0);
+        assert!(matches!(off, DataServerError::LocationNotFound(_)), "{off}");
+        let fault = no_motion_grid(motion_grid::NoMotionGrid::Degenerate, anchor, &field, 300.0);
+        assert_eq!(fault.class(), ErrorClass::Internal, "{fault}");
+        assert!(
+            fault.to_string().contains("2026-09-28T12:00:00Z"),
+            "{fault}"
+        );
+        // Through the grid itself: the same field over any bbox.
+        let spec = GridSpec {
+            west: 0.0,
+            north: 60.0,
+            dlon: 0.1,
+            dlat: 0.1,
+            width: 16,
+            height: 16,
+        };
+        let why = motion_grid::motion_grid(&field, &spec, 300.0, [0.0, 58.0, 1.0, 60.0])
+            .err()
+            .unwrap();
+        assert_eq!(
+            no_motion_grid(why, anchor, &field, 300.0).class(),
+            ErrorClass::Internal
+        );
     }
 
     /// #1143: a cell is labelled by its rank, severity class and peak

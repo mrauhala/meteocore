@@ -45,7 +45,7 @@ pub(crate) async fn error_detail(
     let pairs = Query::<Vec<(String, String)>>::try_from_uri(request.uri())
         .map(|Query(pairs)| pairs)
         .unwrap_or_default();
-    let (request, id, _) = crate::query_form::route_ids(request).await;
+    let (request, id, instance) = crate::query_form::route_ids(request).await;
     let mut response = next.run(request).await;
     let (Some(query_type), Some(id)) = (query_type, id) else {
         return response;
@@ -66,9 +66,12 @@ pub(crate) async fn error_detail(
         StatusCode::BAD_REQUEST => {
             unknown_parameter(engine.as_ref(), value("parameter-name"), &response)
         }
-        StatusCode::NOT_FOUND if is_no_data(&response) => {
-            Some(no_data(engine.as_ref(), query_type, value("datetime")))
-        }
+        StatusCode::NOT_FOUND if is_no_data(&response) => Some(no_data(
+            engine.as_ref(),
+            query_type,
+            value("datetime"),
+            instance.as_deref(),
+        )),
         _ => None,
     };
     if let Some(detail) = detail {
@@ -121,8 +124,15 @@ fn is_no_data(response: &Response) -> bool {
 }
 
 /// The detail of a data query that found no data: wording for its query
-/// type and the time range the collection advertises.
-fn no_data(engine: &dyn EdrEngine, query_type: &str, datetime: Option<&str>) -> ErrorDetail {
+/// type and the time range the collection advertises, or on an instance
+/// route the valid times of that run, which may be one instant (a nowcast
+/// generation is valid at its anchor alone).
+fn no_data(
+    engine: &dyn EdrEngine,
+    query_type: &str,
+    datetime: Option<&str>,
+    instance: Option<&str>,
+) -> ErrorDetail {
     let (title, place) = match query_type {
         "position" => ("No data at this position", "at this position"),
         "trajectory" => ("No data along this path", "along this path"),
@@ -132,13 +142,31 @@ fn no_data(engine: &dyn EdrEngine, query_type: &str, datetime: Option<&str>) -> 
         Some(datetime) => format!(" at datetime {datetime}"),
         None => String::new(),
     };
-    let hint = match engine.get_temporal_extent() {
-        Some((start, end)) => format!(
-            "The collection advertises data from {} to {}. Choose a time in that range, or another place.",
-            start.format("%Y-%m-%dT%H:%M:%SZ"),
-            end.format("%Y-%m-%dT%H:%M:%SZ")
+    let at = |t: &chrono::DateTime<chrono::Utc>| t.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let run = instance
+        .and_then(ds_core::instances::parse_instance_id)
+        .and_then(|reference_time| engine.find_instance(reference_time));
+    let id = run
+        .as_ref()
+        .map(|r| ds_core::instances::format_instance_id(r.reference_time));
+    let hint = match (run.as_ref().map(|r| r.valid_times.as_slice()), id) {
+        (Some([only]), Some(id)) => format!(
+            "Instance {id} holds data at {} only. Choose that time, or another place.",
+            at(only)
         ),
-        None => "Try another time, another area or fewer parameters.".to_owned(),
+        (Some([first, .., last]), Some(id)) => format!(
+            "Instance {id} holds data from {} to {}. Choose a time in that range, or another place.",
+            at(first),
+            at(last)
+        ),
+        _ => match engine.get_temporal_extent() {
+            Some((start, end)) => format!(
+                "The collection advertises data from {} to {}. Choose a time in that range, or another place.",
+                at(&start),
+                at(&end)
+            ),
+            None => "Try another time, another area or fewer parameters.".to_owned(),
+        },
     };
     ErrorDetail {
         title: Some(title.into()),
