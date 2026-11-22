@@ -372,7 +372,7 @@ async fn a_slow_collection_holds_only_itself() {
     assert!(reload.1 .0["error"]
         .as_str()
         .unwrap()
-        .contains("still loading"));
+        .contains("still running"));
 
     loads.release("slow");
     assert!(matches!(load.await.unwrap(), Settled::Loaded { .. }));
@@ -768,29 +768,51 @@ async fn a_colliding_id_keeps_the_owner_one_load_gives_it() {
     loads.release("pvol");
     load.await.unwrap();
     let health = state.health.read().unwrap().clone();
-    let entries: Vec<_> = health
-        .iter()
-        .filter(|h| h.id == "pvol-test")
-        .map(|h| (h.engine_type.clone(), h.status, h.error.clone()))
-        .collect();
-    assert_eq!(
-        entries,
-        [
-            ("odim-volume".to_string(), CollectionStatus::Ready, None),
-            (
-                "csv".to_string(),
-                CollectionStatus::Failed,
-                Some("id collides with an already-registered collection".to_string())
+    let entries = |health: &[CollectionHealth]| -> Vec<_> {
+        health
+            .iter()
+            .filter(|h| h.id == "pvol-test")
+            .map(|h| (h.engine_type.clone(), h.status, h.error.clone()))
+            .collect()
+    };
+    let expected = [
+        ("odim-volume".to_string(), CollectionStatus::Ready, None),
+        (
+            "csv".to_string(),
+            CollectionStatus::Failed,
+            Some(
+                "id collides with radar site 'test' of network 'pvol', registered first"
+                    .to_string(),
             ),
-        ]
-    );
-    assert!(state.wms.load().engines.contains_key("pvol-test"));
-    assert!(!state.features.load().engines.contains_key("pvol-test"));
+        ),
+    ];
+    assert_eq!(entries(&health), expected);
+    let served = |state: &AdminState| {
+        (
+            state.wms.load().engines.contains_key("pvol-test"),
+            state.edr.load().collections["pvol-test"]
+                .engine_type
+                .clone(),
+            state.features.load().engines.contains_key("pvol-test"),
+        )
+    };
+    assert_eq!(served(&state), (true, "odim-volume".to_string(), false));
     assert!(!state
         .engine_handles
         .read()
         .unwrap()
         .contains_key("pvol-test"));
+    // One load, and so a reload of the same config, decide it alike.
+    let (once, _) = one_load(&config_file(dir.path(), &body)).await;
+    assert_eq!(outcomes(&health), outcomes(&once));
+    let reloaded = state.clone();
+    crate::poll_runtime()
+        .spawn(async move { admin::do_reload(&reloaded).map(|_| ()) })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(entries(&state.health.read().unwrap()), expected);
+    assert_eq!(served(&state), (true, "odim-volume".to_string(), false));
     stop(&state);
 }
 
@@ -1004,4 +1026,84 @@ fn colliding_ids_wait_in_the_order_one_load_registers_them() {
         dependencies(&config.collections),
         [vec![], vec![0], vec![1], vec![], vec![1]]
     );
+}
+
+/// After its grace the readiness check passes only once some collection is
+/// served: a pod whose first loads are all slow, or failed, serves only
+/// 404s.
+#[tokio::test]
+async fn readiness_after_the_grace_waits_for_a_collection_to_serve() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_file_with(
+        dir.path(),
+        "startup_readiness_grace_secs = 1",
+        &format!("{}{}", csv("slow", true), csv("broken", false)),
+    );
+    let state = crate::watcher::tests::build_state_at(&path, true);
+    let health = health_router(&state);
+    let loads = gated(&["slow"], &[]);
+    let load = start(&state, loads.loader.clone());
+    wait_until("the grace and the broken collection", || {
+        state.startup.grace_elapsed() && error_of(&state, "broken").is_some()
+    })
+    .await;
+    let (status, body) = get(&health, "/health?loaded").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["loaded"], "1 loading, none ready");
+    assert!(state.edr.load().engines.is_empty());
+    loads.release("slow");
+    load.await.unwrap();
+    let (status, body) = get(&health, "/health?loaded").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["loaded"], "settled");
+}
+
+/// Each publish fits the plan again without applying it: the valve then
+/// finds a grant for a cache a collection registered after boot, its size
+/// still the configured one.
+///
+/// Runs in a child process: the plan registry must be its alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_publish_refits_the_plan_for_the_valve_without_applying_it() {
+    const CHILD: &str = "MC_TEST_STARTUP_REFIT_CHILD";
+    const NAME: &str =
+        "startup::tests::each_publish_refits_the_plan_for_the_valve_without_applying_it";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{NAME} failed in its child process");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_file_with(
+        dir.path(),
+        "[memory]\nmode = \"auto\"\ntotal_mb = 1024",
+        &radar("radar"),
+    );
+    let state = crate::watcher::tests::build_state_at(&path, true);
+    let boot = crate::memory_plan::lower_at_boot(&state);
+    let tile_cache = |rows: &[ds_cache::plan::Row]| {
+        rows.iter()
+            .find(|r| r.entry.id == "tile_cache" && r.entry.scope.collection() == Some("radar"))
+            .cloned()
+    };
+    assert!(tile_cache(&crate::cache_plan::snapshot(&state)).is_none());
+    let loads = gated(&[], &[]);
+    start(&state, loads.loader.clone()).await.unwrap();
+    let row = tile_cache(&crate::cache_plan::snapshot(&state)).expect("registered by the load");
+    assert!(boot.plan.as_ref().unwrap().grant(&row.entry).is_none());
+    let report = crate::memory_plan::last().unwrap();
+    assert!(
+        report.plan.as_ref().unwrap().grant(&row.entry).is_some(),
+        "refitted"
+    );
+    assert_eq!(
+        row.usage.capacity_bytes, row.configured_bytes,
+        "not applied"
+    );
+    assert!(report.changes.is_empty());
+    stop(&state);
 }

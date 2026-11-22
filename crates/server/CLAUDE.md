@@ -96,10 +96,17 @@ moment it is built, so a slow source holds only its own collection.
   (`{base}-{nod}`) load in the order one load registers them, a higher pass
   after a lower, else the later declared after the earlier, so the same one
   keeps the id whichever load ends first. The other's id is dropped and its
-  entry fails (a site: "derived id collides …", as one load; a collection
-  declared after its network's site: "id collides …", where one load
-  silently overwrote the site). A load whose every id collided publishes no
-  engine or poll loop, and nothing to `BuiltSources`.
+  entry fails: a site "derived id collides …", a collection "id collides
+  with radar site '{nod}' of network '{base}', registered first"
+  (`admin::id_taken_error`). One load decides it the same way
+  (`id_taken!` at the top of each pass's collection), so a reload of the
+  boot config, a watched change or a recovery pass among them, keeps what
+  the boot decided. A load whose every id collided publishes no engine or
+  poll loop, and nothing to `BuiltSources`. Any `{network}-{alphanumeric}`
+  id counts as a possible site, so a collection named so after a
+  polar-volume network (`radar-composite` after `radar`) waits for the
+  network's bootstrap: name site-like collections only `<network>-<site>`,
+  and others so that no network's id and a dash begin them.
 - `admin::publish_load` adds a load's engines to the engine lists and spawns
   their poll loops, then swaps each registry once with `rcu` (the MCP state
   follows Features), then replaces the collection's `loading` entry with its
@@ -115,7 +122,10 @@ moment it is built, so a slow source holds only its own collection.
   then applies every change it saw once (`do_reload` diffs against the boot
   config, reusing what the load built), and the recovery loop skips its
   passes (each registers the whole accepted config again).
-- The memory plan: at boot, before any collection is built,
+- The memory plan: each publish fits it again without applying it
+  (`memory_plan::refit_during_load`), so the pressure valve finds a grant
+  and floor for every cache registered so far. At boot, before any
+  collection is built,
   `memory_plan::lower_at_boot` fits it over what is registered then and,
   in `auto`, applies only the sizes it lowers (every cache is empty, so a
   shrink keeps nothing; a partial set's larger grant is never applied). The
@@ -130,9 +140,15 @@ moment it is built, so a slow source holds only its own collection.
   at boot: an engine first seen later is a baseline.
 - `/health?loaded`, the chart's readiness probe, is 503 while collections
   load until `[server] startup_readiness_grace_secs` (default 300, 0: none)
-  after the load started (`StartupLoad::grace_elapsed`), its `loaded`
-  member saying which (`settled`, `N still loading`, `grace elapsed, N
-  still loading`).
+  after the load started (`StartupLoad::grace_elapsed`) with some
+  collection ready or degraded: a pod whose first loads are all slow, or
+  failed, serves only 404s and takes no traffic. Its `loaded` member says
+  which: `settled`, `N still loading`, `N loading, none ready`, `grace
+  elapsed, N still loading`.
+- A load that never ends has no remedy short of a restart: reloads keep
+  answering 409, and a watched change, the recovery loop and the full plan
+  wait. The server serves what it built meanwhile, and `CollectionsLoading`
+  fires after 15 minutes.
 - While collections load, `admin::loading_cache_control` turns a 200 or
   304 with the short metadata policy or none into `no-cache`: catalogs
   grow during the load. Data policies are kept.
@@ -1147,7 +1163,8 @@ PR:
   seconds of the bind, so a load longer than its 10 minutes never restarts
   the pod. The readiness probe reads `/health?loaded`: 503 while
   collections load, until `[server] startup_readiness_grace_secs` (300 s)
-  after the load started, so a rolling update keeps the old pod serving.
+  after the load started with some collection served, so a rolling update
+  keeps the old pod serving.
   Liveness is a TCP check.
 - **Metrics:** `/metrics` on the main port, for the ServiceMonitor.
 - **Shutdown:** the SIGTERM flush of `state_dir` snapshots must finish

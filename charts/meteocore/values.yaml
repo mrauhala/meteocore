@@ -131,9 +131,10 @@ service:
 # startup probe passes within seconds of the bind, so a long load never
 # restarts the pod. Readiness is /health?loaded: 503 while collections load,
 # until [server] startup_readiness_grace_secs (default 300 s) after the load
-# started, so a rolling update keeps the old pod serving while the new one
-# loads, and a slow source holds a single replica out of service for at
-# most the grace. Readiness failing never restarts a pod.
+# started and some collection is served, so a rolling update keeps the old
+# pod serving while the new one loads, and a slow source holds a single
+# replica out of service for at most the grace. Readiness failing never
+# restarts a pod.
 startupProbe:
   httpGet:
     path: /health

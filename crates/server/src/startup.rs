@@ -344,6 +344,10 @@ pub(crate) async fn load(state: AdminState, loader: Loader, concurrency: usize) 
                     Ok(part) => {
                         let mut built = built.lock().unwrap_or_else(|e| e.into_inner());
                         admin::publish_load(&state, &collection, part, &mut built);
+                        drop(built);
+                        // The valve's view of the plan takes the caches
+                        // this collection registered; nothing is resized.
+                        crate::memory_plan::refit_during_load(&state);
                     }
                     Err(_) => {
                         error!("Collection '{}': its load panicked", collection.id);

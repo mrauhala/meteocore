@@ -222,6 +222,17 @@ pub(crate) fn lower_at_boot(state: &crate::admin::AdminState) -> Arc<Report> {
     keep(report, &rows)
 }
 
+/// The plan fitted again as the startup load publishes a collection
+/// (#317), applying nothing: kept as the last report, so the governor's
+/// pressure valve finds a grant and a floor for every cache registered so
+/// far, a later collection's included, rather than only those the boot
+/// report saw. Sizes move once the load settles.
+pub(crate) fn refit_during_load(state: &crate::admin::AdminState) -> Arc<Report> {
+    let memory = crate::admin::refresh_metrics(state);
+    let rows = crate::cache_plan::snapshot(state);
+    keep(fit(state, &rows, &memory), &rows)
+}
+
 /// [`replan`]'s second half for the memory governor's re-plan tick
 /// (#1315): `report`, fitted by [`fit`], applied only where `wanted` gives
 /// a row a size ([`apply_with`]), counted and kept as the last report.

@@ -211,11 +211,12 @@ minutes, and `/health` lists it `loading` meanwhile.
   the bind, so a load longer than that never restarts the pod.
 - `readinessProbe`: `/health?loaded`, which also answers 503 while
   collections load, until `[server] startup_readiness_grace_secs` (default
-  300 s) after the load started. A rolling update keeps the old pod serving
-  while the new one loads; a slow source holds a pod out of the Service for
-  at most the grace, after which it takes traffic for what it has built
-  (`0` waits for every collection). A pod whose every source is down leaves
-  the Service.
+  300 s) after the load started and some collection is served. A rolling
+  update keeps the old pod serving while the new one loads; a slow source
+  holds a pod out of the Service for at most the grace, after which it
+  takes traffic for what it has built (`0` waits for every collection). A
+  pod that has built nothing yet, or whose every source is down, stays out
+  of the Service.
 - `livenessProbe`: a TCP check. Restarting the pod would not bring upstream
   sources back, so `/health` is not a liveness signal.
 

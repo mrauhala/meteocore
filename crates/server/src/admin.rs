@@ -3785,6 +3785,25 @@ pub(crate) fn load_pass(engine_type: &str) -> u8 {
     }
 }
 
+/// Why a configured collection whose id is already registered fails
+/// (#317): a radar site `{base}-{nod}` took it first, which one load and
+/// the startup load decide alike (the collection registered first, by load
+/// pass then declaration, keeps an id). Names the site's network.
+pub(crate) fn id_taken_error(id: &str, pvol_sites: &PvolSites) -> String {
+    let site = pvol_sites.iter().find_map(|(base, sites)| {
+        sites
+            .keys()
+            .find(|nod| id.strip_prefix(base.as_str()) == Some(&format!("-{nod}")))
+            .map(|nod| (base, nod))
+    });
+    match site {
+        Some((base, nod)) => {
+            format!("id collides with radar site '{nod}' of network '{base}', registered first")
+        }
+        None => "id collides with an already-registered collection".into(),
+    }
+}
+
 /// The engines earlier loads of one startup built (#317), which a derived
 /// collection loaded on its own reads as [`load_collections`] reads the
 /// engines its earlier passes built: [`LoadScope::built`].
@@ -4048,6 +4067,28 @@ fn load_collections_scoped(
         }};
     }
 
+    // A configured id already registered: a radar site an earlier
+    // polar-volume source registered under it. The collection one load
+    // registers first keeps the id, as the startup load decides it
+    // (`publish_load`, #317); this one fails, naming the site's network.
+    macro_rules! id_taken {
+        ($id:expr) => {{
+            let id: &str = $id;
+            [
+                &edr_collections,
+                &feature_collections,
+                &map_collections,
+                &maps_collections,
+                &tiles_collections,
+                &tiles_feature_collections,
+                &volume_collections,
+            ]
+            .iter()
+            .any(|registry| registry.contains_key(id))
+            .then(|| id_taken_error(id, &pvol_sites))
+        }};
+    }
+
     for collection in collections {
         let data_path_display = collection
             .data_path
@@ -4057,6 +4098,16 @@ fn load_collections_scoped(
             "Loading collection '{}' ({}) from {}",
             collection.id, collection.engine_type, data_path_display
         );
+        if let Some(error) = id_taken!(&collection.id) {
+            tracing::error!("Collection '{}': {error}, skipping", collection.id);
+            health.push(CollectionHealth {
+                id: collection.id.clone(),
+                engine_type: collection.engine_type.clone(),
+                status: CollectionStatus::Failed,
+                error: Some(error),
+            });
+            continue;
+        }
 
         // Validate engine+API compatibility
         let supported_apis: &[&str] = match collection.engine_type.as_str() {
@@ -6299,6 +6350,10 @@ fn load_collections_scoped(
                 error: Some(error),
             });
         };
+        if let Some(error) = id_taken!(&collection.id) {
+            fail(error);
+            continue;
+        }
         let Some(nowcast_config) = collection.nowcast.as_ref() else {
             fail("missing [collections.nowcast] config".into());
             continue;
@@ -6536,6 +6591,10 @@ fn load_collections_scoped(
                 error: Some(error),
             });
         };
+        if let Some(error) = id_taken!(&collection.id) {
+            fail(error);
+            continue;
+        }
         let Some(grid_config) = collection.station_grid.as_ref() else {
             fail("missing [collections.station_grid] config".into());
             continue;
@@ -6700,6 +6759,10 @@ fn load_collections_scoped(
                 error: Some(error),
             });
         };
+        if let Some(error) = id_taken!(&collection.id) {
+            fail(error);
+            continue;
+        }
         let Some(period_config) = collection.period.as_ref() else {
             fail("missing [collections.period] config".into());
             continue;
@@ -7801,8 +7864,8 @@ pub(crate) async fn serve_reload(
         return Err((
             StatusCode::CONFLICT,
             Json(json!({
-                "error": "Collections are still loading after startup; reload once /health \
-                          lists none as loading"
+                "error": "The startup load is still running: collections are loading, or \
+                          the steps after them have not finished. Retry shortly."
             })),
         ));
     }
@@ -9067,7 +9130,10 @@ pub(crate) fn publish_load(
             h.status = CollectionStatus::Failed;
             // One load's words for a radar site whose id was taken first.
             h.error = Some(if h.id == configured.id {
-                "id collides with an already-registered collection".into()
+                id_taken_error(
+                    &h.id,
+                    &state.pvol_sites.read().unwrap_or_else(|e| e.into_inner()),
+                )
             } else {
                 "derived id collides with an already-registered collection".into()
             });
@@ -9838,8 +9904,9 @@ fn refresh_data_age_gauge_locked(
 pub struct HealthQuery {
     /// `loaded` (`loaded=true`), the readiness check (#317): answer 503
     /// while collections are still loading, until the startup load's
-    /// readiness grace (`[server] startup_readiness_grace_secs`) has
-    /// passed. `loaded=false` is the plain check.
+    /// readiness grace (`[server] startup_readiness_grace_secs`) has passed
+    /// with some collection ready or degraded. `loaded=false` is the plain
+    /// check.
     loaded: Option<String>,
 }
 
@@ -10093,8 +10160,17 @@ pub async fn health_handler(
         .iter()
         .filter(|h| h.status == CollectionStatus::Loading)
         .count();
+    // The grace counts once some collection is served: a pod whose first
+    // loads are all slow serves only 404s, and must not take traffic.
+    let serving = health.iter().any(|h| {
+        matches!(
+            h.status,
+            CollectionStatus::Ready | CollectionStatus::Degraded
+        )
+    });
     let grace_elapsed = state.startup.grace_elapsed();
-    let status_code = if all_failed || (wait_for_load && loading && !grace_elapsed) {
+    let ready_by_grace = grace_elapsed && serving;
+    let status_code = if all_failed || (wait_for_load && loading && !ready_by_grace) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -10105,10 +10181,11 @@ pub async fn health_handler(
         "collections": collections
     });
     if wait_for_load {
-        body["loaded"] = json!(match (loading, grace_elapsed) {
-            (false, _) => "settled".to_string(),
-            (true, true) => format!("grace elapsed, {still_loading} still loading"),
-            (true, false) => format!("{still_loading} still loading"),
+        body["loaded"] = json!(match (loading, grace_elapsed, serving) {
+            (false, ..) => "settled".to_string(),
+            (true, true, true) => format!("grace elapsed, {still_loading} still loading"),
+            (true, _, false) => format!("{still_loading} loading, none ready"),
+            (true, false, true) => format!("{still_loading} still loading"),
         });
     }
     (status_code, Json(body)).into_response()
