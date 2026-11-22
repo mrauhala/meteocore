@@ -7266,12 +7266,16 @@ impl EdrEngine for PolarVolumeSiteView {
     /// `parameter_names` is not left with the bare code and no unit (#273):
     /// the site's snapshot, built with the catalog (#1500).
     fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        // A site that has dropped out of the catalog while its collection is
+        // still registered shares one empty map, never a new one per call
+        // (#1500 E18).
+        static NONE: std::sync::LazyLock<Arc<ParameterDescriptions>> =
+            std::sync::LazyLock::new(Arc::default);
         self.catalog
             .load()
             .by_site_meta
             .get(&self.nod)
-            .map(|m| Arc::clone(&m.descriptions))
-            .unwrap_or_default()
+            .map_or_else(|| Arc::clone(&NONE), |m| Arc::clone(&m.descriptions))
     }
 
     fn get_vertical_extent(&self) -> Option<VerticalDimension> {
