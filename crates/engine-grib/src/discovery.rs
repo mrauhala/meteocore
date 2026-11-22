@@ -13,7 +13,13 @@ pub(super) struct Discovery {
     pub views: BTreeMap<Option<GribLevelType>, Arc<RasterInfo>>,
     /// Each view's wind components (#897), rebuilt with `views`.
     pub wind: BTreeMap<Option<GribLevelType>, Arc<WindFacts>>,
+    /// Each view's EDR parameter descriptions (#1500), rebuilt with
+    /// `views`: a header probe or decode that adds a parameter's metadata
+    /// refreshes them, as it does the map layers' titles and units.
+    pub descriptions: BTreeMap<Option<GribLevelType>, Arc<ParameterDescriptions>>,
     pub empty: Arc<RasterInfo>,
+    /// What a view without a catalog describes: nothing.
+    pub no_descriptions: Arc<ParameterDescriptions>,
     // At most one representative per view. Cache unknown/unsupported geometry
     // too, so a successful header probe is not repeated every poll.
     grids: HashMap<MessageId, Option<GridGeometry>>,
@@ -25,6 +31,8 @@ impl Default for Discovery {
         Self {
             views: BTreeMap::new(),
             wind: BTreeMap::new(),
+            descriptions: BTreeMap::new(),
+            no_descriptions: Arc::default(),
             grids: HashMap::new(),
             wanted: HashSet::new(),
             empty: Arc::new(RasterInfo {
@@ -212,6 +220,7 @@ impl GribEngine {
         discovery.grids.retain(|id, _| wanted.contains(id));
         discovery.wanted = wanted;
         let mut wind = BTreeMap::new();
+        let mut descriptions = BTreeMap::new();
         discovery.views = catalogs(&catalog)
             .map(|(family, catalog)| {
                 let geometry = representative(catalog).and_then(|(file, entry)| {
@@ -227,10 +236,12 @@ impl GribEngine {
                     source: self.source.clone(),
                 };
                 wind.insert(family, Arc::new(view.build_wind_facts(catalog)));
+                descriptions.insert(family, Arc::new(view.build_descriptions(catalog)));
                 (family, Arc::new(view.build_raster_info(catalog, geometry)))
             })
             .collect();
         discovery.wind = wind;
+        discovery.descriptions = descriptions;
         let nodes = discovery
             .views
             .values()
@@ -342,6 +353,26 @@ impl GribEngine {
             grid: GridAxes::NorthAligned,
             parameters,
         }
+    }
+
+    /// Each advertised parameter's EDR description from its cached
+    /// metadata, at the canonical key of the newest run that has it: the
+    /// label and the served unit the map layers report (#1500).
+    fn build_descriptions(&self, catalog: &Catalog) -> ParameterDescriptions {
+        catalog
+            .all_params()
+            .into_iter()
+            .map(|p| {
+                let meta = self.param_metadata(catalog, &p);
+                let description = ParameterDescription {
+                    label: meta.label(),
+                    unit: meta.display.display_unit.to_string(),
+                    observed_property: p.clone(),
+                    standard_name: None,
+                };
+                (p, description)
+            })
+            .collect()
     }
 
     fn build_raster_info(
@@ -598,11 +629,24 @@ mod tests {
         let engine = GribEngine::new("retry", &source.config()).unwrap();
         let unknown = engine.raster_info_shared();
         assert!(unknown.spatial_extent.is_none());
+        // The EDR descriptions are a snapshot published with the view
+        // (#1500): unprobed, the placeholder, shared by every read.
+        let placeholder = engine.get_parameter_descriptions();
+        assert_eq!(placeholder["TMP"].unit, "");
+        assert!(Arc::ptr_eq(
+            &placeholder,
+            &engine.get_parameter_descriptions()
+        ));
         std::fs::write(source.dir.join("f000.grib2"), bytes).unwrap();
         engine.scan_once().unwrap();
         let first = engine.raster_info_shared();
         assert_eq!(first.spatial_extent, Some([0.0, 0.0, 1.0, 1.0]));
         assert!(!Arc::ptr_eq(&unknown, &first));
+        // The probe that read the header published its label and unit.
+        let probed = engine.get_parameter_descriptions();
+        assert_eq!(probed["TMP"].unit, "°C");
+        assert!(probed["TMP"].label.contains("2 m above ground"));
+        assert!(Arc::ptr_eq(&probed, &engine.get_parameter_descriptions()));
         let mut shifted = message(0, 280.0, [0; 4], 103, 2);
         shifted[87..91].copy_from_slice(&20_000_000u32.to_be_bytes());
         shifted[96..100].copy_from_slice(&21_000_000u32.to_be_bytes());

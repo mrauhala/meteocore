@@ -23,8 +23,7 @@ use ds_core::feature::{
 use ds_core::feature_engine::FeatureEngine;
 use ds_core::map_engine::MapEngine;
 use ds_core::model::{
-    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    CoverageResponse, DomainDescription, LocationSnapshot, NdArray, QueryResult, ValuePrecision,
 };
 use engine_station_grid::residuals::Summary;
 use engine_station_grid::StationGridEngine;
@@ -289,8 +288,8 @@ impl EdrEngine for Lattice {
         vec!["t2m".into()]
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        HashMap::new()
+    fn get_parameter_descriptions(&self) -> Arc<ds_core::model::ParameterDescriptions> {
+        Arc::default()
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

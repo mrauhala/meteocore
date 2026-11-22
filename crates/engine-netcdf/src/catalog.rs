@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{ParameterInfo, RasterInfo};
+use ds_core::model::ParameterDescriptions;
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::{CurvilinearGrid, SourceGrid};
 use ds_core::units::{cf_display_conversion, DisplayConversion};
@@ -573,6 +574,10 @@ pub(crate) struct Catalog {
     /// catalog ([`run_times`]), so a request clones an `Arc`.
     pub run_times: BTreeMap<DateTime<Utc>, Arc<[DateTime<Utc>]>>,
     pub info: Arc<RasterInfo>,
+    /// Every served parameter's EDR description, built with the catalog
+    /// from `layout` and `info` (`NetcdfEngine::all_descriptions`), so
+    /// collection metadata reads an `Arc` (#1500).
+    pub descriptions: Arc<ParameterDescriptions>,
     /// [`ds_core::map_engine::MapEngine::content_version`]: moves when a
     /// catalogued file is replaced on disk.
     pub content_version: u64,
@@ -588,6 +593,7 @@ impl Catalog {
             runs: BTreeMap::new(),
             run_times: BTreeMap::new(),
             info: Arc::new(raster_info(None, &BTreeMap::new(), &BTreeMap::new())),
+            descriptions: Arc::default(),
             content_version,
             polled_at: None,
         }

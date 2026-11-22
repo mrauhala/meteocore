@@ -54,7 +54,7 @@ const MAX_AREA_VARIABLES: usize = 8;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    ParameterDescriptions, QueryResult,
 };
 use ds_core::resample::ProjectionGrid;
 
@@ -495,23 +495,9 @@ impl EdrEngine for ZarrEngine {
             .collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.catalog
-            .load()
-            .vars
-            .iter()
-            .map(|v| {
-                (
-                    v.name.clone(),
-                    ParameterDescription {
-                        label: v.label.clone(),
-                        unit: v.units.clone(),
-                        observed_property: v.name.clone(),
-                        standard_name: v.standard_name.clone(),
-                    },
-                )
-            })
-            .collect()
+    /// The catalog's snapshot, built with it (#1500).
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.catalog.load().descriptions)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

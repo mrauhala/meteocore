@@ -1569,14 +1569,17 @@ impl NetcdfEngine {
             );
         }
         let info = catalog::raster_info(layout.as_deref(), &runs, &self.titles);
-        Catalog {
+        let mut catalog = Catalog {
             layout,
             run_times: catalog::run_times(&runs),
             runs,
             info: Arc::new(info),
+            descriptions: Arc::default(),
             content_version: state.content_version,
             polled_at: Some(Utc::now()),
-        }
+        };
+        catalog.descriptions = Self::all_descriptions(&catalog);
+        catalog
     }
 
     /// The parameter served as `parameter`, the first variable for `None`.

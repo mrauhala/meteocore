@@ -725,9 +725,9 @@ mod collections {
                 self.0.query_location(location_id, dt, params, z, rt)
             }
             fn get_parameters(&self) -> Vec<String> {
-                self.get_parameter_descriptions().into_keys().collect()
+                self.get_parameter_descriptions().keys().cloned().collect()
             }
-            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+            fn get_parameter_descriptions(&self) -> Arc<ds_core::model::ParameterDescriptions> {
                 let desc = |label: &str, unit: &str, id: &str, cf: Option<&str>| {
                     let desc = ParameterDescription {
                         label: label.into(),
@@ -737,7 +737,7 @@ mod collections {
                     };
                     (id.to_string(), desc)
                 };
-                HashMap::from([
+                Arc::new(ds_core::model::ParameterDescriptions::from([
                     desc("2 metre temperature", "K", "t2m", Some("air_temperature")),
                     desc("DBZH — Reflectivity (horizontal)", "dBZ", "DBZH", None),
                     desc("Specific differential phase", "deg/km", "KDP", None),
@@ -755,7 +755,7 @@ mod collections {
                         "t_err",
                         Some("air_temperature standard_error"),
                     ),
-                ])
+                ]))
             }
             fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
                 self.0.get_temporal_extent()

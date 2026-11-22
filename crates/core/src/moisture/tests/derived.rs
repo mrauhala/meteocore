@@ -3,7 +3,6 @@
 //! map and in EDR, the level's pressure from the request and the coverage,
 //! and the metadata every API serves.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -133,21 +132,23 @@ impl EdrEngine for Mock {
         self.names()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.fields
-            .iter()
-            .map(|f| {
-                (
-                    f.facts.name.clone(),
-                    ParameterDescription {
-                        label: f.facts.name.clone(),
-                        unit: f.facts.unit.clone(),
-                        observed_property: f.facts.name.clone(),
-                        standard_name: None,
-                    },
-                )
-            })
-            .collect()
+    fn get_parameter_descriptions(&self) -> Arc<crate::model::ParameterDescriptions> {
+        Arc::new(
+            self.fields
+                .iter()
+                .map(|f| {
+                    (
+                        f.facts.name.clone(),
+                        ParameterDescription {
+                            label: f.facts.name.clone(),
+                            unit: f.facts.unit.clone(),
+                            observed_property: f.facts.name.clone(),
+                            standard_name: None,
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

@@ -2112,25 +2112,14 @@ impl EdrEngine for GribEngine {
         self.catalog().all_params()
     }
 
-    fn get_parameter_descriptions(
-        &self,
-    ) -> std::collections::HashMap<String, ParameterDescription> {
-        let catalog = self.catalog();
-        let all = catalog.all_params();
-        let mut map = std::collections::HashMap::new();
-        for p in all {
-            let meta = self.param_metadata(&catalog, &p);
-            map.insert(
-                p.clone(),
-                ParameterDescription {
-                    label: meta.label(),
-                    unit: meta.display.display_unit.to_string(),
-                    observed_property: p,
-                    standard_name: None,
-                },
-            );
-        }
-        map
+    /// The view's snapshot, rebuilt with its `RasterInfo` (#1500).
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        let discovery = self.source.discovery.read().unwrap();
+        discovery
+            .descriptions
+            .get(&self.family)
+            .unwrap_or(&discovery.no_descriptions)
+            .clone()
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

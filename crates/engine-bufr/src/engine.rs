@@ -21,7 +21,7 @@ use ds_core::geo::great_circle_distance_m;
 use ds_core::health::{LiveStatus, WarmupCause};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    ParameterDescriptions, QueryResult, ValuePrecision,
 };
 use ds_core::state::{
     collection_key, hours_minutes, StateError, StateStore, StateWriter, WriteOutcome, WritePolicy,
@@ -1048,7 +1048,7 @@ impl ds_core::edr_engine::EdrEngine for BufrEngine {
         self.table.names()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
         self.table.descriptions()
     }
 

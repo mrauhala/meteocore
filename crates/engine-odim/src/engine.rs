@@ -38,6 +38,7 @@ use chrono::{DateTime, Utc};
 use ds_core::error::DataServerError;
 use ds_core::geo::Crs;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
+use ds_core::model::{ParameterDescription, ParameterDescriptions};
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
@@ -571,7 +572,9 @@ pub struct OdimEngine {
     pub(crate) catalog: Arc<ArcSwap<CompositeCatalog>>,
     pub(crate) collection_id: String,
     pub(crate) parameter: String,
-    pub(crate) unit: String,
+    /// The one quantity's EDR description, with the configured unit, built
+    /// at construction: collection metadata reads it per request (#1500).
+    pub(crate) descriptions: Arc<ParameterDescriptions>,
     pub(crate) gain_override: Option<f64>,
     pub(crate) offset_override: Option<f64>,
     pub(crate) nodata_override: Option<f64>,
@@ -851,11 +854,20 @@ impl OdimEngine {
         // collection shares the one byte-bounded LRU (#212).
         COMPOSITE_CACHE.insert(Arc::from(seed_location.id().as_str()), composite);
 
+        let descriptions = Arc::new(ParameterDescriptions::from([(
+            parameter.clone(),
+            ParameterDescription {
+                label: parameter.replace('_', " "),
+                unit,
+                observed_property: parameter.clone(),
+                standard_name: None,
+            },
+        )]));
         Ok(Self {
             catalog: Arc::new(ArcSwap::from_pointee(catalog)),
             collection_id: collection_id.to_string(),
             parameter,
-            unit,
+            descriptions,
             gain_override: overrides.gain,
             offset_override: overrides.offset,
             nodata_override: overrides.nodata,

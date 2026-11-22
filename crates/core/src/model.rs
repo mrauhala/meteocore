@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 use std::sync::{Arc, LazyLock, OnceLock};
 
@@ -242,6 +242,15 @@ pub struct ParameterDescription {
     /// publishes it as the NERC vocabulary URI in `observedProperty.id`.
     pub standard_name: Option<String>,
 }
+
+/// An EDR engine's parameter descriptions by name, iterated in name order:
+/// the map [`EdrEngine::get_parameter_descriptions`] shares behind an `Arc`
+/// (#1500). An engine builds it when its parameters change and every
+/// request reads that one map, so collection metadata neither copies nor
+/// sorts it.
+///
+/// [`EdrEngine::get_parameter_descriptions`]: crate::edr_engine::EdrEngine::get_parameter_descriptions
+pub type ParameterDescriptions = BTreeMap<String, ParameterDescription>;
 
 #[derive(Debug, Clone)]
 pub struct NdArray {

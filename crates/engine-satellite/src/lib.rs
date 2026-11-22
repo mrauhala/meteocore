@@ -37,7 +37,7 @@ use ds_core::map_engine::{
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    ParameterDescriptions, QueryResult, ValuePrecision,
 };
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
@@ -163,6 +163,9 @@ pub struct SatelliteEngine {
     source: Source,
     products: Vec<Product>,
     parameters: Vec<ParameterInfo>,
+    /// `parameters` described, built once: collection metadata reads them
+    /// per request (#1500).
+    descriptions: Arc<ParameterDescriptions>,
     /// RGB composites served as their own layers, in config order.
     composites: Arc<[CompositeDef]>,
     /// Per composite: the product indices of its bands, in
@@ -175,6 +178,16 @@ pub struct SatelliteEngine {
     /// by each poll.
     demand: DemandSlot,
     shutdown: Shutdown,
+}
+
+/// A product's EDR description: its configured title and unit.
+fn describe(parameter: &ParameterInfo) -> ParameterDescription {
+    ParameterDescription {
+        label: parameter.title.clone(),
+        unit: parameter.unit.clone(),
+        observed_property: parameter.name.clone(),
+        standard_name: None,
+    }
 }
 
 /// The scan cache's demand rule (#1309), for every satellite collection.
@@ -275,6 +288,12 @@ impl SatelliteEngine {
                     .collect()
             })
             .collect();
+        let descriptions = Arc::new(
+            parameters
+                .iter()
+                .map(|p| (p.name.clone(), describe(p)))
+                .collect(),
+        );
         let empty = vec![BTreeMap::new(); products.len()];
         let catalog = Catalog::build(
             empty,
@@ -291,6 +310,7 @@ impl SatelliteEngine {
             source,
             products,
             parameters,
+            descriptions,
             composites,
             composite_bands,
             window,
@@ -888,13 +908,7 @@ impl SatelliteEngine {
     }
 
     fn description(&self, index: usize) -> ParameterDescription {
-        let parameter = &self.parameters[index];
-        ParameterDescription {
-            label: parameter.title.clone(),
-            unit: parameter.unit.clone(),
-            observed_property: parameter.name.clone(),
-            standard_name: None,
-        }
+        describe(&self.parameters[index])
     }
 
     /// The scan, from the cache or fetched again after eviction. A request
@@ -1088,10 +1102,8 @@ impl EdrEngine for SatelliteEngine {
         self.parameters.iter().map(|p| p.name.clone()).collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        (0..self.parameters.len())
-            .map(|index| (self.parameters[index].name.clone(), self.description(index)))
-            .collect()
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.descriptions)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

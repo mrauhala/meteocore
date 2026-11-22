@@ -11,10 +11,11 @@
 //! The rule is keyed on the unit string, never on the parameter name.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::decode::XY;
 use ds_core::config::BufrParameterConfig;
-use ds_core::model::ParameterDescription;
+use ds_core::model::{ParameterDescription, ParameterDescriptions};
 use ds_core::units::{display_conversion, DisplayConversion};
 
 use crate::decode::{xy_from_code, ObsReport};
@@ -267,6 +268,9 @@ const BUILTIN: &[Builtin] = &[
 pub struct ParameterTable {
     pub params: Vec<ParamDef>,
     by_name: HashMap<String, usize>,
+    /// `params` described, built with the table: the engine's
+    /// `get_parameter_descriptions` shares this `Arc` (#1500).
+    descriptions: Arc<ParameterDescriptions>,
 }
 
 impl ParameterTable {
@@ -320,7 +324,27 @@ impl ParameterTable {
             .enumerate()
             .map(|(i, p)| (p.name.clone(), i))
             .collect();
-        ParameterTable { params, by_name }
+        let descriptions = Arc::new(
+            params
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        ParameterDescription {
+                            label: p.label.clone(),
+                            unit: p.unit.clone(),
+                            observed_property: p.observed_property.clone(),
+                            standard_name: p.standard_name.clone(),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        ParameterTable {
+            params,
+            by_name,
+            descriptions,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -339,21 +363,9 @@ impl ParameterTable {
         self.params.iter().map(|p| p.name.clone()).collect()
     }
 
-    pub fn descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.params
-            .iter()
-            .map(|p| {
-                (
-                    p.name.clone(),
-                    ParameterDescription {
-                        label: p.label.clone(),
-                        unit: p.unit.clone(),
-                        observed_property: p.observed_property.clone(),
-                        standard_name: p.standard_name.clone(),
-                    },
-                )
-            })
-            .collect()
+    /// Every column's description, by name: the table's one map.
+    pub fn descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.descriptions)
     }
 
     /// Extract one dense row (`NaN` = missing) from a report, in display

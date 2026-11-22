@@ -5,7 +5,6 @@
 //! convergence varies with both longitude and latitude, so a value turned
 //! at another cell's position shows.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -202,21 +201,23 @@ impl EdrEngine for Rotated {
         COMPONENTS.iter().map(|c| c.to_string()).collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        COMPONENTS
-            .iter()
-            .map(|&c| {
-                (
-                    c.to_string(),
-                    ParameterDescription {
-                        label: c.into(),
-                        unit: "m s-1".into(),
-                        observed_property: c.into(),
-                        standard_name: Some(c.into()),
-                    },
-                )
-            })
-            .collect()
+    fn get_parameter_descriptions(&self) -> Arc<crate::model::ParameterDescriptions> {
+        Arc::new(
+            COMPONENTS
+                .iter()
+                .map(|&c| {
+                    (
+                        c.to_string(),
+                        ParameterDescription {
+                            label: c.into(),
+                            unit: "m s-1".into(),
+                            observed_property: c.into(),
+                            standard_name: Some(c.into()),
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

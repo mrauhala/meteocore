@@ -20,7 +20,7 @@ use chrono::{DateTime, TimeZone};
 
 use crate::feature::{Feature, Geometry, PropertyValue, Related, RelatedTarget};
 use crate::map_engine::{ParameterInfo, RasterInfo};
-use crate::model::Location;
+use crate::model::{Location, ParameterDescription};
 use crate::vertical::VerticalDimension;
 
 /// Bytes of an `Arc`'s strong and weak counts, ahead of its value.
@@ -293,6 +293,15 @@ impl HeapSize for Location {
 impl HeapSize for ParameterInfo {
     fn heap_size(&self) -> usize {
         self.name.heap_size() + self.title.heap_size() + self.unit.heap_size()
+    }
+}
+
+impl HeapSize for ParameterDescription {
+    fn heap_size(&self) -> usize {
+        self.label.heap_size()
+            + self.unit.heap_size()
+            + self.observed_property.heap_size()
+            + self.standard_name.heap_size()
     }
 }
 

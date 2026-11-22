@@ -28,7 +28,7 @@ use ds_core::feature::{
 use ds_core::feature_pick::{FeaturePick, PickedFeature, PickedFeatures};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    ParameterDescriptions, QueryResult, ValuePrecision,
 };
 use ds_poll::Shutdown;
 use tokio_postgres::Row;
@@ -1104,8 +1104,8 @@ impl EdrEngine for PostgisEngine {
             .collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        (*self.load_meta().parameters).clone()
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.load_meta().parameters)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
@@ -3315,7 +3315,7 @@ mod tests {
             feature_stations: std::sync::Arc::new(stations),
             locations: std::sync::Arc::new(LocationSnapshot::new(locations)),
             station_idx: std::sync::Arc::new(station_idx),
-            parameters: std::sync::Arc::new(HashMap::new()),
+            parameters: std::sync::Arc::default(),
             temporal_extent: None,
             future_latest: None,
             spatial_extent: None,
@@ -3627,9 +3627,11 @@ mod tests {
     }
 
     /// The EDR descriptions of `t2m` (labelled) and `ws` (no label, so the
-    /// name stands in), as configured.
+    /// name stands in), as configured, from the metadata snapshot: two
+    /// reads share one `Arc` (#1500).
     fn assert_configured_parameters_described(engine: &PostgisEngine) {
         let params = engine.get_parameter_descriptions();
+        assert!(Arc::ptr_eq(&params, &engine.get_parameter_descriptions()));
         assert_eq!(params.len(), 2, "descriptions: {params:?}");
         let t2m = &params["t2m"];
         assert_eq!(t2m.label, "Air temperature");

@@ -35,7 +35,7 @@ use ds_core::geo::Crs;
 use ds_core::map_engine::OutputCrs;
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    ParameterDescriptions, QueryResult,
 };
 use ds_core::resample::ProjectionGrid;
 
@@ -527,20 +527,13 @@ impl OdimEngine {
         Ok(())
     }
 
-    /// Build the single-entry parameter-description map this engine
-    /// advertises (one quantity per collection).
+    /// The single-entry parameter-description map a query result carries:
+    /// the collection's one quantity, as the engine's `descriptions` has it.
     fn parameter_map(&self) -> HashMap<String, ParameterDescription> {
-        let mut map = HashMap::new();
-        map.insert(
-            self.parameter.clone(),
-            ParameterDescription {
-                label: self.parameter.replace('_', " "),
-                unit: self.unit.clone(),
-                observed_property: self.parameter.clone(),
-                standard_name: None,
-            },
-        );
-        map
+        self.descriptions
+            .iter()
+            .map(|(name, description)| (name.clone(), description.clone()))
+            .collect()
     }
 
     /// Position query: a `PointSeries` coverage with one bilinearly
@@ -804,8 +797,8 @@ impl EdrEngine for OdimEngine {
         vec![self.parameter.clone()]
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.parameter_map()
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.descriptions)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
