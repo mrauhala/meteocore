@@ -204,21 +204,31 @@ then reads its last step carrying them all (`grid_steps`), else its last
 step.
 
 `max_runs` counts the runs that have finished publishing (#1562). The
-newest run is kept on top of them while it publishes
+catalog's newest run is kept on top of them while it publishes
 (`Catalog::evict(max_runs, publishing)`), so its first steps add to the
-horizon instead of evicting the run that covers it; at most one run is
-kept so. It publishes while its newest index file is younger than
-`PUBLISHING_GRACE` (`ds_storage::discovery::DEFAULT_RUN_GRACE`, 30 min):
-the listed last-modified time of the first run prefix with files, newest
-first, clamped to the scan's `now` and kept across scans in
-`GribSource::newest_index`, so a failed listing neither restarts nor ends
-the grace, and a run whose publication stalls keeps the extra run no
-longer. Meanwhile the scan lists one more run prefix, so a restart during
-publication finds the run being replaced; a scan without new indexes
-still evicts once the grace passes. Every run accessor reads the catalog's
-`runs`, so instances, `run_times`, the map axes and defaults and both run
-selections include the run kept on top. The cache demands (#1309) count
-fields, not runs. Pinned by `run_eviction_tests.rs`.
+horizon instead of evicting the run that covers it. `publication.rs`
+tracks only that run, so the runs kept are always the newest
+`max_runs + 1`: back-to-back publication (hourly runs) keeps the run just
+below the newest throughout, never an older one. The grace runs on the
+engine's clock, never the store's: a run publishes from when the catalog
+first holds it until no scan has seen a new or rewritten index of it for
+`PUBLISHING_GRACE` (`ds_storage::discovery::DEFAULT_RUN_GRACE`, 30 min).
+A listed size and last-modified time only tell a rewritten file from its
+earlier listing. Of the first run prefix with files, newest first (a
+fixed-prefix source's one prefix), a file counts unless it was read into
+an older run, and one not read yet (failed or deferred) counts when first
+seen. A failed listing neither restarts nor ends the grace. Once judged
+finished a run stays finished until a newer run is catalogued: a rewrite
+or a stalled run's late step neither keeps an extra run again nor has the
+hourly re-list read back an evicted one. While it publishes, or on a
+restart (an empty catalog, which cannot tell), the scan lists one more run
+prefix, so a restart during publication finds the run being replaced; a
+restart afterwards reads one more run and keeps it for the grace. A scan
+without new indexes still evicts once the grace passes. Every run
+accessor reads the catalog's `runs`, so instances, `run_times`, the map
+axes and defaults and both run selections include the run kept on top.
+The cache demands (#1309) count fields, not runs. Pinned by
+`run_eviction_tests.rs` and `publication.rs`'s tests.
 
 Each run also has canonical `(parameter, level type, level)` selectors,
 rebuilt with `Catalog::refresh_metadata` before publication. Metadata

@@ -239,8 +239,8 @@ with a 404.
   `numberReturned` and `next`/`prev` links.
 - The runs listed are those the engine retains. A GRIB collection with
   `max_runs` lists one more while its newest run is still publishing, so
-  the run that covers the rest of the horizon stays an instance until 30
-  minutes after the new run's last index file was written.
+  the run that covers the rest of the horizon stays an instance until no
+  new index file of the new run has been seen for 30 minutes.
 - An instance document has its collection's title and description and the
   run's own extent. A query under `/instances/{instanceId}/` reads that
   run; the same query without an instance path reads the latest run.

@@ -846,10 +846,11 @@ impl Catalog {
 
     /// Apply `max_runs` eviction (#1562): keep the newest `max_runs` runs
     /// that have finished publishing, and on top of them the newest run
-    /// while it is still `publishing`. Runs publish in order, so only the
-    /// newest can be publishing and at most one run is kept on top: a run
-    /// with its first steps adds to the runs that cover the horizon until
-    /// it has them all, instead of replacing the oldest.
+    /// while it is still `publishing`. The flag is about the newest run by
+    /// construction (the poll's `Publication` tracks no other), so the runs
+    /// kept are always the newest `max_runs + 1`: a run with its first
+    /// steps adds to the runs that cover the horizon until it has them all,
+    /// instead of replacing the oldest.
     pub fn evict(&mut self, max_runs: usize, publishing: bool) {
         let keep = max_runs.saturating_add(usize::from(publishing));
         while self.runs.len() > keep {
