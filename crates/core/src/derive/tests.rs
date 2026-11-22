@@ -3,7 +3,6 @@
 //! wind-only behaviour is pinned by `crate::wind`'s tests, which build the
 //! same wrapper through `DerivedWind::new`.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
@@ -15,7 +14,7 @@ use crate::geopotential::STANDARD_GRAVITY;
 use crate::map_engine::{MapEngine, OutputCrs, ParameterInfo, RasterInfo, RasterTile};
 use crate::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    ParameterDescriptions, QueryResult, ValuePrecision,
 };
 use crate::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts, WindSource};
 
@@ -63,6 +62,9 @@ type Call = (
 struct Mock {
     facts: Arc<WindFacts>,
     info: Arc<RasterInfo>,
+    /// The engine's description snapshot, which [`Mock::relabel`] replaces
+    /// as a poll would.
+    descriptions: Mutex<Arc<ParameterDescriptions>>,
     tiles: Mutex<Vec<Call>>,
     queries: Mutex<Vec<Option<Vec<String>>>>,
     samples: usize,
@@ -110,10 +112,34 @@ impl Mock {
                 reference_times: vec![hour(0)],
                 native_grid: None,
             }),
+            descriptions: Mutex::new(Arc::new(
+                PARAMETERS
+                    .iter()
+                    .map(|&p| {
+                        (
+                            p.to_string(),
+                            ParameterDescription {
+                                label: p.into(),
+                                unit: unit(p).into(),
+                                observed_property: p.into(),
+                                standard_name: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            )),
             tiles: Mutex::new(Vec::new()),
             queries: Mutex::new(Vec::new()),
             samples: 4,
         })
+    }
+
+    /// Publish a new description snapshot with `name` labelled `label`.
+    fn relabel(&self, name: &str, label: &str) {
+        let mut descriptions = self.descriptions.lock().unwrap();
+        let mut next = (**descriptions).clone();
+        next.get_mut(name).unwrap().label = label.into();
+        *descriptions = Arc::new(next);
     }
 }
 
@@ -268,21 +294,8 @@ impl EdrEngine for Mock {
         PARAMETERS.iter().map(|p| p.to_string()).collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        PARAMETERS
-            .iter()
-            .map(|&p| {
-                (
-                    p.to_string(),
-                    ParameterDescription {
-                        label: p.into(),
-                        unit: unit(p).into(),
-                        observed_property: p.into(),
-                        standard_name: None,
-                    },
-                )
-            })
-            .collect()
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        self.descriptions.lock().unwrap().clone()
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
@@ -430,6 +443,41 @@ fn every_derivation_is_planned_logged_and_listed() {
     // Unchanged facts: no new plan, no new log line.
     derived.plan();
     assert_eq!(logged.lock().unwrap().len(), 2);
+}
+
+/// The descriptions collection metadata reads per request are a snapshot
+/// (#1500): two reads share one `Arc` while the engine's snapshot and the
+/// plan stay, a new engine snapshot builds them again with the derived
+/// parameters added, and without a derivation they are the engine's own.
+#[test]
+fn parameter_descriptions_are_built_again_only_when_the_engine_publishes() {
+    let mock = Mock::new();
+    let (derived, _) = wrap(&mock, Derivations::ALL);
+    let first = derived.get_parameter_descriptions();
+    assert!(
+        Arc::ptr_eq(&first, &derived.get_parameter_descriptions()),
+        "built per call"
+    );
+    let names: Vec<&str> = first.keys().map(String::as_str).collect();
+    assert_eq!(names, ["10si", "10u", "10v", "10wdir", "2t", "gh", "z"]);
+
+    mock.relabel("2t", "2 metre temperature");
+    let second = derived.get_parameter_descriptions();
+    assert!(!Arc::ptr_eq(&first, &second), "kept a stale snapshot");
+    assert_eq!(second["2t"].label, "2 metre temperature");
+    assert_eq!(second["gh"].unit, "gpm");
+    assert!(Arc::ptr_eq(&second, &derived.get_parameter_descriptions()));
+
+    let none = Derivations {
+        wind: false,
+        geopotential_height: false,
+        humidity: false,
+    };
+    let (plain, _) = wrap(&mock, none);
+    assert!(Arc::ptr_eq(
+        &plain.get_parameter_descriptions(),
+        &mock.get_parameter_descriptions()
+    ));
 }
 
 /// Each derivation is its own opt-out: off, the parameters are the

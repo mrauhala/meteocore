@@ -763,6 +763,103 @@ fn sample_rows() -> Vec<Row> {
     ]
 }
 
+/// Collection metadata reads every EDR engine's parameter descriptions on
+/// each `/collections` request, so every engine shares one snapshot
+/// (#1500, Critical Rule 10): two reads return the same `Arc`, through the
+/// derived-parameter wrapper too. Over [`every_engine_config`] with EDR on
+/// every collection that serves it, and BUFR, QueryData, period and
+/// nowcast collections: one collection of each engine type that loads
+/// from committed fixtures, PostGIS aside.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_edr_engine_shares_its_parameter_descriptions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = every_engine_config(dir.path());
+    let config = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("apis = [\"wms\"]\n", "apis = [\"wms\", \"edr\"]\n")
+        .replace(
+            "apis = [\"features\"]\n",
+            "apis = [\"features\", \"edr\"]\n",
+        )
+        + &format!(
+            r#"
+[[collections]]
+id = "synop"
+title = "SYNOP"
+description = "test"
+engine_type = "bufr"
+apis = ["edr"]
+[collections.bufr]
+data_path = {bufr:?}
+retention = "P36500D"
+
+[[collections]]
+id = "kenya"
+title = "Kenya"
+description = "test"
+engine_type = "querydata"
+data_path = {kenya:?}
+apis = ["edr"]
+
+[[collections]]
+id = "rain"
+title = "Rain"
+description = "test"
+engine_type = "period"
+apis = ["edr"]
+[collections.period]
+source = "radar"
+parameter = "reflectivity"
+statistic = "sum"
+windows = ["PT1H"]
+rain_rate = {{ a = 200.0, b = 1.6, min_dbz = 7.0 }}
+
+[[collections]]
+id = "nowcast"
+title = "Nowcast"
+description = "test"
+engine_type = "nowcast"
+apis = ["edr"]
+[collections.nowcast]
+source = "radar"
+"#,
+            bufr = testdata("bufr-synop").to_str().unwrap(),
+            kenya = testdata("ecmwf-kenya").to_str().unwrap(),
+        );
+    std::fs::write(&path, config).unwrap();
+    let state = crate::watcher::tests::build_state(&path);
+    let edr = state.edr.load();
+    let mut engines: Vec<&String> = edr.engines.keys().collect();
+    engines.sort();
+    for id in [
+        "radar",
+        "grib-default",
+        "zarr",
+        "netcdf",
+        "comp",
+        "pvol-test",
+        "goes",
+        "weather",
+        "grid",
+        "synop",
+        "kenya",
+        "rain",
+        "nowcast",
+    ] {
+        assert!(edr.engines.contains_key(id), "{id} not loaded: {engines:?}");
+    }
+    for (id, engine) in &edr.engines {
+        let first = engine.get_parameter_descriptions();
+        assert!(
+            Arc::ptr_eq(&first, &engine.get_parameter_descriptions()),
+            "{id} builds its parameter descriptions per call"
+        );
+    }
+    assert!(!edr.engines["grib-default"]
+        .get_parameter_descriptions()
+        .is_empty());
+}
+
 /// The document's shape: an object per cache and per budget with the
 /// fields the issue names, totals, and the memory gauges by name; a cache's
 /// demand, its rule and kind, the size it suggests and each collection's

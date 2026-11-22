@@ -107,6 +107,14 @@ with WMS):
 - What every run's document shares is read from the engine once per request:
   `CollectionMetadata::new`, then `build(Some(run))` per run. Never call
   `build_collection_metadata` in a per-run loop.
+- `parameter_names` is built from `get_parameter_descriptions()`, the
+  engine's shared `Arc<ParameterDescriptions>` (#1500): a `BTreeMap`, so it
+  iterates in name order and the document neither copies nor sorts it. That
+  order keeps the bytes, and the ETag, the same from request to request
+  (#499). Engines build it where their parameters change, and `Derived`
+  only when the engine's `Arc` or its plan changes. The server test
+  `cache_plan::tests::every_edr_engine_shares_its_parameter_descriptions`
+  fails for an engine that builds it per call.
 - Collection metadata never describes the run axis: no `extent.custom`, and
   nothing in `CollectionMetadata` reads `instance_reference_times` or
   `get_instances` (`instances_tests`' `archive-doc` mock panics on either), so a

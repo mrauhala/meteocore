@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration, Utc};
@@ -45,7 +45,7 @@ use ds_core::instances::{build_instances, format_instance_id, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile, RasterValues};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    ParameterDescriptions, QueryResult, ValuePrecision,
 };
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
@@ -2379,13 +2379,16 @@ fn cell_feature(
 
 /// Parameter metadata for the served motion field, from the one static
 /// table in `motion_grid` (see `PARAM_SPECS` for why the labels say
-/// "precipitation motion").
-fn motion_parameter_descriptions() -> HashMap<String, ParameterDescription> {
-    PARAM_SPECS
-        .iter()
-        .map(|p| (p.name.to_string(), describe_motion_param(p)))
-        .collect()
-}
+/// "precipitation motion"): built once, shared by every nowcast collection
+/// (#1500).
+static MOTION_PARAMETER_DESCRIPTIONS: LazyLock<Arc<ParameterDescriptions>> = LazyLock::new(|| {
+    Arc::new(
+        PARAM_SPECS
+            .iter()
+            .map(|p| (p.name.to_string(), describe_motion_param(p)))
+            .collect(),
+    )
+});
 
 fn describe_motion_param(p: &motion_grid::ParamSpec) -> ParameterDescription {
     ParameterDescription {
@@ -2526,8 +2529,8 @@ impl EdrEngine for NowcastEngine {
         PARAM_SPECS.iter().map(|p| p.name.to_string()).collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        motion_parameter_descriptions()
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&MOTION_PARAMETER_DESCRIPTIONS)
     }
 
     /// The motion field is an analysis product: one per generation, valid

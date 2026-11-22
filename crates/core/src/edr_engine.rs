@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -7,7 +6,9 @@ use crate::cube::CubeResolution;
 use crate::error::DataServerError;
 use crate::feature::{Bbox, DatetimeInterval, Feature};
 use crate::instances::RunInfo;
-use crate::model::{CoverageResponse, Location, LocationSnapshot, ParameterDescription};
+use crate::model::{
+    CoverageResponse, Location, LocationSnapshot, ParameterDescription, ParameterDescriptions,
+};
 use crate::vertical::VerticalDimension;
 
 /// A predicate over [`EdrEngine::get_locations`] entries: `true` keeps the
@@ -161,21 +162,38 @@ pub trait EdrEngine: Send + Sync {
 
     fn get_parameters(&self) -> Vec<String>;
 
-    /// Returns parameter descriptions including units for collection-level metadata.
-    /// Default implementation builds descriptions from `get_parameters()` with empty units.
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.get_parameters()
-            .into_iter()
-            .map(|name| {
-                let desc = ParameterDescription {
-                    label: name.replace('_', " "),
-                    unit: String::new(),
-                    observed_property: name.clone(),
-                    standard_name: None,
-                };
-                (name, desc)
-            })
-            .collect()
+    /// Each parameter's label, unit and observed property, by name: the
+    /// collection's `parameter_names`, the HTML query forms and the preview's
+    /// parameter lists.
+    ///
+    /// **O(1)** (Critical Rule 10, #1500): return a clone of the `Arc` the
+    /// engine built when its parameters last changed (at load, or by the poll
+    /// or catalog swap that changed them), never a map built per call. Every
+    /// `/collections` and `/collections/{id}` request reads it, once per
+    /// collection. A wrapper that adds parameters (`ds_core::derive::Derived`)
+    /// builds its own map again only when the wrapped engine's `Arc` or its
+    /// own plan changes.
+    ///
+    /// The default builds the map from [`Self::get_parameters`] on every
+    /// call, with empty units: for test engines. Every serving engine MUST
+    /// override it.
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        // NOTE: serving engines MUST override this, as `has_instances`: the
+        // default allocates a map per call.
+        Arc::new(
+            self.get_parameters()
+                .into_iter()
+                .map(|name| {
+                    let desc = ParameterDescription {
+                        label: name.replace('_', " "),
+                        unit: String::new(),
+                        observed_property: name.clone(),
+                        standard_name: None,
+                    };
+                    (name, desc)
+                })
+                .collect(),
+        )
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)>;

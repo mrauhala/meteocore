@@ -174,9 +174,10 @@ impl EdrEngine for MockEngine {
     }
 
     fn get_parameters(&self) -> Vec<String> {
-        // Six parameters so the /collections metadata path (default
-        // `get_parameter_descriptions` → fresh HashMap) also exercises the
-        // sorted serialization guarded by the revalidation tests.
+        // Six parameters, not in name order, so the /collections metadata
+        // path (the default `get_parameter_descriptions`, a new map per
+        // call) also exercises the sorted serialization guarded by the
+        // revalidation tests.
         [
             "temperature",
             "humidity",

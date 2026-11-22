@@ -51,8 +51,8 @@ fn the_default_parameter_is_named_as_its_layer() {
         assert!(info.parameters.iter().any(|p| p.name == default));
         assert_eq!(info.parameter_unit(None), Some(unit), "{wms_parameter:?}");
         assert_eq!(engine.get_parameters(), [MSL, T2M, "rr1h"]);
-        let mut described: Vec<String> = engine.get_parameter_descriptions().into_keys().collect();
-        described.sort_unstable();
+        let descriptions = engine.get_parameter_descriptions();
+        let described: Vec<&str> = descriptions.keys().map(String::as_str).collect();
         assert_eq!(described, [T2M, MSL, "rr1h"]);
     }
 }

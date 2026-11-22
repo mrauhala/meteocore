@@ -123,8 +123,8 @@ impl EdrEngine for Source {
     }
 
     /// BUFR's built-ins: CF standard names stated by the source.
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        HashMap::from([
+    fn get_parameter_descriptions(&self) -> Arc<ds_core::model::ParameterDescriptions> {
+        Arc::new(ds_core::model::ParameterDescriptions::from([
             (
                 "t2m".to_string(),
                 describe("Air temperature", "°C", "air_temperature"),
@@ -137,7 +137,7 @@ impl EdrEngine for Source {
                 "rh".to_string(),
                 describe("Relative humidity", "%", "relative_humidity"),
             ),
-        ])
+        ]))
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

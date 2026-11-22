@@ -67,7 +67,7 @@ use ds_core::geo::geodetic_to_ecef;
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, Location, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, VerticalCoord,
+    ParameterDescriptions, QueryResult, VerticalCoord,
 };
 use ds_core::resample::ProjectionGrid;
 use ds_core::temp_files;
@@ -2279,6 +2279,10 @@ pub(crate) struct SiteMeta {
     raster_info: Arc<RasterInfo>,
     /// Bare EDR quantities (lowest sweep), sorted distinct.
     pub(crate) quantities: Vec<String>,
+    /// `quantities` described from the dictionary, so
+    /// `EdrEngine::get_parameter_descriptions` is an `Arc` clone (#1500).
+    /// Rebuilt on each catalog swap.
+    descriptions: Arc<ParameterDescriptions>,
     /// This site's distinct volume times, ascending.
     times: Vec<DateTime<Utc>>,
     /// This site's circular coverage bbox `[w, s, e, n]` (WGS84).
@@ -2367,6 +2371,7 @@ fn site_meta_bytes(meta: &SiteMeta) -> usize {
     meta.plc.heap_size()
         + meta.wmo.heap_size()
         + meta.quantities.heap_size()
+        + meta.descriptions.heap_size()
         + meta.times.heap_size()
         + vertical
         + volume_info
@@ -3742,6 +3747,12 @@ fn derive_site_meta(nod: &str, list: &[VolumeEntry]) -> Option<SiteMeta> {
         reference_times: Vec::new(),
         native_grid: None,
     });
+    let descriptions = Arc::new(
+        quantities
+            .iter()
+            .map(|q| (q.clone(), quantity_description(q)))
+            .collect(),
+    );
     Some(SiteMeta {
         lon: site.lon,
         lat: site.lat,
@@ -3750,6 +3761,7 @@ fn derive_site_meta(nod: &str, list: &[VolumeEntry]) -> Option<SiteMeta> {
         height_m: site.height,
         raster_info,
         quantities,
+        descriptions,
         times,
         spatial_extent,
         coverage_radius_m,
@@ -7251,15 +7263,15 @@ impl EdrEngine for PolarVolumeSiteView {
     }
 
     /// The same label and unit the query results carry, so the collection's
-    /// `parameter_names` is not left with the bare code and no unit (#273).
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.get_parameters()
-            .into_iter()
-            .map(|q| {
-                let desc = quantity_description(&q);
-                (q, desc)
-            })
-            .collect()
+    /// `parameter_names` is not left with the bare code and no unit (#273):
+    /// the site's snapshot, built with the catalog (#1500).
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        self.catalog
+            .load()
+            .by_site_meta
+            .get(&self.nod)
+            .map(|m| Arc::clone(&m.descriptions))
+            .unwrap_or_default()
     }
 
     fn get_vertical_extent(&self) -> Option<VerticalDimension> {
@@ -13949,6 +13961,7 @@ mod tests {
                 height_m,
                 raster_info: NO_SITE_INFO.clone(),
                 quantities: vec!["DBZH".to_string()],
+                descriptions: Arc::default(),
                 times: vec![],
                 spatial_extent: None,
                 coverage_radius_m: None,

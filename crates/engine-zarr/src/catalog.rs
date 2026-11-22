@@ -25,7 +25,7 @@ use ds_core::cf::{
 use ds_core::error::DataServerError;
 use ds_core::instances;
 use ds_core::map_engine::RasterInfo;
-use ds_core::model::ValuePrecision;
+use ds_core::model::{ParameterDescription, ParameterDescriptions, ValuePrecision};
 use ds_core::units::{cf_display_conversion, DisplayConversion};
 use ds_core::wind::{GridAxes, ParameterFacts, VectorFrame, WindFacts};
 
@@ -185,6 +185,9 @@ pub struct Catalog {
     pub raster_info: Arc<RasterInfo>,
     /// The variables' wind components (#897), built with the catalog.
     pub wind: Arc<WindFacts>,
+    /// The variables' EDR descriptions, built with the catalog: collection
+    /// metadata reads them per request (#1500).
+    pub descriptions: Arc<ParameterDescriptions>,
 }
 
 /// How an Icechunk store's decoded-chunk cache demand is computed (#1309).
@@ -1217,6 +1220,7 @@ fn build_with_codec_setup(
         [lons.len() as u32, lats.len() as u32],
     ));
     let wind = Arc::new(wind_facts(&vars));
+    let descriptions = Arc::new(descriptions(&vars));
 
     Ok(Catalog {
         read_budget: read_budget::BUDGET.clone(),
@@ -1232,7 +1236,25 @@ fn build_with_codec_setup(
         extent,
         raster_info,
         wind,
+        descriptions,
     })
+}
+
+/// Each variable's EDR description, in its served unit.
+fn descriptions(vars: &[Variable]) -> ParameterDescriptions {
+    vars.iter()
+        .map(|v| {
+            (
+                v.name.clone(),
+                ParameterDescription {
+                    label: v.label.clone(),
+                    unit: v.units.clone(),
+                    observed_property: v.name.clone(),
+                    standard_name: v.standard_name.clone(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// What the variables state for wind derivation (#897): the CF

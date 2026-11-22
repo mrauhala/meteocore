@@ -534,17 +534,17 @@ fn edr_parameters(
     config: Option<&CollectionConfig>,
     engine: &dyn ds_core::edr_engine::EdrEngine,
 ) -> Vec<Value> {
-    let mut descriptions: Vec<_> = engine.get_parameter_descriptions().into_iter().collect();
-    descriptions.sort_by(|a, b| a.0.cmp(&b.0));
-    descriptions
-        .into_iter()
+    // The engine's snapshot (#1500), in name order.
+    engine
+        .get_parameter_descriptions()
+        .iter()
         .map(|(name, description)| {
             let mut entry = json!({
                 "name": name,
                 "title": description.label,
                 "unit": description.unit,
             });
-            if let Some(times) = engine.get_parameter_available_times(&name) {
+            if let Some(times) = engine.get_parameter_available_times(name) {
                 entry["temporal_extent"] = parameter_temporal_extent(id, config, None, &times);
             }
             entry
@@ -2166,8 +2166,8 @@ mod tests {
             fn get_parameters(&self) -> Vec<String> {
                 vec!["2t".into(), "msl".into(), "10u".into()]
             }
-            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-                let mut m = HashMap::new();
+            fn get_parameter_descriptions(&self) -> Arc<ds_core::model::ParameterDescriptions> {
+                let mut m = ds_core::model::ParameterDescriptions::new();
                 m.insert(
                     "2t".into(),
                     ParameterDescription {
@@ -2195,7 +2195,7 @@ mod tests {
                         standard_name: None,
                     },
                 );
-                m
+                Arc::new(m)
             }
             fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
                 None
@@ -2516,8 +2516,8 @@ mod tests {
             fn get_parameters(&self) -> Vec<String> {
                 vec!["a".into(), "b".into()]
             }
-            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-                let mut m = HashMap::new();
+            fn get_parameter_descriptions(&self) -> Arc<ds_core::model::ParameterDescriptions> {
+                let mut m = ds_core::model::ParameterDescriptions::new();
                 for n in ["a", "b"] {
                     m.insert(
                         n.to_string(),
@@ -2529,7 +2529,7 @@ mod tests {
                         },
                     );
                 }
-                m
+                Arc::new(m)
             }
             fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
                 None
@@ -2615,8 +2615,8 @@ mod tests {
             fn get_parameters(&self) -> Vec<String> {
                 vec!["2t".into(), "msl".into(), "derived_index".into()]
             }
-            fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-                let mut m = HashMap::new();
+            fn get_parameter_descriptions(&self) -> Arc<ds_core::model::ParameterDescriptions> {
+                let mut m = ds_core::model::ParameterDescriptions::new();
                 m.insert(
                     "2t".into(),
                     ParameterDescription {
@@ -2644,7 +2644,7 @@ mod tests {
                         standard_name: None,
                     },
                 );
-                m
+                Arc::new(m)
             }
             fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
                 None
@@ -3019,21 +3019,21 @@ mod tests {
         fn get_parameters(&self) -> Vec<String> {
             self.parameters.iter().map(|p| p.0.to_string()).collect()
         }
-        fn get_parameter_descriptions(
-            &self,
-        ) -> HashMap<String, ds_core::model::ParameterDescription> {
-            self.parameters
-                .iter()
-                .map(|&(name, label, unit)| {
-                    let description = ds_core::model::ParameterDescription {
-                        label: label.into(),
-                        unit: unit.into(),
-                        observed_property: name.into(),
-                        standard_name: None,
-                    };
-                    (name.to_string(), description)
-                })
-                .collect()
+        fn get_parameter_descriptions(&self) -> Arc<ds_core::model::ParameterDescriptions> {
+            Arc::new(
+                self.parameters
+                    .iter()
+                    .map(|&(name, label, unit)| {
+                        let description = ds_core::model::ParameterDescription {
+                            label: label.into(),
+                            unit: unit.into(),
+                            observed_property: name.into(),
+                            standard_name: None,
+                        };
+                        (name.to_string(), description)
+                    })
+                    .collect(),
+            )
         }
         fn get_parameter_available_times(&self, parameter: &str) -> Option<Vec<DateTime<Utc>>> {
             self.own_times

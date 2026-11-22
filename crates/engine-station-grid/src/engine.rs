@@ -52,7 +52,7 @@ use ds_core::map_engine::{
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, GridResolution, LocationSnapshot, NdArray,
-    ParameterDescription, QueryResult, ValuePrecision,
+    ParameterDescription, ParameterDescriptions, QueryResult, ValuePrecision,
 };
 use ds_core::native_grid::NativeGrid;
 use ds_core::resample::ProjectionGrid;
@@ -165,6 +165,9 @@ struct Inner {
     last_analysis_ms: AtomicU64,
     stopped: AtomicBool,
     provenance: String,
+    /// `params` described, built once: collection metadata reads them per
+    /// request (#1500).
+    descriptions: Arc<ParameterDescriptions>,
 }
 
 /// A derived collection gridding a station collection; see the module
@@ -420,6 +423,7 @@ impl StationGridEngine {
         .join(" ")
         .trim_end()
         .to_string();
+        let descriptions = Arc::new(described.into_iter().collect());
         let inner = Arc::new(Inner {
             collection_id: collection_id.to_string(),
             source_id: source_id.to_string(),
@@ -460,6 +464,7 @@ impl StationGridEngine {
             last_analysis_ms: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             provenance,
+            descriptions,
         });
         inner.publish(inner.build_times());
         let engine = Self {
@@ -1433,8 +1438,8 @@ impl EdrEngine for StationGridEngine {
         self.parameter_names()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.description_map(&(0..self.inner.params.len()).collect::<Vec<_>>())
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.inner.descriptions)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

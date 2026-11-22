@@ -246,6 +246,9 @@ pub struct GeoTiffEngine {
     filename_matcher: Option<FilenameMatcher>,
     parameter: String,
     unit: String,
+    /// The one parameter's description, built at load: collection
+    /// metadata reads it per request (#1500).
+    descriptions: Arc<ParameterDescriptions>,
     poll_interval: Duration,
     exclude_patterns: Vec<String>,
     max_files: Option<usize>,
@@ -1090,6 +1093,15 @@ impl GeoTiffEngine {
             filename_matcher,
             parameter: config.parameter.clone(),
             unit: config.unit.clone(),
+            descriptions: Arc::new(ParameterDescriptions::from([(
+                config.parameter.clone(),
+                ParameterDescription {
+                    label: config.parameter.replace('_', " "),
+                    unit: config.unit.clone(),
+                    observed_property: config.parameter.clone(),
+                    standard_name: None,
+                },
+            )])),
             poll_interval: Duration::from_secs(config.poll_interval_secs),
             exclude_patterns: config.exclude_patterns.clone(),
             max_files: config.max_files,
@@ -3332,18 +3344,8 @@ impl EdrEngine for GeoTiffEngine {
         vec![self.parameter.clone()]
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        let mut map = HashMap::new();
-        map.insert(
-            self.parameter.clone(),
-            ParameterDescription {
-                label: self.parameter.replace('_', " "),
-                unit: self.unit.clone(),
-                observed_property: self.parameter.clone(),
-                standard_name: None,
-            },
-        );
-        map
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.descriptions)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

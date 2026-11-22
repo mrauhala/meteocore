@@ -48,7 +48,7 @@ use ds_core::map_engine::{
 };
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    ParameterDescriptions, QueryResult, ValuePrecision,
 };
 use ds_core::native_grid::NativeGrid;
 use ds_poll::{FirstTick, Shutdown};
@@ -137,7 +137,9 @@ pub struct PeriodEngine {
     max_reads: usize,
     read_strip_cells: usize,
     params: Vec<Param>,
-    descriptions: HashMap<String, ParameterDescription>,
+    /// The windows' descriptions, built once: `get_parameter_descriptions`
+    /// shares this `Arc` (#1500).
+    descriptions: Arc<ParameterDescriptions>,
     /// Each window's live grids, read by requests under the read lock.
     slots: Vec<RwLock<Option<Grids>>>,
     /// Each window's served version, which keys the map caches: moved to a
@@ -360,20 +362,22 @@ impl PeriodEngine {
             summed_unit.as_deref(),
             config.threshold,
         );
-        let descriptions = params
-            .iter()
-            .map(|p| {
-                (
-                    p.name.clone(),
-                    ParameterDescription {
-                        label: p.title.clone(),
-                        unit: p.unit.clone(),
-                        observed_property: p.name.clone(),
-                        standard_name: None,
-                    },
-                )
-            })
-            .collect();
+        let descriptions = Arc::new(
+            params
+                .iter()
+                .map(|p| {
+                    (
+                        p.name.clone(),
+                        ParameterDescription {
+                            label: p.title.clone(),
+                            unit: p.unit.clone(),
+                            observed_property: p.name.clone(),
+                            standard_name: None,
+                        },
+                    )
+                })
+                .collect(),
+        );
         let geom = info
             .spatial_extent
             .zip(info.grid_size)
@@ -1233,8 +1237,8 @@ impl EdrEngine for PeriodEngine {
         self.params.iter().map(|p| p.name.clone()).collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.descriptions.clone()
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.descriptions)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

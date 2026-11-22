@@ -423,8 +423,8 @@ impl EdrEngine for Synthetic {
         vec!["t2m".into()]
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        HashMap::from([(
+    fn get_parameter_descriptions(&self) -> Arc<ds_core::model::ParameterDescriptions> {
+        Arc::new(ds_core::model::ParameterDescriptions::from([(
             "t2m".to_string(),
             ParameterDescription {
                 label: "air temperature".into(),
@@ -432,7 +432,7 @@ impl EdrEngine for Synthetic {
                 observed_property: "air_temperature".into(),
                 standard_name: None,
             },
-        )])
+        )]))
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

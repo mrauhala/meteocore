@@ -20,7 +20,7 @@ use crate::map_engine::{
 };
 use crate::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult,
+    ParameterDescriptions, QueryResult,
 };
 use crate::vertical::{VerticalDimension, VerticalKind};
 use crate::wind::{OutcomeLog, WindFacts, WindSource};
@@ -68,7 +68,8 @@ type TimeAndRun = (Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 ///
 /// Every capability accessor stays O(1) (Critical Rule 10): the plan is
 /// rebuilt only when the source's [`WindFacts`] snapshot changes, and the
-/// extended `RasterInfo` only when the plan or the engine's snapshot does.
+/// extended `RasterInfo` and parameter descriptions only when the plan or
+/// the engine's snapshot does.
 pub struct Derived {
     collection_id: String,
     map: Arc<dyn MapEngine>,
@@ -78,6 +79,7 @@ pub struct Derived {
     log: DerivationLog,
     plan: RwLock<Option<(Arc<WindFacts>, Arc<Plan>)>>,
     raster: RwLock<Option<RasterSnapshot>>,
+    descriptions: RwLock<Option<DescriptionSnapshot>>,
     axes: RwLock<HashMap<String, AxisSnapshot>>,
     logged: Mutex<HashMap<OutcomeKey, Outcome>>,
 }
@@ -86,6 +88,14 @@ struct RasterSnapshot {
     inner: Arc<RasterInfo>,
     plan: Arc<Plan>,
     info: Arc<RasterInfo>,
+}
+
+/// The engine's parameter descriptions with the derived ones added, and
+/// the snapshots they were built from (#1500).
+struct DescriptionSnapshot {
+    inner: Arc<ParameterDescriptions>,
+    plan: Arc<Plan>,
+    descriptions: Arc<ParameterDescriptions>,
 }
 
 struct AxisSnapshot {
@@ -141,6 +151,7 @@ impl Derived {
             log,
             plan: RwLock::new(None),
             raster: RwLock::new(None),
+            descriptions: RwLock::new(None),
             axes: RwLock::new(HashMap::new()),
             logged: Mutex::new(HashMap::new()),
         };
@@ -1277,18 +1288,37 @@ impl EdrEngine for Derived {
         names
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        let mut descriptions = self.edr.get_parameter_descriptions();
+    /// The engine's descriptions and every derived parameter whose inputs
+    /// it describes, built again only when the engine's `Arc` or the plan
+    /// changes (#1500).
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        let inner = self.edr.get_parameter_descriptions();
         let plan = self.plan();
+        if let Some(snapshot) = &*read(&self.descriptions) {
+            if Arc::ptr_eq(&snapshot.inner, &inner) && Arc::ptr_eq(&snapshot.plan, &plan) {
+                return snapshot.descriptions.clone();
+            }
+        }
+        let mut extended = (*inner).clone();
         for d in &plan.derived {
             if d.edr_inputs
                 .iter()
-                .all(|input| descriptions.contains_key(input))
-                && !descriptions.contains_key(&d.name)
+                .all(|input| extended.contains_key(input))
+                && !extended.contains_key(&d.name)
             {
-                descriptions.insert(d.name.clone(), description(d));
+                extended.insert(d.name.clone(), description(d));
             }
         }
+        let descriptions = if extended.len() == inner.len() {
+            inner.clone()
+        } else {
+            Arc::new(extended)
+        };
+        *write(&self.descriptions) = Some(DescriptionSnapshot {
+            inner,
+            plan,
+            descriptions: descriptions.clone(),
+        });
         descriptions
     }
 

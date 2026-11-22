@@ -14,7 +14,7 @@ use ds_core::instances::{self, RunInfo};
 use ds_core::map_engine::{MapEngine, OutputCrs, RasterInfo, RasterTile};
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, ValuePrecision,
+    ParameterDescriptions, QueryResult, ValuePrecision,
 };
 use ds_core::moisture::MoistureRole;
 use ds_core::temp_files;
@@ -56,6 +56,9 @@ struct RunSet {
     /// swapped with it, so `raster_info_shared` is an `Arc` clone and a
     /// reader never sees new runs with old metadata.
     raster_info: Arc<RasterInfo>,
+    /// The latest run's EDR descriptions, built with the set for the same
+    /// reason: collection metadata reads them per request (#1500).
+    descriptions: Arc<ParameterDescriptions>,
 }
 
 impl Default for RunSet {
@@ -69,15 +72,24 @@ impl RunSet {
     /// wind facts and the map metadata, its default parameter the one
     /// `wms_parameter` names.
     fn new(runs: BTreeMap<DateTime<Utc>, RunEntry>, wms_parameter: Option<&str>) -> Self {
-        let wind = runs
-            .values()
-            .next_back()
-            .map(|latest| Arc::new(wind_facts(&latest.data)));
+        let latest = runs.values().next_back().map(|latest| &latest.data);
+        let wind = latest.map(|data| Arc::new(wind_facts(data)));
+        let descriptions = Arc::new(
+            latest
+                .map(|data| {
+                    data.params
+                        .iter()
+                        .map(|p| (p.name.clone(), description(p)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
         let raster_info = Arc::new(raster_info_of(&runs, wms_parameter));
         Self {
             runs,
             wind,
             raster_info,
+            descriptions,
         }
     }
 
@@ -340,14 +352,9 @@ impl EdrEngine for QueryDataEngine {
         data.params.iter().map(|p| p.name.clone()).collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        let Some(data) = self.latest_data() else {
-            return HashMap::new();
-        };
-        data.params
-            .iter()
-            .map(|p| (p.name.clone(), description(p)))
-            .collect()
+    /// The latest run's, from the run set (#1500).
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.runs.load().descriptions)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

@@ -299,21 +299,23 @@ impl EdrEngine for Mock {
         PARAMETERS.iter().map(|p| p.to_string()).collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        PARAMETERS
-            .iter()
-            .map(|&p| {
-                (
-                    p.to_string(),
-                    ParameterDescription {
-                        label: p.into(),
-                        unit: "m s-1".into(),
-                        observed_property: p.into(),
-                        standard_name: None,
-                    },
-                )
-            })
-            .collect()
+    fn get_parameter_descriptions(&self) -> Arc<crate::model::ParameterDescriptions> {
+        Arc::new(
+            PARAMETERS
+                .iter()
+                .map(|&p| {
+                    (
+                        p.to_string(),
+                        ParameterDescription {
+                            label: p.into(),
+                            unit: "m s-1".into(),
+                            observed_property: p.into(),
+                            standard_name: None,
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {

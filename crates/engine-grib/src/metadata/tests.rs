@@ -343,8 +343,16 @@ async fn metadata_probe_replay() {
         let elapsed = start.elapsed();
         let descriptions: BTreeMap<_, _> = engine
             .get_parameter_descriptions()
-            .into_iter()
-            .map(|(name, meta)| (name, (meta.label, meta.unit, meta.observed_property)))
+            .iter()
+            .map(|(name, meta)| {
+                let ds_core::model::ParameterDescription {
+                    label,
+                    unit,
+                    observed_property,
+                    ..
+                } = meta.clone();
+                (name.clone(), (label, unit, observed_property))
+            })
             .collect();
         if let Some(expected) = &baseline {
             assert_eq!(&descriptions, expected);

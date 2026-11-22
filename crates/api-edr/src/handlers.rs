@@ -4173,12 +4173,12 @@ struct CollectionMetadata<'a> {
     discovery: &'a Discovery,
     base_url: &'a str,
     items: bool,
-    /// `get_parameter_descriptions`, sorted by name: serde_json's
+    /// The engine's `get_parameter_descriptions` snapshot, shared, never
+    /// copied (#1500). It iterates in name order: serde_json's
     /// workspace-enabled `preserve_order` makes insertion order the wire
-    /// order, and the engine builds a fresh HashMap per call — unsorted,
-    /// byte-identical requests would serialize differently and the
-    /// content-derived ETag would never revalidate (#499).
-    parameters: Vec<(String, ds_core::model::ParameterDescription)>,
+    /// order, so byte-identical requests serialize identically and the
+    /// content-derived ETag revalidates (#499).
+    parameters: std::sync::Arc<ds_core::model::ParameterDescriptions>,
     /// A CRS84-domain extent: engine bounds can be grid cell edges past the
     /// domain, or an empty-accumulator sentinel.
     spatial: Option<[f64; 4]>,
@@ -4201,8 +4201,7 @@ impl<'a> CollectionMetadata<'a> {
         base_url: &'a str,
         items: bool,
     ) -> Self {
-        let mut parameters: Vec<_> = engine.get_parameter_descriptions().into_iter().collect();
-        parameters.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let parameters = engine.get_parameter_descriptions();
         Self {
             engine,
             config,

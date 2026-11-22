@@ -37,6 +37,9 @@ pub struct CsvEngine {
     /// The station-symbol map layers (#1204), built once: the file is
     /// static until a reload rebuilds the engine.
     pub(crate) map: StationMap,
+    /// The parameters' descriptions, built once for the same reason:
+    /// collection metadata reads them per request (#1500).
+    descriptions: Arc<ParameterDescriptions>,
 }
 
 impl CsvEngine {
@@ -59,6 +62,7 @@ impl CsvEngine {
         let time_extent = instants.first().copied().zip(instants.last().copied());
         let spatial_extent = spatial_extent(&store);
         let locations = Arc::new(LocationSnapshot::new(inventory(&store)));
+        let descriptions = Arc::new(descriptions(&store));
         let map = StationMap::new(
             &store,
             time_extent,
@@ -73,6 +77,7 @@ impl CsvEngine {
             spatial_extent,
             instants: instants.into(),
             map,
+            descriptions,
         }
     }
 
@@ -282,28 +287,8 @@ impl EdrEngine for CsvEngine {
         self.store.parameter_names.clone()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        self.store
-            .parameter_names
-            .iter()
-            .map(|name| {
-                let unit = self
-                    .store
-                    .parameter_units
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_default();
-                (
-                    name.clone(),
-                    ParameterDescription {
-                        label: name.replace('_', " "),
-                        unit,
-                        observed_property: name.clone(),
-                        standard_name: None,
-                    },
-                )
-            })
-            .collect()
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.descriptions)
     }
 
     /// The span the rows cover, from the load-time snapshot: read per
@@ -507,6 +492,27 @@ fn spatial_extent(store: &CsvDataStore) -> Option<[f64; 4]> {
     }
 
     Some([min_lon, min_lat, max_lon, max_lat])
+}
+
+/// Each parameter column described: its name as the label, with the unit
+/// its header gives.
+fn descriptions(store: &CsvDataStore) -> ParameterDescriptions {
+    store
+        .parameter_names
+        .iter()
+        .map(|name| {
+            let unit = store.parameter_units.get(name).cloned().unwrap_or_default();
+            (
+                name.clone(),
+                ParameterDescription {
+                    label: name.replace('_', " "),
+                    unit,
+                    observed_property: name.clone(),
+                    standard_name: None,
+                },
+            )
+        })
+        .collect()
 }
 
 /// One location per station, at its first row's coordinates, in

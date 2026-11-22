@@ -20,7 +20,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use deadpool_postgres::Pool;
 use ds_core::feature::{FilterableProperties, PropertyValue};
 use ds_core::map_engine::RasterInfo;
-use ds_core::model::{Location, LocationSnapshot, ParameterDescription};
+use ds_core::model::{Location, LocationSnapshot, ParameterDescription, ParameterDescriptions};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use thiserror::Error;
 use tokio_postgres::types::Type;
@@ -152,7 +152,7 @@ pub struct CollectionMeta {
     /// `FeatureEngine::get_feature` — at 30 k stations the previous
     /// `iter().find()` was 12 M string compares per area request.
     pub station_idx: Arc<HashMap<String, usize>>,
-    pub parameters: Arc<HashMap<String, ParameterDescription>>,
+    pub parameters: Arc<ParameterDescriptions>,
     /// The advertised temporal extent: the first observation to the latest
     /// one not after the refresh's `now` (#1139).
     pub temporal_extent: Option<(DateTime<Utc>, DateTime<Utc>)>,
@@ -373,9 +373,7 @@ impl MetadataCache {
     }
 }
 
-fn build_parameter_descriptions(
-    params: &[ValidatedParameter],
-) -> HashMap<String, ParameterDescription> {
+fn build_parameter_descriptions(params: &[ValidatedParameter]) -> ParameterDescriptions {
     params
         .iter()
         .map(|p| {
@@ -997,7 +995,7 @@ mod tests {
             filterables: Default::default(),
             locations: Arc::new(LocationSnapshot::new(vec![mk_loc("s", 1.0, 2.0)])),
             station_idx: Arc::new(HashMap::from([("s".to_string(), 0)])),
-            parameters: Arc::new(HashMap::new()),
+            parameters: Arc::default(),
             temporal_extent: None,
             future_latest: None,
             spatial_extent: Some([1.0, 2.0, 1.0, 2.0]),

@@ -58,7 +58,7 @@ use ds_core::instances::RunInfo;
 use ds_core::map_engine::OutputCrs;
 use ds_core::model::{
     CoverageResponse, DomainDescription, LocationSnapshot, NdArray, ParameterDescription,
-    QueryResult, VerticalCoord,
+    ParameterDescriptions, QueryResult, VerticalCoord,
 };
 use ds_core::resample::{CellWindow, SourceGrid};
 use ds_core::vertical::VerticalDimension;
@@ -982,6 +982,16 @@ impl NetcdfEngine {
             .collect()
     }
 
+    /// Every parameter of `catalog` described, for its `descriptions`
+    /// snapshot (#1500): what `get_parameter_descriptions` serves.
+    pub(crate) fn all_descriptions(catalog: &Catalog) -> Arc<ParameterDescriptions> {
+        let Some(layout) = catalog.layout.as_deref() else {
+            return Arc::default();
+        };
+        let all: Vec<Param> = layout.params().collect();
+        Arc::new(Self::described(catalog, layout, &all).into_iter().collect())
+    }
+
     /// [`Self::descriptions`] in `params` order, the order a trajectory's
     /// values are laid out in.
     fn described(
@@ -1332,13 +1342,9 @@ impl EdrEngine for NetcdfEngine {
             .collect()
     }
 
-    fn get_parameter_descriptions(&self) -> HashMap<String, ParameterDescription> {
-        let catalog = self.catalog.load();
-        let Some(layout) = catalog.layout.as_ref() else {
-            return HashMap::new();
-        };
-        let all: Vec<Param> = layout.params().collect();
-        Self::descriptions(&catalog, layout, &all)
+    /// The catalog's snapshot, built with it (#1500).
+    fn get_parameter_descriptions(&self) -> Arc<ParameterDescriptions> {
+        Arc::clone(&self.catalog.load().descriptions)
     }
 
     fn get_temporal_extent(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
