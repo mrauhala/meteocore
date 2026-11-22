@@ -9,7 +9,9 @@
 //! as in flight meanwhile, for a test of how many reads a caller overlaps.
 //! And [`FailingReads`], a store whose GETs fail as a store that kept
 //! answering one status through every retry, for a test of what a caller
-//! answers an unavailable store (#1523).
+//! answers an unavailable store (#1523). And [`ThrottledBucket`], a back-off
+//! a test drives, for a caller that pauses while its bucket backs off
+//! (#1530).
 //!
 //! Compiled for ds-storage's own tests and, through its `test-util`
 //! feature, for the tests of a crate that enables the feature on its
@@ -685,13 +687,78 @@ pub struct QuickBackoff(#[allow(dead_code)] Arc<crate::throttle::HostThrottle>);
 /// theirs. Build the stores on the host while the guard lives: the
 /// throttle is the host's for as long as something holds it.
 pub fn quick_backoff(url: &str) -> QuickBackoff {
-    use crate::throttle::{Timing, PACE_CAP, PACE_FLOOR, RETRY_DELAY};
     let url = url::Url::parse(url).expect("an absolute URL");
     let host = crate::throttle::for_url(&url);
+    quicken(&host);
+    QuickBackoff(host)
+}
+
+/// [`quick_backoff`] of the S3 bucket `bucket` at `endpoint` (#1530), as
+/// its `503 SlowDown`s back it off: its pace from 2.5 ms up to 20 ms, a
+/// refused request retried after 20 ms. Unlike an HTTP host's, a bucket's
+/// back-off lives for the process, so the stores may be built before or
+/// after.
+pub fn quick_bucket_backoff(endpoint: &str, bucket: &str) -> QuickBackoff {
+    let label = crate::traced::s3_label(Some(endpoint), None, bucket);
+    let host = crate::bucket::bucket(&label, bucket).throttle;
+    quicken(&host);
+    QuickBackoff(host)
+}
+
+/// Back `host` off on a hundredth of the real times.
+fn quicken(host: &crate::throttle::HostThrottle) {
+    use crate::throttle::{Timing, PACE_CAP, PACE_FLOOR, RETRY_DELAY};
     host.set_timing(Timing {
         pace_floor: PACE_FLOOR / 100,
         pace_cap: PACE_CAP / 100,
         retry_delay: RETRY_DELAY / 100,
     });
-    QuickBackoff(host)
+}
+
+/// An S3 bucket's back-off that a test drives (#1530): stores on it
+/// ([`Self::store`]) report it through [`crate::DataStore::back_off`],
+/// [`Self::slow_down`] backs it off as a `503 SlowDown` the bucket
+/// answered would, and [`Self::quiet`] ends it, as the quiet intervals
+/// after the last one would. Nothing is sent through it: a store's reads
+/// are its inner store's, so a test fails them itself, as
+/// [`FailingReads`] does, and reports their `SlowDown`s.
+#[derive(Debug, Clone)]
+pub struct ThrottledBucket(Arc<crate::throttle::HostThrottle>);
+
+impl ThrottledBucket {
+    /// A bucket's back-off, labelled `source` (`host[:port]/bucket`), its
+    /// own whatever other test made one of that name.
+    pub fn new(source: &str) -> Self {
+        let bucket = source.rsplit('/').next().unwrap_or(source).to_string();
+        Self(Arc::new(crate::throttle::HostThrottle::new(
+            source.to_string(),
+            crate::throttle::Kind::Bucket(bucket),
+        )))
+    }
+
+    /// A remote store reading `inner` from this bucket.
+    pub fn store(&self, inner: Arc<dyn ObjectStore>) -> crate::DataStore {
+        let source = crate::traced::Labels {
+            store: self.0.host().into(),
+            collection: None,
+        };
+        crate::DataStore::layered(
+            inner,
+            Some(source),
+            Some(self.0.clone()),
+            Default::default(),
+        )
+    }
+
+    /// The bucket answered `503 SlowDown`: it backs off, as through a
+    /// store's transport.
+    pub fn slow_down(&self) {
+        self.0
+            .throttled(reqwest::StatusCode::SERVICE_UNAVAILABLE, None);
+    }
+
+    /// Its back-off is over.
+    pub fn quiet(&self) {
+        self.0.quiet();
+    }
 }

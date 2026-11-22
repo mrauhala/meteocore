@@ -28,6 +28,14 @@
 //! The fills are kept ([`MessageCache::prewarm`]): in a full cache each
 //! would otherwise wait in the cold ring until the next fill evicted it.
 //!
+//! A pre-warm waits while its source backs off (#1530): a bucket answering
+//! `503 SlowDown`, an HTTP host answering 429
+//! ([`ds_storage::DataStore::back_off`]). Then a poll starts none, and one
+//! under way stops before its next GET; what it has not fetched is kept
+//! ([`Prewarm::deferred`]) and fetched by the first poll after the source's
+//! back-off has cleared, while that run is the newest. The pre-warm is the
+//! one speculative burst a poll makes, and a throttled bucket refuses it.
+//!
 //! What was read lives in memory only: after a restart or a rebuild of the
 //! engine nothing pre-warms until clients read again. Area, radius, cube and
 //! trajectory queries read decoded grids, not the point path, and do not
@@ -190,6 +198,9 @@ pub(crate) struct Prewarm {
     /// The run the pre-warm last fetched for and its bytes, against
     /// [`SHARE_PERCENT`].
     spent: Mutex<(Option<DateTime<Utc>>, u64)>,
+    /// The fetches a pre-warm left while its source backed off, and their
+    /// run: within its share, earliest steps first (#1530).
+    deferred: Mutex<Option<(DateTime<Utc>, Vec<Fetch>)>>,
     gets: AtomicU64,
     bytes: AtomicU64,
 }
@@ -201,6 +212,7 @@ impl Prewarm {
         (enabled && cache.is_some()).then(|| Self {
             reads: RecentReads::default(),
             spent: Mutex::new((None, 0)),
+            deferred: Mutex::new(None),
             gets: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
         })
@@ -221,12 +233,46 @@ impl Prewarm {
         }
         spent.1 = spent.1.saturating_add(bytes);
     }
+
+    /// The fetches deferred for `run`, taken; those of an older run are
+    /// dropped, as a poll leaves an older run's messages to queries.
+    fn take_deferred(&self, run: DateTime<Utc>) -> Vec<Fetch> {
+        match self.deferred.lock().unwrap().take() {
+            Some((deferred, fetches)) if deferred == run => fetches,
+            _ => Vec::new(),
+        }
+    }
+
+    /// Keep `fetches` of `run` for a poll after the source's back-off.
+    fn defer(&self, run: DateTime<Utc>, fetches: Vec<Fetch>) {
+        *self.deferred.lock().unwrap() = (!fetches.is_empty()).then_some((run, fetches));
+    }
+
+    /// The messages waiting for the source's back-off to clear.
+    pub(crate) fn deferred_len(&self) -> usize {
+        self.deferred
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(0, |(_, fetches)| fetches.len())
+    }
 }
 
 /// One message to pre-warm.
+#[derive(Clone)]
 struct Fetch {
     url: String,
     entry: MessageEntry,
+}
+
+impl Fetch {
+    fn length(&self) -> u64 {
+        self.entry.length.unwrap_or_default()
+    }
+
+    fn same(&self, other: &Fetch) -> bool {
+        self.url == other.url && self.entry.offset == other.entry.offset
+    }
 }
 
 /// What a poll pre-warms of the newest run: the new messages to fetch,
@@ -328,6 +374,8 @@ enum Warmed {
     Fetched(usize),
     /// Resident by then, or the engine is shutting down.
     Skipped,
+    /// Not fetched: the source backs off.
+    Paused(Fetch),
     Failed(String),
 }
 
@@ -339,10 +387,21 @@ struct Outcome {
     failed: usize,
     /// Not fetched by [`BUDGET`].
     unfinished: usize,
+    /// Not fetched while the source backed off, for a later poll.
+    paused: Vec<Fetch>,
     first_error: Option<String>,
 }
 
 impl GribEngine {
+    /// Whether the source's host or bucket backs off now (#1530): a
+    /// throttle's pace or `Retry-After` is in force. A local source never.
+    pub(crate) fn source_backing_off(&self) -> bool {
+        self.source
+            .store
+            .back_off()
+            .is_some_and(|back_off| back_off.backing_off)
+    }
+
     /// [`Self::background_fetch`] once one of the source's
     /// [`BackgroundGets`] is free, waiting at most `wait` for it; `None`
     /// past it.
@@ -409,11 +468,26 @@ impl GribEngine {
         )
     }
 
+    /// A poll that catalogued nothing new: fetch what a pre-warm left
+    /// while the source backed off, if anything (#1530).
+    pub(crate) fn resume_prewarm(&self) {
+        let deferred = self
+            .source
+            .prewarm
+            .as_ref()
+            .map_or(0, Prewarm::deferred_len);
+        if deferred > 0 {
+            self.prewarm_new_steps(&self.source.catalog.load_full());
+        }
+    }
+
     /// After a poll published its catalog: fetch the messages of the
     /// newest run's steps that `previous`, the catalog before it, lacked,
     /// for the keys position queries read within [`READ_WINDOW`] (see the
-    /// module docs). Runs on the poll runtime; returns once every fetch
-    /// has finished or [`BUDGET`] has passed.
+    /// module docs), after those a pre-warm left while the source backed
+    /// off. While it backs off, fetch nothing and keep them all. Runs on
+    /// the poll runtime; returns once every fetch has finished or
+    /// [`BUDGET`] has passed.
     pub(crate) fn prewarm_new_steps(&self, previous: &Catalog) {
         let (Some(prewarm), Some(cache)) = (&self.source.prewarm, &self.source.message_cache)
         else {
@@ -428,14 +502,32 @@ impl GribEngine {
             return;
         };
         let reference_time = run.reference_time;
-        let remaining = prewarm.remaining(reference_time, cache);
-        let Some(Plan {
-            fetches,
-            capped,
-            not_held,
-        }) = plan(previous, run, &keys, cache, remaining)
-        else {
-            return;
+        // The deferred ones first: earlier steps, planned at an earlier
+        // poll, within the share then. Fetched meanwhile, by a query, they
+        // are dropped; their bytes come off what the new ones may plan.
+        let mut fetches = prewarm.take_deferred(reference_time);
+        fetches.retain(|fetch| {
+            let key = MessageKey::new(Path::from(fetch.url.as_str()).as_ref(), &fetch.entry);
+            !cache.is_resident(&key)
+        });
+        let deferred_bytes: u64 = fetches.iter().map(Fetch::length).sum();
+        let remaining = prewarm
+            .remaining(reference_time, cache)
+            .saturating_sub(deferred_bytes);
+        let (capped, not_held) = match plan(previous, run, &keys, cache, remaining) {
+            Some(Plan {
+                fetches: new,
+                capped,
+                not_held,
+            }) => {
+                for fetch in new {
+                    if !fetches.iter().any(|deferred| deferred.same(&fetch)) {
+                        fetches.push(fetch);
+                    }
+                }
+                (capped, not_held)
+            }
+            None => (0, Vec::new()),
         };
         if !not_held.is_empty() {
             let names: Vec<String> = not_held
@@ -459,9 +551,28 @@ impl GribEngine {
         if fetches.is_empty() {
             return;
         }
+        if self.source_backing_off() {
+            tracing::info!(
+                "Collection '{}': pre-warm of run {reference_time} waits while its source \
+                 backs off (503 SlowDown or 429): {} messages for a later poll",
+                self.collection_id,
+                fetches.len()
+            );
+            prewarm.defer(reference_time, fetches);
+            return;
+        }
         cache.forget_evicted_prewarms();
-        let outcome = self.prewarm(reference_time, fetches);
+        let mut outcome = self.prewarm(reference_time, fetches);
         prewarm.spend(reference_time, outcome.bytes);
+        if !outcome.paused.is_empty() {
+            tracing::info!(
+                "Collection '{}': pre-warm of run {reference_time} stopped as its source \
+                 began to back off (503 SlowDown or 429): {} messages for a later poll",
+                self.collection_id,
+                outcome.paused.len()
+            );
+            prewarm.defer(reference_time, std::mem::take(&mut outcome.paused));
+        }
         if outcome.messages > 0 {
             tracing::info!(
                 "Collection '{}': pre-warmed {} messages ({:.1} MiB) of run {reference_time} \
@@ -510,6 +621,7 @@ impl GribEngine {
                         outcome.bytes += bytes as u64;
                     }
                     Warmed::Skipped => {}
+                    Warmed::Paused(fetch) => outcome.paused.push(fetch),
                     Warmed::Failed(error) => {
                         outcome.failed += 1;
                         outcome.first_error.get_or_insert(error);
@@ -529,7 +641,8 @@ impl GribEngine {
     /// position queries: [`Warmed::Failed`] for a failed GET or a message
     /// that does not decode, which a query then reads itself. Only the
     /// budget's deadline stops the pre-warm; at shutdown the rest is
-    /// skipped.
+    /// skipped, and while the source backs off it is
+    /// [`Warmed::Paused`], before its GET.
     fn prewarm_message(
         &self,
         run: DateTime<Utc>,
@@ -541,6 +654,9 @@ impl GribEngine {
         };
         if self.source.shutdown.is_shutdown() {
             return Ok(Warmed::Skipped);
+        }
+        if self.source_backing_off() {
+            return Ok(Warmed::Paused(fetch.clone()));
         }
         let entry = &fetch.entry;
         let path = Path::from(fetch.url.as_str());

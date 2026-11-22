@@ -36,6 +36,9 @@ use super::{CUT_WINDOW, QUIET_INTERVAL};
 pub(crate) struct AdaptiveLimit {
     /// `host[:port]`, for the line logged when the limit is back.
     host: String,
+    /// The throttling answer the host has stopped sending, for that line:
+    /// `429`, or an S3 bucket's `SlowDown` ([`super::Kind::quiet_name`]).
+    quiet_name: &'static str,
     /// The limit the store was built with, which growth returns to.
     configured: usize,
     semaphore: Arc<Semaphore>,
@@ -58,11 +61,13 @@ struct LimitState {
 }
 
 impl AdaptiveLimit {
-    /// A limit of `configured` requests (at least 1) to `host`.
-    pub(crate) fn new(host: String, configured: usize) -> Self {
+    /// A limit of `configured` requests (at least 1) to `host`, cut by
+    /// the answers `kind` names.
+    pub(crate) fn new(host: String, configured: usize, kind: &super::Kind) -> Self {
         let configured = configured.max(1);
         Self {
             host,
+            quiet_name: kind.quiet_name(),
             configured,
             semaphore: Arc::new(Semaphore::new(configured)),
             state: Mutex::new(LimitState {
@@ -140,8 +145,9 @@ impl AdaptiveLimit {
             tracing::info!(
                 host = %self.host,
                 limit = self.configured,
-                "{} has answered no 429 for {} s: its request limit is back at {}",
+                "{} has answered no {} for {} s: its request limit is back at {}",
                 self.host,
+                self.quiet_name,
                 QUIET_INTERVAL.as_secs(),
                 self.configured
             );
@@ -327,7 +333,11 @@ mod tests {
     /// it frees new permits, and stops at the configured limit.
     #[tokio::test(start_paused = true)]
     async fn a_cut_owes_held_permits_and_growth_pays_them_first() {
-        let limit = Arc::new(AdaptiveLimit::new("host.test".into(), 8));
+        let limit = Arc::new(AdaptiveLimit::new(
+            "host.test".into(),
+            8,
+            &super::super::Kind::Http,
+        ));
         let held: Vec<Permit> = futures::future::join_all((0..6).map(|_| limit.acquire())).await;
         assert_eq!(free(&limit), 2);
 

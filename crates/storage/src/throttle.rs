@@ -29,8 +29,16 @@
 //!   429, back to the configured limit.
 //!
 //! [`throttled_answers`] counts each host's 429s, for its callers and
-//! `/metrics`. S3 stores are not throttled here: S3 answers 503 SlowDown,
-//! which object_store retries and `retryable.rs` counts (#1336).
+//! `/metrics`.
+//!
+//! An S3 bucket throttles with `503 SlowDown` instead, and it throttles
+//! the bucket as a whole: on 2026-11-22 every GET of a public bucket, on
+//! every prefix, was refused for 40 minutes while HEADs and LISTs were
+//! answered (#1530). So every S3 store this crate builds has a throttle
+//! per bucket (`bucket.rs`), [`Kind::Bucket`], shared by every store on
+//! it: the requests that name the bucket go through it, and a 503 or a
+//! 429 backs it off exactly as a 429 backs off an HTTP host. Requests to
+//! another host, a credential endpoint, pass by.
 
 mod limit;
 #[cfg(test)]
@@ -45,6 +53,7 @@ use std::time::{Duration, SystemTime};
 
 use object_store::client::{HttpError, HttpRequest, HttpResponse, HttpService};
 use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::StatusCode;
 use tokio::time::Instant;
 
 /// The longest a `Retry-After` stops new requests to a host. A server may
@@ -102,14 +111,71 @@ impl Timing {
     };
 }
 
+/// What a throttle governs, and which answers back it off.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// An HTTP host: every request to it, backed off by a 429.
+    Http,
+    /// The S3 bucket of this name (#1530): the requests naming it, by
+    /// path (`/bucket/key`) or host (`bucket.s3.…`), backed off by a 503,
+    /// S3's `SlowDown`, or a 429.
+    Bucket(String),
+}
+
+impl Kind {
+    /// Whether a request to `uri` goes through the throttle.
+    fn governs(&self, uri: &http::Uri) -> bool {
+        let Kind::Bucket(bucket) = self else {
+            return true;
+        };
+        let by_path = uri
+            .path()
+            .strip_prefix('/')
+            .and_then(|path| path.strip_prefix(bucket.as_str()))
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'));
+        let by_host = uri
+            .host()
+            .and_then(|host| host.strip_prefix(bucket.as_str()))
+            .is_some_and(|rest| rest.starts_with('.'));
+        by_path || by_host
+    }
+
+    /// Whether an answer with `status` asks for fewer requests.
+    pub(crate) fn refuses(&self, status: StatusCode) -> bool {
+        status == StatusCode::TOO_MANY_REQUESTS
+            || (matches!(self, Kind::Bucket(_)) && status == StatusCode::SERVICE_UNAVAILABLE)
+    }
+
+    /// The throttling answer, as the quiet-time log lines name it.
+    pub(crate) fn quiet_name(&self) -> &'static str {
+        match self {
+            Kind::Http => "429",
+            Kind::Bucket(_) => "SlowDown",
+        }
+    }
+}
+
+/// The answer `status` as the WARN names it: S3's 503 is its `SlowDown`.
+fn answer_name(status: StatusCode) -> &'static str {
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        "503 SlowDown"
+    } else {
+        "429 Too Many Requests"
+    }
+}
+
 /// What one host asked for with its 429s, shared by every HTTP store on
-/// its scheme, host and port ([`for_url`]).
+/// its scheme, host and port ([`for_url`]), or one S3 bucket with its
+/// `SlowDown`s, shared by every S3 store on it (`bucket.rs`).
 #[derive(Debug)]
 pub(crate) struct HostThrottle {
-    /// `host[:port]`, as the `storage` span and `/metrics` name it.
+    /// `host[:port]`, as the `storage` span and `/metrics` name it; an S3
+    /// bucket's `host[:port]/bucket`.
     host: String,
+    kind: Kind,
     state: Mutex<HostState>,
-    /// The 429s the host has answered.
+    /// The throttling answers the host has given: 429s, and an S3
+    /// bucket's 503s.
     answers: AtomicU64,
 }
 
@@ -137,9 +203,10 @@ struct HostState {
 }
 
 impl HostThrottle {
-    pub(crate) fn new(host: String) -> Self {
+    pub(crate) fn new(host: String, kind: Kind) -> Self {
         Self {
             host,
+            kind,
             state: Mutex::new(HostState {
                 paused_until: None,
                 pace: Duration::ZERO,
@@ -155,9 +222,37 @@ impl HostThrottle {
         }
     }
 
-    /// The 429s the host has answered, to every store on it.
+    /// The throttling answers the host has given, to every store on it.
     pub(crate) fn answers(&self) -> u64 {
         self.answers.load(Ordering::Relaxed)
+    }
+
+    /// `host[:port]`, or an S3 bucket's `host[:port]/bucket`.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Whether the host's requests are paced or paused now: from its
+    /// throttling answer until the pace has decayed below the floor, one
+    /// to four [`QUIET_INTERVAL`]s later, and while a `Retry-After` lasts.
+    /// The adaptive limit may still be growing back after that.
+    pub(crate) fn backing_off(&self) -> bool {
+        let mut state = self.state();
+        let now = Instant::now();
+        self.decay(&mut state, now);
+        !state.pace.is_zero() || state.paused_until.is_some_and(|until| until > now)
+    }
+
+    /// End the back-off at once, as its quiet intervals would: no pace and
+    /// no pause. The limits keep theirs.
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn quiet(&self) {
+        let mut state = self.state();
+        state.pace = Duration::ZERO;
+        state.next_at = None;
+        state.paced_at = None;
+        state.paused_until = None;
     }
 
     /// The pace now: zero while the host is not throttling.
@@ -232,8 +327,9 @@ impl HostThrottle {
                     .map(|at| since.saturating_duration_since(at));
                 tracing::info!(
                     host = %self.host,
-                    "{} has answered no 429 for {} s: its requests are no longer paced",
+                    "{} has answered no {} for {} s: its requests are no longer paced",
                     self.host,
+                    self.kind.quiet_name(),
                     quiet.unwrap_or_default().as_secs()
                 );
             }
@@ -241,12 +337,17 @@ impl HostThrottle {
         state.pace_quiet_since = Some(since);
     }
 
-    /// The host answered 429, with `retry_after` when it said how long to
-    /// wait: pause new requests that long, at most [`MAX_RETRY_AFTER`],
-    /// raise the pace and cut the host's limits. Returns how long the
-    /// refused request waits before it is retried: nothing more when the
-    /// host said (the pause holds the retry too), else the retry delay.
-    pub(crate) fn throttled(&self, retry_after: Option<Duration>) -> Option<Duration> {
+    /// The host answered `status`, a 429 or an S3 bucket's 503, with
+    /// `retry_after` when it said how long to wait: pause new requests that
+    /// long, at most [`MAX_RETRY_AFTER`], raise the pace and cut the host's
+    /// limits. Returns how long the refused request waits before it is
+    /// retried: nothing more when the host said (the pause holds the retry
+    /// too), else the retry delay.
+    pub(crate) fn throttled(
+        &self,
+        status: StatusCode,
+        retry_after: Option<Duration>,
+    ) -> Option<Duration> {
         let now = Instant::now();
         self.answers.fetch_add(1, Ordering::Relaxed);
         let wait = retry_after
@@ -311,8 +412,9 @@ impl HostThrottle {
             configured_limit = sum.map(|(_, configured)| configured),
             pace_secs = paced.map(|pace| pace.as_secs_f64()),
             retry_after_secs = wait.map(|wait| wait.as_secs_f64()),
-            "{} answered 429 Too Many Requests: {}",
+            "{} answered {}: {}",
             self.host,
+            answer_name(status),
             detail.join("; ")
         );
         delay
@@ -346,6 +448,7 @@ pub(crate) fn for_url(url: &url::Url) -> Arc<HostThrottle> {
     hosts.retain(|_, host| host.strong_count() > 0);
     let host = Arc::new(HostThrottle::new(
         crate::traced::host_port(url).unwrap_or_default(),
+        Kind::Http,
     ));
     hosts.insert(key, Arc::downgrade(&host));
     host
@@ -368,11 +471,12 @@ pub fn throttled_answers(url: &str) -> u64 {
         .map_or(0, |host| host.answers())
 }
 
-/// An HTTP transport whose every request waits for its turn under its
-/// host's pace and `Retry-After` before it is sent, and whose every 429 is
-/// reported to the host ([`HostThrottle::throttled`]) and handed back after
-/// the retry delay, if any. object_store calls it once per attempt, so it
-/// sees the attempts object_store retries as well.
+/// An HTTP transport whose every request the throttle governs waits for
+/// its turn under its host's pace and `Retry-After` before it is sent, and
+/// whose every throttling answer (a 429, an S3 bucket's 503) is reported to
+/// the host ([`HostThrottle::throttled`]) and handed back after the retry
+/// delay, if any. object_store calls it once per attempt, so it sees the
+/// attempts object_store retries as well.
 #[derive(Debug, Clone)]
 pub(crate) struct Throttled<S> {
     pub inner: S,
@@ -382,11 +486,15 @@ pub(crate) struct Throttled<S> {
 #[async_trait::async_trait]
 impl<S: HttpService> HttpService for Throttled<S> {
     async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        if !self.host.kind.governs(request.uri()) {
+            return self.inner.call(request).await;
+        }
         self.host.wait().await;
         let response = self.inner.call(request).await?;
-        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let status = response.status();
+        if self.host.kind.refuses(status) {
             let wait = retry_after(response.headers(), SystemTime::now());
-            if let Some(delay) = self.host.throttled(wait) {
+            if let Some(delay) = self.host.throttled(status, wait) {
                 tokio::time::sleep(delay).await;
             }
         }

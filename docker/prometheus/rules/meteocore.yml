@@ -232,7 +232,7 @@ groups:
           severity: info
         annotations:
           summary: "{{ $labels.host }} throttles MeteoCore"
-          description: "{{ $labels.host }} has answered 429 Too Many Requests for 15 minutes; collections it serves may fall behind."
+          description: "{{ $labels.host }} has throttled for 15 minutes, with 429 Too Many Requests or, from an S3 bucket, 503 SlowDown; collections it serves may fall behind."
 
       # Resident memory over the memory plan's total, memory_plan_total_bytes
       # (#1312): the memory the server sizes its caches and budgets to fit.

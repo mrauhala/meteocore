@@ -130,7 +130,8 @@ mod tests {
     use crate::test_store::{RangeServer, QUICK_S3_RETRY};
 
     /// An S3 bucket holding `object`, on a server answering every request
-    /// for it with `status` when one is given.
+    /// for it with `status` when one is given. Its `SlowDown`s back it off
+    /// on a hundredth of the real times (#1530).
     fn bucket(status: Option<&'static str>) -> (RangeServer, crate::DataStore) {
         let server = RangeServer::new(b"0123456789", "2026-10-29T08:00:00Z".parse().unwrap());
         {
@@ -138,6 +139,10 @@ mod tests {
             object.path = "/bucket/object".into();
             object.status = status;
         }
+        drop(crate::test_util::quick_bucket_backoff(
+            &server.url,
+            "bucket",
+        ));
         let store = crate::s3_store_from_parts(&server.url, "bucket", QUICK_S3_RETRY).unwrap();
         (server, store)
     }

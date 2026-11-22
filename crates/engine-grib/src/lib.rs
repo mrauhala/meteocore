@@ -865,15 +865,17 @@ impl GribEngine {
         }
 
         // Settle every run we listed with hits except the newest (first in the
-        // newest-first iteration order), which may still be gaining steps.
+        // newest-first iteration order), which may still be gaining steps,
+        // and any whose indexes this scan left unread for a source that kept
+        // refusing reads (#1530): the next poll lists it again and reads them.
         // Prune the settled set to the current scan window so it cannot grow
         // unbounded as old runs age out (and so a prefix that ever reappears is
         // rescanned).
-        {
+        let settle = |unread: &[ds_storage::object_store::path::Path]| {
             let window: HashSet<&str> = prefixes.iter().map(|run| run.prefix.as_str()).collect();
             let mut settled = self.source.settled_prefixes.lock().unwrap();
-            settle_completed_runs(&mut settled, &listed_with_hits, &window);
-        }
+            settle_completed_runs(&mut settled, &listed_with_hits, &window, unread);
+        };
 
         // Reset the re-validation clock after a forced full pass. The clock
         // only *paces* a best-effort hourly re-list of settled runs to catch
@@ -925,7 +927,11 @@ impl GribEngine {
             // Metadata work is independent of discovery. With retention enabled,
             // continue below so existing steps can expire even during an outage.
             if self.source.time_window.is_none() {
+                settle(&[]);
                 self.probe_new_parameters();
+                // A pre-warm paused while the source backed off resumes
+                // (#1530).
+                self.resume_prewarm();
                 return Ok(());
             }
         }
@@ -946,8 +952,22 @@ impl GribEngine {
 
         // Fetch one bounded chunk at a time: get_many retains the completed
         // bodies until it returns. Results are in input order, preserving the
-        // sorted merge order even when downloads finish out of order.
+        // sorted merge order even when downloads finish out of order. The
+        // reads in flight are the source's: an S3 bucket's request limit,
+        // which its `SlowDown`s cut, bounds them below the chunk (#1530).
+        // Once a chunk's read failed while the source throttled, the scan
+        // reads no more: a bucket refusing GETs refuses the next chunk too,
+        // and each read would spend its retries on it. The collection keeps
+        // what it has; the next poll reads the rest.
+        let mut refused = false;
+        let mut unread: Vec<ds_storage::object_store::path::Path> = Vec::new();
         for chunk in new_paths.chunks(INDEX_FETCH_CONCURRENCY) {
+            if refused {
+                unread.extend_from_slice(chunk);
+                continue;
+            }
+            let before = self.source.store.back_off();
+            let mut failed = false;
             // No HEAD per sidecar: the indexes are already listed and only
             // their contents are needed. Each GET keeps its own timeout.
             let results = match self
@@ -962,13 +982,15 @@ impl GribEngine {
                         self.collection_id,
                         e
                     );
-                    continue;
+                    failed = true;
+                    Vec::new()
                 }
             };
             for (path, result) in chunk.iter().zip(results) {
                 let bytes = match result {
                     Ok(b) => b,
                     Err(e) => {
+                        failed = true;
                         tracing::warn!(
                             "Collection '{}': failed to read index file {}: {}",
                             self.collection_id,
@@ -1049,7 +1071,18 @@ impl GribEngine {
                     .unwrap()
                     .insert(path.as_ref().to_string());
             }
+            refused = failed && throttled_since(before, self.source.store.back_off());
         }
+        if !unread.is_empty() {
+            tracing::warn!(
+                "Collection '{}': its source throttles (503 SlowDown or 429) and \
+                 refused index reads; {} of {} new index files wait for the next poll",
+                self.collection_id,
+                unread.len(),
+                new_paths.len()
+            );
+        }
+        settle(&unread);
 
         ambiguities.emit(&self.collection_id);
 
@@ -1128,8 +1161,17 @@ impl GribEngine {
     ///
     /// Any failures are logged and swallowed — the probe is best-effort and
     /// the metadata cache will eventually fill in as real queries land on
-    /// the missing parameters anyway.
+    /// the missing parameters anyway. None while the source backs off
+    /// (#1530): a bucket refusing GETs would refuse the probes too, each
+    /// through its retries; a poll after the back-off probes them.
     fn probe_new_parameters(&self) {
+        if self.source_backing_off() {
+            tracing::debug!(
+                "Collection '{}': no metadata probes while the source backs off",
+                self.collection_id
+            );
+            return;
+        }
         let catalog = self.source.catalog.load_full();
         let catalogs: Vec<&Catalog> = if self.source.config.level_types.is_some() {
             catalog.families.values().map(AsRef::as_ref).collect()
@@ -2544,11 +2586,26 @@ fn settle_completed_runs(
     settled: &mut HashSet<String>,
     listed_with_hits_newest_first: &[String],
     window: &HashSet<&str>,
+    unread: &[ds_storage::object_store::path::Path],
 ) {
     for prefix in listed_with_hits_newest_first.iter().skip(1) {
+        let run = ds_storage::object_store::path::Path::from(prefix.as_str());
+        if unread.iter().any(|path| path.prefix_matches(&run)) {
+            continue;
+        }
         settled.insert(prefix.clone());
     }
     settled.retain(|p| window.contains(p.as_str()));
+}
+
+/// Whether the source throttled between two readings of its back-off
+/// (#1530): its count of throttling answers rose. `false` for a store
+/// without one, a local directory.
+fn throttled_since(
+    before: Option<ds_storage::HostBackOff>,
+    after: Option<ds_storage::HostBackOff>,
+) -> bool {
+    matches!((before, after), (Some(before), Some(after)) if after.throttled > before.throttled)
 }
 
 #[cfg(test)]
@@ -3358,7 +3415,12 @@ mod tests {
             "runN-1".to_string(),
             "runN-2".to_string(),
         ];
-        settle_completed_runs(&mut settled, &listed, &win(&["runN", "runN-1", "runN-2"]));
+        settle_completed_runs(
+            &mut settled,
+            &listed,
+            &win(&["runN", "runN-1", "runN-2"]),
+            &[],
+        );
         assert!(!settled.contains("runN"), "newest run must not be settled");
         assert!(settled.contains("runN-1"));
         assert!(settled.contains("runN-2"));
@@ -3377,6 +3439,7 @@ mod tests {
                 "runN-3".to_string(),
             ],
             &window,
+            &[],
         );
         assert_eq!(
             settled,
@@ -3384,7 +3447,7 @@ mod tests {
         );
 
         // Scan 2: nothing new; only the unsettled newest (N-1) was listed.
-        settle_completed_runs(&mut settled, &["runN-1".to_string()], &window);
+        settle_completed_runs(&mut settled, &["runN-1".to_string()], &window, &[]);
         assert!(
             !settled.contains("runN-1"),
             "newest still re-listed, not settled"
@@ -3397,6 +3460,7 @@ mod tests {
             &mut settled,
             &["runN".to_string(), "runN-1".to_string()],
             &window3,
+            &[],
         );
         assert!(
             !settled.contains("runN"),
@@ -3412,8 +3476,45 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        settle_completed_runs(&mut settled, &[], &win(&["runN", "runN-1"]));
+        settle_completed_runs(&mut settled, &[], &win(&["runN", "runN-1"]), &[]);
         assert_eq!(settled, ["runN-1"].iter().map(|s| s.to_string()).collect());
+    }
+
+    /// A run whose indexes a scan left unread, its source refusing reads
+    /// (#1530), is not settled: the next poll lists it again and reads them.
+    /// A run whose name only starts like its prefix is another run.
+    #[test]
+    fn settle_leaves_a_run_with_unread_indexes_to_the_next_poll() {
+        use ds_storage::object_store::path::Path;
+        let mut settled = HashSet::new();
+        let listed = [
+            "20261122/06z/".to_string(),
+            "20261122/00z/".to_string(),
+            "20261121/18z/".to_string(),
+            "20261121/1/".to_string(),
+        ];
+        let window = win(&[
+            "20261122/06z/",
+            "20261122/00z/",
+            "20261121/18z/",
+            "20261121/1/",
+        ]);
+        let unread = [Path::from(
+            "20261122/00z/ifs/0p25/oper/20261122000000-6h-oper-fc.index",
+        )];
+        settle_completed_runs(&mut settled, &listed, &window, &unread);
+        assert_eq!(
+            settled,
+            ["20261121/18z/", "20261121/1/"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+        let unread = [Path::from("20261121/18z/a.index")];
+        let mut settled = HashSet::new();
+        settle_completed_runs(&mut settled, &listed, &window, &unread);
+        assert!(settled.contains("20261121/1/"), "{settled:?}");
+        assert!(!settled.contains("20261121/18z/"), "{settled:?}");
     }
 
     #[test]

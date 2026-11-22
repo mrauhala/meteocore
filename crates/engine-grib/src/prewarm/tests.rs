@@ -10,7 +10,9 @@ use ds_core::edr_engine::EdrEngine;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_core::model::CoverageResponse;
 use ds_storage::object_store::{path::Path as ObjectPath, ObjectStoreExt};
+use ds_storage::test_util::ThrottledBucket;
 use ds_storage::{bytes::Bytes, DataStore};
+use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 
 /// A real CCSDS global field (0.55 MB): a position query reads it through
@@ -63,6 +65,19 @@ fn served(
     message_mb: u64,
     delay: Duration,
 ) -> (GribEngine, GribEngine, Arc<TestStore>) {
+    served_with(source, message_mb, delay, None, BTreeMap::new())
+}
+
+/// [`served`], the store read from `bucket` when one is given, whose
+/// back-off it reports and its throttled reads back off (#1530), and the
+/// GETs of the paths in `delays` taking theirs.
+fn served_with(
+    source: &TestSource,
+    message_mb: u64,
+    delay: Duration,
+    bucket: Option<ThrottledBucket>,
+    delays: BTreeMap<String, Duration>,
+) -> (GribEngine, GribEngine, Arc<TestStore>) {
     let mut config = source.config();
     config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(message_mb));
     config.point_index_cache_mb = Some(ds_core::config::CacheSize::Mib(16));
@@ -73,10 +88,16 @@ fn served(
         suffix: ".grib2",
         allow_heads: true,
         delay,
+        delays,
+        bucket: bucket.clone(),
         ..Default::default()
     });
     publish(source, &store);
-    Arc::get_mut(&mut owner.source).unwrap().store = DataStore::new(store.clone());
+    let reads: Arc<dyn ds_storage::object_store::ObjectStore> = store.clone();
+    Arc::get_mut(&mut owner.source).unwrap().store = match &bucket {
+        Some(bucket) => bucket.store(reads),
+        None => DataStore::new(reads),
+    };
     let view = owner.level_collections().remove(0);
     (owner, view, store)
 }
@@ -516,4 +537,168 @@ fn reads_are_kept_for_a_day_and_bounded() {
     assert_eq!(recent.len(), MAX_KEYS);
     assert!(recent.contains(&key("q")));
     assert!(!recent.contains(&key("w")), "the one read longest ago");
+}
+
+/// While the source's bucket backs off (#1530), a poll's pre-warm fetches
+/// nothing and keeps its plan; the first poll after the back-off cleared
+/// fetches it, the deferred steps first and a step new since with them, and
+/// nothing twice.
+#[test]
+fn the_prewarm_waits_while_the_bucket_backs_off_and_resumes_after() {
+    let source = TestSource::new();
+    write_step(&source, "", RUN, 0, &["q"]);
+    let bucket = ThrottledBucket::new("s3.test/forecasts");
+    let (owner, view, store) = served_with(
+        &source,
+        20,
+        Duration::ZERO,
+        Some(bucket.clone()),
+        BTreeMap::new(),
+    );
+    series(&view, "q", &[NORTH], RUN, None);
+    for step in 1..4 {
+        write_step(&source, "", RUN, step, &["q"]);
+    }
+    publish(&source, &store);
+    gets(&store);
+    bucket.slow_down();
+    owner.scan_once().unwrap();
+    assert_eq!(whole(gets(&store)), [], "no pre-warm while it backs off");
+    assert_eq!(owner.prewarm_counts().0, 0);
+    let prewarm = owner.source.prewarm.as_ref().unwrap();
+    assert_eq!(prewarm.deferred_len(), 3);
+
+    owner.scan_once().unwrap();
+    assert_eq!(
+        whole(gets(&store)),
+        [],
+        "nor at the next poll while it still does"
+    );
+    assert_eq!(prewarm.deferred_len(), 3);
+
+    bucket.quiet();
+    write_step(&source, "", RUN, 4, &["q"]);
+    publish(&source, &store);
+    owner.scan_once().unwrap();
+    let file = |step: u32| (format!("f{step:03}.grib2"), 0, len());
+    assert_eq!(whole(gets(&store)), [file(1), file(2), file(3), file(4)]);
+    assert_eq!(owner.prewarm_counts(), (4, 4 * len(), 0));
+    assert_eq!(prewarm.deferred_len(), 0);
+    owner.scan_once().unwrap();
+    assert_eq!(whole(gets(&store)), [], "nothing twice");
+}
+
+/// A pre-warm under way when its bucket begins to back off stops before its
+/// next GET (#1530): the GETs in flight finish, the rest wait for a poll
+/// after the back-off, which fetches them with no new step to prompt it.
+#[test]
+fn a_prewarm_under_way_stops_when_its_bucket_begins_to_back_off() {
+    let source = TestSource::new();
+    write_step(&source, "", RUN, 0, &["q"]);
+    let bucket = ThrottledBucket::new("s3.test/forecasts");
+    let slow = Duration::from_millis(300);
+    let delays = BTreeMap::from([
+        ("f001.grib2".to_string(), slow),
+        ("f002.grib2".to_string(), slow),
+    ]);
+    let (owner, view, store) =
+        served_with(&source, 20, Duration::ZERO, Some(bucket.clone()), delays);
+    series(&view, "q", &[NORTH], RUN, None);
+    let previous = owner.catalog();
+    for step in 1..5 {
+        write_step(&source, "", RUN, step, &["q"]);
+    }
+    publish(&source, &store);
+    // The scan catalogues the steps; its own pre-warm waits.
+    bucket.slow_down();
+    owner.scan_once().unwrap();
+    let prewarm = owner.source.prewarm.as_ref().unwrap();
+    assert_eq!(prewarm.deferred_len(), 4);
+    bucket.quiet();
+    gets(&store);
+
+    // Two GETs of 0.3 s in flight; the bucket backs off 0.1 s in.
+    let backing_off = {
+        let bucket = bucket.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            bucket.slow_down();
+        })
+    };
+    owner.prewarm_new_steps(&previous);
+    backing_off.join().unwrap();
+    let file = |step: u32| (format!("f{step:03}.grib2"), 0, len());
+    assert_eq!(whole(gets(&store)), [file(1), file(2)]);
+    assert_eq!(prewarm.deferred_len(), 2, "steps 3 and 4 wait");
+
+    bucket.quiet();
+    owner.scan_once().unwrap();
+    assert_eq!(whole(gets(&store)), [file(3), file(4)]);
+    assert_eq!(prewarm.deferred_len(), 0);
+    assert_eq!(owner.prewarm_counts().0, 4);
+}
+
+/// A run newer than the deferred one replaces it: the older run's
+/// messages are left to queries, as a poll leaves them (#1530).
+#[test]
+fn a_newer_run_drops_the_deferred_prewarm_of_an_older_one() {
+    let source = TestSource::new();
+    write_step(&source, "", RUN, 0, &["q"]);
+    let bucket = ThrottledBucket::new("s3.test/forecasts");
+    let (owner, view, store) = served_with(
+        &source,
+        20,
+        Duration::ZERO,
+        Some(bucket.clone()),
+        BTreeMap::new(),
+    );
+    series(&view, "q", &[NORTH], RUN, None);
+    write_step(&source, "", RUN, 1, &["q"]);
+    publish(&source, &store);
+    bucket.slow_down();
+    owner.scan_once().unwrap();
+    let prewarm = owner.source.prewarm.as_ref().unwrap();
+    assert_eq!(prewarm.deferred_len(), 1);
+
+    bucket.quiet();
+    write_step(&source, "next-", NEXT_RUN, 0, &["q"]);
+    publish(&source, &store);
+    gets(&store);
+    owner.scan_once().unwrap();
+    assert_eq!(
+        whole(gets(&store)),
+        [("next-f000.grib2".to_string(), 0, len())]
+    );
+    assert_eq!(prewarm.deferred_len(), 0);
+}
+
+/// The metadata probes of a scan wait while the source's bucket backs off
+/// too (#1530): a new parameter's header is read by the first poll after.
+#[test]
+fn metadata_probes_wait_while_the_bucket_backs_off() {
+    let source = TestSource::new();
+    write_step(&source, "", RUN, 0, &["q"]);
+    let bucket = ThrottledBucket::new("s3.test/forecasts");
+    let (owner, _view, store) = served_with(
+        &source,
+        20,
+        Duration::ZERO,
+        Some(bucket.clone()),
+        BTreeMap::new(),
+    );
+    write_step(&source, "", RUN, 1, &["q", "w"]);
+    publish(&source, &store);
+    gets(&store);
+    bucket.slow_down();
+    owner.scan_once().unwrap();
+    assert_eq!(gets(&store), [], "no probe while it backs off");
+
+    bucket.quiet();
+    owner.scan_once().unwrap();
+    let probed = gets(&store);
+    assert!(!probed.is_empty(), "w's header is read");
+    for (file, offset, bytes) in probed {
+        assert_eq!((file.as_str(), offset), ("f001.grib2", len()));
+        assert!(bytes < len(), "a header, not the message");
+    }
 }

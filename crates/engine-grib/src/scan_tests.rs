@@ -219,3 +219,73 @@ async fn indexes_in_hidden_folders_are_never_fetched() {
         ]
     );
 }
+
+/// A source whose bucket keeps refusing index reads with `503 SlowDown`
+/// (#1530): a chunk whose read failed while the bucket throttled stops the
+/// scan, and the indexes after it are not read at all; a failure without a
+/// throttle does not stop it. The collection keeps what it read, and the
+/// next poll, the bucket answering again, reads the rest and only them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bucket_refusing_index_reads_stops_the_scan_until_the_next_poll() {
+    let count = 2 * INDEX_FETCH_CONCURRENCY + 3;
+    let (_source, mut engine, _) = engine_with_indexes(count, "ecmwf-json", Duration::ZERO).await;
+    let bucket = ds_storage::test_util::ThrottledBucket::new("s3.test/forecasts");
+    let store = Arc::new(ScanStore {
+        bucket: Some(bucket.clone()),
+        ..Default::default()
+    });
+    for file in 0..count {
+        store
+            .inner
+            .put(
+                &Path::from(format!("f{file:03}.idx")),
+                index_body("ecmwf-json", file).into(),
+            )
+            .await
+            .unwrap();
+    }
+    {
+        let mut reads = store.reads.lock().unwrap();
+        // The first chunk: a transient failure, no throttle.
+        reads.fail_once.insert("f001.idx".into());
+        // The second: a SlowDown through every retry.
+        reads
+            .throttled
+            .insert(format!("f{:03}.idx", INDEX_FETCH_CONCURRENCY + 2));
+    }
+    let reads: Arc<dyn ds_storage::object_store::ObjectStore> = store.clone();
+    Arc::get_mut(&mut engine.source).unwrap().store = bucket.store(reads);
+
+    engine.scan_once().unwrap();
+    let attempts = store.reads.lock().unwrap().attempts.clone();
+    let read: Vec<usize> = (0..count)
+        .filter(|file| attempts.contains_key(&format!("f{file:03}.idx")))
+        .collect();
+    assert_eq!(
+        read,
+        (0..2 * INDEX_FETCH_CONCURRENCY).collect::<Vec<_>>(),
+        "two chunks read, the third not"
+    );
+    let known = engine.source.known_indexes.lock().unwrap().len();
+    assert_eq!(known, 2 * INDEX_FETCH_CONCURRENCY - 2);
+    assert_eq!(
+        origins(&engine).len(),
+        known,
+        "the collection keeps what it read"
+    );
+
+    bucket.quiet();
+    store.reads.lock().unwrap().throttled.clear();
+    engine.scan_once().unwrap();
+    assert_eq!(engine.source.known_indexes.lock().unwrap().len(), count);
+    assert_eq!(origins(&engine).len(), count);
+    let attempts = store.reads.lock().unwrap().attempts.clone();
+    for file in 0..count {
+        let again = [1, INDEX_FETCH_CONCURRENCY + 2].contains(&file);
+        assert_eq!(
+            attempts[&format!("f{file:03}.idx")],
+            if again { 2 } else { 1 },
+            "f{file:03}"
+        );
+    }
+}

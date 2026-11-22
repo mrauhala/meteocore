@@ -3,16 +3,17 @@
 //!
 //! [`crate::build_http_store_limited`] wraps the host's limited store
 //! (`throttle::Limited`) in a [`Gauged`] store and the HTTP store under it
-//! in another: the outer one counts every request that has asked for a
-//! permit, the inner one those that hold one. Each counts a GET until its
-//! body has been read or dropped, as the limit holds its permit.
+//! in another, and so does every S3 store with its bucket's (`bucket.rs`,
+//! #1530): the outer one counts every request that has asked for a permit,
+//! the inner one those that hold one. Each counts a GET until its body has
+//! been read or dropped, and a LIST until its stream has, as the limit
+//! holds its permit.
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use futures::stream::{BoxStream, Stream, StreamExt};
 use object_store::path::Path;
 use object_store::{
@@ -21,9 +22,10 @@ use object_store::{
 };
 
 /// An object store that adds one to `count` for each request in flight: a
-/// GET or HEAD until its body has been read or dropped, a put, copy or
-/// delimited list while it runs. Streamed lists and deletes are passed
-/// through uncounted; the HTTP sources this measures never make them.
+/// GET or HEAD until its body has been read or dropped, a streamed list
+/// until its stream has, a put, copy or delimited list while it runs.
+/// Streamed deletes are passed through uncounted; the sources this
+/// measures never make them.
 #[derive(Debug)]
 pub(crate) struct Gauged {
     pub inner: Arc<dyn ObjectStore>,
@@ -46,14 +48,38 @@ impl Drop for Held {
     }
 }
 
-/// A GET body that keeps its operation counted until it ends or is dropped.
-struct HeldStream {
-    inner: BoxStream<'static, Result<Bytes>>,
+/// A GET body or a listing that keeps its operation counted until it ends
+/// or is dropped.
+struct HeldStream<T> {
+    inner: BoxStream<'static, Result<T>>,
     held: Option<Held>,
 }
 
-impl Stream for HeldStream {
-    type Item = Result<Bytes>;
+impl<T> HeldStream<T> {
+    /// `inner`, counted in `count` until it ends or is dropped. A listing
+    /// is counted from when it is first polled, as the limit under it
+    /// takes its permit then.
+    fn lazily(
+        count: &Arc<AtomicUsize>,
+        inner: BoxStream<'static, Result<T>>,
+    ) -> BoxStream<'static, Result<T>>
+    where
+        T: Send + 'static,
+    {
+        let count = count.clone();
+        futures::stream::once(async move {
+            HeldStream {
+                inner,
+                held: Some(Held::new(&count)),
+            }
+        })
+        .flatten()
+        .boxed()
+    }
+}
+
+impl<T> Stream for HeldStream<T> {
+    type Item = Result<T>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next = self.inner.poll_next_unpin(cx);
@@ -114,7 +140,15 @@ impl ObjectStore for Gauged {
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
-        self.inner.list(prefix)
+        HeldStream::lazily(&self.count, self.inner.list(prefix))
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        HeldStream::lazily(&self.count, self.inner.list_with_offset(prefix, offset))
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
@@ -128,14 +162,18 @@ impl ObjectStore for Gauged {
     }
 }
 
-/// The requests through one host's limit ([`crate::host_requests`]).
+/// The requests through one host's limit ([`crate::host_requests`]), or
+/// one S3 bucket's (#1530).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostRequests {
-    /// The host and port, as `thredds.met.no` or `127.0.0.1:8080`.
+    /// The host and port, as `thredds.met.no` or `127.0.0.1:8080`; for an
+    /// S3 bucket the endpoint's and the bucket, as
+    /// `s3.eu-central-1.amazonaws.com/ecmwf-forecasts`.
     pub host: String,
     /// Requests the host allows in flight at once now: the configured
-    /// limit, or less while it backs off from a 429 (#1235). Requests in
-    /// flight when it was cut finish, so `in_flight` can exceed it.
+    /// limit, or less while it backs off from a 429 (#1235) or a bucket's
+    /// `503 SlowDown`. Requests in flight when it was cut finish, so
+    /// `in_flight` can exceed it.
     pub limit: usize,
     /// Requests holding one of its permits, those waiting for the host's
     /// `Retry-After` included: the wait comes after the permit.
@@ -143,7 +181,8 @@ pub struct HostRequests {
     /// Requests waiting for one.
     pub queued: usize,
     /// The 429 Too Many Requests answers the host has given since the
-    /// process started, to every store on it (#1290).
+    /// process started, to every store on it (#1290); a bucket's 503s and
+    /// 429s.
     pub throttled: u64,
 }
 
@@ -234,5 +273,32 @@ mod tests {
         assert_eq!(gauges.read(), (0, 0));
         drop(store.get(&path).await.unwrap());
         assert_eq!(gauges.read(), (0, 0), "a dropped body is released");
+    }
+
+    /// A listing counts from its first poll until its stream ends or is
+    /// dropped, as the limit under it holds its permit (#1530: an S3
+    /// bucket's store lists through its limit).
+    #[tokio::test]
+    async fn a_listing_is_in_flight_until_its_stream_ends() {
+        let memory = InMemory::new();
+        for key in ["a/1", "a/2"] {
+            memory
+                .put(&Path::from(key), PutPayload::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let (store, gauges) = stack(Arc::new(memory), 2);
+        let prefix = Path::from("a");
+        let mut listing = store.list(Some(&prefix));
+        assert_eq!(gauges.read(), (0, 0), "not before its first poll");
+        assert!(listing.next().await.unwrap().is_ok());
+        assert_eq!(gauges.read(), (1, 0));
+        assert!(listing.next().await.unwrap().is_ok());
+        assert!(listing.next().await.is_none());
+        assert_eq!(gauges.read(), (0, 0));
+        let mut dropped = store.list(Some(&prefix));
+        assert!(dropped.next().await.unwrap().is_ok());
+        drop(dropped);
+        assert_eq!(gauges.read(), (0, 0), "a dropped listing is released");
     }
 }

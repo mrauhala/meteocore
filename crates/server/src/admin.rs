@@ -1146,27 +1146,28 @@ fn host_gauge(name: &str, help: &str) -> IntGaugeVec {
 static STORAGE_HOST_REQUESTS_IN_FLIGHT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     host_gauge(
         "storage_host_requests_in_flight",
-        "Requests holding one of a remote host's request permits",
+        "Requests holding one of a remote host's or S3 bucket's request permits",
     )
 });
 static STORAGE_HOST_REQUESTS_QUEUED: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     host_gauge(
         "storage_host_requests_queued",
-        "Requests waiting for one of a remote host's request permits",
+        "Requests waiting for one of a remote host's or S3 bucket's request permits",
     )
 });
 static STORAGE_HOST_REQUEST_LIMIT: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     host_gauge(
         "storage_host_request_limit",
-        "Requests a remote host allows in flight at once now: the configured limit, \
-         or less while it backs off from a 429",
+        "Requests a remote host or S3 bucket allows in flight at once now: the configured \
+         limit, or less while it backs off from a 429 or an S3 503 SlowDown",
     )
 });
 static STORAGE_HOST_THROTTLED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     let counter = IntCounterVec::new(
         Opts::new(
             "storage_host_throttled_total",
-            "429 Too Many Requests answers from a remote host, to every store on it (#1290)",
+            "Throttling answers from a remote host or S3 bucket, to every store on it: 429 \
+             Too Many Requests (#1290), an S3 bucket's 503 SlowDown (#1530)",
         ),
         &["host"],
     )
@@ -10420,8 +10421,9 @@ pub(crate) fn refresh_metrics(state: &AdminState) -> MemoryReading {
                 .set(engine.open_file_bytes().min(i64::MAX as u64) as i64);
         }
     }
-    // Hosts behind `ds_storage::build_http_store_limited`: today the remote
-    // NetCDF sources.
+    // Hosts behind `ds_storage::build_http_store_limited`, today the remote
+    // NetCDF sources, and every S3 bucket a store was built for (#1530),
+    // labelled `host[:port]/bucket`.
     for host in ds_storage::host_requests() {
         let label = [host.host.as_str()];
         STORAGE_HOST_REQUESTS_IN_FLIGHT

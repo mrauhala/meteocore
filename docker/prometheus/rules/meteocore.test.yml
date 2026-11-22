@@ -697,7 +697,7 @@ tests:
               host: objects.example.com
             exp_annotations:
               summary: "objects.example.com throttles MeteoCore"
-              description: "objects.example.com has answered 429 Too Many Requests for 15 minutes; collections it serves may fall behind."
+              description: "objects.example.com has throttled for 15 minutes, with 429 Too Many Requests or, from an S3 bucket, 503 SlowDown; collections it serves may fall behind."
 
   # Against the memory plan's total: a holds 20 GiB of a 16 GiB plan, b 4 of
   # 8. c has no plan gauge (a server before #1312), so no series to compare

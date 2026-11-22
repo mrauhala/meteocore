@@ -52,6 +52,15 @@ unlike GeoTIFF's one band per collection.
   The ignored `scan_tests::index_scan_latency_replay` test compares one versus
   eight concurrent reads over 120 indexes with 150 ms simulated GET latency.
   Run with `--ignored --nocapture`; timings are measurements, not CI gates.
+- A bucket refusing GETs (`503 SlowDown`, #1530) is backed off in
+  ds-storage: its request limit, cut by the `SlowDown`s, bounds the reads in
+  flight below the chunk. Once a chunk's read failed while the source
+  throttled (`DataStore::back_off`'s count rose), the scan reads no more
+  indexes: the collection keeps what it read, and the run prefixes holding
+  the unread ones are not settled, so the next poll lists them and reads
+  the rest (`a_bucket_refusing_index_reads_stops_the_scan_until_the_next_poll`).
+  Never retry a refused chunk in the same scan. The metadata probes wait
+  for a poll after the back-off too.
 - Parameter metadata populates lazily: `scan_once` probes ≤32 messages per
   scan, at most eight concurrently, each advertised parameter in the step
   files of the newest run that has it (#1026).
@@ -375,6 +384,13 @@ on the request path. Single-level and legacy views require exact metadata.
   of at most 4096 keys pruned to resident ones before each pre-warm, and
   forgotten when a request fills the key itself.
   `[grib] prewarm = false` turns it off.
+  While the source backs off (`GribEngine::source_backing_off`, #1530) a
+  poll's pre-warm fetches nothing and one under way stops before its next
+  GET; the rest is kept (`Prewarm::deferred`, one run, dropped once a newer
+  run is the newest) and fetched first by the first poll after the back-off
+  clears, a poll with no new index included. Its bytes come off the share
+  the new plan may take. The map read-ahead plans no frame and drops
+  queued fetches meanwhile.
 - Map read-ahead (#1335, `readahead.rs`): after `get_raster_tile(s)` draws
   step k, `read_ahead_after` plans the messages `map_message` would draw at
   the run's next `[grib] read_ahead` steps carrying the parameters

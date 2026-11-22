@@ -25,6 +25,8 @@ thiserror = "2"
 
 [dev-dependencies]
 async-trait = "0.1"
+# A bucket's back-off a test drives (`test_util::ThrottledBucket`, #1530).
+ds-storage = { path = "../storage", features = ["test-util"] }
 # Contour lines over a real field against an independent trace (#1378).
 ds-render = { path = "../render" }
 futures = "0.3"

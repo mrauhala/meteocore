@@ -255,6 +255,7 @@ reads the byte spans of a moment's decode with it (#1047).
 
 # Request limits
 
+Every S3 store is under its bucket's adaptive limit (S3 buckets, below).
 `DataStore::with_request_limit(n)` wraps a store in object_store's
 `LimitStore`: at most `n` operations in flight, a GET holding its permit
 until its body is read. Limits stack, so a background share of 2 within a
@@ -320,8 +321,55 @@ limit's return to the configured one log an INFO each.
 retry delay a hundred times faster, for other crates' tests against a real
 server that answers 429; this crate's own tests pin the real times on a
 paused clock.
-S3 is out of scope: it throttles with 503 SlowDown, which object_store
-retries. Those answers are counted (Retryable answers, below), not backed off.
+
+## S3 buckets
+
+An S3 bucket throttles with `503 SlowDown`, and it throttles the bucket as
+a whole: on 2026-11-22 a public bucket refused every GET, on every prefix
+and old runs included, for 40 minutes after a model run was published,
+from this server and from a client on another network alike, while HEAD
+and LIST were answered (#1530). object_store retried each refused GET on
+its own, ten times at full concurrency, and the retries kept the refusals
+coming. So every S3 store this crate builds (`build_store` of an `s3://`
+or S3 URL, `build_s3_store_from_parts`) is one of its bucket's
+(`bucket.rs`): the stores of one bucket, from every collection and
+engine, share one throttle, one adaptive limit and one pair of request
+gauges, labelled as the `storage` span labels the bucket,
+`host[:port]/bucket` (`s3.eu-central-1.amazonaws.com/ecmwf-forecasts`).
+Two buckets on one regional endpoint back off apart.
+
+- A **503** from the bucket, or a 429, backs it off exactly as a 429 backs
+  off an HTTP host: its `Retry-After` if it sends one, the pace, the 2 s
+  retry delay and the adaptive limit. A 500, 502 or 504 is retried on
+  object_store's back-off alone. object_store hands the transport the
+  status, not S3's error code, and a HEAD's 503 has no body to read one
+  from, so every 503 of a bucket counts; S3 answers 503 only to say
+  `SlowDown` or, the same request, `ServiceUnavailable`: reduce your
+  request rate.
+- The **limit** is `S3_REQUEST_LIMIT`, 64, above what any reader asks of a
+  bucket today (GeoTIFF's COG tiles 16, satellite tiles 16, a GRIB
+  collection's indexes 8), so it binds only once `SlowDown`s have cut it:
+  four seconds of them take it to 4.
+- **Fewer retries** (`S3_RETRY`): 4, from 0.5 s doubling to 4 s. The
+  back-off does the waiting between them, so a GET a bucket keeps refusing
+  gets 5 attempts over about 15 s instead of 11, and is `Unavailable`, each
+  API's 503 with `Retry-After`, inside a request's 30 s budget.
+- Only the requests that **name the bucket**, by path (`/bucket/key`) or
+  host (`bucket.s3.…`), go through its throttle: a credential provider's,
+  which object_store sends through the same connector, passes by.
+- `DataStore::back_off()` reads a store's host or bucket back-off: the
+  throttling answers it has given (to compare two readings) and whether
+  its requests are paced or paused now. GRIB stops a scan's index reads
+  once one fails while its bucket throttles, and pauses its pre-warm and
+  map read-ahead while the bucket backs off.
+- `host_requests()` reports each bucket as it reports an HTTP host, so
+  `storage_host_request_limit`, `storage_host_throttled_total` and the
+  request gauges have one series per configured bucket, never per prefix.
+
+`test_util::quick_bucket_backoff(endpoint, bucket)` is `quick_backoff` for a
+bucket, and `test_util::ThrottledBucket` a bucket's back-off a test drives,
+for an engine's test of what it does while its bucket backs off. A
+bucket's `SlowDown`s are also counted (Retryable answers, below).
 
 # The storage span
 
