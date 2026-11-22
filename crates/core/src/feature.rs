@@ -418,9 +418,40 @@ pub const MAX_EXACT_AREA_CELLS: usize = OLD_AREA_AXIS * OLD_AREA_AXIS;
 
 /// Most values one EDR position response may carry, every MULTIPOINT point
 /// and parameter included. The API refuses a larger one; an engine that
-/// reads ahead for every point checks it first, so a response the API will
-/// refuse reads nothing ahead.
+/// knows its answer's size before reading checks it first
+/// ([`check_position_budget`]), so a response the API will refuse reads
+/// nothing.
 pub const MAX_POSITION_VALUES: usize = 1_000_000;
+
+/// The 400 refusing a position response past [`MAX_POSITION_VALUES`]: the
+/// API's, and an engine's that refuses before reading.
+pub fn position_too_large() -> DataServerError {
+    DataServerError::QueryTooLarge(format!(
+        "Position response exceeds {MAX_POSITION_VALUES} values"
+    ))
+}
+
+/// Refuse, before any read, a position query whose response holds more
+/// than [`MAX_POSITION_VALUES`] values, with the API's own 400
+/// ([`position_too_large`]): `points × ranges × steps`, the ranges being the
+/// engine's `parameters` as the [`AreaShare::derived`] scope in force turns
+/// them into the response's. A derived wind speed is queried as its two
+/// components but answers one range, so its inputs alone never refuse it.
+/// The instants of a `datetime` list are queried alone, and the API holds
+/// their sum to the budget.
+pub fn check_position_budget(
+    points: usize,
+    parameters: usize,
+    steps: usize,
+) -> Result<(), DataServerError> {
+    let (_, extra, fewer) = AREA_SHARE.get();
+    let ranges = parameters.saturating_add(extra).saturating_sub(fewer);
+    let values = points.saturating_mul(ranges).saturating_mul(steps);
+    if values > MAX_POSITION_VALUES {
+        return Err(position_too_large());
+    }
+    Ok(())
+}
 
 /// Enforce [`MAX_AREA_VALUES`] for a `timesteps × ny × nx × parameters`
 /// response, with the message every engine returns.
@@ -480,8 +511,9 @@ impl AreaGridAxes {
 }
 
 thread_local! {
-    /// `(answers, extra parameters)` of the [`AreaShare`] scope in force.
-    static AREA_SHARE: Cell<(usize, usize)> = const { Cell::new((1, 0)) };
+    /// `(answers, extra parameters, fewer parameters)` of the [`AreaShare`]
+    /// scope in force.
+    static AREA_SHARE: Cell<(usize, usize, usize)> = const { Cell::new((1, 0, 0)) };
 }
 
 /// A scope telling [`QueryPolygon::fit_grid`] that the area answers an
@@ -494,17 +526,21 @@ thread_local! {
 ///   gets that share of the budget and every instant the same grid;
 /// - [`AreaShare::extra_parameters`]: the response carries this many ranges
 ///   more than the engine is asked for (the derived parameters a wrapper
-///   adds after the engine answers, less the inputs it drops).
+///   adds after the engine answers, less the inputs it drops);
+/// - [`AreaShare::derived`]: a wrapper adds `added` ranges and drops
+///   `dropped` of the engine's. A grid is fitted for the ranges it adds
+///   beyond those it drops, as `extra_parameters`; [`check_position_budget`]
+///   counts the response's ranges exactly, fewer ones included.
 ///
 /// The scopes nest (answers multiply, parameters add) and restore the
 /// previous one on drop or unwind; like [`crate::deadline::enter`] the
 /// guard must stay on the thread that made it, which is the thread the
 /// engine's synchronous query runs on.
 pub struct AreaShare {
-    previous: (usize, usize),
+    previous: (usize, usize, usize),
     /// What this scope set, which its drop expects to find: a guard
     /// dropped before one made after it would restore a stale scope.
-    set: (usize, usize),
+    set: (usize, usize, usize),
     _thread: PhantomData<Rc<()>>,
 }
 
@@ -514,20 +550,35 @@ impl AreaShare {
         let previous = AREA_SHARE.get();
         Self::enter(
             previous,
-            (previous.0.saturating_mul(answers.max(1)), previous.1),
+            (
+                previous.0.saturating_mul(answers.max(1)),
+                previous.1,
+                previous.2,
+            ),
         )
     }
 
     /// Each answer gains `parameters` ranges after the engine returns it.
     pub fn extra_parameters(parameters: usize) -> Self {
+        Self::derived(parameters, 0)
+    }
+
+    /// Each answer gains `added` ranges after the engine returns it and
+    /// loses `dropped` of those the engine answered: a wrapper's derived
+    /// parameters and the inputs only they asked for.
+    pub fn derived(added: usize, dropped: usize) -> Self {
         let previous = AREA_SHARE.get();
         Self::enter(
             previous,
-            (previous.0, previous.1.saturating_add(parameters)),
+            (
+                previous.0,
+                previous.1.saturating_add(added.saturating_sub(dropped)),
+                previous.2.saturating_add(dropped.saturating_sub(added)),
+            ),
         )
     }
 
-    fn enter(previous: (usize, usize), set: (usize, usize)) -> Self {
+    fn enter(previous: (usize, usize, usize), set: (usize, usize, usize)) -> Self {
         AREA_SHARE.set(set);
         Self {
             previous,
@@ -685,7 +736,7 @@ impl QueryPolygon {
         timesteps: usize,
         parameters: usize,
     ) -> Result<AreaGridAxes, DataServerError> {
-        let (answers, extra) = AREA_SHARE.get();
+        let (answers, extra, _) = AREA_SHARE.get();
         let timesteps = timesteps.max(1).saturating_mul(answers.max(1));
         let parameters = parameters.max(1).saturating_add(extra);
         // Even one cell costs a value per timestep and parameter.
@@ -3192,6 +3243,45 @@ mod tests {
             assert_eq!(cells(&rect), quarter, "the inner scope restored");
         }
         assert_eq!(cells(&rect), alone, "the outer scope restored");
+    }
+
+    /// A position response is refused past the budget before any read,
+    /// counted as the response holds it: a wrapper's derived ranges count,
+    /// the inputs it drops do not, and a `datetime` list's share of the
+    /// budget is the API's to hold (#1500).
+    #[test]
+    fn a_position_budget_counts_the_response_ranges() {
+        let half = MAX_POSITION_VALUES / 2;
+        let refused =
+            |points, parameters, steps| match check_position_budget(points, parameters, steps) {
+                Ok(()) => false,
+                Err(DataServerError::QueryTooLarge(message)) => {
+                    assert_eq!(
+                        message,
+                        format!("Position response exceeds {MAX_POSITION_VALUES} values")
+                    );
+                    true
+                }
+                Err(other) => panic!("{other}"),
+            };
+        assert!(!refused(1, 2, half));
+        assert!(refused(1, 2, half + 1));
+        assert!(refused(2, 1, half + 1));
+        assert!(refused(usize::MAX, 2, 2), "saturates");
+        {
+            // A wind speed alone: two components queried, one range served.
+            let _speed = AreaShare::derived(1, 2);
+            assert!(!refused(1, 2, half + 1));
+            assert!(refused(1, 2, MAX_POSITION_VALUES + 1));
+            {
+                // A height beside them: one range more.
+                let _height = AreaShare::derived(1, 0);
+                assert!(refused(1, 3, half + 1));
+            }
+            assert!(!refused(1, 2, half + 1), "the inner scope restored");
+        }
+        let _instants = AreaShare::answers(4);
+        assert!(!refused(1, 2, half), "the instants are the API's to sum");
     }
 
     #[test]

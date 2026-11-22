@@ -2766,7 +2766,8 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
     ));
 
     // Pinned instance: exact, and to the minute; a datetime excluding the
-    // anchor is a 400, one containing it is fine.
+    // anchor has no data (404, which a datetime list skips, #1500), one
+    // containing it is fine; an unretained pin is no run.
     assert!(engine
         .query_area(&coords, None, None, None, Some(anchor))
         .is_ok());
@@ -2794,7 +2795,7 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
             None,
             Some(anchor)
         ),
-        Err(DataServerError::InvalidDatetime(_))
+        Err(DataServerError::LocationNotFound(_))
     ));
     assert!(engine
         .query_area(
@@ -2806,7 +2807,8 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
         )
         .is_ok());
 
-    // Unpinned datetime honours BOTH bounds (the #548 rule).
+    // Unpinned datetime honours BOTH bounds (the #548 rule); none anchored
+    // inside is no data, a 404 a datetime list skips (#1500).
     assert!(engine
         .query_area(
             &coords,
@@ -2824,7 +2826,35 @@ fn edr_area_serves_the_motion_field_in_m_per_s() {
             None,
             None
         ),
-        Err(DataServerError::ReferenceTimeNotFound(_))
+        Err(DataServerError::LocationNotFound(_))
+    ));
+    // A datetime list's instants one by one, as api-edr's `datetime_list`
+    // runs them: the anchor answers, the minute after it is skipped. Both
+    // routes, latest and the pinned instance.
+    for pin in [None, Some(anchor)] {
+        let instant = |t: DateTime<Utc>| engine.query_area(&coords, Some((t, t)), None, None, pin);
+        assert!(instant(anchor).is_ok(), "{pin:?}");
+        assert!(
+            matches!(
+                instant(anchor + Duration::minutes(1)),
+                Err(DataServerError::LocationNotFound(_))
+            ),
+            "{pin:?}"
+        );
+    }
+
+    // A polygon off the motion grid has no data there: a 404, as on the
+    // other gridded engines, never a 400 failing a list.
+    let off_grid = format!(
+        "POLYGON(({w} {s},{e} {s},{e} {n},{w} {n},{w} {s}))",
+        w = EXTENT[2] + 5.0,
+        s = EXTENT[1],
+        e = EXTENT[2] + 6.0,
+        n = EXTENT[3]
+    );
+    assert!(matches!(
+        engine.query_area(&off_grid, None, None, None, None),
+        Err(DataServerError::LocationNotFound(_))
     ));
 
     // Sub-block bbox inside the grid still gets a block.

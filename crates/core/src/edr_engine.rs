@@ -483,9 +483,75 @@ pub fn select_parameters<'a>(
     Ok(selected)
 }
 
+/// A refusal [`select_parameters`] made, listing `more` names after those
+/// it lists, each once: a wrapper serving more parameters than the engine
+/// it wraps (the derived ones, `ds_core::derive::Derived`) lists them too.
+/// The engine's own list is kept as the message gives it, whatever run or
+/// catalog it was made over, so it need not be the engine's current
+/// `get_parameters`. `None` for any other message, which the wrapper
+/// passes on as it is.
+pub fn relist_parameters(message: &str, more: &[&str]) -> Option<String> {
+    const LISTED: &str = "; available: ";
+    let at = message.rfind(LISTED)?;
+    let (head, listed) = (&message[..at], &message[at + LISTED.len()..]);
+    if !(head.starts_with("Unknown parameter '") || head == "No parameter requested") {
+        return None;
+    }
+    let names: Vec<&str> = listed.split(", ").filter(|n| !n.is_empty()).collect();
+    let mut all = names.clone();
+    for &name in more {
+        if !all.contains(&name) {
+            all.push(name);
+        }
+    }
+    Some(format!("{head}{LISTED}{}", all.join(", ")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::select_parameters;
+    use super::{relist_parameters, select_parameters};
+
+    /// The shared rule's refusals list the more names after their own, as
+    /// a refusal over every name would; a list over other names than the
+    /// engine's current ones keeps them; any other message is not
+    /// rewritten.
+    #[test]
+    fn a_refusal_is_relisted_with_more_names() {
+        let stored = ["u", "v"];
+        let all = ["u", "v", "ws", "wdir"];
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for requested in [
+            names(&["nope"]),
+            names(&["u", "x; available: u"]),
+            names(&[]),
+        ] {
+            let refusal =
+                |available: &[&str]| match select_parameters(Some(requested.as_slice()), available)
+                {
+                    Err(crate::error::DataServerError::InvalidParameter(message)) => message,
+                    other => panic!("{other:?}"),
+                };
+            assert_eq!(
+                relist_parameters(&refusal(&stored), &["ws", "wdir"]),
+                Some(refusal(&all)),
+                "{requested:?}"
+            );
+        }
+        // An older run's names, other than the engine lists now.
+        assert_eq!(
+            relist_parameters("Unknown parameter 'x'; available: u, v, t", &["ws", "v"]).as_deref(),
+            Some("Unknown parameter 'x'; available: u, v, t, ws")
+        );
+        assert_eq!(
+            relist_parameters("No parameter requested; available: ", &["ws"]).as_deref(),
+            Some("No parameter requested; available: ws")
+        );
+        assert_eq!(relist_parameters("No parameters available", &["ws"]), None);
+        assert_eq!(
+            relist_parameters("'x' is a wind direction; available: u, v", &["ws"]),
+            None
+        );
+    }
 
     #[test]
     fn select_parameters_is_all_or_exactly_the_known_names() {

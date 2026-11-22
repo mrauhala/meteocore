@@ -931,10 +931,11 @@ async fn a_second_plan_never_takes_a_first_plans_staged_ranges() {
     assert_eq!(engine.icechunk_staged_bytes(), Some(0));
 }
 
-/// A MULTIPOINT response the API will refuse for its size reads nothing
-/// ahead; one within the cap does.
+/// A MULTIPOINT response past the response cap is refused before anything
+/// is read, ahead or point by point (#1500); one within the cap fetches
+/// its chunks ahead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_multipoint_past_the_response_cap_fetches_nothing_ahead() {
+async fn a_multipoint_past_the_response_cap_reads_nothing() {
     let dir = tempfile::tempdir().unwrap();
     // 8000 steps: 64 points × 2 variables × 8000 is past the million.
     grid_repository(
@@ -948,22 +949,33 @@ async fn a_multipoint_past_the_response_cap_fetches_nothing_ahead() {
     let names = vec!["a".to_owned(), "b".to_owned()];
     let query = |points: Vec<String>| {
         let (engine, _) = engine("cap", &config(dir.path()));
+        meter(&engine).take_log();
         let mut emitted = 0;
-        engine
-            .query_positions(&points, None, Some(&names), None, None, &mut |_| {
-                emitted += 1;
-                Ok(())
-            })
-            .unwrap();
-        assert_eq!(emitted, points.len());
-        read_ahead(&engine)
+        let result = engine.query_positions(&points, None, Some(&names), None, None, &mut |_| {
+            emitted += 1;
+            Ok(())
+        });
+        let requests = meter(&engine).take_log().len();
+        (result.map(|()| emitted), requests, read_ahead(&engine))
     };
     let point = |i: usize| {
         let lon = if i.is_multiple_of(2) { 10.05 } else { 10.25 };
         format!("POINT({lon} 59.95)")
     };
     const { assert!(64 * 2 * 8000 > ds_core::feature::MAX_POSITION_VALUES) };
-    assert_eq!(query((0..64).map(point).collect()), ReadAhead::default());
+    let (result, requests, ahead) = query((0..64).map(point).collect());
+    assert!(
+        matches!(
+            result,
+            Err(ds_core::error::DataServerError::QueryTooLarge(_))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(requests, 0, "nothing read");
+    assert_eq!(ahead, ReadAhead::default());
     // One point: two variables' eight inner chunks each, fetched ahead.
-    assert_eq!(query(vec![point(0)]).used, 16);
+    let (result, requests, ahead) = query(vec![point(0)]);
+    assert_eq!(result.unwrap(), 1);
+    assert!(requests > 0);
+    assert_eq!(ahead.used, 16);
 }

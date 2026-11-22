@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, TimeZone, Utc};
 use ds_core::config::ZarrConfig;
 use ds_core::edr_engine::EdrEngine;
+use ds_core::error::DataServerError;
 use ds_core::map_engine::{MapEngine, OutputCrs};
 use ds_core::model::CoverageResponse;
 use engine_zarr::ZarrEngine;
@@ -1584,6 +1585,43 @@ fn radius_query_delegates_to_area() {
     assert!(nd.values[0].is_none(), "NW corner must be masked");
     let centre = ((y.len() / 2) * x.len()) + x.len() / 2;
     assert!(nd.values[centre].is_some(), "centre must have data");
+}
+
+/// A position response past the value budget is refused before anything
+/// is read (#1500): no chunk is fetched, where the first point was read
+/// whole before the API refused the response. One point within the budget
+/// reads its chunks, so the counters do see reads.
+#[test]
+fn a_position_query_past_the_budget_reads_nothing() {
+    let e = engine();
+    let reads = |e: &ZarrEngine| {
+        let objects = e.object_cache_metrics().expect("a plain store");
+        let decoded = e.decoded_cache_metrics();
+        (objects.hits + objects.misses, decoded.hits + decoded.misses)
+    };
+    let steps = e.get_available_times().unwrap().len();
+    let per_point = e.get_parameters().len() * steps;
+    let points =
+        vec!["POINT(5.5 54.5)".to_string(); ds_core::feature::MAX_POSITION_VALUES / per_point + 1];
+    let before = reads(&e);
+    let mut emitted = 0;
+    let result = e.query_positions(&points, None, None, None, None, &mut |_| {
+        emitted += 1;
+        Ok(())
+    });
+    match result {
+        Err(DataServerError::QueryTooLarge(message)) => {
+            assert_eq!(message, "Position response exceeds 1000000 values")
+        }
+        other => panic!("expected QueryTooLarge, got {other:?}"),
+    }
+    assert_eq!(emitted, 0);
+    assert_eq!(reads(&e), before, "nothing read");
+    let one: Vec<String> = e.get_parameters()[..1].to_vec();
+    assert!(e
+        .query_positions(&points[..1], None, Some(&one), None, None, &mut |_| Ok(()))
+        .is_ok());
+    assert_ne!(reads(&e), before, "a query within the budget reads");
 }
 
 #[test]

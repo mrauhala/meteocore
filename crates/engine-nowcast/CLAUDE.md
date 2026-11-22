@@ -235,10 +235,15 @@ coasting, joins, or raw-byte forecast encoding. See
   product has one valid time, NOT the forecast leads the WMS layer renders.
   Selection: an instance pin resolves exactly or to the minute (the EDR id
   is the exact RFC 3339 anchor, but the compact id served before #947 was
-  minute-precision; 404 otherwise) and a `datetime` excluding the
-  anchor is a 400; with no pin, `datetime` picks the NEWEST generation
-  anchored INSIDE the interval (the #548 cell-history rule, start bound
-  included); neither ⇒ latest. `Generation.interval_secs` is what turns
+  minute-precision; `ReferenceTimeNotFound` otherwise) and a `datetime`
+  excluding the anchor has no data; with no pin, `datetime` picks the
+  NEWEST generation anchored INSIDE the interval (the #548 cell-history
+  rule, start bound included); neither ⇒ latest. A window without an
+  anchor, pinned or not, and a polygon off the motion grid are
+  `LocationNotFound` (404): a `datetime` list skips that instant, where a
+  400 failed the whole list (#968, #1500). A generation whose field has no
+  blocks or no positive interval (`NoMotionGrid::Degenerate`) is an
+  internal error, never that 404. `Generation.interval_secs` is what turns
   the vectors into m/s — it is the SOURCE interval the field was measured
   over, not the nowcast `step`. The #524 EMA now rescales the previous
   field by the interval ratio before blending, so a skipped composite no
