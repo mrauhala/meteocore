@@ -3636,7 +3636,9 @@ pub struct GribConfig {
     /// Poll interval in seconds. Default: 600 (10 min)
     #[serde(default = "default_grib_poll_interval")]
     pub poll_interval_secs: u64,
-    /// Maximum number of forecast runs to retain. Default: 4
+    /// The newest forecast runs to retain that have finished publishing;
+    /// the newest run is kept on top of them while it publishes (#1562).
+    /// Unset keeps every run found.
     pub max_runs: Option<usize>,
     /// Time window for file selection (ISO 8601 duration)
     pub time_window: Option<String>,

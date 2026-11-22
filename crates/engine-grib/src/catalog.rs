@@ -844,9 +844,16 @@ impl Catalog {
         }
     }
 
-    /// Apply max_runs eviction: keep only the N most recent runs.
-    pub fn evict(&mut self, max_runs: usize) {
-        while self.runs.len() > max_runs {
+    /// Apply `max_runs` eviction (#1562): keep the newest `max_runs` runs
+    /// that have finished publishing, and on top of them the newest run
+    /// while it is still `publishing`. The flag is about the newest run by
+    /// construction (the poll's `Publication` tracks no other), so the runs
+    /// kept are always the newest `max_runs + 1`: a run with its first
+    /// steps adds to the runs that cover the horizon until it has them all,
+    /// instead of replacing the oldest.
+    pub fn evict(&mut self, max_runs: usize, publishing: bool) {
+        let keep = max_runs.saturating_add(usize::from(publishing));
+        while self.runs.len() > keep {
             self.runs.pop_first();
         }
     }
@@ -963,11 +970,15 @@ mod tests {
             );
         }
         assert_eq!(catalog.runs.len(), 5);
-        catalog.evict(2);
-        assert_eq!(catalog.runs.len(), 2);
-        // Should keep the two most recent
-        let keys: Vec<_> = catalog.runs.keys().collect();
-        assert_eq!(keys[0].day(), 4);
-        assert_eq!(keys[1].day(), 5);
+        let days = |catalog: &Catalog| catalog.runs.keys().map(|t| t.day()).collect::<Vec<_>>();
+        // While the newest publishes, it is kept on top of the two newest
+        // runs that have finished (#1562).
+        catalog.evict(2, true);
+        assert_eq!(days(&catalog), [3, 4, 5]);
+        // Once it has finished, it is one of them.
+        catalog.evict(2, false);
+        assert_eq!(days(&catalog), [4, 5]);
+        catalog.evict(2, true);
+        assert_eq!(days(&catalog), [4, 5], "nothing to keep on top");
     }
 }
