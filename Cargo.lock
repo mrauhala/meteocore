@@ -4835,6 +4835,7 @@ dependencies = [
  "jsonschema",
  "libc",
  "notify",
+ "png",
  "prometheus",
  "quick-xml 0.42.0",
  "robotstxt",

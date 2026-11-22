@@ -24,6 +24,17 @@
 //! linear over-render, paid only on a tile cache miss; ≤ 1.19× perceived
 //! softening relative to a nearest-neighbour snap).
 //!
+//! ## World copies
+//!
+//! A turn of longitude is `2^(level/2)` EPSG:3857 tiles: a whole number on
+//! an even step, not on an odd one. An odd step's grid is anchored to the
+//! world copy holding the view's centre and continues across ±180° within
+//! the view, so a view a whole turn away is cut from the same grid a turn
+//! away: the same texels, the same pixels wherever the engine draws the
+//! same data there (#1189). Its tiles are its own cache entries, since an
+//! engine may draw a copy otherwise. Views centred in the world in place,
+//! and every view on an even step, use the grid of the world in place.
+//!
 //! ## Scope
 //!
 //! EPSG:3857 retains its WebMercatorQuad-aligned ladder. EPSG:3067 and
@@ -52,8 +63,14 @@ const R: f64 = ds_core::web_mercator::EARTH_RADIUS;
 /// Half the Web Mercator world span in metres (`π·R`). The grid origin is the
 /// top-left corner `(-ORIGIN, +ORIGIN)`.
 const ORIGIN: f64 = std::f64::consts::PI * R;
+/// One turn of longitude in Web Mercator metres (`2π·R`): the distance
+/// between world copies.
+const TURN: f64 = 2.0 * ORIGIN;
 /// Ground resolution at zoom 0 (metres/pixel): `2·ORIGIN / 256 ≈ 156543.034`.
-const Z0_RES: f64 = (2.0 * ORIGIN) / TILE_PX as f64;
+const Z0_RES: f64 = TURN / TILE_PX as f64;
+/// Farthest world copy a view's grid is anchored to (#1189); a view
+/// centred farther out keeps the grid of the world in place.
+const MAX_WORLD_COPY: f64 = 1e6;
 /// Maximum half-octave ladder level (`level/2 ≈ zoom`, so ~zoom 24).
 const MAX_LEVEL: i32 = 48;
 /// Tile-budget floor so small requests always qualify regardless of rounding.
@@ -147,6 +164,32 @@ impl Grid {
         self.base_resolution() / 2f64.powf(level as f64 / 2.0)
     }
 
+    /// The world copy whose grid a view from `west_m` to `east_m` is cut
+    /// from at `level` (#1189). A turn of the Web Mercator world is
+    /// `2^(level/2)` tiles: a whole number on an even level, where every
+    /// copy shares the grid of the world in place (copy 0), and not on an
+    /// odd one, where a grid continued past ±180° is offset from itself a
+    /// turn away by a fraction of a texel (0.619 of one at level 9), so a
+    /// view and its copy would sample texels at different places. There
+    /// the grid is anchored at the west edge of the copy holding the
+    /// view's centre, and continues across ±180° within the view: a view
+    /// a turn away is cut from the same grid a turn away and draws the
+    /// same texels. Views centred in the world in place keep its grid.
+    /// The seam this needs lies at ±180° + k·360°: on an odd level a view
+    /// whose centre crosses it moves to the next copy's grid and shifts by
+    /// up to a texel. Projected grids have no copies.
+    fn world_copy(self, level: i32, west_m: f64, east_m: f64) -> i64 {
+        if self != Self::WebMercator || level % 2 == 0 {
+            return 0;
+        }
+        let copy = ((0.5 * (west_m + east_m) + ORIGIN) / TURN).floor();
+        if copy.abs() <= MAX_WORLD_COPY {
+            copy as i64
+        } else {
+            0
+        }
+    }
+
     /// Choose the coarsest step no coarser than the requested resolution.
     /// The epsilon keeps exact ladder resolutions on their own level despite
     /// roundoff. Over-zoom is declined, never clamped to a coarser tile.
@@ -190,6 +233,10 @@ pub struct TileKey {
     content_version: u64,
     grid: Grid,
     level: i32,
+    /// The world copy the tile's grid is anchored to (`Grid::world_copy`):
+    /// 0 except on an odd Web Mercator level, whose copies' grids differ.
+    copy: i64,
+    /// Column from the west edge of `copy`.
     col: i64,
     row: i64,
 }
@@ -264,6 +311,7 @@ impl TilePixelCache {
                 content_version: 0,
                 grid: Grid::WebMercator,
                 level: 20,
+                copy: 0,
                 col,
                 row: 0,
             };
@@ -713,6 +761,12 @@ where
         }
     }
 
+    // Columns count from the west edge of the world copy the view's grid is
+    // anchored to (#1189); the world in place's for every view centred in
+    // it, and on every even level.
+    let copy = grid.world_copy(level, west_m, east_m);
+    let anchor_x = origin_x + copy as f64 * TURN;
+
     // A tiny epsilon trims a spurious tile when an edge is on a grid line.
     let eps = span * 1e-9;
     let (tile_south, tile_north) = if grid == Grid::WebMercator {
@@ -724,8 +778,8 @@ where
         (south_m, north_m)
     };
     let indices = [
-        ((west_m - origin_x) / span).floor(),
-        ((east_m - origin_x - eps) / span).floor(),
+        ((west_m - anchor_x) / span).floor(),
+        ((east_m - anchor_x - eps) / span).floor(),
         ((origin_y - tile_north) / span).floor(),
         ((origin_y - tile_south - eps) / span).floor(),
     ];
@@ -775,6 +829,7 @@ where
                 content_version: prefix.content_version,
                 grid,
                 level,
+                copy,
                 col,
                 row,
             };
@@ -785,7 +840,7 @@ where
                 misses += 1;
                 // The miss's cost (#1314): an error or a fallback drops it.
                 let fill = cache.cache.fill_timer();
-                let tx0 = origin_x + col as f64 * span;
+                let tx0 = anchor_x + col as f64 * span;
                 let tx1 = tx0 + span;
                 let ty_top = origin_y - row as f64 * span;
                 let ty_bot = ty_top - span;
@@ -876,7 +931,7 @@ where
     // global tile-pixel space. Nearest-neighbour sampling preserves palettes.
     let res_x = (east_m - west_m) / width as f64;
     let res_y = (north_m - south_m) / height as f64;
-    let to_global_x = |x_m: f64| (x_m - origin_x) / span * TILE_PX as f64;
+    let to_global_x = |x_m: f64| (x_m - anchor_x) / span * TILE_PX as f64;
     let to_global_y = |y_m: f64| (origin_y - y_m) / span * TILE_PX as f64;
 
     // usize arithmetic throughout: `width * height * 4` overflows `u32` past
@@ -997,6 +1052,7 @@ mod tests {
             content_version: 0,
             grid: Grid::WebMercator,
             level: 3,
+            copy: 0,
             col: 1,
             row: 2,
         };
@@ -1977,6 +2033,128 @@ mod tests {
              lat[{d_lo:.1},{d_hi:.1}]"
         );
     }
+
+    /// A value to 24 bits of colour, so two pixels differ wherever the
+    /// values they were assembled from do.
+    struct Exact;
+    impl ColorMap for Exact {
+        fn color(&self, value: Option<f64>) -> [u8; 4] {
+            match value {
+                Some(v) => {
+                    let [_, r, g, b] = (((v + 180.0) * 40_000.0).round() as u32).to_be_bytes();
+                    [r, g, b, 255]
+                }
+                None => [0, 0, 0, 0],
+            }
+        }
+    }
+
+    /// A view a whole turn of longitude away, a world copy, assembles the
+    /// pixels of the view in place (#1189): on an odd ladder level, whose
+    /// turn is not a whole number of tiles, on an even one, and across
+    /// ±180°, a turn and two turns east and west. Each tile pixel is the
+    /// longitude of its centre in the world in place, as engines draw every
+    /// copy alike, so pixels differ exactly where the texels assembled lie
+    /// at different places. The copy's tiles are the view's a turn away.
+    /// With the grid of the world in place continued to the copy, the odd
+    /// level's copy differed in every pixel: a turn there is 5792.619
+    /// texels, and the copy's texels lay 0.619 of one off the view's.
+    #[test]
+    fn a_world_copy_assembles_the_pixels_of_the_view_in_place() {
+        let prefix = TileKeyPrefix {
+            layer: "l".into(),
+            parameter: None,
+            style: "default".into(),
+            time: None,
+            z: None,
+            reference_time: None,
+            content_version: 0,
+        };
+        let requested = std::sync::Mutex::new(Vec::new());
+        let render = |b: [f64; 4], w: u32, h: u32, _: &OutputCrs| {
+            requested.lock().unwrap().push(b);
+            let values = (0..h)
+                .flat_map(|_| {
+                    (0..w).map(move |i| {
+                        let lon = b[0] + (f64::from(i) + 0.5) / f64::from(w) * (b[2] - b[0]);
+                        Some((lon + 180.0).rem_euclid(360.0) - 180.0)
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(RasterTile {
+                width: w,
+                height: h,
+                values: values.into(),
+            })
+        };
+        let size = 512;
+        let assemble = |[x0, y0, x1, y1]: [f64; 4], turns: f64| {
+            requested.lock().unwrap().clear();
+            let bbox = [
+                x_to_lon(x0 + turns * TURN),
+                y_to_lat(y0),
+                x_to_lon(x1 + turns * TURN),
+                y_to_lat(y1),
+            ];
+            let cache = TilePixelCache::new(64);
+            let pixels = assemble_metatiled(
+                bbox,
+                &OutputCrs::WebMercator,
+                size,
+                size,
+                &prefix,
+                &Exact,
+                &cache,
+                render,
+            )
+            .unwrap();
+            let MetaTilePixels::Image { rgba, .. } = pixels else {
+                panic!("{bbox:?}: no image");
+            };
+            (rgba, std::mem::take(&mut *requested.lock().unwrap()))
+        };
+        let zoom_5 = 512.0 * Z0_RES / 32.0;
+        for (case, view, level) in [
+            ("odd level", [0.0, 7.0e6, 4.0e6, 11.0e6], 9),
+            (
+                "even level",
+                [1.0e5, 7.0e6, 1.0e5 + zoom_5, 7.0e6 + zoom_5],
+                10,
+            ),
+            ("across ±180°", [18.0e6, -3.0e6, 22.0e6, 1.0e6], 9),
+        ] {
+            let res = (view[2] - view[0]) / f64::from(size);
+            assert_eq!(Grid::WebMercator.snap_level(res), level, "{case}");
+            let (in_place, tiles) = assemble(view, 0.0);
+            assert!(!tiles.is_empty(), "{case}");
+            if case == "across ±180°" {
+                // One grid within the view, continued past 180°.
+                assert!(tiles.iter().any(|t| t[0] < 180.0 && t[2] > 180.0), "{case}");
+            }
+            for turns in [1.0, -1.0, 2.0, -2.0] {
+                let (copy, copy_tiles) = assemble(view, turns);
+                let differ = in_place
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(copy.as_chunks::<4>().0)
+                    .filter(|(a, b)| a != b)
+                    .count();
+                assert_eq!(differ, 0, "{case}, {turns} turns: pixels differ");
+                assert_eq!(copy_tiles.len(), tiles.len(), "{case}, {turns} turns");
+                for (a, b) in tiles.iter().zip(&copy_tiles) {
+                    let shift = 360.0 * turns;
+                    assert!(
+                        (b[0] - a[0] - shift).abs() < 1e-9
+                            && (b[2] - a[2] - shift).abs() < 1e-9
+                            && (b[1], b[3]) == (a[1], a[3]),
+                        "{case}, {turns} turns: tile {b:?} is not {a:?} a turn away"
+                    );
+                }
+            }
+        }
+    }
+
     fn projected_prefix() -> TileKeyPrefix {
         TileKeyPrefix {
             layer: "projected".into(),

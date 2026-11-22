@@ -75,6 +75,9 @@ ds-storage = { path = "../storage", features = ["test-util"] }
 engine-geotiff = { path = "../engine-geotiff", features = ["test-util"] }
 http-body-util = "0.1"
 jsonschema = { version = "0.60", default-features = false }
+# Decode GetMap PNGs to count the pixels two world copies differ in (#1189);
+# already in the graph via ds-render.
+png = "0.18"
 robotstxt = "0.3"
 tempfile = "3"
 toml = "1.1"
