@@ -1,7 +1,8 @@
 //! The startup load (#317) over real loads of fixture collections, with a
 //! test's hook holding chosen loads back: HTTP serves while they load, each
 //! collection is published once built, a derived collection waits for its
-//! source, a reload is refused until the load settles.
+//! source, a reload is refused and a watched change waits until the load
+//! settles, and colliding ids keep the owner one load gives them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,13 +26,79 @@ fn testdata(name: &str) -> String {
 
 /// A config file in `dir` whose `[[collections]]` are `body`.
 fn config_file(dir: &Path, body: &str) -> PathBuf {
+    config_file_with(dir, "", body)
+}
+
+/// [`config_file`] with `server` lines in `[server]`.
+fn config_file_with(dir: &Path, server: &str, body: &str) -> PathBuf {
     let path = dir.join("config.toml");
     std::fs::write(
         &path,
-        format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{body}"),
+        format!("[server]\nhost = \"127.0.0.1\"\nport = 8000\n{server}\n{body}"),
     )
     .unwrap();
     path
+}
+
+/// A geotiff radar over the TM35FIN fixture, a nowcast's raster source.
+fn radar(id: &str) -> String {
+    format!(
+        r#"
+[[collections]]
+id = "{id}"
+title = "{id}"
+description = "Radar"
+engine_type = "geotiff"
+data_path = {data:?}
+apis = ["wms"]
+[collections.geotiff]
+filename_template = "radar_tm35_%Y%m%dT%H%MZ.tif"
+parameter = "reflectivity"
+unit = "dBZ"
+"#,
+        data = testdata("radar-tm35fin")
+    )
+}
+
+/// A polar-volume network over a copy of the two-sweep fixture in `dir`:
+/// one radar site, `{id}-test`.
+fn pvol(dir: &Path, id: &str) -> String {
+    let volumes = dir.join(format!("{id}-volumes"));
+    std::fs::create_dir_all(&volumes).unwrap();
+    std::fs::copy(testdata("pvol-cold-batch.h5"), volumes.join("pvol.h5")).unwrap();
+    format!(
+        r#"
+[[collections]]
+id = "{id}"
+title = "{id}"
+description = "Volumes"
+engine_type = "odim-volume"
+apis = ["edr", "wms", "maps", "tiles", "features"]
+data_path = {volumes:?}
+[collections.odim]
+prewarm_sweeps = 0
+"#
+    )
+}
+
+/// A nowcast over `source`, its beam geometry from `radar_source`.
+fn nowcast(id: &str, source: &str, radar_source: Option<&str>) -> String {
+    let radar = radar_source
+        .map(|r| format!("radar_source = \"{r}\"\n"))
+        .unwrap_or_default();
+    format!(
+        r#"
+[[collections]]
+id = "{id}"
+title = "{id}"
+description = "Nowcast"
+engine_type = "nowcast"
+apis = ["wms", "features"]
+[collections.nowcast]
+source = "{source}"
+horizon = "PT1H"
+{radar}"#
+    )
 }
 
 /// A CSV station collection over the weather fixture, or over a file that
@@ -129,13 +196,71 @@ fn booting(dir: &Path, body: &str) -> AdminState {
 
 /// Stop the poll loops the load spawned, which outlive the test otherwise.
 fn stop(state: &AdminState) {
-    for engine in state.station_grid_engines.read().unwrap().iter() {
-        engine.shutdown();
+    macro_rules! stop {
+        ($($field:ident),*) => {$(
+            for engine in state.$field.read().unwrap().iter() {
+                engine.shutdown();
+            }
+        )*};
     }
+    stop!(
+        geotiff_engines,
+        odim_volume_engines,
+        nowcast_engines,
+        station_grid_engines
+    );
 }
 
 fn start(state: &AdminState, loader: Loader) -> tokio::task::JoinHandle<Settled> {
-    crate::poll_runtime().spawn(load(state.clone(), loader))
+    crate::poll_runtime().spawn(load(state.clone(), loader, 4))
+}
+
+/// The health entries one load of the config at `config_path` gives, on
+/// the poll runtime as the server loads.
+async fn one_load(config_path: &Path) -> (Vec<CollectionHealth>, admin::LoadResult) {
+    let (config, _) =
+        ds_core::config::ServerConfig::from_file(config_path.to_str().unwrap()).unwrap();
+    let result = crate::poll_runtime()
+        .spawn(async move {
+            tokio::task::block_in_place(|| {
+                admin::load_collections(
+                    &ds_render::StyleContext::with_builtins(),
+                    &config.collections,
+                    &[],
+                    "http://x",
+                    false,
+                    &Default::default(),
+                    crate::memory_caches::RenderCacheSizes::mb(
+                        0,
+                        ds_core::config::DEFAULT_RENDERED_CACHE_MB,
+                    ),
+                    admin::ReusableCaches::default(),
+                    admin::EngineReuse::default(),
+                )
+            })
+        })
+        .await
+        .unwrap();
+    (result.health.clone(), result)
+}
+
+/// Each entry's id, whether it failed, and a failure's error: what a load
+/// decides, as against a ready or degraded entry, which a poll the load
+/// spawned may move on.
+fn outcomes(health: &[CollectionHealth]) -> Vec<(String, bool, Option<String>)> {
+    let mut out: Vec<_> = health
+        .iter()
+        .map(|h| {
+            let failed = h.status == CollectionStatus::Failed;
+            (
+                h.id.clone(),
+                failed,
+                failed.then(|| h.error.clone()).flatten(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 async fn wait_until(what: &str, done: impl Fn() -> bool) {
@@ -220,10 +345,9 @@ async fn a_slow_collection_holds_only_itself() {
     assert_eq!(body["status"], "loading");
     assert_eq!(status_of(&body, "fast"), "ready");
     assert_eq!(status_of(&body, "slow"), "loading");
-    assert_eq!(
-        get(&health, "/health?loaded").await.0,
-        StatusCode::SERVICE_UNAVAILABLE
-    );
+    let (status, body) = get(&health, "/health?loaded").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["loaded"], "1 still loading");
     assert_eq!(get(&health, "/health?loaded=false").await.0, StatusCode::OK);
     assert_eq!(
         get(&health, "/health?loaded=soon").await.0,
@@ -256,6 +380,7 @@ async fn a_slow_collection_holds_only_itself() {
     let (status, body) = get(&health, "/health?loaded").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], "healthy");
+    assert_eq!(body["loaded"], "settled");
     // In the config's order, as one load lists them.
     let ids: Vec<&str> = body["collections"]
         .as_array()
@@ -378,7 +503,8 @@ async fn shutdown_abandons_a_load_still_running() {
     wait_until("the slow load to start", || !loads.started().is_empty()).await;
     state.recovery_shutdown.shutdown();
     assert_eq!(load.await.unwrap(), Settled::ShutDown);
-    state.startup.stop_publishing();
+    // As `main` shuts down: the reload lock for good.
+    let _shut = state.reload_lock.lock().await;
     loads.release("slow");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(state.edr.load().engines.is_empty());
@@ -513,5 +639,369 @@ bucket = "radar"
     assert_eq!(
         verdict(&radar.collections, &[entry("radar", Failed)]),
         Verdict::RetryRadar
+    );
+}
+
+/// `/health?loaded` waits for the load only as long as its readiness
+/// grace: then 200 with collections still loading, saying so.
+#[tokio::test]
+async fn readiness_waits_for_the_load_only_as_long_as_its_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_file_with(
+        dir.path(),
+        "startup_readiness_grace_secs = 1",
+        &format!("{}{}", csv("slow", true), csv("fast", true)),
+    );
+    let state = crate::watcher::tests::build_state_at(&path, true);
+    let health = health_router(&state);
+    let loads = gated(&["slow"], &[]);
+    let load = start(&state, loads.loader.clone());
+    let (status, body) = get(&health, "/health?loaded").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    wait_until("the grace and the fast collection", || {
+        state.startup.grace_elapsed() && state.edr.load().engines.contains_key("fast")
+    })
+    .await;
+    let (status, body) = get(&health, "/health?loaded").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["loaded"], "grace elapsed, 1 still loading");
+    assert_eq!(status_of(&body, "slow"), "loading");
+    loads.release("slow");
+    load.await.unwrap();
+
+    // 0: no grace, every collection waited for.
+    assert!(!StartupLoad::loading(0).grace_elapsed());
+    assert!(!StartupLoad::default().grace_elapsed());
+}
+
+/// A collections.d change made while the load runs is applied once it
+/// settles, against the config the load built: the slow collection's engine
+/// is reused, the added collection is built.
+#[tokio::test]
+async fn a_watched_change_during_the_load_is_applied_once_it_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let collections_d = dir.path().join("collections.d");
+    std::fs::create_dir(&collections_d).unwrap();
+    std::fs::write(
+        collections_d.join("slow.toml"),
+        csv("slow", true).replace("[[collections]]\n", ""),
+    )
+    .unwrap();
+    let path = config_file_with(
+        dir.path(),
+        "collections_dir = \"collections.d\"",
+        &csv("fast", true),
+    );
+    let state = crate::watcher::tests::build_state_at(&path, true);
+    let loads = gated(&["slow"], &[]);
+    let load = start(&state, loads.loader.clone());
+    crate::watcher::spawn_config_watcher(
+        state.clone(),
+        Some(collections_d.canonicalize().unwrap()),
+        None,
+        Duration::from_millis(50),
+    )
+    .unwrap();
+    wait_until("the fast collection", || {
+        state.edr.load().engines.contains_key("fast")
+    })
+    .await;
+    std::fs::write(
+        collections_d.join("added.toml"),
+        csv("added", true).replace("[[collections]]\n", ""),
+    )
+    .unwrap();
+    // Well past the debounce: the reload waits for the load.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!state.edr.load().engines.contains_key("added"));
+    assert!(state.startup.is_loading());
+
+    loads.release("slow");
+    load.await.unwrap();
+    // As `main` does once the steps after the load have run.
+    state.startup.settle();
+    wait_until("the added collection", || {
+        state.edr.load().engines.contains_key("added")
+    })
+    .await;
+    assert!(state.edr.load().engines.contains_key("slow"));
+    assert!(state.edr.load().engines.contains_key("fast"));
+    assert!(state
+        .health
+        .read()
+        .unwrap()
+        .iter()
+        .all(|h| h.status == CollectionStatus::Ready));
+}
+
+/// A radar site `{pvol}-test` and a collection named so: whichever one
+/// load registers first keeps the id however the loads finish, and a
+/// loser serving nothing leaves no engine behind. A site declared after
+/// the collection fails as one load fails it.
+#[tokio::test]
+async fn a_colliding_id_keeps_the_owner_one_load_gives_it() {
+    // The collection first: the radar network waits for it.
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!("{}{}", csv("pvol-test", true), pvol(dir.path(), "pvol"));
+    let state = booting(dir.path(), &body);
+    let loads = gated(&["pvol-test"], &[]);
+    let load = start(&state, loads.loader.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(loads.started(), ["pvol-test"]);
+    loads.release("pvol-test");
+    load.await.unwrap();
+    let health = state.health.read().unwrap().clone();
+    let (once, _) = one_load(&config_file(dir.path(), &body)).await;
+    assert_eq!(outcomes(&health), outcomes(&once));
+    assert!(state.features.load().engines.contains_key("pvol-test"));
+    assert!(!state.wms.load().engines.contains_key("pvol-test"));
+    stop(&state);
+
+    // The network first: the collection waits, and fails.
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!("{}{}", pvol(dir.path(), "pvol"), csv("pvol-test", true));
+    let state = booting(dir.path(), &body);
+    let loads = gated(&["pvol"], &[]);
+    let load = start(&state, loads.loader.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(loads.started(), ["pvol"]);
+    loads.release("pvol");
+    load.await.unwrap();
+    let health = state.health.read().unwrap().clone();
+    let entries: Vec<_> = health
+        .iter()
+        .filter(|h| h.id == "pvol-test")
+        .map(|h| (h.engine_type.clone(), h.status, h.error.clone()))
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("odim-volume".to_string(), CollectionStatus::Ready, None),
+            (
+                "csv".to_string(),
+                CollectionStatus::Failed,
+                Some("id collides with an already-registered collection".to_string())
+            ),
+        ]
+    );
+    assert!(state.wms.load().engines.contains_key("pvol-test"));
+    assert!(!state.features.load().engines.contains_key("pvol-test"));
+    assert!(!state
+        .engine_handles
+        .read()
+        .unwrap()
+        .contains_key("pvol-test"));
+    stop(&state);
+}
+
+/// Nowcasts over a radar raster and over a radar site, with a radar
+/// network's beam geometry, wait for their sources' loads and end as one
+/// load of the same config ends them.
+#[tokio::test]
+async fn nowcasts_over_radar_and_radar_site_sources_load_as_in_one_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!(
+        "{}{}{}{}{}",
+        nowcast("nc", "radar", Some("pvol")),
+        nowcast("site-nc", "pvol-test", None),
+        nowcast("orphan-nc", "no-such-radar", None),
+        radar("radar"),
+        pvol(dir.path(), "pvol"),
+    );
+    let state = booting(dir.path(), &body);
+    let loads = gated(&["radar", "pvol"], &[]);
+    let load = start(&state, loads.loader.clone());
+    wait_until("the orphan to fail", || {
+        error_of(&state, "orphan-nc").is_some()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = loads.started();
+    assert!(
+        !started.contains(&"nc".to_string()) && !started.contains(&"site-nc".to_string()),
+        "{started:?}"
+    );
+    loads.release("radar");
+    loads.release("pvol");
+    load.await.unwrap();
+
+    let health = state.health.read().unwrap().clone();
+    let (once, _) = one_load(&config_file(dir.path(), &body)).await;
+    assert_eq!(outcomes(&health), outcomes(&once));
+    let failed = |id: &str| {
+        health
+            .iter()
+            .any(|h| h.id == id && h.status == CollectionStatus::Failed)
+    };
+    assert!(
+        !failed("nc") && failed("orphan-nc"),
+        "{:?}",
+        outcomes(&health)
+    );
+    assert!(state.wms.load().engines.contains_key("nc"));
+    assert!(state.features.load().engines.contains_key("nc"));
+    stop(&state);
+}
+
+/// A collection's live status never moves its `loading` entry: the engine
+/// is listed a moment before the entry is replaced.
+#[tokio::test]
+async fn a_loading_entry_ignores_its_engines_live_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!("{}{}", csv("weather", true), grid("grid", "weather"));
+    let state = booting(dir.path(), &body);
+    let (_, built) = one_load(&config_file(dir.path(), &body)).await;
+    let grid = built.station_grid_engines[0].clone();
+    grid.poll_once();
+    assert!(grid.has_data());
+    state.station_grid_engines.write().unwrap().push(grid);
+    let entry = admin::effective_health(&state)
+        .into_iter()
+        .find(|h| h.id == "grid")
+        .unwrap();
+    assert_eq!(entry.status, CollectionStatus::Loading);
+}
+
+/// While collections load, a catalog's short or missing policy is
+/// `no-cache`; data policies stay, and nothing changes once it settles.
+#[tokio::test]
+async fn catalogs_are_not_cached_while_collections_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = booting(dir.path(), &csv("a", true));
+    let router = |state: &AdminState| {
+        let with = |policy: Option<&'static str>| {
+            axum::routing::get(move || async move {
+                match policy {
+                    Some(policy) => {
+                        ([(axum::http::header::CACHE_CONTROL, policy)], "x").into_response()
+                    }
+                    None => "x".into_response(),
+                }
+            })
+        };
+        axum::Router::new()
+            .route(
+                "/short",
+                with(Some(ds_core::http_cache::CACHE_CONTROL_SHORT)),
+            )
+            .route("/none", with(None))
+            .route("/tile", with(Some("public, max-age=86400, immutable")))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                admin::loading_cache_control,
+            ))
+    };
+    use axum::response::IntoResponse;
+    let policy = |router: axum::Router, uri: &'static str| async move {
+        router
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .headers()
+            .get(axum::http::header::CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap().to_owned())
+    };
+    let app = router(&state);
+    assert_eq!(
+        policy(app.clone(), "/short").await.as_deref(),
+        Some("no-cache")
+    );
+    assert_eq!(
+        policy(app.clone(), "/none").await.as_deref(),
+        Some("no-cache")
+    );
+    assert_eq!(
+        policy(app.clone(), "/tile").await.as_deref(),
+        Some("public, max-age=86400, immutable")
+    );
+    state.startup.settle();
+    assert_eq!(
+        policy(app.clone(), "/short").await.as_deref(),
+        Some(ds_core::http_cache::CACHE_CONTROL_SHORT)
+    );
+    assert_eq!(policy(app, "/none").await, None);
+}
+
+/// The plan at boot, before any collection is built, in `auto`: a
+/// process-wide entry it sizes down is lowered (the render budget, 10 % of
+/// the total), one it would grow keeps its size (the meta-tile cache, which
+/// the full plan grows at this total), and an engine's entries keep theirs
+/// for the plan once the load settles.
+///
+/// Runs in a child process: the process-wide entries must be its alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_boot_plan_only_lowers_process_wide_sizes() {
+    const CHILD: &str = "MC_TEST_STARTUP_BOOT_PLAN_CHILD";
+    const NAME: &str = "startup::tests::the_boot_plan_only_lowers_process_wide_sizes";
+    if std::env::var_os(CHILD).is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture"])
+            .env(CHILD, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "{NAME} failed in its child process");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = config_file_with(
+        dir.path(),
+        "[memory]\nmode = \"auto\"\ntotal_mb = 8192",
+        &radar("radar"),
+    );
+    let state = crate::watcher::tests::build_state_at(&path, true);
+    // An engine's entries, built already (by a test, a metric read).
+    let _ = engine_geotiff::decode_budget::metrics();
+    let _ = engine_geotiff::decoded_chunk_cache_metrics();
+    let report = crate::memory_plan::lower_at_boot(&state);
+    let plan = report.plan.as_ref().expect("a total");
+    let rows = crate::cache_plan::snapshot(&state);
+    let row = |id: &str| rows.iter().find(|r| r.entry.id == id).unwrap();
+    assert_eq!(
+        row("render_budget").usage.capacity_bytes,
+        819 * ds_cache::MIB
+    );
+    let metatile = row("metatile_cache");
+    assert!(plan.grant(&metatile.entry).unwrap().bytes > metatile.configured_bytes);
+    assert_eq!(metatile.usage.capacity_bytes, metatile.configured_bytes);
+    let engine_scoped: Vec<_> = rows
+        .iter()
+        .filter(|r| r.entry.scope != ds_cache::plan::Scope::Process)
+        .collect();
+    assert!(!engine_scoped.is_empty());
+    for row in engine_scoped {
+        assert_eq!(
+            row.usage.capacity_bytes, row.configured_bytes,
+            "{}",
+            row.entry.id
+        );
+    }
+    for row in &rows {
+        assert!(
+            row.usage.capacity_bytes <= row.configured_bytes,
+            "{} grew",
+            row.entry.id
+        );
+    }
+}
+
+/// A radar network and the collections a site of it may collide with wait
+/// in the order one load registers them: a lower pass first, then the
+/// earlier declared. An id with more than one segment after the network's
+/// is no site's.
+#[test]
+fn colliding_ids_wait_in_the_order_one_load_registers_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config: ds_core::config::ServerConfig = toml::from_str(&format!(
+        "[server]\nhost = \"127.0.0.1\"\nport = 8000\n{}{}{}{}{}",
+        csv("net-a", true),
+        pvol(dir.path(), "net"),
+        csv("net-b", true),
+        csv("net-b-c", true),
+        nowcast("net-n", "other", None),
+    ))
+    .unwrap();
+    assert_eq!(
+        dependencies(&config.collections),
+        [vec![], vec![0], vec![1], vec![], vec![1]]
     );
 }

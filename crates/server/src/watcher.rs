@@ -143,6 +143,16 @@ pub fn spawn_config_watcher(
                 }
             }
 
+            // A change made while the startup load runs waits for it (#317)
+            // and is applied once after it, every event meanwhile with it:
+            // the reload diffs the config against the one the load built.
+            if state.startup.is_loading() {
+                info!(
+                    "config directory change seen while collections load: applied once they have"
+                );
+                state.startup.settled().await;
+                while rx.try_recv().is_ok() {}
+            }
             // Serialize against a concurrent admin reload; wait rather than skip
             // so a change is never silently dropped. `do_reload` blocks (sync
             // load) but runs here on the background runtime, off request workers.
@@ -475,7 +485,7 @@ pub(crate) mod tests {
             wind_handles: RwLock::new(result.wind_by_id),
             delivery_delays: Default::default(),
             startup: if startup {
-                crate::startup::StartupLoad::loading()
+                crate::startup::StartupLoad::loading(config.server.startup_readiness_grace_secs)
             } else {
                 Default::default()
             },

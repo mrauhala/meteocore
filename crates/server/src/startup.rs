@@ -8,20 +8,31 @@
 //!   the blocking load inside `block_in_place`, as a reload runs on that
 //!   runtime: never on a request worker (root CLAUDE.md Critical Rules 6
 //!   and 7), and without holding a poll worker while it blocks.
-//! - At most [`LOAD_CONCURRENCY`] build at once.
+//! - At most `[server] startup_concurrency` (default 4) build at once: a
+//!   load mostly waits on its source (LISTs, index and header GETs, a PVOL
+//!   or HDF5 scan), each with its own bounded concurrency inside, so a
+//!   handful at once loads a config of tens of collections in a few of its
+//!   slowest builds, while the boot's requests to one object store stay a
+//!   small multiple of one load's (a throttling store answers more of them
+//!   with 503 SlowDown) and so does its memory peak (a PVOL bootstrap, a
+//!   GRIB index). A source stuck for minutes holds one slot.
 //! - A derived collection (nowcast, station grid, period products) waits
 //!   for the collections of lower load passes its sources name
 //!   ([`dependencies`]), then reads their engines from the loads that built
 //!   them ([`admin::BuiltSources`]), with the errors one load gives when a
-//!   source is missing or failed.
+//!   source is missing or failed. Collections that can register the same
+//!   id (a radar site `{base}-{nod}` and a collection named so) publish in
+//!   the order one load registers them, so the same one wins.
 //! - `/health` lists every configured collection from the first request,
-//!   `loading` until it is built ([`loading_health`]).
-//! - The load holds `reload_lock` until it settles: a reload answers 409
-//!   meanwhile, and the watcher, the recovery loop and the memory governor
-//!   start after it (`main`).
+//!   `loading` until it is built ([`loading_health`]); `/health?loaded`
+//!   is 503 until the load settles or its readiness grace passes.
+//! - Each publish holds `reload_lock`, briefly; the load does not hold it
+//!   between them, so the memory governor's valve keeps running. Reloads
+//!   wait for the load instead ([`StartupLoad::is_loading`]): the admin
+//!   endpoint answers 409, the watcher waits and applies what changed
+//!   after, the recovery loop and the governor's re-plan skip.
 
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,59 +46,74 @@ use crate::admin::{
     ServerState,
 };
 
-/// How many collections build at once. A load is mostly waiting on its
-/// source (LISTs, index and header GETs, a PVOL or HDF5 scan), each with its
-/// own bounded concurrency inside, so a handful at once loads a config of
-/// tens of collections in a few of its slowest builds, while the boot's
-/// requests to one object store stay a small multiple of one load's (a
-/// throttling store answers more of them with 503 SlowDown) and so does its
-/// memory: the large scans, a PVOL bootstrap or a GRIB index, are the
-/// boot's peak. A source stuck for minutes holds one slot; it takes four
-/// stuck at once to hold the rest back again.
-pub(crate) const LOAD_CONCURRENCY: usize = 4;
-
 /// The startup load's state on [`ServerState`]. `Default` is a server with
 /// no startup load running (tests, which build their registries in one
 /// load).
-#[derive(Default)]
 pub struct StartupLoad {
-    loading: AtomicBool,
-    /// Held while a load publishes. Shutdown takes it once after the
-    /// signal, so no collection is published after its engines are stopped.
-    publish: Mutex<()>,
+    /// `true` while the load and the steps after it run.
+    loading: watch::Sender<bool>,
+    started: Instant,
+    /// `[server] startup_readiness_grace_secs`; `None` (0) waits for every
+    /// collection.
+    grace: Option<Duration>,
+}
+
+impl Default for StartupLoad {
+    fn default() -> Self {
+        Self {
+            loading: watch::channel(false).0,
+            started: Instant::now(),
+            grace: None,
+        }
+    }
 }
 
 impl StartupLoad {
-    /// A startup load about to run.
-    pub(crate) fn loading() -> Self {
+    /// A startup load about to run, its readiness grace `grace_secs` (0:
+    /// none).
+    pub(crate) fn loading(grace_secs: u64) -> Self {
         Self {
-            loading: AtomicBool::new(true),
-            publish: Mutex::new(()),
+            loading: watch::channel(true).0,
+            started: Instant::now(),
+            grace: (grace_secs > 0).then(|| Duration::from_secs(grace_secs)),
         }
     }
 
-    /// Whether the startup load still runs: every configured collection is
-    /// not yet built, or the steps after it have not run.
+    /// Whether the startup load still runs: some configured collection is
+    /// not built yet, or the steps after the load have not run.
     pub(crate) fn is_loading(&self) -> bool {
-        self.loading.load(Ordering::Acquire)
+        *self.loading.borrow()
     }
 
-    /// Marks the startup load and the steps after it done when dropped,
-    /// so a panic in them leaves no reload refused for good.
+    /// Wait until the startup load and the steps after it are done (at
+    /// once without one).
+    pub(crate) async fn settled(&self) {
+        let mut loading = self.loading.subscribe();
+        let _ = loading.wait_for(|loading| !*loading).await;
+    }
+
+    /// The startup load and the steps after it are done.
+    pub(crate) fn settle(&self) {
+        self.loading.send_replace(false);
+    }
+
+    /// [`Self::settle`] when dropped, so a panic in the steps after the load
+    /// refuses no reload for good.
     pub(crate) fn settles_on_drop(&self) -> impl Drop + '_ {
-        struct Settles<'a>(&'a AtomicBool);
+        struct Settles<'a>(&'a StartupLoad);
         impl Drop for Settles<'_> {
             fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+                self.0.settle();
             }
         }
-        Settles(&self.loading)
+        Settles(self)
     }
 
-    /// Wait for a publish in progress to end. Called after the shutdown
-    /// signal: any later publish sees it and publishes nothing.
-    pub(crate) fn stop_publishing(&self) {
-        drop(self.publish.lock().unwrap_or_else(|e| e.into_inner()));
+    /// Whether the load has run longer than its readiness grace: from then
+    /// on `/health?loaded` answers 200 with collections still loading.
+    pub(crate) fn grace_elapsed(&self) -> bool {
+        self.grace
+            .is_some_and(|grace| self.started.elapsed() >= grace)
     }
 }
 
@@ -133,31 +159,63 @@ fn named_sources(collection: &CollectionConfig) -> Vec<&str> {
     named
 }
 
+/// Whether `id` is one config `of` registers beside its own: a GRIB level
+/// view `{id}-single`, a radar site `{id}-{nod}`.
+fn derived_from(id: &str, of: &str) -> bool {
+    id.strip_prefix(of)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Whether a radar site of the polar-volume source `source` may take the id
+/// of `other`, a configured collection: `{source}-{nod}`, a `nod` being
+/// alphanumeric.
+fn site_may_collide(source: &CollectionConfig, other: &CollectionConfig) -> bool {
+    source.engine_type == "odim-volume"
+        && other
+            .id
+            .strip_prefix(source.id.as_str())
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|nod| !nod.is_empty() && nod.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
 /// For each collection, the indices of the collections whose loads it
-/// waits for: of a lower load pass ([`admin::load_pass`]), the one its
-/// sources name, or for an id one config registers several of (a GRIB level
-/// view `{id}-single`, a radar site `{id}-{nod}`), each whose id and a `-`
-/// begin it. A lower pass only, as in one load, where a derived collection
-/// sees the engines its earlier passes built: so no two wait for each
-/// other. A name no collection can register waits for nothing, and its
-/// collection fails as in one load.
+/// waits for:
+///
+/// - Of a lower load pass ([`admin::load_pass`]), the one its sources
+///   name, or for an id one config registers several of (a GRIB level view
+///   `{id}-single`, a radar site `{id}-{nod}`), each whose id and a `-`
+///   begin it. A lower pass only, as in one load, where a derived
+///   collection sees the engines its earlier passes built. A name no
+///   collection can register waits for nothing, and its collection fails
+///   as in one load.
+/// - A polar-volume source and a collection named like one of its radar
+///   sites: the one one load registers later waits for the other, a higher
+///   pass for a lower, else the later declared for the earlier, so the
+///   same one keeps the id ([`admin::publish_load`]).
+///
+/// Every edge points to an earlier collection in (pass, declaration)
+/// order, so no two wait for each other.
 pub(crate) fn dependencies(collections: &[CollectionConfig]) -> Vec<Vec<usize>> {
+    let order = |index: usize| (admin::load_pass(&collections[index].engine_type), index);
     collections
         .iter()
-        .map(|collection| {
+        .enumerate()
+        .map(|(at, collection)| {
             let pass = admin::load_pass(&collection.engine_type);
             let named = named_sources(collection);
             collections
                 .iter()
                 .enumerate()
-                .filter(|(_, c)| admin::load_pass(&c.engine_type) < pass)
-                .filter(|(_, c)| {
-                    named.iter().any(|name| {
-                        *name == c.id
-                            || name
-                                .strip_prefix(c.id.as_str())
-                                .is_some_and(|rest| rest.starts_with('-'))
-                    })
+                .filter(|&(index, c)| {
+                    let source = admin::load_pass(&c.engine_type) < pass
+                        && named
+                            .iter()
+                            .any(|name| *name == c.id || derived_from(name, &c.id));
+                    let collides = index != at
+                        && order(index) < order(at)
+                        && (site_may_collide(c, collection) || site_may_collide(collection, c));
+                    source || collides
                 })
                 .map(|(index, _)| index)
                 .collect()
@@ -216,10 +274,11 @@ fn fail_loading(state: &ServerState, id: &str, error: &str) {
     admin::update_health_gauges(&health);
 }
 
-/// Build and publish every collection of the accepted config (#317), as
-/// the module documents, and return once each is built or failed, or the
-/// server shuts down. Run it on the poll runtime.
-pub(crate) async fn load(state: AdminState, loader: Loader) -> Settled {
+/// Build and publish every collection of the accepted config (#317), at
+/// most `concurrency` at once, as the module documents, and return once
+/// each is built or failed, or the server shuts down. Run it on the poll
+/// runtime.
+pub(crate) async fn load(state: AdminState, loader: Loader, concurrency: usize) -> Settled {
     let started = Instant::now();
     let Some(config) = state
         .accepted_load
@@ -237,7 +296,7 @@ pub(crate) async fn load(state: AdminState, loader: Loader) -> Settled {
         .iter()
         .map(|_| Arc::new(watch::channel(false).0))
         .collect();
-    let permits = Arc::new(tokio::sync::Semaphore::new(LOAD_CONCURRENCY));
+    let permits = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
     let built = Arc::new(Mutex::new(BuiltSources::default()));
     let pools = Arc::new(Mutex::new(PoolRegistry::new()));
 
@@ -273,21 +332,18 @@ pub(crate) async fn load(state: AdminState, loader: Loader) -> Settled {
                         loader(&state, &config, &collection, &sources, &pools)
                     }))
                 });
-                let _publishing = state
-                    .startup
-                    .publish
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                // Under the reload lock, briefly: no memory governor step
+                // resizes caches meanwhile, and shutdown, which takes the
+                // lock for good, finds no publish half done and lets none
+                // start after it.
+                let _publishing = state.reload_lock.lock().await;
                 if state.recovery_shutdown.is_shutdown() {
                     return;
                 }
                 match part {
                     Ok(part) => {
-                        built
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .add(&collection, &part);
-                        admin::publish_load(&state, &collection, part);
+                        let mut built = built.lock().unwrap_or_else(|e| e.into_inner());
+                        admin::publish_load(&state, &collection, part, &mut built);
                     }
                     Err(_) => {
                         error!("Collection '{}': its load panicked", collection.id);

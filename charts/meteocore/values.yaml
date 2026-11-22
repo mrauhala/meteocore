@@ -127,9 +127,13 @@ service:
 
 # /health answers 200 unless every collection has failed, also while the
 # collections still load: the server serves from boot and each collection
-# once it is built, which can take minutes for large remote catalogs.
-# /health?loaded answers 503 until every collection is built, for a
-# readiness probe that should wait for all of them.
+# once it is built, which can take minutes for large remote catalogs. The
+# startup probe passes within seconds of the bind, so a long load never
+# restarts the pod. Readiness is /health?loaded: 503 while collections load,
+# until [server] startup_readiness_grace_secs (default 300 s) after the load
+# started, so a rolling update keeps the old pod serving while the new one
+# loads, and a slow source holds a single replica out of service for at
+# most the grace. Readiness failing never restarts a pod.
 startupProbe:
   httpGet:
     path: /health
@@ -139,7 +143,7 @@ startupProbe:
   failureThreshold: 120
 readinessProbe:
   httpGet:
-    path: /health
+    path: /health?loaded
     port: http
   periodSeconds: 10
   timeoutSeconds: 5

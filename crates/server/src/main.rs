@@ -694,7 +694,7 @@ async fn serve(cli: CliArgs) {
         engine_handles: RwLock::new(result.engines_by_id),
         wind_handles: RwLock::new(result.wind_by_id),
         delivery_delays: Default::default(),
-        startup: startup::StartupLoad::loading(),
+        startup: startup::StartupLoad::loading(config.server.startup_readiness_grace_secs),
     });
     admin::update_health_gauges(
         &server_state
@@ -702,8 +702,24 @@ async fn serve(cli: CliArgs) {
             .read()
             .unwrap_or_else(|e| e.into_inner()),
     );
+    // The memory plan (#1306) at boot, before any collection is built:
+    // lowering sizes only (#317). Its block is logged once the load settles.
     cache_plan::register_render_caches(&server_state);
+    memory_plan::lower_at_boot(&server_state);
 
+    // The server's own loops run from boot (#317). The recovery loop and
+    // the governor's re-plan wait for the startup load to settle; the
+    // governor's pressure valve does not.
+    let recovery_state = server_state.clone();
+    poll_runtime().spawn(async move {
+        admin::radar_recovery_loop(recovery_state).await;
+    });
+    // The memory governor (#1315): the re-plan tick and the pressure valve,
+    // serialized with reloads like the recovery loop.
+    let governor_state = server_state.clone();
+    poll_runtime().spawn(async move {
+        governor::run(governor_state).await;
+    });
     // Each collection's delivery delay (#1389): the first observation of an
     // engine, at boot or once its collection is published, is its baseline.
     let delay_state = server_state.clone();
@@ -711,26 +727,55 @@ async fn serve(cli: CliArgs) {
         admin::delivery_delay_loop(delay_state).await;
     });
 
+    // Start the config-directory watcher (issues #318, #571) if enabled.
+    // Best-effort: a watcher init failure logs and the server runs without
+    // auto-reload. A change it sees while the startup load runs is applied
+    // once the load settles (#317).
+    if watch_collections.is_some() || watch_colormaps.is_some() {
+        // Trust-model note: watch-triggered reloads are gated by write access
+        // to the watched directories (a local-filesystem control plane), NOT
+        // the HTTP `ADMIN_TOKEN` that gates `POST /admin/collections/reload`.
+        // Make the asymmetry explicit when both are in play (e.g. a shared/NFS
+        // dir).
+        if server_state.admin_token.is_some() {
+            let dirs: Vec<&str> = [
+                watch_collections.as_ref().map(|_| "collections_dir"),
+                watch_colormaps.as_ref().map(|_| "colormaps_dir"),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            tracing::warn!(
+                "config-directory watcher is enabled and an admin token is set: \
+                 filesystem-triggered reloads do NOT require the token — they are \
+                 authorized by write access to {}. Ensure only trusted principals \
+                 can write there.",
+                dirs.join(" and ")
+            );
+        }
+        let debounce = std::time::Duration::from_millis(config.server.watch_debounce_ms);
+        if let Err(e) = watcher::spawn_config_watcher(
+            server_state.clone(),
+            watch_collections,
+            watch_colormaps,
+            debounce,
+        ) {
+            tracing::warn!("Failed to start config-directory watcher: {e}");
+        }
+    }
+
     // The startup load (#317), behind the HTTP service: each collection is
-    // built on the poll runtime and published once built. It holds the
-    // reload lock until it settles, so no reload runs against the
-    // registries it fills; what runs after the load at boot runs then.
-    let reload_guard = server_state
-        .reload_lock
-        .clone()
-        .try_lock_owned()
-        .expect("nothing holds the reload lock before the server serves");
+    // built on the poll runtime and published once built, under the reload
+    // lock for each publish only. Reloads wait for it to settle
+    // (`StartupLoad::is_loading`); what ran after the load at boot runs then.
     let configured = config.collections.len();
-    let watch_debounce = std::time::Duration::from_millis(config.server.watch_debounce_ms);
+    let concurrency = config.server.startup_concurrency;
     let load_state = server_state.clone();
     poll_runtime().spawn(async move {
-        let _reload_guard = reload_guard;
         let state = load_state;
-        // Dropped before the guard: a reload request then waits for the
-        // lock rather than hearing the load still runs.
         let _settled = state.startup.settles_on_drop();
         let startup::Settled::Loaded { elapsed } =
-            startup::load(state.clone(), startup::loader()).await
+            startup::load(state.clone(), startup::loader(), concurrency).await
         else {
             return;
         };
@@ -766,56 +811,14 @@ async fn serve(cli: CliArgs) {
                 std::process::exit(1);
             }
         }
-
-        // The memory plan (#1306): what every cache and budget holds and why.
+        // The memory plan (#1306) over every collection, applied as its
+        // mode says, under the reload lock as a reload's is.
+        let _plan = state.reload_lock.lock().await;
+        if state.recovery_shutdown.is_shutdown() {
+            return;
+        }
         cache_plan::register_render_caches(&state);
         cache_plan::log(&state, cache_plan::Occasion::Boot);
-
-        let recovery_state = state.clone();
-        poll_runtime().spawn(async move {
-            admin::radar_recovery_loop(recovery_state).await;
-        });
-        // The memory governor (#1315): the re-plan tick and the pressure
-        // valve, serialized with reloads like the recovery loop.
-        let governor_state = state.clone();
-        poll_runtime().spawn(async move {
-            governor::run(governor_state).await;
-        });
-
-        // Start the config-directory watcher (issues #318, #571) if
-        // enabled. Best-effort: a watcher init failure logs and the server
-        // runs without auto-reload.
-        if watch_collections.is_some() || watch_colormaps.is_some() {
-            // Trust-model note: watch-triggered reloads are gated by write
-            // access to the watched directories (a local-filesystem control
-            // plane), NOT the HTTP `ADMIN_TOKEN` that gates `POST
-            // /admin/collections/reload`. Make the asymmetry explicit when
-            // both are in play (e.g. a shared/NFS dir).
-            if state.admin_token.is_some() {
-                let dirs: Vec<&str> = [
-                    watch_collections.as_ref().map(|_| "collections_dir"),
-                    watch_colormaps.as_ref().map(|_| "colormaps_dir"),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                tracing::warn!(
-                    "config-directory watcher is enabled and an admin token is set: \
-                     filesystem-triggered reloads do NOT require the token — they are \
-                     authorized by write access to {}. Ensure only trusted principals \
-                     can write there.",
-                    dirs.join(" and ")
-                );
-            }
-            if let Err(e) = watcher::spawn_config_watcher(
-                state.clone(),
-                watch_collections,
-                watch_colormaps,
-                watch_debounce,
-            ) {
-                tracing::warn!("Failed to start config-directory watcher: {e}");
-            }
-        }
     });
 
     // The shared OGC API root (#789): Maps, Tiles and Features as building
@@ -931,6 +934,11 @@ async fn serve(cli: CliArgs) {
         let edr = edr_state.load();
         api_common::request_base_url(&edr.base_url, edr.trust_proxy_headers, headers)
     });
+    // A partial catalog is not cached while collections load (#317).
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        server_state.clone(),
+        admin::loading_cache_control,
+    ));
     let app = admin::with_request_layers(app);
 
     // Normalize trailing slashes (e.g., /wms/ → /wms) before routing
@@ -947,10 +955,9 @@ async fn serve(cli: CliArgs) {
     .expect("Server error");
 
     server_state.recovery_shutdown.shutdown();
-    // The startup load lets the lock go at the signal; a collection still
-    // loading then publishes nothing.
+    // Each startup publish holds the lock: a collection still loading
+    // publishes nothing after this.
     let _reload_guard = server_state.reload_lock.lock().await;
-    server_state.startup.stop_publishing();
     // The engines holding push-fed state (WIS2 CAP and BUFR) flush a state
     // snapshot in `shutdown()`: a blocking encode and save each, under
     // their own key through their own writer, sharing nothing but the

@@ -37,6 +37,18 @@ groups:
           summary: "{{ $value }} collection(s) failed on {{ $labels.instance }}"
           description: "Collections failed to load or lost their source. /health names them and their errors."
 
+      # The server serves from boot and builds its collections behind it
+      # (#317): a source that keeps a collection loading for 15 minutes is
+      # stuck. Before, such a boot answered nothing and fired MeteoCoreDown.
+      - alert: CollectionsLoading
+        expr: collections_loading{job="meteocore"} > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} collection(s) still loading on {{ $labels.instance }}"
+          description: "Collections have not finished loading 15 minutes after start: their source is slow or unreachable. /health lists them as loading."
+
   - name: meteocore.freshness
     rules:
       # The data age is now minus the newest data a collection serves; the

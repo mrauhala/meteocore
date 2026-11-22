@@ -8170,6 +8170,12 @@ data_path = "/missing/weather.csv"
 pub(crate) async fn radar_recovery_loop(state: AdminState) {
     let mut delay = std::time::Duration::from_secs(30);
     while state.recovery_shutdown.sleep(delay).await {
+        // A pass registers the whole accepted config again: while the
+        // startup load runs it would build its unpublished collections a
+        // second time (#317).
+        if state.startup.is_loading() {
+            continue;
+        }
         let Ok(_guard) = state.reload_lock.try_lock() else {
             continue;
         };
@@ -8886,6 +8892,29 @@ impl LoadResult {
         .collect()
     }
 
+    /// Drop every engine this load built, with what would run or reuse them:
+    /// a startup load whose every id another collection took (#317).
+    fn drop_engines(&mut self) {
+        self.geotiff_engines.clear();
+        self.querydata_engines.clear();
+        self.grib_engines.clear();
+        self.zarr_engines.clear();
+        self.satellite_engines.clear();
+        self.netcdf_engines.clear();
+        self.netcdf_parameters.clear();
+        self.odim_engines.clear();
+        self.odim_volume_engines.clear();
+        self.pvol_sites.clear();
+        self.cap_engines.clear();
+        self.bufr_engines.clear();
+        self.postgis_engines.clear();
+        self.nowcast_engines.clear();
+        self.station_grid_engines.clear();
+        self.period_engines.clear();
+        self.engines_by_id.clear();
+        self.wind_by_id.clear();
+    }
+
     /// Take `ids` out of every registry of this load, their layers' styles
     /// (`{id}` and `{id}/{parameter}`) included: a startup load whose
     /// collection id another load registered first (#317).
@@ -8988,15 +9017,19 @@ pub(crate) fn load_for_startup(
 /// collections other loads published stay.
 ///
 /// A registered id another load published first (a radar site
-/// `{base}-{nod}` named like a configured collection) keeps its first
-/// owner, as one load keeps the first collection to register an id: it is
-/// dropped from `part` and its health entry fails.
+/// `{base}-{nod}` and a collection named so) keeps that owner, which the
+/// startup load makes the one one load registers first
+/// ([`crate::startup::dependencies`]): it is dropped from `part` and its
+/// health entry fails. A load every registered id of which collided serves
+/// nothing: its engines are dropped, no poll loop runs for them. What is
+/// published joins `built`, for the derived collections loaded later.
 ///
-/// The caller serializes publishes ([`crate::startup::StartupLoad`]).
+/// The caller serializes publishes under `reload_lock`.
 pub(crate) fn publish_load(
     state: &ServerState,
     configured: &CollectionConfig,
     mut part: LoadResult,
+    built: &mut BuiltSources,
 ) {
     // A startup load reuses nothing, so neither is staged; applied as a
     // reload applies them should that change.
@@ -9011,22 +9044,40 @@ pub(crate) fn publish_load(
             .cloned()
             .collect()
     };
-    let collides: HashSet<String> = part
-        .registered_ids()
-        .into_iter()
-        .filter(|id| taken.contains(id))
+    let registered = part.registered_ids();
+    let collides: HashSet<String> = registered
+        .iter()
+        .filter(|id| taken.contains(*id))
+        .cloned()
         .collect();
+    let serves_nothing = !collides.is_empty() && collides.len() == registered.len();
     if !collides.is_empty() {
         tracing::error!(
-            "Collection '{}': {:?} already registered by another collection — skipping them",
+            "Collection '{}': {:?} already registered by another collection — skipping {}",
             configured.id,
-            collides
+            collides,
+            if serves_nothing {
+                "the collection"
+            } else {
+                "them"
+            }
         );
         part.drop_ids(&collides);
         for h in part.health.iter_mut().filter(|h| collides.contains(&h.id)) {
             h.status = CollectionStatus::Failed;
-            h.error = Some("id collides with an already-registered collection".into());
+            // One load's words for a radar site whose id was taken first.
+            h.error = Some(if h.id == configured.id {
+                "id collides with an already-registered collection".into()
+            } else {
+                "derived id collides with an already-registered collection".into()
+            });
         }
+    }
+    if serves_nothing {
+        // Nothing of it is served: no engine, poll loop or reuse entry.
+        part.drop_engines();
+    } else {
+        built.add(configured, &part);
     }
 
     // Engines first: their poll loops run from now on.
@@ -9199,7 +9250,12 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             .iter()
             .filter_map(|e| Some((e.collection_id(), e.live_health()?)))
             .collect();
-        for h in health.iter_mut().filter(|h| h.engine_type == "postgis") {
+        // A `loading` entry stays the startup load's until it publishes the
+        // collection's own (#317): the engine is listed a moment before.
+        for h in health
+            .iter_mut()
+            .filter(|h| h.engine_type == "postgis" && h.status != CollectionStatus::Loading)
+        {
             if let Some(&s) = live.get(h.id.as_str()) {
                 apply_postgis_live_health(h, s);
             }
@@ -9254,7 +9310,7 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             matches!(
                 h.engine_type.as_str(),
                 "cap" | "bufr" | "satellite" | "netcdf"
-            )
+            ) && h.status != CollectionStatus::Loading
         }) {
             match live.get(h.id.as_str()) {
                 Some(ds_core::health::LiveStatus::Ready) => {
@@ -9281,7 +9337,10 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             .iter()
             .map(|e| (e.collection_id(), e.has_data()))
             .collect();
-        for h in health.iter_mut().filter(|h| h.engine_type == "nowcast") {
+        for h in health
+            .iter_mut()
+            .filter(|h| h.engine_type == "nowcast" && h.status != CollectionStatus::Loading)
+        {
             if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
                 h.status = CollectionStatus::Ready;
                 h.error = None;
@@ -9307,7 +9366,7 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             .collect();
         for h in health
             .iter_mut()
-            .filter(|h| h.engine_type == "station-grid")
+            .filter(|h| h.engine_type == "station-grid" && h.status != CollectionStatus::Loading)
         {
             if has_data.get(h.id.as_str()).copied().unwrap_or(false) {
                 h.status = CollectionStatus::Ready;
@@ -9329,7 +9388,10 @@ pub(crate) fn effective_health(state: &ServerState) -> Vec<CollectionHealth> {
             .iter()
             .map(|e| (e.collection_id(), (e.has_data(), e.waiting_for())))
             .collect();
-        for h in health.iter_mut().filter(|h| h.engine_type == "period") {
+        for h in health
+            .iter_mut()
+            .filter(|h| h.engine_type == "period" && h.status != CollectionStatus::Loading)
+        {
             if let Some((has_data, waiting)) = live.get(h.id.as_str()) {
                 h.status = if *has_data {
                     CollectionStatus::Ready
@@ -9774,17 +9836,19 @@ fn refresh_data_age_gauge_locked(
 /// `GET /health` parameters. Others are ignored, as they always were.
 #[derive(Debug, Default, serde::Deserialize)]
 pub struct HealthQuery {
-    /// `loaded` (`loaded=true`): answer 503 while any collection is still
-    /// loading (#317), a readiness check for a client that should wait for
-    /// every collection. `loaded=false` is the plain check.
+    /// `loaded` (`loaded=true`), the readiness check (#317): answer 503
+    /// while collections are still loading, until the startup load's
+    /// readiness grace (`[server] startup_readiness_grace_secs`) has
+    /// passed. `loaded=false` is the plain check.
     loaded: Option<String>,
 }
 
 /// GET /health — per-collection health status with data staleness info.
 ///
 /// 200 while collections load (#317), so a container health check passes
-/// from the first request; 503 once every collection failed, and with
-/// `loaded` while any collection is loading.
+/// from the first request; 503 once every collection failed. With `loaded`,
+/// also 503 while collections load within the readiness grace, the body's
+/// `loaded` saying why it answers as it does.
 pub async fn health_handler(
     State(state): State<AdminState>,
     api_common::JsonQuery(query): api_common::JsonQuery<HealthQuery>,
@@ -10025,20 +10089,29 @@ pub async fn health_handler(
 
     // Only return 503 when the server can't serve anything at all, or
     // when asked to wait for the startup load.
-    let status_code = if all_failed || (wait_for_load && loading) {
+    let still_loading = health
+        .iter()
+        .filter(|h| h.status == CollectionStatus::Loading)
+        .count();
+    let grace_elapsed = state.startup.grace_elapsed();
+    let status_code = if all_failed || (wait_for_load && loading && !grace_elapsed) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
     };
 
-    (
-        status_code,
-        Json(json!({
-            "status": overall,
-            "collections": collections
-        })),
-    )
-        .into_response()
+    let mut body = json!({
+        "status": overall,
+        "collections": collections
+    });
+    if wait_for_load {
+        body["loaded"] = json!(match (loading, grace_elapsed) {
+            (false, _) => "settled".to_string(),
+            (true, true) => format!("grace elapsed, {still_loading} still loading"),
+            (true, false) => format!("{still_loading} still loading"),
+        });
+    }
+    (status_code, Json(body)).into_response()
 }
 
 /// GET /metrics — Prometheus text format.
@@ -10962,6 +11035,38 @@ fn panic_response(payload: Box<dyn std::any::Any + Send + 'static>) -> axum::res
         Json(json!({"code": "ServerError", "description": "Internal server error"})),
     )
     .into_response()
+}
+
+/// `Cache-Control` while the startup load runs (#317): the catalog grows
+/// as collections are built, so a 200 or 304 that carries the short
+/// metadata policy (`public, max-age=60`, the one `conditional_get` gives
+/// collection lists, landing pages and collection documents) or none (WMS
+/// GetCapabilities, the per-API Maps and Tiles documents) carries
+/// `no-cache` instead: no browser or shared cache holds a partial list past
+/// the next request, and an ETag still answers it with a 304. Data answers
+/// keep their own policies. Once the load settles, nothing changes.
+pub async fn loading_cache_control(
+    State(state): State<AdminState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    if !state.startup.is_loading()
+        || !matches!(response.status(), StatusCode::OK | StatusCode::NOT_MODIFIED)
+    {
+        return response;
+    }
+    let short = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .is_none_or(|value| value == ds_core::http_cache::CACHE_CONTROL_SHORT);
+    if short {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+    }
+    response
 }
 
 /// Middleware that records HTTP request metrics.

@@ -4499,3 +4499,35 @@ fn a_returning_cache_does_not_also_reclaim() {
         .collect();
     assert_eq!(kinds, [(MoveKind::Return, "pool")]);
 }
+
+/// #317: while the startup load runs the governor steps, its valve
+/// sampling, since the load holds no lock between its publishes, but fits
+/// no plan over a part of the collections; once the load settles, the
+/// first step fits it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_governor_samples_but_does_not_replan_while_collections_load() {
+    if !in_child("governor::tests::the_governor_samples_but_does_not_replan_while_collections_load")
+    {
+        return;
+    }
+    let fixture = Fixture::new(AUTO);
+    let state = crate::watcher::tests::build_state_at(&fixture.path, true);
+    let now = Instant::now();
+    assert_eq!(
+        step(&state, now),
+        Step::Ran {
+            sampled: true,
+            relieved: false,
+            replanned: false,
+        }
+    );
+    state.startup.settle();
+    assert_eq!(
+        step(&state, now),
+        Step::Ran {
+            sampled: true,
+            relieved: false,
+            replanned: true,
+        }
+    );
+}

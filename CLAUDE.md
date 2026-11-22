@@ -1805,7 +1805,8 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   status. The server serves from boot and publishes each collection once
   built (#317, `crates/server/CLAUDE.md` "Startup load"): 200 while
   collections load, 503 only once none is loading and all failed;
-  `/health?loaded` is 503 until every collection is built.
+  `/health?loaded`, the readiness check, is 503 while collections load,
+  within `[server] startup_readiness_grace_secs`.
   `data_age_secs` (and the `collection_data_age_seconds` gauge) is now
   minus the newest data a collection serves, never the time since its last
   poll (#1007); see
