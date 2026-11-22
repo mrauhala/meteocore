@@ -44,7 +44,6 @@ use ds_core::resample::ProjectionGrid;
 use ds_poll::{FirstTick, Shutdown};
 use ds_storage::discovery::TimeWindow;
 use ds_storage::object_store::path::Path as ObjectPath;
-use ds_storage::FetchBudget;
 
 pub use cache::{
     frame_metrics, frame_reingests, resize_frame_cache, resize_strip_cache, strip_metrics,
@@ -650,7 +649,7 @@ impl SatelliteEngine {
         };
         // The request budget: a request for this scan waits on the fill
         // claimed above, so a stalled download must not hold it longer.
-        match self.open(index, &held.paths, FetchBudget::Request) {
+        match self.open(index, &held.paths, source::Reader::Request) {
             Ok(frame) => {
                 let _ = guard.insert(Arc::new(frame));
                 cache::count_reingest();
@@ -698,17 +697,18 @@ impl SatelliteEngine {
     ) -> Result<Arc<Frame>, DataServerError> {
         // A new scan is not in the published catalog yet, so no request
         // waits on this download.
-        let frame = Arc::new(self.open(index, scan, FetchBudget::Background)?);
+        let frame = Arc::new(self.open(index, scan, source::Reader::Ingest)?);
         FRAMES.insert(self.frame_key(index, time), frame.clone());
         Ok(frame)
     }
 
-    /// Download a scan's files, each limited to `budget`, and parse them.
+    /// Download a scan's files for `reader` ([`source::Source::fetch`]) and
+    /// parse them.
     fn open(
         &self,
         index: usize,
         scan: &Scan,
-        budget: FetchBudget,
+        reader: source::Reader,
     ) -> Result<Frame, DataServerError> {
         let product = &self.products[index];
         let options = FrameOptions {
@@ -716,7 +716,7 @@ impl SatelliteEngine {
             variable: &product.variable,
             valid_fallback: product.valid_fallback,
         };
-        Frame::open(self.source.fetch(scan, budget)?, options).map_err(DataServerError::Engine)
+        Frame::open(self.source.fetch(scan, reader)?, options).map_err(DataServerError::Engine)
     }
 
     fn frame_key(&self, index: usize, time: DateTime<Utc>) -> FrameKey {
@@ -924,7 +924,10 @@ impl SatelliteEngine {
         FRAMES.get_or_insert_with_until(
             &self.frame_key(index, time),
             ds_core::deadline::current(),
-            || self.open(index, scan, FetchBudget::Request).map(Arc::new),
+            || {
+                self.open(index, scan, source::Reader::Request)
+                    .map(Arc::new)
+            },
             || DataServerError::DeadlineExceeded,
         )
     }

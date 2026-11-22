@@ -273,6 +273,9 @@ struct GribSource {
     /// Whether the catalog's newest run is still publishing, by the
     /// engine's own clock (#1562): it is kept on top of `max_runs` then.
     publication: Mutex<publication::Publication>,
+    /// The index files the last scan left unread because its source backed
+    /// off (#1530): a run listing one is still publishing until it is read.
+    deferred_indexes: Mutex<HashSet<String>>,
     /// Which index file format this collection uses.
     index_format: index::IndexFormat,
     /// Parameter metadata keyed by short name AND level identity. Populated
@@ -694,6 +697,7 @@ impl GribEngine {
                 settled_prefixes: Mutex::new(HashSet::new()),
                 last_full_scan: Mutex::new(None),
                 publication: Mutex::default(),
+                deferred_indexes: Mutex::default(),
                 index_format,
                 param_meta: RwLock::new(ParamMetadataCache::default()),
                 probe_cursor: Mutex::new(None),
@@ -751,6 +755,10 @@ impl GribEngine {
     }
 
     fn scan_at(&self, now: DateTime<Utc>) -> Result<(), DataServerError> {
+        // A scan's LISTs and index reads are background work (#1530): no
+        // request waits on them, so they hold at most half a bucket's
+        // permits and leave requests room.
+        let scan_store = self.source.store.clone().for_background();
         let index_suffix = self
             .source
             .config
@@ -801,7 +809,8 @@ impl GribEngine {
         // Collect all index files across all prefixes, iterating newest-first
         // and stopping once we have collected enough runs to satisfy
         // `max_runs`.
-        let mut all_index_paths: Vec<ds_storage::object_store::path::Path> = Vec::new();
+        // Each with the rank of its run prefix, newest first.
+        let mut all_index_paths: Vec<(usize, ds_storage::object_store::path::Path)> = Vec::new();
         // The newest run prefix's index files as listed (#1562).
         let mut newest_listed: Option<HashMap<String, publication::Version>> = None;
         let mut runs_with_hits = 0usize;
@@ -828,7 +837,7 @@ impl GribEngine {
             .is_none_or(|t| t.elapsed() >= SETTLED_REVALIDATE_INTERVAL);
         let settled_snapshot = self.source.settled_prefixes.lock().unwrap().clone();
         let mut listed_with_hits: Vec<String> = Vec::new();
-        for RunPrefix { prefix, .. } in &prefixes {
+        for (rank, RunPrefix { prefix, .. }) in prefixes.iter().enumerate() {
             if let Some(budget) = scan_budget {
                 if runs_with_hits >= budget {
                     break;
@@ -842,7 +851,7 @@ impl GribEngine {
             let obj_prefix = ds_storage::object_store::path::Path::from(prefix.as_str());
             let mut hits_in_this_prefix = 0usize;
             let mut versions = HashMap::new();
-            match self.source.store.list(&obj_prefix) {
+            match scan_store.list(&obj_prefix) {
                 Ok(objects) => {
                     for obj in objects {
                         let loc = obj.location.as_ref();
@@ -865,7 +874,7 @@ impl GribEngine {
                         if listed_with_hits.is_empty() {
                             versions.insert(loc.to_owned(), (obj.size, obj.last_modified));
                         }
-                        all_index_paths.push(obj.location);
+                        all_index_paths.push((rank, obj.location));
                         hits_in_this_prefix += 1;
                     }
                 }
@@ -889,15 +898,17 @@ impl GribEngine {
         }
 
         // Settle every run we listed with hits except the newest (first in the
-        // newest-first iteration order), which may still be gaining steps.
+        // newest-first iteration order), which may still be gaining steps,
+        // and any whose indexes this scan left unread for a source that kept
+        // refusing reads (#1530): the next poll lists it again and reads them.
         // Prune the settled set to the current scan window so it cannot grow
         // unbounded as old runs age out (and so a prefix that ever reappears is
         // rescanned).
-        {
+        let settle = |unread: &[ds_storage::object_store::path::Path]| {
             let window: HashSet<&str> = prefixes.iter().map(|run| run.prefix.as_str()).collect();
             let mut settled = self.source.settled_prefixes.lock().unwrap();
-            settle_completed_runs(&mut settled, &listed_with_hits, &window);
-        }
+            settle_completed_runs(&mut settled, &listed_with_hits, &window, unread);
+        };
 
         // Reset the re-validation clock after a forced full pass. The clock
         // only *paces* a best-effort hourly re-list of settled runs to catch
@@ -929,16 +940,27 @@ impl GribEngine {
             );
         }
 
-        // Filter to only new index files (not seen before)
+        // Filter to only new index files (not seen before), the newest
+        // run's first and each run's in step order (#1530): a scan the
+        // source stops leaves the oldest unread, not the newest. Runs are
+        // known by their prefix here; a fixed-prefix source, local or a
+        // remote `data_path`, has one, so its indexes go in path order
+        // only: it is static data, whose runs are all there at once.
         let mut new_paths: Vec<_> = {
             let known = self.source.known_indexes.lock().unwrap();
             all_index_paths
                 .iter()
-                .filter(|p| !known.contains(p.as_ref()))
+                .filter(|(_, p)| !known.contains(p.as_ref()))
                 .cloned()
                 .collect()
         };
-        new_paths.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        new_paths.sort_by(|(a_run, a), (b_run, b)| {
+            a_run
+                .cmp(b_run)
+                .then_with(|| natural_order(a.as_ref(), b.as_ref()))
+        });
+        let new_paths: Vec<ds_storage::object_store::path::Path> =
+            new_paths.into_iter().map(|(_, path)| path).collect();
 
         if new_paths.is_empty() {
             tracing::debug!(
@@ -961,7 +983,11 @@ impl GribEngine {
                 catalog.runs.len() > max_runs.saturating_add(usize::from(publishing))
             });
             if self.source.time_window.is_none() && !over_max_runs {
+                settle(&[]);
                 self.probe_new_parameters();
+                // A pre-warm paused while the source backed off resumes
+                // (#1530).
+                self.resume_prewarm();
                 return Ok(());
             }
         }
@@ -982,15 +1008,26 @@ impl GribEngine {
 
         // Fetch one bounded chunk at a time: get_many retains the completed
         // bodies until it returns. Results are in input order, preserving the
-        // sorted merge order even when downloads finish out of order.
+        // sorted merge order even when downloads finish out of order. The
+        // reads in flight are the source's: an S3 bucket's request limit,
+        // which its `SlowDown`s cut, bounds them below the chunk (#1530).
+        // Once a chunk's own read failed, a timeout included, while the
+        // source backs off, the scan reads no more: a bucket refusing GETs
+        // refuses the next chunk too, and each read would spend its retries
+        // on it. The collection keeps what it has; the chunk's failed
+        // indexes and the rest are unread, so their runs stay unsettled and
+        // the next poll reads them.
+        let mut refused = false;
+        let mut unread: Vec<ds_storage::object_store::path::Path> = Vec::new();
         for chunk in new_paths.chunks(INDEX_FETCH_CONCURRENCY) {
+            if refused {
+                unread.extend_from_slice(chunk);
+                continue;
+            }
+            let mut failed: Vec<ds_storage::object_store::path::Path> = Vec::new();
             // No HEAD per sidecar: the indexes are already listed and only
             // their contents are needed. Each GET keeps its own timeout.
-            let results = match self
-                .source
-                .store
-                .get_many(chunk, INDEX_FETCH_CONCURRENCY, None)
-            {
+            let results = match scan_store.get_many(chunk, INDEX_FETCH_CONCURRENCY, None) {
                 Ok(results) => results,
                 Err(e) => {
                     tracing::warn!(
@@ -998,13 +1035,15 @@ impl GribEngine {
                         self.collection_id,
                         e
                     );
-                    continue;
+                    failed.extend_from_slice(chunk);
+                    Vec::new()
                 }
             };
             for (path, result) in chunk.iter().zip(results) {
                 let bytes = match result {
                     Ok(b) => b,
                     Err(e) => {
+                        failed.push(path.clone());
                         tracing::warn!(
                             "Collection '{}': failed to read index file {}: {}",
                             self.collection_id,
@@ -1085,7 +1124,23 @@ impl GribEngine {
                     .unwrap()
                     .insert(path.as_ref().to_string());
             }
+            refused = !failed.is_empty() && self.source_backing_off();
+            if refused {
+                unread.extend(failed);
+            }
         }
+        if !unread.is_empty() {
+            tracing::warn!(
+                "Collection '{}': its source throttles (503 SlowDown or 429) and \
+                 refused index reads; {} of {} new index files wait for the next poll",
+                self.collection_id,
+                unread.len(),
+                new_paths.len()
+            );
+        }
+        settle(&unread);
+        *self.source.deferred_indexes.lock().unwrap() =
+            unread.iter().map(|path| path.as_ref().to_owned()).collect();
 
         ambiguities.emit(&self.collection_id);
 
@@ -1194,12 +1249,16 @@ impl GribEngine {
             .contains(path.replace(index_suffix, data_suffix).as_str())
         };
         let known = self.source.known_indexes.lock().unwrap();
+        let deferred = self.source.deferred_indexes.lock().unwrap();
         self.source.publication.lock().unwrap().observe(
             now,
             newest.map(|run| run.reference_time),
             listed,
-            |path| known.contains(path),
-            in_newest,
+            publication::Reads {
+                read: |path: &str| known.contains(path),
+                deferred: |path: &str| deferred.contains(path),
+                in_newest,
+            },
         )
     }
 
@@ -1209,8 +1268,17 @@ impl GribEngine {
     ///
     /// Any failures are logged and swallowed — the probe is best-effort and
     /// the metadata cache will eventually fill in as real queries land on
-    /// the missing parameters anyway.
+    /// the missing parameters anyway. None while the source backs off
+    /// (#1530): a bucket refusing GETs would refuse the probes too, each
+    /// through its retries; a poll after the back-off probes them.
     fn probe_new_parameters(&self) {
+        if self.source_backing_off() {
+            tracing::debug!(
+                "Collection '{}': no metadata probes while the source backs off",
+                self.collection_id
+            );
+            return;
+        }
         let catalog = self.source.catalog.load_full();
         let catalogs: Vec<&Catalog> = if self.source.config.level_types.is_some() {
             catalog.families.values().map(AsRef::as_ref).collect()
@@ -1298,7 +1366,9 @@ impl GribEngine {
             .iter()
             .map(|(_, (file, entry))| (file.message_url(entry), *entry))
             .collect();
-        let results = metadata::read_batch(&self.source.store, &entries);
+        // Background work, as the scan's index reads are (#1530).
+        let store = self.source.store.clone().for_background();
+        let results = metadata::read_batch(&store, &entries);
         // Apply in cursor order, preserving deterministic metadata fallback
         // representatives even when the reads complete out of order.
         let mut changed = false;
@@ -2626,11 +2696,48 @@ fn settle_completed_runs(
     settled: &mut HashSet<String>,
     listed_with_hits_newest_first: &[String],
     window: &HashSet<&str>,
+    unread: &[ds_storage::object_store::path::Path],
 ) {
     for prefix in listed_with_hits_newest_first.iter().skip(1) {
+        let run = ds_storage::object_store::path::Path::from(prefix.as_str());
+        if unread.iter().any(|path| path.prefix_matches(&run)) {
+            continue;
+        }
         settled.insert(prefix.clone());
     }
     settled.retain(|p| window.contains(p.as_str()));
+}
+
+/// `a` against `b` with each run of digits compared as the number it is,
+/// so ECMWF's `-6h-` comes before `-12h-` and `-102h-` (#1530); equal
+/// numbers spelt apart (`06`, `6`) by their bytes.
+fn natural_order(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
+    let (mut x, mut y) = (a, b);
+    loop {
+        match (x.chars().next(), y.chars().next()) {
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(cx), Some(cy)) if cx.is_ascii_digit() && cy.is_ascii_digit() => {
+                let (nx, rx) = x.split_at(digits(x));
+                let (ny, ry) = y.split_at(digits(y));
+                let (nx, ny) = (nx.trim_start_matches('0'), ny.trim_start_matches('0'));
+                let order = nx.len().cmp(&ny.len()).then_with(|| nx.cmp(ny));
+                if order != Ordering::Equal {
+                    return order;
+                }
+                (x, y) = (rx, ry);
+            }
+            (Some(cx), Some(cy)) => {
+                if cx != cy {
+                    return cx.cmp(&cy);
+                }
+                (x, y) = (&x[cx.len_utf8()..], &y[cy.len_utf8()..]);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3440,7 +3547,12 @@ mod tests {
             "runN-1".to_string(),
             "runN-2".to_string(),
         ];
-        settle_completed_runs(&mut settled, &listed, &win(&["runN", "runN-1", "runN-2"]));
+        settle_completed_runs(
+            &mut settled,
+            &listed,
+            &win(&["runN", "runN-1", "runN-2"]),
+            &[],
+        );
         assert!(!settled.contains("runN"), "newest run must not be settled");
         assert!(settled.contains("runN-1"));
         assert!(settled.contains("runN-2"));
@@ -3459,6 +3571,7 @@ mod tests {
                 "runN-3".to_string(),
             ],
             &window,
+            &[],
         );
         assert_eq!(
             settled,
@@ -3466,7 +3579,7 @@ mod tests {
         );
 
         // Scan 2: nothing new; only the unsettled newest (N-1) was listed.
-        settle_completed_runs(&mut settled, &["runN-1".to_string()], &window);
+        settle_completed_runs(&mut settled, &["runN-1".to_string()], &window, &[]);
         assert!(
             !settled.contains("runN-1"),
             "newest still re-listed, not settled"
@@ -3479,6 +3592,7 @@ mod tests {
             &mut settled,
             &["runN".to_string(), "runN-1".to_string()],
             &window3,
+            &[],
         );
         assert!(
             !settled.contains("runN"),
@@ -3494,8 +3608,45 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        settle_completed_runs(&mut settled, &[], &win(&["runN", "runN-1"]));
+        settle_completed_runs(&mut settled, &[], &win(&["runN", "runN-1"]), &[]);
         assert_eq!(settled, ["runN-1"].iter().map(|s| s.to_string()).collect());
+    }
+
+    /// A run whose indexes a scan left unread, its source refusing reads
+    /// (#1530), is not settled: the next poll lists it again and reads them.
+    /// A run whose name only starts like its prefix is another run.
+    #[test]
+    fn settle_leaves_a_run_with_unread_indexes_to_the_next_poll() {
+        use ds_storage::object_store::path::Path;
+        let mut settled = HashSet::new();
+        let listed = [
+            "20261122/06z/".to_string(),
+            "20261122/00z/".to_string(),
+            "20261121/18z/".to_string(),
+            "20261121/1/".to_string(),
+        ];
+        let window = win(&[
+            "20261122/06z/",
+            "20261122/00z/",
+            "20261121/18z/",
+            "20261121/1/",
+        ]);
+        let unread = [Path::from(
+            "20261122/00z/ifs/0p25/oper/20261122000000-6h-oper-fc.index",
+        )];
+        settle_completed_runs(&mut settled, &listed, &window, &unread);
+        assert_eq!(
+            settled,
+            ["20261121/18z/", "20261121/1/"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
+        );
+        let unread = [Path::from("20261121/18z/a.index")];
+        let mut settled = HashSet::new();
+        settle_completed_runs(&mut settled, &listed, &window, &unread);
+        assert!(settled.contains("20261121/1/"), "{settled:?}");
+        assert!(!settled.contains("20261121/18z/"), "{settled:?}");
     }
 
     #[test]

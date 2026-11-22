@@ -16,7 +16,10 @@ per-host request limits for files read in place; every remote operation
 runs in a `storage{collection, store, path}` span, and an engine names its
 collection with `DataStore::for_collection(id)` where it builds the store,
 #1233; its `throttle` module is the one home for HTTP host back-off on
-429: `Retry-After` and the adaptive host limit, #1235; THREDDS catalog
+429: `Retry-After` and the adaptive host limit, #1235, and for an S3
+bucket's on `503 SlowDown` (`bucket.rs`, one throttle and limit per
+bucket for every store on it; `DataStore::back_off` tells an engine its
+source is backing off, #1530); THREDDS catalog
 discovery is `discovery::thredds`, #1170, and a generated HTTP document
 without `Content-Length`, such as a THREDDS catalog, is read with
 `DataStore::get_documents`, never a second client: object_store's GET fails
@@ -183,7 +186,11 @@ Violating these has caused production incidents. Never break them.
      120 s), so object_store's own retry of a stalled 30 s attempt can run.
      Anything a request can wait on, a single-flight cache fill included,
      keeps `FetchBudget::Request` (30 s or the render deadline). See
-     `crates/storage/README.md` (#1011). A new budgeted call gets a test over
+     `crates/storage/README.md` (#1011). The budget is not who waits: work
+     no request waits on (polls, scans, ingest, pre-warms) reads through
+     `DataStore::for_background()`, which holds at most half a limited
+     host's or a bucket's permits; a read a request waits on never does,
+     whatever its budget (engine-netcdf's detached fills, #1530). A new budgeted call gets a test over
      `ds_storage::test_util::{StalledBody, run_stalled}` (feature `test-util`,
      dev-dependencies only) that fails when its budget is swapped (#1055).
    - Never wait on a runtime worker for work that needs that runtime: a

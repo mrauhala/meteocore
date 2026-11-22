@@ -40,7 +40,10 @@
 //! - [`CONCURRENCY`] GETs in flight, shared with the pre-warm
 //!   ([`crate::prewarm::BackgroundGets`]): the bucket that answers 503
 //!   SlowDown to a third counts both;
-//! - at most [`MAX_QUEUED`] messages waiting.
+//! - at most [`MAX_QUEUED`] messages waiting;
+//! - nothing while the source backs off (#1530): no frame plans and a
+//!   queued fetch is dropped, so a bucket answering `503 SlowDown` gets no
+//!   speculative GETs; the maps read what they draw themselves.
 //!
 //! The fetches run on [`CONCURRENCY`] workers per source on the GRIB I/O
 //! runtime ([`runtime::spawn_background`]), each GET through that runtime's
@@ -412,7 +415,10 @@ impl GribEngine {
             catalog.carried_steps(run, parameters)
         };
         let view = self.view_id(run.reference_time, parameters, field);
+        // While the source backs off (#1530) no frame plans: the next one
+        // drawn after it has cleared does, the animation still seen.
         if !ahead.animating(view, step, carried.before(step))
+            || self.source_backing_off()
             || !ahead.plan_once(self.frame_id(run.reference_time, step, parameters, field.z))
         {
             return;
@@ -491,13 +497,14 @@ impl GribEngine {
 
     /// One message, fetched whole into the message cache once one of the
     /// source's background GETs is free; a short read is not admitted.
-    /// `None` without a fetch: resident, or another reader fills it.
+    /// `None` without a fetch: resident, another reader fills it, or the
+    /// source backs off (#1530), when a map reads it itself.
     fn read_ahead_message(&self, fetch: &Fetch) -> Result<Option<usize>, DataServerError> {
         let (Some(ahead), Some(cache)) = (&self.source.read_ahead, &self.source.message_cache)
         else {
             return Ok(None);
         };
-        if cache.is_resident(&fetch.key) {
+        if cache.is_resident(&fetch.key) || self.source_backing_off() {
             return Ok(None);
         }
         let Some(range) = message_range(&fetch.entry) else {
@@ -514,7 +521,12 @@ impl GribEngine {
         })?;
         let path = Path::from(fetch.url.as_str());
         let get = move || {
-            let bytes = self.background_fetch(&path, range, (&ahead.gets, &ahead.bytes));
+            let bytes = self.background_fetch(
+                &path,
+                range,
+                (&ahead.gets, &ahead.bytes),
+                crate::prewarm::Reader::ReadAhead,
+            );
             drop(permit);
             bytes
         };

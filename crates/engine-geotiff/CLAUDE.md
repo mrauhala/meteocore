@@ -731,4 +731,7 @@ object-store and direct HTTP range/body reads. All retries share one absolute
 end time; deadline errors stop retries and fail the request with 503 rather
 than becoming nodata gaps. Background scans have no render deadline. Their
 full-download fallback uses `FetchBudget::Background` (120 s), so
-object_store's retry of a stalled body gets to run (#1011).
+object_store's retry of a stalled body gets to run (#1011). The scan's
+header reads and downloads read through `store.for_background()`: no
+request waits on them, so they hold at most half a bucket's permits
+(#1530).

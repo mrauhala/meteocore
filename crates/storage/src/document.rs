@@ -90,8 +90,8 @@ fn generic(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> objec
 /// Why one attempt failed, and whether another may succeed.
 enum Failure {
     /// Another attempt may succeed. `throttled`: the host answered 429,
-    /// so the transport has already waited its retry delay, and the next
-    /// attempt waits its turn under the host's pace and `Retry-After`.
+    /// so the next attempt waits the host's retry delay from the refusal,
+    /// its `Retry-After` and its turn under the pace, in the transport.
     Retry {
         error: object_store::Error,
         throttled: bool,

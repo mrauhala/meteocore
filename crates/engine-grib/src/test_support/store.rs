@@ -33,6 +33,9 @@ pub struct TestStore {
     pub delay: Duration,
     pub delays: BTreeMap<String, Duration>,
     pub suffix: &'static str,
+    /// The bucket a throttled read reports its `SlowDown` to, as the last
+    /// attempt's answer would through a store's transport (#1530).
+    pub bucket: Option<ds_storage::test_util::ThrottledBucket>,
 }
 
 impl Default for TestStore {
@@ -47,6 +50,7 @@ impl Default for TestStore {
             delay: Duration::ZERO,
             delays: BTreeMap::new(),
             suffix: ".idx",
+            bucket: None,
         }
     }
 }
@@ -115,6 +119,9 @@ impl ObjectStore for TestStore {
                 source: std::io::Error::other("transient index failure").into(),
             })
         } else if throttled {
+            if let Some(bucket) = &self.bucket {
+                bucket.slow_down();
+            }
             // object_store's wording for the last answer, which ds-storage
             // reads the status from.
             Err(object_store::Error::Generic {

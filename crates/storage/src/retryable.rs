@@ -9,8 +9,9 @@
 //! (`throttle.rs`), and nothing else was.
 //!
 //! Every remote store this crate builds sends its requests through a
-//! [`Counted`] transport: an HTTP store's under its host's throttle, an S3
-//! store's through [`CountingConnector`], over object_store's own client.
+//! [`Counted`] transport under its host's throttle: an HTTP store's, and an
+//! S3 store's under its bucket's (`bucket.rs`), over object_store's own
+//! client.
 //! It sees the response to each attempt, object_store's retries and the
 //! document layer's included, and counts each retryable one under the
 //! collection the operation's `storage` span names, the `host[:port]` that
@@ -25,10 +26,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
-use object_store::client::{
-    HttpClient, HttpConnector, HttpError, HttpRequest, HttpResponse, HttpService, ReqwestConnector,
-};
-use object_store::ClientOptions;
+use object_store::client::{HttpClient, HttpError, HttpRequest, HttpResponse, HttpService};
 use reqwest::StatusCode;
 
 tokio::task_local! {
@@ -134,22 +132,10 @@ impl<S: HttpService> HttpService for Counted<S> {
     }
 }
 
-/// An S3 store's connector: object_store's own, its client built from the
-/// store's options as object_store builds it, with every request
-/// [`Counted`].
-#[derive(Debug, Default)]
-pub(crate) struct CountingConnector;
-
-impl HttpConnector for CountingConnector {
-    fn connect(&self, options: &ClientOptions) -> object_store::Result<HttpClient> {
-        let client = ReqwestConnector::default().connect(options)?;
-        Ok(HttpClient::new(Counted(Client(client))))
-    }
-}
-
-/// An object_store client as a transport.
+/// An object_store client as a transport: an S3 store's own, under its
+/// bucket's throttle (`bucket.rs`).
 #[derive(Debug)]
-struct Client(HttpClient);
+pub(crate) struct Client(pub HttpClient);
 
 #[async_trait::async_trait]
 impl HttpService for Client {
@@ -215,6 +201,7 @@ mod tests {
     async fn an_s3_slowdown_counts_for_the_collection_and_host() {
         let (server, host) = server_with("/bucket/object");
         fail_next(&server, &["503 Slow Down"]);
+        let _quick = crate::test_util::quick_bucket_backoff(&server.url, "bucket");
         let store = crate::s3_store_from_parts(&server.url, "bucket", QUICK_S3_RETRY)
             .unwrap()
             .for_collection("nwp-slowdown");

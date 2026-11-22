@@ -4,6 +4,7 @@
 //! supporting local filesystem, S3, and HTTP backends.
 
 mod admitted;
+mod bucket;
 pub mod discovery;
 mod document;
 mod error;
@@ -223,20 +224,38 @@ pub struct DataStore {
     bytes_read: Arc<AtomicU64>,
 }
 
-/// A remote store's store without the `storage` span, and what the span
-/// names.
+/// A remote store's store without the `storage` span, what the span
+/// names, and the throttle of its host or S3 bucket.
 struct Remote {
     /// [`DataStore::with_request_limit`] and [`DataStore::for_collection`]
     /// build on it, so a span never nests in another.
     base: Arc<dyn ObjectStore>,
     labels: traced::Labels,
+    /// `None` for a store built elsewhere ([`DataStore::remote`]).
+    throttle: Option<Arc<throttle::HostThrottle>>,
+}
+
+/// What a store's host, or an S3 store's bucket, has asked for with its
+/// throttling answers ([`DataStore::back_off`], #1530): 429 Too Many
+/// Requests from an HTTP host, `503 SlowDown` (or a 429) from a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostBackOff {
+    /// The throttling answers the host has given, to every store on it,
+    /// since the first was built: compare two readings to tell whether it
+    /// throttled in between.
+    pub throttled: u64,
+    /// Whether its requests are paced or paused now: from a throttling
+    /// answer until 30 s to 2 min of quiet have taken the pace off, and
+    /// while a `Retry-After` lasts. Background work that can wait, such as
+    /// a pre-warm, waits for this to clear.
+    pub backing_off: bool,
 }
 
 impl DataStore {
     /// A store whose operations run in no span of their own: a local or
     /// in-memory one, which never retries.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self::layered(store, None, Arc::new(AtomicU64::new(0)))
+        Self::layered(store, None, None, Arc::new(AtomicU64::new(0)))
     }
 
     /// A store reading a remote `source`, an HTTP server or an S3 bucket:
@@ -244,19 +263,33 @@ impl DataStore {
     /// `source` is what a log line shows, `host[:port]` of a server or
     /// `host[:port]/bucket` of a bucket, so it must carry no credentials
     /// or query string. Every `build_*` function of this crate that makes
-    /// a remote store labels it.
+    /// a remote store labels it. A store built elsewhere has no host
+    /// back-off of this crate's ([`Self::back_off`] is `None`).
     pub fn remote(store: Arc<dyn ObjectStore>, source: &str) -> Self {
+        Self::remote_throttled(store, source, None)
+    }
+
+    /// [`Self::remote`] of a store whose requests go through `throttle`,
+    /// its host's or its bucket's.
+    fn remote_throttled(
+        store: Arc<dyn ObjectStore>,
+        source: &str,
+        throttle: Option<Arc<throttle::HostThrottle>>,
+    ) -> Self {
         let labels = traced::Labels {
             store: source.into(),
             collection: None,
+            background: false,
         };
-        Self::layered(store, Some(labels), Arc::new(AtomicU64::new(0)))
+        Self::layered(store, Some(labels), throttle, Arc::new(AtomicU64::new(0)))
     }
 
-    /// `base`, inside the span `labels` name when there are any.
+    /// `base`, inside the span `labels` name when there are any, its host
+    /// backing off through `throttle`.
     fn layered(
         base: Arc<dyn ObjectStore>,
         labels: Option<traced::Labels>,
+        throttle: Option<Arc<throttle::HostThrottle>>,
         bytes_read: Arc<AtomicU64>,
     ) -> Self {
         let Some(labels) = labels else {
@@ -268,9 +301,30 @@ impl DataStore {
         };
         Self {
             inner: traced::layer(base.clone(), labels.clone()),
-            remote: Some(Arc::new(Remote { base, labels })),
+            remote: Some(Arc::new(Remote {
+                base,
+                labels,
+                throttle,
+            })),
             bytes_read,
         }
+    }
+
+    /// The throttle of this store's host or bucket, if it has one.
+    fn throttle(&self) -> Option<&Arc<throttle::HostThrottle>> {
+        self.remote.as_ref()?.throttle.as_ref()
+    }
+
+    /// What this store's host, or its S3 bucket, has asked for with its
+    /// throttling answers, shared by every store on it (#1530): `None` for
+    /// a local or in-memory store, or one built elsewhere. O(1): a counter
+    /// and the host's back-off state, no I/O.
+    pub fn back_off(&self) -> Option<HostBackOff> {
+        let throttle = self.throttle()?;
+        Some(HostBackOff {
+            throttled: throttle.answers(),
+            backing_off: throttle.backing_off(),
+        })
     }
 
     /// The store without the `storage` span.
@@ -298,8 +352,40 @@ impl DataStore {
         let labels = traced::Labels {
             store: remote.labels.store.clone(),
             collection: Some(id.into()),
+            background: remote.labels.background,
         };
-        Self::layered(remote.base.clone(), Some(labels), self.bytes_read.clone())
+        Self::layered(
+            remote.base.clone(),
+            Some(labels),
+            remote.throttle.clone(),
+            self.bytes_read.clone(),
+        )
+    }
+
+    /// This store, its reads background work (#1530): polls, scans, ingest
+    /// and pre-warms, which no request waits on. They may hold at most half
+    /// of a throttling host's or bucket's request limit, so requests always
+    /// have room; otherwise they wait their turn for permits and paced
+    /// sends as any read does. A read a request may wait on, such as a
+    /// fill a request started and left to finish, is no background work,
+    /// whatever its [`FetchBudget`]. The store, its limits, its collection
+    /// and its byte counter are kept; a local or in-memory store, which no
+    /// host limits, is returned as it is.
+    #[must_use]
+    pub fn for_background(self) -> DataStore {
+        let Some(remote) = &self.remote else {
+            return self;
+        };
+        let labels = traced::Labels {
+            background: true,
+            ..remote.labels.clone()
+        };
+        Self::layered(
+            remote.base.clone(),
+            Some(labels),
+            remote.throttle.clone(),
+            self.bytes_read.clone(),
+        )
     }
 
     /// Whether `self` and `other` read through one store, whatever
@@ -1399,7 +1485,12 @@ impl DataStore {
             max_requests.max(1),
         ));
         let labels = self.remote.as_ref().map(|remote| remote.labels.clone());
-        Self::layered(base, labels, self.bytes_read.clone())
+        Self::layered(
+            base,
+            labels,
+            self.throttle().cloned(),
+            self.bytes_read.clone(),
+        )
     }
 }
 
@@ -1605,13 +1696,18 @@ pub fn build_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServe
 /// (a 5xx, 429 Too Many Requests, 408, or a transport error, #1355).
 ///
 /// A public bucket answers `503 SlowDown` to a large share of GETs while a
-/// few are in flight (#1336). object_store's default back-off starts at
-/// 0.1 s, and its 10 retries gave up within 2.5–11 s. From 0.5 s, doubling
-/// with jitter up to 4 s, the 10 back-offs add up to about 13 s at the
-/// median and 24 s at the 95th percentile. A request's deadline still
-/// bounds its fetch (EDR's 30 s, past which the query answers its 504), and
-/// a read that outlasts every retry is [`StorageError::Unavailable`], each
-/// API's 503.
+/// few are in flight (#1336), and refuses every GET for minutes after a
+/// model run is published (#1530). object_store retries each request on
+/// its own: the back-off starts at 0.5 s, doubling with jitter up to 4 s,
+/// the same for every retryable answer (its retry policy has no per-status
+/// setting). 6 retries, 7 attempts, span 6 s at the median and 11 s at the
+/// 95th percentile, room for a 500, a 502 or 504 or a dropped connection
+/// to pass, where the 10 of 0.5–4 s took 13 s and 24 s. Against a bucket
+/// that throttles (`bucket.rs`) a retry also waits 2 s from the refusal
+/// and its turn under the bucket's pace: 9 s and 12 s, which leaves a
+/// request's 30 s budget room for the pace's turns, so a read that outlasts
+/// the retries is [`StorageError::Unavailable`], each API's 503 with
+/// `Retry-After`, rather than a timeout.
 ///
 /// `retry_timeout` is the background fetch budget: no fetch waits longer,
 /// and a first attempt that stalls until its 30 s timeout still leaves room
@@ -1623,7 +1719,7 @@ pub(crate) const S3_RETRY: object_store::RetryConfig = object_store::RetryConfig
         max_backoff: std::time::Duration::from_secs(4),
         base: 2.0,
     },
-    max_retries: 10,
+    max_retries: 6,
     retry_timeout: FetchBudget::Background.timeout(),
 };
 
@@ -1635,6 +1731,11 @@ pub(crate) const S3_RETRY: object_store::RetryConfig = object_store::RetryConfig
 ///
 /// Skips request signing (for public buckets). Add credential support later
 /// if needed.
+///
+/// Like every S3 store this crate builds, it is one of its bucket's
+/// (`bucket.rs`, #1530): every store on the bucket shares one request
+/// limit, and a `503 SlowDown` backs the bucket off as a 429 backs off an
+/// HTTP host ([`build_http_store_limited`]).
 pub fn build_s3_store_from_parts(
     endpoint: &str,
     bucket: &str,
@@ -1650,25 +1751,28 @@ fn s3_store_from_parts(
     retry: object_store::RetryConfig,
 ) -> Result<DataStore, DataServerError> {
     let allow_http = has_scheme(endpoint, "http://");
-
-    let store = object_store::aws::AmazonS3Builder::new()
+    let builder = object_store::aws::AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_region("auto")
         .with_endpoint(endpoint)
         .with_allow_http(allow_http)
         .with_skip_signature(true)
-        .with_retry(retry)
-        .with_http_connector(retryable::CountingConnector)
-        .build()
-        .map_err(|e| {
-            DataServerError::Storage(format!(
-                "Cannot create S3 store for endpoint={endpoint} bucket={bucket}: {e}"
-            ))
-        })?;
-
-    tracing::info!("S3 store: endpoint={endpoint}, bucket={bucket}");
+        .with_retry(retry);
     let source = traced::s3_label(Some(endpoint), None, bucket);
-    Ok(DataStore::remote(Arc::new(store), &source))
+    let path = bucket::endpoint_path(Some(endpoint));
+    let store = bucket::s3_store(&source, bucket, &path, |throttle| {
+        let store = builder
+            .with_http_connector(bucket::Connector(throttle.clone()))
+            .build()
+            .map_err(|e| {
+                DataServerError::Storage(format!(
+                    "Cannot create S3 store for endpoint={endpoint} bucket={bucket}: {e}"
+                ))
+            })?;
+        Ok(Arc::new(store))
+    })?;
+    tracing::info!("S3 store: endpoint={endpoint}, bucket={bucket}");
+    Ok(store)
 }
 
 /// Detect S3-style HTTP URLs like https://s3-eu-west-1.amazonaws.com/bucket/...
@@ -1711,24 +1815,32 @@ fn build_s3_store(data_path: &str) -> Result<(DataStore, ObjectPath), DataServer
 
     let builder = object_store::aws::AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
-        .with_retry(S3_RETRY)
-        .with_http_connector(retryable::CountingConnector);
+        .with_retry(S3_RETRY);
     // The endpoint and region object_store will use (`AWS_ENDPOINT_URL_S3`
-    // over `AWS_ENDPOINT`), for the span's label only.
+    // over `AWS_ENDPOINT`), for the span's label and the bucket's back-off.
     let config = |key| builder.get_config_value(&key);
+    let endpoint =
+        config(AmazonS3ConfigKey::S3Endpoint).or_else(|| config(AmazonS3ConfigKey::Endpoint));
     let source = traced::s3_label(
-        config(AmazonS3ConfigKey::S3Endpoint)
-            .or_else(|| config(AmazonS3ConfigKey::Endpoint))
-            .as_deref(),
+        endpoint.as_deref(),
         config(AmazonS3ConfigKey::Region).as_deref(),
         bucket,
     );
-    let store = builder.build().map_err(|e| {
-        DataServerError::Storage(format!("Cannot create S3 store for bucket '{bucket}': {e}"))
+    let path = bucket::endpoint_path(endpoint.as_deref());
+    let store = bucket::s3_store(&source, bucket, &path, |throttle| {
+        let store = builder
+            .with_http_connector(bucket::Connector(throttle.clone()))
+            .build()
+            .map_err(|e| {
+                DataServerError::Storage(format!(
+                    "Cannot create S3 store for bucket '{bucket}': {e}"
+                ))
+            })?;
+        Ok(Arc::new(store))
     })?;
 
     let prefix_path = ObjectPath::from(prefix.trim_end_matches('/'));
-    Ok((DataStore::remote(Arc::new(store), &source), prefix_path))
+    Ok((store, prefix_path))
 }
 
 /// Parse an S3 HTTP URL into bucket + prefix and build an S3 store.
@@ -1788,25 +1900,25 @@ fn build_s3_from_http_url(data_path: &str) -> Result<(DataStore, ObjectPath), Da
         region
     );
 
-    let mut builder = object_store::aws::AmazonS3Builder::new()
+    // For public buckets, skip signing
+    let builder = object_store::aws::AmazonS3Builder::new()
         .with_bucket_name(&bucket)
         .with_region(&region)
         .with_endpoint(&endpoint)
-        .with_allow_http(url.scheme() == "http");
-
-    // For public buckets, skip signing
-    builder = builder
+        .with_allow_http(url.scheme() == "http")
         .with_skip_signature(true)
-        .with_retry(S3_RETRY)
-        .with_http_connector(retryable::CountingConnector);
-
-    let store = builder
-        .build()
-        .map_err(|e| DataServerError::Storage(format!("Cannot create S3 store: {e}")))?;
+        .with_retry(S3_RETRY);
+    let source = traced::s3_label(Some(&endpoint), None, &bucket);
+    let store = bucket::s3_store(&source, &bucket, "", |throttle| {
+        let store = builder
+            .with_http_connector(bucket::Connector(throttle.clone()))
+            .build()
+            .map_err(|e| DataServerError::Storage(format!("Cannot create S3 store: {e}")))?;
+        Ok(Arc::new(store))
+    })?;
 
     let prefix_path = ObjectPath::from(prefix.trim_end_matches('/'));
-    let source = traced::s3_label(Some(&endpoint), None, &bucket);
-    Ok((DataStore::remote(Arc::new(store), &source), prefix_path))
+    Ok((store, prefix_path))
 }
 
 /// The generic HTTP backend must not follow an operator-trusted URL to an
@@ -1847,7 +1959,11 @@ fn http_store(
 ) -> Result<(DataStore, ObjectPath), DataServerError> {
     let (base_url, path) = http_base(data_path)?;
     let store = connect(&base_url)?;
-    Ok((DataStore::remote(store, &http_label(&base_url)), path))
+    let throttle = Some(throttle::for_url(&base_url));
+    Ok((
+        DataStore::remote_throttled(store, &http_label(&base_url), throttle),
+        path,
+    ))
 }
 
 /// A host store [`build_http_store_limited`] built: its configured limit,
@@ -1919,6 +2035,7 @@ fn limited_http_store(
             let adaptive = Arc::new(throttle::AdaptiveLimit::new(
                 http_label(&base_url),
                 max_requests,
+                &throttle::Kind::Http,
             ));
             let throttle = throttle::for_url(&base_url);
             throttle.add_limit(adaptive.clone());
@@ -1947,7 +2064,9 @@ fn limited_http_store(
             host.limit
         );
     }
-    Ok((DataStore::remote(host.store, &http_label(&base_url)), path))
+    let store =
+        DataStore::remote_throttled(host.store, &http_label(&base_url), Some(host.throttle));
+    Ok((store, path))
 }
 
 /// The requests in flight and waiting under each limit
@@ -1955,8 +2074,11 @@ fn limited_http_store(
 /// configured one, or less while the host backs off from a 429 (#1235),
 /// and the 429s the host has answered (#1290). One entry per host and
 /// port: the bases of one host that differ in their query strings are
-/// summed, their 429s counted once. One entry per configured host, so a
-/// bounded label set for `/metrics`.
+/// summed, their 429s counted once. And one per S3 bucket a store was
+/// built for (#1530), labelled `host[:port]/bucket`, its limit
+/// [`bucket::S3_REQUEST_LIMIT`] until it throttles, its `throttled` the
+/// bucket's `503 SlowDown`s and 429s. One entry per configured host or
+/// bucket, so a bounded label set for `/metrics`.
 pub fn host_requests() -> Vec<HostRequests> {
     requests_to(|_| true)
 }
@@ -2002,6 +2124,8 @@ fn requests_to(wanted: impl Fn(&str) -> bool) -> Vec<HostRequests> {
             counted.push((label, host.throttle.clone()));
         }
     }
+    drop(hosts);
+    bucket::requests_to(&wanted, &mut by_host);
     by_host.into_values().collect()
 }
 
@@ -2709,7 +2833,8 @@ mod budget_tests {
         );
         assert_eq!(FetchBudget::Request.timeout(), Duration::from_secs(30));
         // S3's longer back-off (#1355) keeps that room: object_store retries
-        // for as long as the background budget runs.
+        // for as long as the background budget runs. Six retries: a
+        // throttling bucket's back-off waits between them too (#1530).
         let s3 = &S3_RETRY.backoff;
         assert_eq!(
             (
@@ -2718,7 +2843,7 @@ mod budget_tests {
                 s3.base,
                 S3_RETRY.max_retries
             ),
-            (Duration::from_millis(500), Duration::from_secs(4), 2.0, 10)
+            (Duration::from_millis(500), Duration::from_secs(4), 2.0, 6)
         );
         assert_eq!(S3_RETRY.retry_timeout, FetchBudget::Background.timeout());
         assert!(S3_RETRY.retry_timeout >= 2 * DataStore::ATTEMPT_TIMEOUT + s3.init_backoff);

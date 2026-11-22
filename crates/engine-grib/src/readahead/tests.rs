@@ -108,6 +108,19 @@ fn served(
     depth: usize,
     store: TestStore,
 ) -> (GribEngine, GribEngine, Arc<TestStore>) {
+    served_in(source, message_mb, grid_mb, depth, store, None)
+}
+
+/// [`served`], `store` read from `bucket` when one is given, whose
+/// back-off it reports (#1530).
+fn served_in(
+    source: &TestSource,
+    message_mb: u64,
+    grid_mb: u64,
+    depth: usize,
+    store: TestStore,
+    bucket: Option<&ds_storage::test_util::ThrottledBucket>,
+) -> (GribEngine, GribEngine, Arc<TestStore>) {
     let mut config = source.config();
     config.message_cache_mb = Some(ds_core::config::CacheSize::Mib(message_mb));
     config.grid_cache_mb = Some(ds_core::config::CacheSize::Mib(grid_mb));
@@ -121,7 +134,11 @@ fn served(
         ..store
     });
     publish(source, &store);
-    Arc::get_mut(&mut owner.source).unwrap().store = DataStore::new(store.clone());
+    let reads: Arc<dyn ds_storage::object_store::ObjectStore> = store.clone();
+    Arc::get_mut(&mut owner.source).unwrap().store = match bucket {
+        Some(bucket) => bucket.store(reads),
+        None => DataStore::new(reads),
+    };
     let view = owner.level_collections().remove(0);
     (owner, view, store)
 }
@@ -956,4 +973,25 @@ fn abandoned_fills_stop_holding_the_room_after_a_while() {
     assert_eq!(reads(&store), expected);
     let unread = (2..7).filter(|&s| cache(&owner).is_resident(&key_of(&view, s, "q")));
     assert_eq!(unread.count(), 5, "the abandoned fills stay cached");
+}
+
+/// While the source's bucket backs off (#1530) an animation reads nothing
+/// ahead: each frame reads its own message, and none is read in the
+/// background. Once the back-off has cleared, the next frames read ahead
+/// again, the animation still seen.
+#[test]
+fn an_animation_reads_nothing_ahead_while_its_bucket_backs_off() {
+    let source = TestSource::new();
+    write_q(&source, "", RUN, 0..8);
+    let bucket = ds_storage::test_util::ThrottledBucket::new("s3.test/forecasts");
+    let (owner, view, store) = served_in(&source, 64, 0, 3, TestStore::default(), Some(&bucket));
+    reads(&store);
+    bucket.slow_down();
+    animate(&owner, &view, 0..4, "q");
+    assert_eq!(reads(&store), expected(&[0, 1, 2, 3], 0..0, len()));
+    assert_eq!(owner.read_ahead_counts().0, 0);
+
+    bucket.quiet();
+    animate(&owner, &view, 4..6, "q");
+    assert_eq!(reads(&store), expected(&[4], 5..8, len()));
 }
