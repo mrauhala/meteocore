@@ -27,8 +27,9 @@ unlike GeoTIFF's one band per collection.
   `ds_storage::discovery::expand_run_prefixes` (#817), never a local copy:
   every run of today and yesterday (`SCAN_DAYS`) up to now, each day's
   strftime date formatted and each `run_hours` hour substituted into `{run}`
-  as two digits. Runs come newest first: the `max_runs` early stop and
-  `settle_completed_runs` depend on that order. A pattern without `{run}` is
+  as two digits. Runs come newest first: the `max_runs` early stop,
+  `settle_completed_runs` and the newest run's publishing grace (#1562,
+  "Model runs" below) depend on that order. A pattern without `{run}` is
   one prefix per day. A prefix repeated across runs (no day specifier) is
   listed once; a second copy would settle the newest run.
   `validate_run_prefix_pattern` runs at load: no `%H` (the run hour is
@@ -201,6 +202,42 @@ pins do not fall back. No requested datetime selects the latest run, among
 those with every named parameter first (#1026); an area, radius or cube
 then reads its last step carrying them all (`grid_steps`), else its last
 step.
+
+`max_runs` counts the runs that have finished publishing (#1562). The
+catalog's newest run is kept on top of them while it publishes
+(`Catalog::evict(max_runs, publishing)`), so its first steps add to the
+horizon instead of evicting the run that covers it. `publication.rs`
+tracks only that run, so the runs kept are always the newest
+`max_runs + 1`: back-to-back publication (hourly runs) keeps the run just
+below the newest throughout, never an older one. The grace runs on the
+engine's clock, never the store's: a run publishes from when the catalog
+first holds it until no scan has seen a new or rewritten index of it for
+`PUBLISHING_GRACE` (`ds_storage::discovery::DEFAULT_RUN_GRACE`, 30 min).
+A listed size and last-modified time only tell a rewritten file from its
+earlier listing. Of the first run prefix with files, newest first (a
+fixed-prefix source's one prefix), a file counts unless it was read into
+an older run, and one not read yet (failed or deferred) counts when first
+seen. Every listed file's version is remembered, read or not, for two
+days after it was last listed (`UNREAD_MEMORY`, the prefixes a scan
+lists), so an index that is never readable (not UTF-8, rejected by the
+parser, a GET that keeps failing) is new once, not after every listing
+that misses it. A failed or empty listing neither restarts nor ends the
+grace. A sync that rewrites every file on each pass (`rsync -r` without
+`-t`, a `cp` cron job) never lets the newest run finish: the collection
+keeps one extra run for good, always the one just below the newest. Keep
+modification times (`rsync -t` or `-a`) or move finished files into
+place by rename. Once judged
+finished a run stays finished until a newer run is catalogued: a rewrite
+or a stalled run's late step neither keeps an extra run again nor has the
+hourly re-list read back an evicted one. While it publishes, or on a
+restart (an empty catalog, which cannot tell), the scan lists one more run
+prefix, so a restart during publication finds the run being replaced; a
+restart afterwards reads one more run and keeps it for the grace. A scan
+without new indexes still evicts once the grace passes. Every run
+accessor reads the catalog's `runs`, so instances, `run_times`, the map
+axes and defaults and both run selections include the run kept on top.
+The cache demands (#1309) count fields, not runs. Pinned by
+`run_eviction_tests.rs` and `publication.rs`'s tests.
 
 Each run also has canonical `(parameter, level type, level)` selectors,
 rebuilt with `Catalog::refresh_metadata` before publication. Metadata
