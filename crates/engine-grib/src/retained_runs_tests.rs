@@ -437,10 +437,14 @@ fn an_m_trajectory_naming_an_older_runs_parameter_reads_that_run() {
 }
 
 /// A parameter dropped from the newer runs stays advertised until the last
-/// run that has it is evicted.
+/// run that has it is evicted: with `max_runs = 1`, once the new run has
+/// finished publishing (#1562).
 #[test]
 fn an_evicted_runs_parameters_are_no_longer_advertised() {
     let (_source, engine) = new_run_with_only_its_analysis(Some(1));
+    // Just written: the new run publishes, and the old one is kept.
+    assert_eq!(engine.raster_info_shared().reference_times, [at(0), at(6)]);
+    engine.scan_at(Utc::now() + PUBLISHING_GRACE).unwrap();
     let info = engine.raster_info_shared();
     assert_eq!(info.reference_times, [at(6)]);
     assert_eq!(names(&info), ["TMP", "TCDC"]);

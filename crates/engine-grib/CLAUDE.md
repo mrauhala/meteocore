@@ -27,8 +27,9 @@ unlike GeoTIFF's one band per collection.
   `ds_storage::discovery::expand_run_prefixes` (#817), never a local copy:
   every run of today and yesterday (`SCAN_DAYS`) up to now, each day's
   strftime date formatted and each `run_hours` hour substituted into `{run}`
-  as two digits. Runs come newest first: the `max_runs` early stop and
-  `settle_completed_runs` depend on that order. A pattern without `{run}` is
+  as two digits. Runs come newest first: the `max_runs` early stop,
+  `settle_completed_runs` and the newest run's publishing grace (#1562,
+  "Model runs" below) depend on that order. A pattern without `{run}` is
   one prefix per day. A prefix repeated across runs (no day specifier) is
   listed once; a second copy would settle the newest run.
   `validate_run_prefix_pattern` runs at load: no `%H` (the run hour is
@@ -201,6 +202,23 @@ pins do not fall back. No requested datetime selects the latest run, among
 those with every named parameter first (#1026); an area, radius or cube
 then reads its last step carrying them all (`grid_steps`), else its last
 step.
+
+`max_runs` counts the runs that have finished publishing (#1562). The
+newest run is kept on top of them while it publishes
+(`Catalog::evict(max_runs, publishing)`), so its first steps add to the
+horizon instead of evicting the run that covers it; at most one run is
+kept so. It publishes while its newest index file is younger than
+`PUBLISHING_GRACE` (`ds_storage::discovery::DEFAULT_RUN_GRACE`, 30 min):
+the listed last-modified time of the first run prefix with files, newest
+first, clamped to the scan's `now` and kept across scans in
+`GribSource::newest_index`, so a failed listing neither restarts nor ends
+the grace, and a run whose publication stalls keeps the extra run no
+longer. Meanwhile the scan lists one more run prefix, so a restart during
+publication finds the run being replaced; a scan without new indexes
+still evicts once the grace passes. Every run accessor reads the catalog's
+`runs`, so instances, `run_times`, the map axes and defaults and both run
+selections include the run kept on top. The cache demands (#1309) count
+fields, not runs. Pinned by `run_eviction_tests.rs`.
 
 Each run also has canonical `(parameter, level type, level)` selectors,
 rebuilt with `Catalog::refresh_metadata` before publication. Metadata

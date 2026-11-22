@@ -40,6 +40,8 @@ mod readahead;
 pub mod reader;
 #[cfg(test)]
 mod retained_runs_tests;
+#[cfg(test)]
+mod run_eviction_tests;
 mod runtime;
 #[cfg(test)]
 mod scan_tests;
@@ -187,6 +189,19 @@ const INDEX_FETCH_CONCURRENCY: usize = 8;
 /// of the path-keyed `known_indexes` dedup, not addressed here.)
 const SETTLED_REVALIDATE_INTERVAL: Duration = Duration::from_secs(3600);
 
+/// How long after its newest index file was written the newest run counts
+/// as still publishing (#1562), which keeps it on top of `max_runs`: the
+/// 30 minutes the template prober gives a run's missing files
+/// ([`ds_storage::discovery::DEFAULT_RUN_GRACE`]). A run whose publication
+/// stalls stops counting after it, so it keeps the extra run no longer.
+const PUBLISHING_GRACE: chrono::Duration = ds_storage::discovery::DEFAULT_RUN_GRACE;
+
+/// Whether the newest run is still publishing at `now` (#1562): its newest
+/// index file, `newest_index`, was written within [`PUBLISHING_GRACE`].
+fn publishing(newest_index: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    newest_index.is_some_and(|written| now - written < PUBLISHING_GRACE)
+}
+
 /// How [`GribEngine::scan_once`] enumerates index files.
 enum ScanMode {
     /// Remote S3/HTTP: expand `prefix_pattern` over recent dates × run hours
@@ -267,6 +282,12 @@ struct GribSource {
     /// until the first scan. Drives the periodic re-validation in `scan_once`
     /// (see [`SETTLED_REVALIDATE_INTERVAL`]).
     last_full_scan: Mutex<Option<Instant>>,
+    /// When the newest index file of the newest run listed was written (its
+    /// listed last-modified time, never later than the scan that listed
+    /// it), the latest of every scan's: whether that run is still
+    /// [`publishing`] (#1562). Kept across scans, so a listing that fails
+    /// neither restarts nor ends the grace.
+    newest_index: Mutex<Option<DateTime<Utc>>>,
     /// Which index file format this collection uses.
     index_format: index::IndexFormat,
     /// Parameter metadata keyed by short name AND level identity. Populated
@@ -687,6 +708,7 @@ impl GribEngine {
                 known_indexes: Mutex::new(HashSet::new()),
                 settled_prefixes: Mutex::new(HashSet::new()),
                 last_full_scan: Mutex::new(None),
+                newest_index: Mutex::new(None),
                 index_format,
                 param_meta: RwLock::new(ParamMetadataCache::default()),
                 probe_cursor: Mutex::new(None),
@@ -779,10 +801,13 @@ impl GribEngine {
         // runs we want to keep in the catalog; there is no point scanning
         // older prefixes that would immediately be evicted. We iterate
         // prefixes newest-first and stop after collecting hits from exactly
-        // that many runs.
+        // that many runs, one more while the newest is still publishing: it
+        // is kept on top of them (#1562), so a restart while a run publishes
+        // lists the run it is about to replace too.
         //
         // Without `max_runs` set, we fall back to listing every prefix.
         let scan_budget = self.source.config.max_runs;
+        let mut newest_index = *self.source.newest_index.lock().unwrap();
 
         // Collect all index files across all prefixes, iterating newest-first
         // and stopping once we have collected enough runs to satisfy
@@ -814,7 +839,9 @@ impl GribEngine {
         let mut listed_with_hits: Vec<String> = Vec::new();
         for RunPrefix { prefix, .. } in &prefixes {
             if let Some(budget) = scan_budget {
-                if runs_with_hits >= budget {
+                if runs_with_hits
+                    >= budget.saturating_add(usize::from(publishing(newest_index, now)))
+                {
                     break;
                 }
             }
@@ -825,6 +852,7 @@ impl GribEngine {
             listed_prefixes += 1;
             let obj_prefix = ds_storage::object_store::path::Path::from(prefix.as_str());
             let mut hits_in_this_prefix = 0usize;
+            let mut newest_in_prefix: Option<DateTime<Utc>> = None;
             match self.source.store.list(&obj_prefix) {
                 Ok(objects) => {
                     for obj in objects {
@@ -845,6 +873,7 @@ impl GribEngine {
                                 continue;
                             }
                         }
+                        newest_in_prefix = newest_in_prefix.max(Some(obj.last_modified));
                         all_index_paths.push(obj.location);
                         hits_in_this_prefix += 1;
                     }
@@ -859,10 +888,16 @@ impl GribEngine {
                 }
             }
             if hits_in_this_prefix > 0 {
+                // The newest run is the first listed with files (#1562).
+                if listed_with_hits.is_empty() {
+                    newest_index = newest_index.max(newest_in_prefix.map(|t| t.min(now)));
+                }
                 runs_with_hits += 1;
                 listed_with_hits.push(prefix.clone());
             }
         }
+        *self.source.newest_index.lock().unwrap() = newest_index;
+        let still_publishing = publishing(newest_index, now);
 
         // Settle every run we listed with hits except the newest (first in the
         // newest-first iteration order), which may still be gaining steps.
@@ -924,7 +959,13 @@ impl GribEngine {
             );
             // Metadata work is independent of discovery. With retention enabled,
             // continue below so existing steps can expire even during an outage.
-            if self.source.time_window.is_none() {
+            // So does the run kept on top of `max_runs` once the newest has
+            // finished publishing (#1562): no new index says it has.
+            let over_max_runs = self.source.config.max_runs.is_some_and(|max_runs| {
+                self.source.catalog.load().runs.len()
+                    > max_runs.saturating_add(usize::from(still_publishing))
+            });
+            if self.source.time_window.is_none() && !over_max_runs {
                 self.probe_new_parameters();
                 return Ok(());
             }
@@ -1066,9 +1107,10 @@ impl GribEngine {
             new_catalog.runs.retain(|_, run| !run.steps.is_empty());
         }
 
-        // Apply max_runs eviction
+        // Apply max_runs eviction: the newest run, while it publishes, is
+        // kept on top of `max_runs` (#1562).
         if let Some(max_runs) = self.source.config.max_runs {
-            new_catalog.evict(max_runs);
+            new_catalog.evict(max_runs, still_publishing);
         }
 
         // Clean up known_indexes: remove entries for runs that were evicted
@@ -2514,10 +2556,11 @@ fn run_hours(config: &GribConfig) -> &[u32] {
 /// The shared [`expand_run_prefixes`] formats each day's strftime date and
 /// substitutes each run hour into `{run}`, zero-padded (`00`, `06`, …).
 /// Runs come newest first, so the scan can stop once it has `max_runs`
-/// runs, and `settle_completed_runs` relies on that order. A future run is
-/// skipped, since a run cannot be published before its reference time. A
-/// pattern without `{run}` is one prefix per day, ordered by the day's
-/// 00 UTC.
+/// runs (one more while the newest publishes, #1562), the newest run's
+/// files are the first listed, and `settle_completed_runs` relies on that
+/// order. A future run is skipped, since a run cannot be published before
+/// its reference time. A pattern without `{run}` is one prefix per day,
+/// ordered by the day's 00 UTC.
 fn build_scan_prefixes(
     pattern: &str,
     now: DateTime<Utc>,

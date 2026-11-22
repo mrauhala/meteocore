@@ -17,7 +17,8 @@ level type) exposes every parameter; each retained run is an EDR instance.
 
 - **Discovery.** A poll loop on the server's background runtime lists the
   sidecars: for a remote source, the runs of today and yesterday (UTC)
-  from `prefix_pattern`, newest first, until `max_runs` runs have files;
+  from `prefix_pattern`, newest first, until `max_runs` runs have files,
+  or one more while the newest run publishes (below);
   for `data_path`, one fixed prefix. Older runs are re-listed hourly to
   catch late steps. Temporary names and hidden folders are skipped. New
   sidecars are fetched eight at a time; the data file is the index path
@@ -190,7 +191,7 @@ parameters = ["2t", "10u", "10v", "msl", "tp", "t", "z"]
 | `parameters` | all | Parameter filter; set it for wgrib2 sources (a GFS 0.25° file holds about 700 messages). A wgrib2 base name (`APCP`) also selects its window keys (`APCP_acc_6h`). |
 | `level_types` | – | Non-empty list of `"single"`, `"pressure"`, `"model"`. |
 | `poll_interval_secs` | `600` | Poll cadence, > 0. |
-| `max_runs` | none | Keep the newest N runs; unset keeps every run found. |
+| `max_runs` | none | Keep the newest N runs that have finished publishing, and the newest run on top of them while it publishes: until 30 minutes after its newest index file was written, as the store lists it. A new run's first steps then add to the forecast horizon and instances rather than replacing the oldest run. Unset keeps every run found. |
 | `time_window` | none | ISO 8601 duration relative to the current time: `-PT12H` keeps steps valid in the last 12 h, `P5D` in the next 5 days. |
 | `grid_cache_mb` | `256` | Decoded-grid cache per source; `0` disables it. An EDR query over more fields than it holds reads around it; `{ min, max }` leaves it to the memory plan within those bounds. |
 | `message_cache_mb` | `0` | Compressed-message cache per source; `0` disables it; `{ min, max }` leaves it to the memory plan within those bounds. |
@@ -243,6 +244,10 @@ fixtures ([`split-levels`](../../testdata/grib-local/split-levels.toml),
   a file rewritten in place under the same name is not picked up.
 - Without `max_runs` or `time_window` no run is evicted. A parameter
   dropped from later runs stays listed until its last run is evicted.
+  Whether a run still publishes is told by its index files' modification
+  times alone: a mirror that keeps its source's times and copies a run in
+  parts, each older than the grace when it arrives, evicts the oldest run
+  at the new run's first steps.
 - Soil, isentropic and fractional levels belong to no level view; model
   levels are not converted to height or pressure.
 - wgrib2 hour-window accumulations and averages are keyed by duration
