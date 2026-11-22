@@ -386,8 +386,16 @@ pub(crate) mod tests {
     use std::fs;
     use std::sync::{Arc, RwLock};
 
-    /// Build a live `AdminState` over `config_path`, mirroring `main.rs`.
+    /// Build a live `AdminState` over `config_path` with every collection
+    /// loaded, as `main.rs` serves once its startup load settled.
     pub(crate) fn build_state(config_path: &Path) -> AdminState {
+        build_state_at(config_path, false)
+    }
+
+    /// `build_state`, or with `startup` the state `main.rs` serves before
+    /// its startup load (#317): empty registries over the render caches,
+    /// every collection `loading`, the load about to run.
+    pub(crate) fn build_state_at(config_path: &Path, startup: bool) -> AdminState {
         let (config, _) = ServerConfig::from_file(config_path.to_str().unwrap()).unwrap();
         let style_ctx = ds_render::StyleContext::new(
             crate::colormaps::build_palette_registry(&config, config_path.parent())
@@ -403,7 +411,7 @@ pub(crate) mod tests {
         );
         let result = load_collections(
             &style_ctx,
-            &config.collections,
+            if startup { &[] } else { &config.collections },
             &config.style_bundles,
             &config.server.base_url(),
             config.server.trust_proxy_headers,
@@ -429,7 +437,11 @@ pub(crate) mod tests {
             )))),
             recovery_shutdown: ds_poll::Shutdown::new(),
             config_path: config_path.to_str().unwrap().to_string(),
-            health: RwLock::new(result.health),
+            health: RwLock::new(if startup {
+                crate::startup::loading_health(&config.collections)
+            } else {
+                result.health
+            }),
             geotiff_engines: RwLock::new(result.geotiff_engines),
             querydata_engines: RwLock::new(result.querydata_engines),
             grib_engines: RwLock::new(result.grib_engines),
@@ -462,6 +474,11 @@ pub(crate) mod tests {
             engine_handles: RwLock::new(result.engines_by_id),
             wind_handles: RwLock::new(result.wind_by_id),
             delivery_delays: Default::default(),
+            startup: if startup {
+                crate::startup::StartupLoad::loading()
+            } else {
+                Default::default()
+            },
         });
         crate::cache_plan::register_render_caches(&state);
         state

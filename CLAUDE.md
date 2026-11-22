@@ -1801,10 +1801,14 @@ An experiment for the OGC MetOcean Common profile: a WIS2 topic as a
   (poll loop untouched, no re-bootstrap); only added/changed/removed ones
   rebuild, and their cached tiles are evicted per collection. See
   `crates/server/CLAUDE.md` for the rules.
-- **Health:** `GET /health` — per-collection ready/degraded/failed status.
-  HTTP 503 only when all collections failed. `data_age_secs` (and the
-  `collection_data_age_seconds` gauge) is now minus the newest data a
-  collection serves, never the time since its last poll (#1007); see
+- **Health:** `GET /health` — per-collection loading/ready/degraded/failed
+  status. The server serves from boot and publishes each collection once
+  built (#317, `crates/server/CLAUDE.md` "Startup load"): 200 while
+  collections load, 503 only once none is loading and all failed;
+  `/health?loaded` is 503 until every collection is built.
+  `data_age_secs` (and the `collection_data_age_seconds` gauge) is now
+  minus the newest data a collection serves, never the time since its last
+  poll (#1007); see
   `crates/server/CLAUDE.md`. A collection holding no data has no age and
   `collection_has_data` 0 (#1055).
 - **Metrics:** `GET /metrics` — Prometheus format. Path labels use route

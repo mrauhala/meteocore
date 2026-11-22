@@ -125,9 +125,11 @@ service:
   port: 8000
   annotations: {}
 
-# /health answers 200 unless every collection has failed. The server binds its
-# port before loading collections but serves nothing until they are loaded,
-# which can take minutes for large remote catalogs.
+# /health answers 200 unless every collection has failed, also while the
+# collections still load: the server serves from boot and each collection
+# once it is built, which can take minutes for large remote catalogs.
+# /health?loaded answers 503 until every collection is built, for a
+# readiness probe that should wait for all of them.
 startupProbe:
   httpGet:
     path: /health

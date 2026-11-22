@@ -1327,6 +1327,7 @@ mod tests {
             engine_handles: RwLock::new(HashMap::new()),
             wind_handles: RwLock::new(HashMap::new()),
             delivery_delays: Default::default(),
+            startup: Default::default(),
         })
     }
 

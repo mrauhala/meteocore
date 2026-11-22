@@ -64,7 +64,8 @@ colormap = "radar_dbz"
                 deadline = time.monotonic() + 30
                 while True:
                     try:
-                        request("/health")
+                        # 503 until every collection is built (#317).
+                        request("/health?loaded")
                         break
                     except OSError:
                         if process.poll() is not None or time.monotonic() > deadline:

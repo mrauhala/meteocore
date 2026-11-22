@@ -202,14 +202,17 @@ that.
 
 ## Health and probes
 
-`/health` answers 200 while any collection is ready or degraded, and 503 only
-when every collection has failed.
+`/health` answers 200 while collections load and while any is ready or
+degraded, and 503 only once every collection has failed. The server serves
+from boot, each collection once it is built; a large remote catalog can take
+minutes, and `/health` lists it `loading` meanwhile.
 
-- `startupProbe`: `/health`, up to 10 minutes. The server binds its port
-  before it loads the collections but answers only after, and a large remote
-  catalog can take minutes.
+- `startupProbe`: `/health`, up to 10 minutes.
 - `readinessProbe`: `/health`. A pod whose every source is down leaves the
-  Service.
+  Service; one still loading takes traffic for what it has built. For a pod
+  that should take traffic only once every collection is built, such as one
+  of several replicas in a rolling update, set its path to
+  `/health?loaded`, which answers 503 until then.
 - `livenessProbe`: a TCP check. Restarting the pod would not bring upstream
   sources back, so `/health` is not a liveness signal.
 

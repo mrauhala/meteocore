@@ -846,6 +846,16 @@ static COLLECTIONS_FAILED: LazyLock<IntGauge> = LazyLock::new(|| {
     gauge
 });
 
+static COLLECTIONS_LOADING: LazyLock<IntGauge> = LazyLock::new(|| {
+    let gauge = IntGauge::new(
+        "collections_loading",
+        "Configured collections the startup load has not built yet (#317)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
 // Freshness per collection (#1007): `/health`'s `data_age_secs`, set each
 // scrape by `refresh_data_age_gauge` from the same `collection_data_ages`.
 static COLLECTION_DATA_AGE_SECONDS: LazyLock<IntGaugeVec> =
@@ -2986,6 +2996,10 @@ pub enum CollectionStatus {
     Ready,
     Degraded,
     Failed,
+    /// Configured, and the startup load has not built it yet (#317): it is
+    /// served once built, every API answering for it as for an unknown
+    /// collection until then. A reload never lists it.
+    Loading,
 }
 
 // ---------------------------------------------------------------------------
@@ -3074,6 +3088,9 @@ pub struct ServerState {
     /// How late each collection's data arrives (#1389), observed by
     /// [`delivery_delay_loop`]; reloads keep it.
     pub delivery_delays: crate::delivery_delay::DeliveryDelays,
+    /// The startup load while it runs (#317): every collection is built on
+    /// its own and published once built ([`crate::startup`]).
+    pub startup: crate::startup::StartupLoad,
 }
 
 pub type AdminState = Arc<ServerState>;
@@ -3388,7 +3405,7 @@ impl EngineHandle {
 /// derived or non-raster collection fails the grid.
 fn station_grid_auxiliary(
     grid: &ds_core::config::StationGridConfig,
-    engines: &HashMap<String, EngineHandle>,
+    engines: &dyn Fn(&str) -> Option<EngineHandle>,
     collections: &[CollectionConfig],
 ) -> Result<engine_station_grid::Auxiliary, String> {
     let raster = |key: &str,
@@ -3397,7 +3414,7 @@ fn station_grid_auxiliary(
         let Some(id) = id else {
             return Ok(None);
         };
-        if let Some(engine) = engines.get(id).and_then(EngineHandle::raster_source) {
+        if let Some(engine) = engines(id).as_ref().and_then(EngineHandle::raster_source) {
             return Ok(Some(engine));
         }
         Err(match collections.iter().find(|c| &c.id == id) {
@@ -3407,7 +3424,7 @@ fn station_grid_auxiliary(
                  collection",
                 c.engine_type
             ),
-            Some(c) if engines.contains_key(id) => format!(
+            Some(c) if engines(id).is_some() => format!(
                 "{key} '{id}' is a {} collection, not a raster map collection (geotiff, grib, \
                  zarr, netcdf, querydata, satellite or odim)",
                 c.engine_type
@@ -3418,8 +3435,8 @@ fn station_grid_auxiliary(
     Ok(engine_station_grid::Auxiliary {
         elevation: raster("elevation_source", grid.elevation_source.as_ref())?,
         land_mask: raster("land_mask_source", grid.land_mask_source.as_ref())?,
-        stations: engines
-            .get(&grid.source)
+        stations: engines(&grid.source)
+            .as_ref()
             .and_then(EngineHandle::edr_items_engine),
     })
 }
@@ -3754,6 +3771,88 @@ fn volume_collection_page(id: &str, shared_root: bool, edr: bool) -> Option<Stri
     Some(format!("{mount}/collections/{id}"))
 }
 
+/// Whether `engine_type` builds a derived collection, over another
+/// collection's engine, and which load pass builds it (#317): 0 for a base
+/// engine, then nowcast, station grid and period products, in the order
+/// [`load_collections`] builds them. A derived collection sees the engines
+/// of lower passes only; the startup load waits for exactly those.
+pub(crate) fn load_pass(engine_type: &str) -> u8 {
+    match engine_type {
+        "nowcast" => 1,
+        "station-grid" => 2,
+        "period" => 3,
+        _ => 0,
+    }
+}
+
+/// The engines earlier loads of one startup built (#317), which a derived
+/// collection loaded on its own reads as [`load_collections`] reads the
+/// engines its earlier passes built: [`LoadScope::built`].
+#[derive(Clone, Default)]
+pub(crate) struct BuiltSources {
+    /// Every engine built, by collection id ([`LoadResult::engines_by_id`]):
+    /// station-grid and period sources, a station grid's terrain, mask and
+    /// station inventory, a nowcast's lightning and radar sources.
+    pub engines: HashMap<String, EngineHandle>,
+    /// The engines the map APIs registered for non-derived collections, by
+    /// registered id (a GRIB level view, a radar site): what a nowcast may
+    /// extrapolate. Never a derived collection's, so a nowcast wraps no
+    /// nowcast, station grid or period product, as in one load.
+    pub rasters: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>>,
+    /// The Features engines of non-derived collections: a nowcast's impact
+    /// areas.
+    pub features: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>>,
+}
+
+impl BuiltSources {
+    /// Add what `part`, the load of `collection`, built.
+    pub(crate) fn add(&mut self, collection: &CollectionConfig, part: &LoadResult) {
+        self.engines.extend(
+            part.engines_by_id
+                .iter()
+                .map(|(id, engine)| (id.clone(), engine.clone())),
+        );
+        if load_pass(&collection.engine_type) > 0 {
+            return;
+        }
+        for engines in [
+            &part.wms_state.engines,
+            &part.maps_state.engines,
+            &part.tiles_state.map_engines,
+        ] {
+            self.rasters.extend(
+                engines
+                    .iter()
+                    .map(|(id, engine)| (id.clone(), engine.clone())),
+            );
+        }
+        self.features.extend(
+            part.features_state
+                .engines
+                .iter()
+                .map(|(id, engine)| (id.clone(), engine.clone())),
+        );
+    }
+}
+
+/// What a load sees beyond the collections it builds (#317). The startup
+/// load builds each collection on its own ([`load_for_startup`]), and a
+/// derived collection's sources then come from earlier loads; one
+/// [`load_collections`] call builds them all and sees only itself.
+#[derive(Clone, Copy)]
+pub(crate) struct LoadScope<'a> {
+    /// Every collection of the accepted config: the names a derived
+    /// collection's errors check its sources against ("not found", "is a
+    /// derived collection", "failed to load").
+    pub all: &'a [CollectionConfig],
+    /// Engines earlier loads built.
+    pub built: &'a BuiltSources,
+    /// The PostGIS pools every load of one startup shares, so collections on
+    /// one DSN share one pool, as they do in one load. `None`: this load's
+    /// own registry.
+    pub pools: Option<&'a Mutex<engine_postgis::pool::PoolRegistry>>,
+}
+
 #[allow(clippy::too_many_arguments)] // config + style inputs + the two reload reuse pools are all distinct concerns
 pub fn load_collections(
     style_ctx: &ds_render::StyleContext,
@@ -3764,7 +3863,39 @@ pub fn load_collections(
     discovery: &ds_core::discovery::Discovery,
     render_caches: crate::memory_caches::RenderCacheSizes,
     reuse: ReusableCaches,
+    engine_reuse: EngineReuse,
+) -> LoadResult {
+    load_collections_scoped(
+        style_ctx,
+        collections,
+        style_bundles,
+        base_url,
+        trust_proxy_headers,
+        discovery,
+        render_caches,
+        reuse,
+        engine_reuse,
+        LoadScope {
+            all: collections,
+            built: &BuiltSources::default(),
+            pools: None,
+        },
+    )
+}
+
+/// [`load_collections`] building `collections` within `scope` (#317).
+#[allow(clippy::too_many_arguments)] // as `load_collections`, plus the scope
+fn load_collections_scoped(
+    style_ctx: &ds_render::StyleContext,
+    collections: &[CollectionConfig],
+    style_bundles: &[StyleBundle],
+    base_url: &str,
+    trust_proxy_headers: bool,
+    discovery: &ds_core::discovery::Discovery,
+    render_caches: crate::memory_caches::RenderCacheSizes,
+    reuse: ReusableCaches,
     mut engine_reuse: EngineReuse,
+    scope: LoadScope<'_>,
 ) -> LoadResult {
     let plan_sized = engine_reuse.plan_sized;
     let bundle_index: HashMap<&str, &StyleBundle> =
@@ -5863,7 +5994,14 @@ pub fn load_collections(
                         // a second one.
                         let pool_size = std::num::NonZeroU32::new(validated.pool_size)
                             .unwrap_or_else(engine_postgis::pool::default_pool_size);
-                        let pool = match pool_registry.get_or_create(&validated.dsn, pool_size) {
+                        let pool = match scope.pools {
+                            Some(shared) => shared
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .get_or_create(&validated.dsn, pool_size),
+                            None => pool_registry.get_or_create(&validated.dsn, pool_size),
+                        };
+                        let pool = match pool {
                             Ok(p) => p,
                             Err(e) => {
                                 tracing::error!(
@@ -6097,37 +6235,60 @@ pub fn load_collections(
     // another nowcast (chaining extrapolations compounds error and the
     // derived engine's poll cadence assumptions).
     // ------------------------------------------------------------------
-    let base_raster_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> = map_engines
-        .iter()
-        .chain(maps_engines.iter())
-        .chain(tiles_engines.iter())
-        .map(|(id, e)| (id.clone(), e.clone()))
-        .collect();
+    // An earlier load's base engines too (#317): the startup load builds
+    // each collection on its own.
+    let mut base_raster_engines: HashMap<String, Arc<dyn ds_core::map_engine::MapEngine>> =
+        scope.built.rasters.clone();
+    base_raster_engines.extend(
+        map_engines
+            .iter()
+            .chain(maps_engines.iter())
+            .chain(tiles_engines.iter())
+            .map(|(id, e)| (id.clone(), e.clone())),
+    );
     // Same reasoning for impact sources: snapshot BEFORE the loop, so
     // resolution cannot depend on config declaration order. Nowcast engines
     // are themselves `FeatureEngine`s and get inserted into `feature_engines`
     // as this loop runs — resolving against the live map would make
     // `impact_source = "<another nowcast>"` succeed or fail depending purely
     // on which collection happened to be declared first.
-    let base_feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
+    let mut base_feature_engines: HashMap<String, Arc<dyn ds_core::feature_engine::FeatureEngine>> =
+        scope.built.features.clone();
+    base_feature_engines.extend(
         feature_engines
             .iter()
-            .map(|(id, e)| (id.clone(), e.clone()))
-            .collect();
+            .map(|(id, e)| (id.clone(), e.clone())),
+    );
+    // Lightning and radar sources an earlier load built (#317).
+    for (id, handle) in &scope.built.engines {
+        if let EngineHandle::Postgis(engine) = handle {
+            if engine.config().events().is_some() {
+                event_sources
+                    .entry(id.clone())
+                    .or_insert_with(|| engine.clone() as Arc<dyn ds_core::events::EventSource>);
+            }
+        }
+    }
     // Radar-site sources for the beam-geometry join (#642): every
     // polar-volume network engine, keyed by its base collection id. Built
     // from `odim_volume_engines`, which both the fresh and the reuse arms
     // fill, so a reload keeps the wiring resolvable.
-    let radar_site_sources: HashMap<String, Arc<dyn ds_core::radar_sites::RadarSiteSource>> =
-        odim_volume_engines
-            .iter()
-            .map(|e| {
-                (
-                    e.collection_id().to_string(),
-                    e.clone() as Arc<dyn ds_core::radar_sites::RadarSiteSource>,
-                )
-            })
-            .collect();
+    let radar_site_sources: HashMap<String, Arc<dyn ds_core::radar_sites::RadarSiteSource>> = scope
+        .built
+        .engines
+        .values()
+        .filter_map(|handle| match handle {
+            EngineHandle::OdimVolume(e) => Some(e),
+            _ => None,
+        })
+        .chain(odim_volume_engines.iter())
+        .map(|e| {
+            (
+                e.collection_id().to_string(),
+                e.clone() as Arc<dyn ds_core::radar_sites::RadarSiteSource>,
+            )
+        })
+        .collect();
     for collection in nowcast_pending {
         let mut fail = |error: String| {
             tracing::error!("Collection '{}': {error}, skipping", collection.id);
@@ -6142,7 +6303,8 @@ pub fn load_collections(
             fail("missing [collections.nowcast] config".into());
             continue;
         };
-        if collections
+        if scope
+            .all
             .iter()
             .any(|c| c.id == nowcast_config.source && c.engine_type == "nowcast")
         {
@@ -6208,7 +6370,8 @@ pub fn load_collections(
                 // deterministically, but "not found" would be a
                 // baffling message for a collection the operator can
                 // see in their own config.
-                None if collections
+                None if scope
+                    .all
                     .iter()
                     .any(|c| c.id == src_id && c.engine_type == "nowcast") =>
                 {
@@ -6379,6 +6542,7 @@ pub fn load_collections(
         };
         let Some(source) = engines_by_id
             .get(&grid_config.source)
+            .or_else(|| scope.built.engines.get(&grid_config.source))
             .and_then(EngineHandle::station_source)
         else {
             fail(format!(
@@ -6389,7 +6553,16 @@ pub fn load_collections(
             continue;
         };
         // The terrain, the mask and the station inventory (#1206).
-        let aux = match station_grid_auxiliary(grid_config, &engines_by_id, collections) {
+        let aux = match station_grid_auxiliary(
+            grid_config,
+            &|id| {
+                engines_by_id
+                    .get(id)
+                    .or_else(|| scope.built.engines.get(id))
+                    .cloned()
+            },
+            scope.all,
+        ) {
             Ok(aux) => aux,
             Err(e) => {
                 fail(e);
@@ -6536,7 +6709,8 @@ pub fn load_collections(
         // would be null instead of 0 mm, `mean` would average rainy frames
         // only, and coverage would count dry frames as gaps. Refused until
         // the source API tells undetect from nodata.
-        if collections
+        if scope
+            .all
             .iter()
             .any(|c| c.id == period_config.source && c.engine_type == "odim")
         {
@@ -6548,19 +6722,19 @@ pub fn load_collections(
             ));
             continue;
         }
-        let source = match engines_by_id
+        let built_source = engines_by_id
             .get(&period_config.source)
-            .and_then(EngineHandle::period_source)
-        {
+            .or_else(|| scope.built.engines.get(&period_config.source));
+        let source = match built_source.and_then(EngineHandle::period_source) {
             Some(source) => source,
             None => {
                 fail(
-                    match collections.iter().find(|c| c.id == period_config.source) {
+                    match scope.all.iter().find(|c| c.id == period_config.source) {
                         None => format!(
                             "period source '{}' not found (it must be defined in the same config)",
                             period_config.source
                         ),
-                        Some(c) if engines_by_id.contains_key(&c.id) => format!(
+                        Some(c) if built_source.is_some() => format!(
                             "period source '{}' is a {} collection, not gridded observations \
                          (geotiff, satellite, zarr, netcdf or station-grid)",
                             c.id, c.engine_type
@@ -7544,6 +7718,7 @@ pub struct HealthCounts {
     pub healthy: i64,
     pub degraded: i64,
     pub failed: i64,
+    pub loading: i64,
 }
 
 impl HealthCounts {
@@ -7554,6 +7729,7 @@ impl HealthCounts {
             healthy: count(CollectionStatus::Ready),
             degraded: count(CollectionStatus::Degraded),
             failed: count(CollectionStatus::Failed),
+            loading: count(CollectionStatus::Loading),
         }
     }
 }
@@ -7565,6 +7741,7 @@ pub fn update_health_gauges(health: &[CollectionHealth]) -> HealthCounts {
     COLLECTIONS_HEALTHY.set(counts.healthy);
     COLLECTIONS_DEGRADED.set(counts.degraded);
     COLLECTIONS_FAILED.set(counts.failed);
+    COLLECTIONS_LOADING.set(counts.loading);
     counts
 }
 
@@ -7614,10 +7791,21 @@ pub async fn reload_handler(
 const RELOAD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Run `reload` ([`do_reload`], outside tests) for one request and answer it.
-async fn serve_reload(
+pub(crate) async fn serve_reload(
     state: &AdminState,
     reload: impl FnOnce(&AdminState) -> Result<ReloadOutcome, ReloadError> + Send + 'static,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // The startup load holds the lock until every collection is built
+    // (#317), which can take minutes: say so at once.
+    if state.startup.is_loading() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "Collections are still loading after startup; reload once /health \
+                          lists none as loading"
+            })),
+        ));
+    }
     // Serialize reload requests — prevent concurrent reloads from racing.
     // A short wait first: the memory governor's step and a recovery pass
     // hold the lock briefly too, and a request that meets one should not
@@ -7869,6 +8057,11 @@ impl AcceptedLoad {
 
     pub(crate) fn render_cache_sizes(&self) -> &crate::memory_caches::RenderCacheSizes {
         &self.render_cache_sizes
+    }
+
+    /// The accepted collections, in the config's order.
+    pub(crate) fn collections(&self) -> &[CollectionConfig] {
+        &self.collections
     }
 
     pub(crate) fn cache_settings(&self) -> &crate::memory_caches::CacheSettings {
@@ -8649,6 +8842,330 @@ fn apply_load(
     })
 }
 
+/// The configured ids a load registered with any API, from its states'
+/// collection maps (#317).
+fn registered_ids<'a>(
+    edr: &'a EdrState,
+    features: &'a FeaturesState,
+    wms: &'a WmsState,
+    maps: &'a MapsState,
+    tiles: &'a TilesState,
+    tiles_3d: &'a api_3dtiles::TilesState3d,
+) -> impl Iterator<Item = &'a String> {
+    edr.collections
+        .keys()
+        .chain(features.collections.keys())
+        .chain(wms.collections.keys())
+        .chain(maps.collections.keys())
+        .chain(tiles.collections.keys())
+        .chain(tiles.feature_collections.keys())
+        .chain(tiles_3d.collections.keys())
+}
+
+/// Insert a clone of every entry of `from` into `into`.
+fn extend_cloned<K, V>(into: &mut HashMap<K, V>, from: &HashMap<K, V>)
+where
+    K: Clone + Eq + std::hash::Hash,
+    V: Clone,
+{
+    into.extend(from.iter().map(|(k, v)| (k.clone(), v.clone())));
+}
+
+impl LoadResult {
+    /// The collection ids this load registered with any API.
+    fn registered_ids(&self) -> HashSet<String> {
+        registered_ids(
+            &self.edr_state,
+            &self.features_state,
+            &self.wms_state,
+            &self.maps_state,
+            &self.tiles_state,
+            &self.tiles_3d_state,
+        )
+        .cloned()
+        .collect()
+    }
+
+    /// Take `ids` out of every registry of this load, their layers' styles
+    /// (`{id}` and `{id}/{parameter}`) included: a startup load whose
+    /// collection id another load registered first (#317).
+    fn drop_ids(&mut self, ids: &HashSet<String>) {
+        let keep = |id: &String| !ids.contains(id);
+        let keep_layer = |layer: &String| {
+            !ids.contains(layer.split_once('/').map_or(layer.as_str(), |(id, _)| id))
+        };
+        let edr = &mut self.edr_state;
+        edr.engines.retain(|id, _| keep(id));
+        edr.feature_engines.retain(|id, _| keep(id));
+        edr.collections.retain(|id, _| keep(id));
+        edr.styles.retain(|layer, _| keep_layer(layer));
+        let features = &mut self.features_state;
+        features.engines.retain(|id, _| keep(id));
+        features.collections.retain(|id, _| keep(id));
+        features.vector_tileset_ids.retain(keep);
+        features.collection_pages.retain(|id, _| keep(id));
+        let wms = &mut self.wms_state;
+        wms.engines.retain(|id, _| keep(id));
+        wms.point_engines.retain(|id, _| keep(id));
+        wms.collections.retain(|id, _| keep(id));
+        wms.styles.retain(|layer, _| keep_layer(layer));
+        let maps = &mut self.maps_state;
+        maps.engines.retain(|id, _| keep(id));
+        maps.collections.retain(|id, _| keep(id));
+        maps.styles.retain(|layer, _| keep_layer(layer));
+        maps.map_tileset_ids.retain(keep);
+        let tiles = &mut self.tiles_state;
+        tiles.map_engines.retain(|id, _| keep(id));
+        tiles.collections.retain(|id, _| keep(id));
+        tiles.styles.retain(|layer, _| keep_layer(layer));
+        tiles.feature_engines.retain(|id, _| keep(id));
+        tiles.feature_collections.retain(|id, _| keep(id));
+        let tiles_3d = &mut self.tiles_3d_state;
+        tiles_3d.volume_engines.retain(|id, _| keep(id));
+        tiles_3d.collections.retain(|id, _| keep(id));
+        tiles_3d.quantity_styles.retain(|id, _| keep(id));
+        tiles_3d.collection_pages.retain(|id, _| keep(id));
+        self.served_by.retain(|id, _| keep(id));
+    }
+}
+
+impl ReusableCaches {
+    /// The render caches every load of one startup registers its
+    /// collections over (#317): the live registries' own, as they are, with
+    /// no resize staged.
+    fn shared(state: &ServerState) -> Self {
+        let wms = state.wms.load();
+        Self {
+            rendered: Some(wms.rendered_cache.clone()),
+            tile: Some(wms.tile_cache.clone()),
+            vector: Some(state.tiles.load().vector_tile_cache.clone()),
+            plan_sized: PlanSized {
+                rendered: true,
+                tile: true,
+                vector: true,
+            },
+        }
+    }
+}
+
+/// Build `collection` for the startup load (#317) from the accepted config,
+/// on its own: over the render caches the live registries hold, reading
+/// the engines of its sources from `built`, and with the PostGIS pools
+/// every load of the startup shares. Blocking, like [`load_collections`]:
+/// call it on the poll runtime, never on a request worker.
+pub(crate) fn load_for_startup(
+    state: &ServerState,
+    config: &AcceptedLoad,
+    collection: &CollectionConfig,
+    built: &BuiltSources,
+    pools: &Mutex<engine_postgis::pool::PoolRegistry>,
+) -> LoadResult {
+    load_collections_scoped(
+        &config.styles,
+        std::slice::from_ref(collection),
+        &config.style_bundles,
+        &config.base_url,
+        config.trust_proxy_headers,
+        &config.discovery,
+        config.render_cache_sizes.clone(),
+        ReusableCaches::shared(state),
+        EngineReuse::default(),
+        LoadScope {
+            all: &config.collections,
+            built,
+            pools: Some(pools),
+        },
+    )
+}
+
+/// Publish `part`, the startup load of `configured` (#317), to the live
+/// registries: its engines join the engine lists with their poll loops
+/// spawned on the poll runtime, its collections join every API's registry
+/// and the MCP tools, and its health entries replace the collection's
+/// `loading` entry, in that order, so `/health` never lists a collection
+/// the APIs do not serve yet. Each registry is swapped once with `rcu`, so a
+/// request sees the collection in all of an API's maps or in none, and the
+/// collections other loads published stay.
+///
+/// A registered id another load published first (a radar site
+/// `{base}-{nod}` named like a configured collection) keeps its first
+/// owner, as one load keeps the first collection to register an id: it is
+/// dropped from `part` and its health entry fails.
+///
+/// The caller serializes publishes ([`crate::startup::StartupLoad`]).
+pub(crate) fn publish_load(
+    state: &ServerState,
+    configured: &CollectionConfig,
+    mut part: LoadResult,
+) {
+    // A startup load reuses nothing, so neither is staged; applied as a
+    // reload applies them should that change.
+    part.apply_nowcast_dependency_updates();
+    apply_cache_resizes(std::mem::take(&mut part.cache_resizes));
+
+    let taken: HashSet<String> = {
+        let (edr, features, wms) = (state.edr.load(), state.features.load(), state.wms.load());
+        let (maps, tiles, tiles_3d) =
+            (state.maps.load(), state.tiles.load(), state.tiles_3d.load());
+        registered_ids(&edr, &features, &wms, &maps, &tiles, &tiles_3d)
+            .cloned()
+            .collect()
+    };
+    let collides: HashSet<String> = part
+        .registered_ids()
+        .into_iter()
+        .filter(|id| taken.contains(id))
+        .collect();
+    if !collides.is_empty() {
+        tracing::error!(
+            "Collection '{}': {:?} already registered by another collection — skipping them",
+            configured.id,
+            collides
+        );
+        part.drop_ids(&collides);
+        for h in part.health.iter_mut().filter(|h| collides.contains(&h.id)) {
+            h.status = CollectionStatus::Failed;
+            h.error = Some("id collides with an already-registered collection".into());
+        }
+    }
+
+    // Engines first: their poll loops run from now on.
+    macro_rules! publish_engines {
+        ($($field:ident),* $(,)?) => {$(
+            for engine in &part.$field {
+                let poller = engine.clone();
+                crate::poll_runtime().spawn(async move {
+                    poller.poll_loop().await;
+                });
+            }
+            state
+                .$field
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(std::mem::take(&mut part.$field));
+        )*};
+    }
+    publish_engines!(
+        geotiff_engines,
+        querydata_engines,
+        grib_engines,
+        zarr_engines,
+        satellite_engines,
+        netcdf_engines,
+        odim_engines,
+        odim_volume_engines,
+        cap_engines,
+        bufr_engines,
+        postgis_engines,
+        nowcast_engines,
+        station_grid_engines,
+        period_engines,
+    );
+    state
+        .netcdf_parameters
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(std::mem::take(&mut part.netcdf_parameters));
+    state
+        .pvol_sites
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(std::mem::take(&mut part.pvol_sites));
+    state
+        .engine_handles
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(std::mem::take(&mut part.engines_by_id));
+    state
+        .wind_handles
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(std::mem::take(&mut part.wind_by_id));
+
+    // Then the registries, one swap each.
+    state.edr.rcu(|live| {
+        let mut next = EdrState::clone(live);
+        let part = &part.edr_state;
+        extend_cloned(&mut next.engines, &part.engines);
+        extend_cloned(&mut next.feature_engines, &part.feature_engines);
+        extend_cloned(&mut next.collections, &part.collections);
+        extend_cloned(&mut next.styles, &part.styles);
+        next
+    });
+    state.features.rcu(|live| {
+        let mut next = FeaturesState::clone(live);
+        let part = &part.features_state;
+        extend_cloned(&mut next.engines, &part.engines);
+        extend_cloned(&mut next.collections, &part.collections);
+        next.vector_tileset_ids
+            .extend(part.vector_tileset_ids.iter().cloned());
+        extend_cloned(&mut next.collection_pages, &part.collection_pages);
+        next
+    });
+    if let Some(mcp) = &state.mcp {
+        mcp.state
+            .store(Arc::new(mcp_state_from(&state.features.load())));
+    }
+    state.wms.rcu(|live| {
+        let mut next = WmsState::clone(live);
+        let part = &part.wms_state;
+        extend_cloned(&mut next.engines, &part.engines);
+        extend_cloned(&mut next.point_engines, &part.point_engines);
+        extend_cloned(&mut next.collections, &part.collections);
+        extend_cloned(&mut next.styles, &part.styles);
+        next
+    });
+    state.maps.rcu(|live| {
+        let mut next = MapsState::clone(live);
+        let part = &part.maps_state;
+        extend_cloned(&mut next.engines, &part.engines);
+        extend_cloned(&mut next.collections, &part.collections);
+        extend_cloned(&mut next.styles, &part.styles);
+        next.map_tileset_ids
+            .extend(part.map_tileset_ids.iter().cloned());
+        next
+    });
+    state.tiles.rcu(|live| {
+        let mut next = TilesState::clone(live);
+        let part = &part.tiles_state;
+        extend_cloned(&mut next.map_engines, &part.map_engines);
+        extend_cloned(&mut next.collections, &part.collections);
+        extend_cloned(&mut next.styles, &part.styles);
+        extend_cloned(&mut next.feature_engines, &part.feature_engines);
+        extend_cloned(&mut next.feature_collections, &part.feature_collections);
+        next
+    });
+    state.tiles_3d.rcu(|live| {
+        let mut next = api_3dtiles::TilesState3d::clone(live);
+        let part = &part.tiles_3d_state;
+        extend_cloned(&mut next.volume_engines, &part.volume_engines);
+        extend_cloned(&mut next.collections, &part.collections);
+        extend_cloned(&mut next.quantity_styles, &part.quantity_styles);
+        extend_cloned(&mut next.collection_pages, &part.collection_pages);
+        next
+    });
+    state.served_by.rcu(|live| {
+        let mut next = api_common::shared::ServedByMap::clone(live);
+        extend_cloned(&mut next, &part.served_by);
+        next
+    });
+
+    // Health last: the collection's `loading` entry gives way to what its
+    // load reports, in its place in the config's order.
+    let mut health = state.health.write().unwrap_or_else(|e| e.into_inner());
+    let entries = std::mem::take(&mut part.health);
+    match health
+        .iter()
+        .position(|h| h.id == configured.id && h.status == CollectionStatus::Loading)
+    {
+        Some(at) => {
+            health.splice(at..=at, entries);
+        }
+        None => health.extend(entries),
+    }
+    update_health_gauges(&health);
+}
+
 /// The health `/health` reports and the `collections_*` gauges count: the
 /// load/reload snapshot with every live signal applied on top (#990). One
 /// function so the endpoint and the gauges cannot drift — the gauges used to
@@ -9254,8 +9771,37 @@ fn refresh_data_age_gauge_locked(
     ages
 }
 
+/// `GET /health` parameters. Others are ignored, as they always were.
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct HealthQuery {
+    /// `loaded` (`loaded=true`): answer 503 while any collection is still
+    /// loading (#317), a readiness check for a client that should wait for
+    /// every collection. `loaded=false` is the plain check.
+    loaded: Option<String>,
+}
+
 /// GET /health — per-collection health status with data staleness info.
-pub async fn health_handler(State(state): State<AdminState>) -> impl IntoResponse {
+///
+/// 200 while collections load (#317), so a container health check passes
+/// from the first request; 503 once every collection failed, and with
+/// `loaded` while any collection is loading.
+pub async fn health_handler(
+    State(state): State<AdminState>,
+    api_common::JsonQuery(query): api_common::JsonQuery<HealthQuery>,
+) -> axum::response::Response {
+    let wait_for_load = match query.loaded.as_deref() {
+        None | Some("false") => false,
+        Some("" | "true") => true,
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("loaded must be true or false, not '{other}'")
+                })),
+            )
+                .into_response();
+        }
+    };
     let health = effective_health(&state);
 
     // Build per-collection metadata from concrete engine types.
@@ -9462,8 +10008,12 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
 
     let all_failed =
         !health.is_empty() && health.iter().all(|h| h.status == CollectionStatus::Failed);
+    let loading = health.iter().any(|h| h.status == CollectionStatus::Loading);
 
-    let overall = if health.iter().all(|h| h.status == CollectionStatus::Ready) {
+    let overall = if loading {
+        // The startup load has not built every collection yet (#317).
+        "loading"
+    } else if health.iter().all(|h| h.status == CollectionStatus::Ready) {
         "healthy"
     } else if all_failed {
         // Every collection failed — nothing to serve
@@ -9473,8 +10023,9 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
         "degraded"
     };
 
-    // Only return 503 when the server can't serve anything at all
-    let status_code = if all_failed {
+    // Only return 503 when the server can't serve anything at all, or
+    // when asked to wait for the startup load.
+    let status_code = if all_failed || (wait_for_load && loading) {
         StatusCode::SERVICE_UNAVAILABLE
     } else {
         StatusCode::OK
@@ -9487,6 +10038,7 @@ pub async fn health_handler(State(state): State<AdminState>) -> impl IntoRespons
             "collections": collections
         })),
     )
+        .into_response()
 }
 
 /// GET /metrics — Prometheus text format.
@@ -16440,9 +16992,12 @@ colormap = "no_such_map"
 
     async fn health_json(state: &super::AdminState) -> serde_json::Value {
         use axum::response::IntoResponse;
-        let response = super::health_handler(axum::extract::State(state.clone()))
-            .await
-            .into_response();
+        let response = super::health_handler(
+            axum::extract::State(state.clone()),
+            api_common::JsonQuery(Default::default()),
+        )
+        .await
+        .into_response();
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
             .await
@@ -16467,6 +17022,7 @@ colormap = "no_such_map"
             healthy,
             degraded,
             failed,
+            loading: 0,
         }
     }
 

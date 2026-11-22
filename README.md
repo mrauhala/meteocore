@@ -318,7 +318,7 @@ Tiles (raster) reuses `MapEngine` — z/x/y coordinates are converted to a bbox 
 
 ### State Architecture
 
-Each state struct is wrapped in `Arc<ArcSwap<…>>` for lock-free reads and atomic swaps on reload. `ServerState` (in `server/src/admin.rs`) owns all six `ArcSwap` pointers plus the health registry and GeoTIFF engine list (kept separately for the poll runtime). Engine loading lives in `admin::load_collections()`, called by both startup and `POST /admin/collections/reload`.
+Each state struct is wrapped in `Arc<ArcSwap<…>>` for lock-free reads and atomic swaps on reload. `ServerState` (in `server/src/admin.rs`) owns all six `ArcSwap` pointers plus the health registry and GeoTIFF engine list (kept separately for the poll runtime). Engine loading lives in `admin::load_collections()`, called by `POST /admin/collections/reload` for the whole config and by startup for each collection on its own: the server serves from boot and publishes each collection to the registries once it is built (#317).
 
 The render semaphore (`[server] render_concurrency`, default 2× CPU cores, minimum 8) and rendered-image cache are shared across `MapsState`, `TilesState`, and `WmsState`. `TilesState3d` instead holds its own 3D Tiles content pool (`api_3dtiles::CONTENT_SLOTS`, ¼ CPU cores, minimum 2), shared by `.pnts`, the `.glb` isosurface/echo-top meshes and voxels, so slow cold 3D computes serialize among themselves and never occupy raster render slots; it also has its own content cache (`api-3dtiles/src/cache.rs`). The semaphore uses `acquire().await` so excess requests queue rather than fail. The 2× factor reflects loose CPU ownership — libpng decode bursts and bilinear-sample passes interleave, leaving the slot idle a non-trivial fraction of its wall time.
 
@@ -3410,11 +3410,12 @@ The Memory & admission tab stacks RSS less the caches into the stores, the heap 
 
 | Status | Meaning |
 |--------|---------|
+| `loading` | Configured, not built yet: the server serves from boot and each collection once it is built, a few at a time, a derived collection after its sources. Every API answers for it as for an unknown collection until then |
 | `ready` | Engine loaded and has data |
 | `degraded` | Engine loaded but no data yet, or none now: a radar site whose volumes left its source |
 | `failed` | Engine failed to load (error message included) |
 
-Returns HTTP 503 only when all collections have failed.
+The overall `status` is `loading` while any collection is, else `healthy`, `degraded` or `unhealthy`. Returns HTTP 200 while collections load, so a container health check passes during a long boot, and 503 only once none is loading and every collection has failed; a server whose every collection failed then exits, unless each is a remote radar source it retries. `GET /health?loaded` also returns 503 while any collection is loading: a readiness check for a client or load balancer that should wait for every collection. A reload requested while collections load answers 409.
 
 Entries can also carry the collection's temporal extent and two ages in seconds:
 
@@ -3444,6 +3445,7 @@ Entries can also carry the collection's temporal extent and two ages in seconds:
 | `collections_healthy` | gauge | — | Collections in ready state |
 | `collections_degraded` | gauge | — | Collections in degraded state |
 | `collections_failed` | gauge | — | Collections in failed state |
+| `collections_loading` | gauge | — | Configured collections the startup load has not built yet; 0 once it settles |
 | `collection_data_age_seconds` | gauge | collection, alerting | Seconds since the newest data a collection serves, its `/health` `data_age_secs`; only collections that hold data. A radar site's series, and its two below, carry `alerting="false"`, which the freshness alerts leave out (see [Alerting](#alerting)); no other series has the label |
 | `collection_has_data` | gauge | collection, alerting | 1 while a collection whose engine reports a data age (GeoTIFF, QueryData, BUFR, satellite, NetCDF, nowcast, polar-volume site) holds data, 0 when it holds none: it never loaded any, or all of it aged out of a satellite `time_window`, a BUFR `retention` or a polar-volume source's window. Alert on it next to the data age, which has no series then |
 | `collection_expected_interval_seconds` | gauge | collection, alerting | How often the collection's data arrives, measured on the timeline its data age is: the median spacing of the newest six timesteps (GeoTIFF), runs (QueryData, NetCDF with runs), valid times (NetCDF without runs), distinct report times (BUFR), scans (satellite), generations (nowcast) or volumes (polar-volume site). The collection's `expected_interval` wins. No series below two timesteps without one |

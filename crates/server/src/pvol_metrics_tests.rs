@@ -135,9 +135,12 @@ async fn pvol_sites_report_their_newest_volume_as_data_age() {
     let (dir, state) = pvol_state(BASE);
 
     let before = Utc::now();
-    let response = super::health_handler(axum::extract::State(state.clone()))
-        .await
-        .into_response();
+    let response = super::health_handler(
+        axum::extract::State(state.clone()),
+        api_common::JsonQuery(Default::default()),
+    )
+    .await
+    .into_response();
     let bytes = axum::body::to_bytes(response.into_body(), 1_000_000)
         .await
         .unwrap();
