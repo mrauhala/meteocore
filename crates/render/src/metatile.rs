@@ -175,7 +175,9 @@ impl Grid {
     /// view's centre, and continues across ±180° within the view: a view
     /// a turn away is cut from the same grid a turn away and draws the
     /// same texels. Views centred in the world in place keep its grid.
-    /// Projected grids have no copies.
+    /// The seam this needs lies at ±180° + k·360°: on an odd level a view
+    /// whose centre crosses it moves to the next copy's grid and shifts by
+    /// up to a texel. Projected grids have no copies.
     fn world_copy(self, level: i32, west_m: f64, east_m: f64) -> i64 {
         if self != Self::WebMercator || level % 2 == 0 {
             return 0;

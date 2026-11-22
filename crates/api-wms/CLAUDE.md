@@ -98,6 +98,11 @@ path can leave the WMS symptom unchanged (#448 vs #452).
   across ±180° within the view; even steps and views centred in the world
   in place keep the world's grid. A copy's tiles are its own cache entries,
   never the world in place's, since an engine may draw a copy otherwise.
+  The seam a non-whole turn needs lies at ±180° + k·360°: on an odd step, a
+  view whose centre crosses it moves to the next copy's grid and shifts by
+  up to a texel, and views centred just east and just west of it render and
+  cache their overlapping tiles separately. A view centred exactly on 180°
+  takes copy 1; on −180° rounding decides.
   Pinned by `server/tests/wms_world_copies.rs` and ds-render's
   `a_world_copy_assembles_the_pixels_of_the_view_in_place`.
 - EPSG:3067/3035 use separate internal metre grids: origin (0,0),
